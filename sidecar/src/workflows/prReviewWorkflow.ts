@@ -1057,7 +1057,12 @@ export async function runPrReviewWorkflow(params: {
     }
 
     // 7. Post formatted summary to Slack
-    const slackSummary = formatSlackReviewSummary(normalizedOutputs, prContext.url, reviewResult);
+    const hasCriticalOrHigh = allFindings.some(f => f.severity === 'critical' || f.severity === 'high');
+    const blockingCount = allFindings.filter(f => f.severity === 'critical' || f.severity === 'high').length;
+    const baseSummary = formatSlackReviewSummary(normalizedOutputs, prContext.url, reviewResult);
+    const slackSummary = hasCriticalOrHigh
+      ? `${baseSummary}\n⚠️ ${blockingCount} blocking-severity finding(s) — please address before merge.`
+      : baseSummary;
 
     await slack.chat.postMessage({
       channel: task.event.channelId,
@@ -1065,17 +1070,21 @@ export async function runPrReviewWorkflow(params: {
       text: slackSummary,
     });
 
-    const hasCriticalOrHigh = allFindings.some(f => f.severity === 'critical' || f.severity === 'high');
-
+    // A completed review is SUCCESS regardless of finding severity — FAILED is
+    // reserved for the workflow itself failing. The verdict travels in
+    // `result` so consumers (reactions, learning signals, dedup) stop
+    // conflating "review found blockers" with "review broke" (issue #334).
     return {
       workflow: 'PR_REVIEW',
-      status: hasCriticalOrHigh ? 'FAILED' : 'SUCCESS',
+      status: 'SUCCESS',
       message: slackSummary,
       notifyDesktop: false,
       slackPosted: true,
       result: {
         ...(prHeadSha ? { prHeadSha } : {}),
         prUrl: prContext.url,
+        verdict: hasCriticalOrHigh ? 'blocking_findings' : 'clean',
+        hasBlockingFindings: hasCriticalOrHigh,
         totalFindings: allFindings.length,
         attachableFindings: attachableFindings.length,
         unattachableFindings: unattachableFindings.length,
