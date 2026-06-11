@@ -640,3 +640,68 @@ describe('routeTask investigation resume gate', () => {
     expect(runImplementationWorkflow).not.toHaveBeenCalled();
   });
 });
+
+describe('deterministic PR_REVIEW seed (issue #334 bug B)', () => {
+  it('skips the AI classifier and dispatches the review at reviewer tier', async () => {
+    const config = makeConfig('enforce');
+    const logStep = vi.fn();
+
+    const result = await routeTask({
+      task: makeTask({
+        userId: 'UREVIEW',
+        channelId: 'C-REVIEW',
+        text: '<@UBOT1> review https://github.com/Newton-School/newton-web/pull/8652',
+        intent: 'PR_REVIEW',
+        prContext: {
+          url: 'https://github.com/Newton-School/newton-web/pull/8652',
+          owner: 'Newton-School',
+          repo: 'newton-web',
+          number: 8652,
+        },
+      }),
+      config,
+      slack: makeSlack() as never,
+      store: {} as never,
+      logStep,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    expect(classifyWorkflowIntent).not.toHaveBeenCalled();
+    expect(runPrReviewWorkflow).toHaveBeenCalledOnce();
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'router.pr_review.deterministic' }));
+  });
+
+  it('routes the review even when the classifier CLI is dead (the incident failure mode)', async () => {
+    // 2026-06-11 incident: "Please review <newton-web URL>" hit a classifier
+    // CLI exit-1, fell back to INFORMATIONAL@0.00, the access-drop guardrail
+    // held IMPLEMENTATION, and the implementation workflow asked admins
+    // "web or api?" about a message that named the repo in its URL. With the
+    // deterministic seed the classifier is never consulted, so its health is
+    // irrelevant.
+    const config = makeConfig('enforce');
+    classifyWorkflowIntent.mockRejectedValue(new Error('CLI exited 1'));
+
+    const result = await routeTask({
+      task: makeTask({
+        userId: 'UREVIEW',
+        channelId: 'C-REVIEW',
+        text: '<@UBOT1> Please review https://github.com/Newton-School/newton-web/pull/8652',
+        intent: 'PR_REVIEW',
+        prContext: {
+          url: 'https://github.com/Newton-School/newton-web/pull/8652',
+          owner: 'Newton-School',
+          repo: 'newton-web',
+          number: 8652,
+        },
+      }),
+      config,
+      slack: makeSlack() as never,
+      store: {} as never,
+      logStep: vi.fn(),
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    expect(classifyWorkflowIntent).not.toHaveBeenCalled();
+    expect(runPrReviewWorkflow).toHaveBeenCalledOnce();
+  });
+});

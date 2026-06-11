@@ -9,8 +9,22 @@ import type {
 import { getAdminUserIds } from '../access/control.js';
 import { isDossierForgetField, isDossierRole } from '../state/dossierStore.js';
 import { hasDevAssistPrefix, hasNaturalDevAssistAlias } from './devAssistParser.js';
+import { extractAllPrContexts } from './prTargetResolver.js';
 
-const GITHUB_PR_REGEX = /https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)/g;
+const GITHUB_PR_URL_TEST_RE = /https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+/;
+
+// Matches Metabase URLs across deployments — official `metabase.com` and
+// self-hosted instances whose hostname starts with `metabase` (e.g.
+// `metabase-lierhfgoeiwhr.newtonschool.co`). Used to short-circuit the
+// pre-classifier so "explain this table/query/dashboard" questions don't
+// seed as IMPLEMENTATION and trip the access-drop confidence guardrail
+// (see `router/taskRouter.ts` `router.classify.low_confidence_hold`).
+const METABASE_URL_REGEX = /https?:\/\/(?:[a-z0-9-]+\.)*metabase[a-z0-9-]*\.[a-z][a-z0-9.-]+\//i;
+
+export function containsMetabaseUrl(text: string | undefined | null): boolean {
+  if (!text) return false;
+  return METABASE_URL_REGEX.test(text);
+}
 
 // Matches Metabase URLs across deployments — official `metabase.com` and
 // self-hosted instances whose hostname starts with `metabase` (e.g.
@@ -82,23 +96,56 @@ export function detectMention(
   return { detected: false, type: 'none' };
 }
 
+/**
+ * Back-compat single-PR view: the first PR URL across the given texts.
+ * Multi-PR-aware callers should use `extractAllPrContexts` /
+ * `resolvePrReviewTargets` (prTargetResolver.ts) instead — this picks one
+ * URL with no knowledge of what the request asked for.
+ */
 export function extractPrContext(texts: string[]): PrContext | undefined {
-  for (const text of texts) {
-    if (!text) {
-      continue;
-    }
-    const matches = [...text.matchAll(GITHUB_PR_REGEX)];
-    if (matches.length > 0) {
-      const match = matches[0];
-      return {
-        url: match[0],
-        owner: match[1],
-        repo: match[2],
-        number: Number(match[3]),
-      };
-    }
+  const [first] = extractAllPrContexts({ threadTexts: texts });
+  if (!first) return undefined;
+  return { url: first.url, owner: first.owner, repo: first.repo, number: first.number };
+}
+
+const REVIEW_VERB_RE = /\b(re-?review|review)\b/;
+const CONFLICTING_CHANGE_VERB_RE =
+  /\b(create|open|raise|fix|implement|merge|close|revert|rebase|update|address|resolve)\b/;
+
+/**
+ * Deterministic check: is the message asking for a PR review? Runs before
+ * the AI classifier (pattern: isDeployRequest) so a message that carries
+ * all its routing signal in plain text never depends on a CLI subprocess —
+ * the issue #334 incident had "review <PR URL>" cascade into an
+ * admin-clarify/cancel because the classifier call exited 1 (bug B).
+ *
+ * Tier 1 — a PR URL in the trigger message itself: fires when a review verb
+ * is present, or when no conflicting change verb is present (so a bare URL
+ * paste fires, but "fix the comments on <url>" falls through to the
+ * classifier).
+ * Tier 2 — review verb in the trigger, PR URL(s) elsewhere in the thread:
+ * fires only when no conflicting change verb muddies the ask ("review and
+ * fix X" is mixed intent — let the classifier decide).
+ */
+export function isPrReviewRequest(triggerText: string, threadTexts: string[] = []): boolean {
+  if (!triggerText) return false;
+  const normalized = triggerText
+    .replace(/<@[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .toLowerCase()
+    .trim();
+  const hasReviewVerb = REVIEW_VERB_RE.test(normalized);
+  const hasConflictingVerb = CONFLICTING_CHANGE_VERB_RE.test(normalized);
+
+  if (GITHUB_PR_URL_TEST_RE.test(triggerText)) {
+    return hasReviewVerb || !hasConflictingVerb;
   }
-  return undefined;
+
+  if (hasReviewVerb && !hasConflictingVerb) {
+    return threadTexts.some(text => Boolean(text) && GITHUB_PR_URL_TEST_RE.test(text));
+  }
+
+  return false;
 }
 
 /**
@@ -168,6 +215,7 @@ function inferIntent(
   event: SlackEventEnvelope,
   config: AppConfig,
   mention: { detected: boolean; type: 'bot' | 'owner' | 'none' },
+  threadTexts: string[] = [],
 ): { intent: WorkflowIntent; miniogSubcommand?: MiniogSubcommand } {
   // Dossier subcommands (whoami / set-role / forget) take precedence over every other route
   // when the bot is mentioned. They are read-only or operator-self-edit commands and
@@ -190,6 +238,16 @@ function inferIntent(
   // Deterministic deploy detection — routed before the AI classifier.
   if (mention.detected && isDeployRequest(event.text ?? '')) {
     return { intent: 'DEPLOY' };
+  }
+
+  // Deterministic PR-review detection — before the owner/default seeding so
+  // owners get it too. Seeding PR_REVIEW here (reviewer tier) skips the AI
+  // classifier in routeTask entirely: a "review <PR URL>" message routes
+  // identically whether the classifier CLI is healthy or down (issue #334
+  // bug B), and the access check evaluates reviewer tier directly with no
+  // override for the confidence guardrail to hold.
+  if (mention.detected && mention.type === 'bot' && isPrReviewRequest(event.text ?? '', threadTexts)) {
+    return { intent: 'PR_REVIEW' };
   }
 
   // Intent classification (PR_REVIEW, INFORMATIONAL, etc.) is handled by the
@@ -230,8 +288,10 @@ export function normalizeTask(
   const mention = detectMention(event.text, config, event.channelType);
   const isOwnerAuthor = config.ownerSlackUserIds.includes(event.userId);
   const isCoreDevAuthor = getAdminUserIds(config).includes(event.userId);
-  const prContext = extractPrContext([event.text, ...threadTexts]);
-  const inferred = inferIntent(event, config, mention);
+  const prContexts = extractAllPrContexts({ triggerText: event.text, threadTexts });
+  const first = prContexts[0];
+  const prContext = first ? { url: first.url, owner: first.owner, repo: first.repo, number: first.number } : undefined;
+  const inferred = inferIntent(event, config, mention, threadTexts);
 
   return {
     event,
@@ -241,6 +301,7 @@ export function normalizeTask(
     isCoreDevAuthor,
     intent: inferred.intent,
     prContext,
+    prContexts: prContexts.length > 0 ? prContexts : undefined,
     miniogSubcommand: inferred.miniogSubcommand,
   };
 }

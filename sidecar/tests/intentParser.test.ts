@@ -56,7 +56,7 @@ describe('intentParser', () => {
     expect(result?.number).toBe(123);
   });
 
-  it('normalizes non-owner PR-containing message to IMPLEMENTATION (AI classifier refines in router)', () => {
+  it('routes review-verb + PR URL deterministically to PR_REVIEW (no classifier dependency)', () => {
     const task = normalizeTask(
       {
         ...baseEvent,
@@ -66,9 +66,9 @@ describe('intentParser', () => {
       [],
     );
 
-    // Non-owner bot mentions get IMPLEMENTATION as the preliminary intent;
-    // the AI classifier in routeTask refines it to PR_REVIEW.
-    expect(task.intent).toBe('IMPLEMENTATION');
+    // Deterministic gate (issue #334 bug B): a message carrying both the
+    // review verb and the PR URL must never depend on the AI classifier CLI.
+    expect(task.intent).toBe('PR_REVIEW');
     expect(task.mentionDetected).toBe(true);
     expect(task.isOwnerAuthor).toBe(false);
     expect(task.prContext?.repo).toBe('newton-web');
@@ -99,7 +99,7 @@ describe('intentParser', () => {
     expect(otherChannel.intent).toBe('IMPLEMENTATION');
   });
 
-  it('returns IMPLEMENTATION for non-owner PR URL in any channel (AI refines in router)', () => {
+  it('routes "review <url>" to PR_REVIEW deterministically in any channel', () => {
     const task = normalizeTask(
       {
         ...baseEvent,
@@ -110,7 +110,7 @@ describe('intentParser', () => {
       [],
     );
 
-    expect(task.intent).toBe('IMPLEMENTATION');
+    expect(task.intent).toBe('PR_REVIEW');
     expect(task.mentionDetected).toBe(true);
     expect(task.prContext?.number).toBe(22);
   });
@@ -226,7 +226,7 @@ describe('intentParser', () => {
     expect(task.intent).toBe('OWNER_AUTOPILOT');
   });
 
-  it('extracts PR context for non-owner mentions and tags intent as IMPLEMENTATION (AI refines in router)', () => {
+  it('routes a bare PR URL paste to PR_REVIEW (implicit review ask, no conflicting verb)', () => {
     const task = normalizeTask(
       {
         ...baseEvent,
@@ -236,8 +236,80 @@ describe('intentParser', () => {
       [],
     );
 
+    expect(task.intent).toBe('PR_REVIEW');
+    expect(task.prContext?.number).toBe(99);
+  });
+
+  it('keeps PR-URL messages with change verbs on IMPLEMENTATION (AI refines in router)', () => {
+    const task = normalizeTask(
+      {
+        ...baseEvent,
+        text: '<@UBOT1> fix the failing checks on https://github.com/Newton-School/newton-web/pull/99',
+      },
+      config,
+      [],
+    );
+
     expect(task.intent).toBe('IMPLEMENTATION');
     expect(task.prContext?.number).toBe(99);
+  });
+
+  it('routes "review the frontend PR" to PR_REVIEW when the PR URLs live in the thread (incident shape)', () => {
+    const task = normalizeTask(
+      {
+        ...baseEvent,
+        text: '<@UBOT1> review the frontend PR and comment the findings directly in the PR.',
+      },
+      config,
+      [
+        'backend : https://github.com/Newton-School/newton-api/pull/5781\nfrontend : https://github.com/Newton-School/newton-web/pull/8652',
+      ],
+    );
+
+    expect(task.intent).toBe('PR_REVIEW');
+    expect(task.prContexts).toHaveLength(2);
+    expect(task.prContexts?.every(t => t.source === 'thread')).toBe(true);
+  });
+
+  it('does not fire the review gate on review-verb messages with no PR anywhere', () => {
+    const task = normalizeTask(
+      {
+        ...baseEvent,
+        text: '<@UBOT1> review my approach for the new caching layer',
+      },
+      config,
+      ['just chatting', 'no links here'],
+    );
+
+    expect(task.intent).toBe('IMPLEMENTATION');
+  });
+
+  it('does not fire the review gate on mixed review+change asks with only thread URLs', () => {
+    const task = normalizeTask(
+      {
+        ...baseEvent,
+        text: '<@UBOT1> review and fix the spacing bug',
+      },
+      config,
+      ['https://github.com/Newton-School/newton-web/pull/8652'],
+    );
+
+    expect(task.intent).toBe('IMPLEMENTATION');
+  });
+
+  it('routes owner review asks to PR_REVIEW too (gate precedes OWNER_AUTOPILOT seeding)', () => {
+    const task = normalizeTask(
+      {
+        ...baseEvent,
+        userId: 'UOWNER1',
+        text: '<@UBOT1> review https://github.com/Newton-School/newton-web/pull/22',
+      },
+      config,
+      [],
+    );
+
+    expect(task.intent).toBe('PR_REVIEW');
+    expect(task.isOwnerAuthor).toBe(true);
   });
 
   it('defaults non-owner bot mentions to IMPLEMENTATION (no owner-implying label)', () => {
