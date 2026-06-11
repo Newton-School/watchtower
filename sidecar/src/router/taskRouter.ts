@@ -87,7 +87,25 @@ export async function routeTask(params: {
     .replace(/\s+/g, ' ')
     .trim();
 
-  if (task.intent !== 'DEV_ASSIST' && task.intent !== 'DEPLOY' && task.intent !== 'MINIOG_DOSSIER') {
+  // PR_REVIEW can only be seeded pre-classifier by the deterministic gate
+  // (isPrReviewRequest in intentParser.ts) — nothing else produces it before
+  // this point. Skip the AI classifier entirely so a "review <PR URL>"
+  // message routes identically whether the classifier CLI is healthy or
+  // down (issue #334, bug B).
+  if (task.intent === 'PR_REVIEW') {
+    logStep?.({
+      stage: 'router.pr_review.deterministic',
+      message: 'Deterministic PR-review gate fired — skipping the AI classifier.',
+      data: { userMessage, prCount: task.prContexts?.length ?? (task.prContext ? 1 : 0) },
+    });
+  }
+
+  if (
+    task.intent !== 'DEV_ASSIST' &&
+    task.intent !== 'DEPLOY' &&
+    task.intent !== 'MINIOG_DOSSIER' &&
+    task.intent !== 'PR_REVIEW'
+  ) {
     if (isPresencePing(userMessage)) {
       resolvedIntent = 'CONVERSATIONAL';
     } else if (

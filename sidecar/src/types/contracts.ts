@@ -271,6 +271,15 @@ export interface PrContext {
   number: number;
 }
 
+/**
+ * A PR mentioned somewhere in the request. `source` records whether the URL
+ * was in the trigger message itself or elsewhere in the thread — trigger
+ * URLs outrank thread URLs during review-target resolution.
+ */
+export interface PrTarget extends PrContext {
+  source: 'trigger' | 'thread';
+}
+
 export interface NormalizedTask {
   event: SlackEventEnvelope;
   mentionDetected: boolean;
@@ -278,7 +287,10 @@ export interface NormalizedTask {
   isOwnerAuthor: boolean;
   isCoreDevAuthor: boolean;
   intent: WorkflowIntent;
+  /** First PR found (trigger-ranked) — back-compat single-PR view of `prContexts`. */
   prContext?: PrContext;
+  /** Every distinct PR URL in the trigger + thread, trigger URLs first. */
+  prContexts?: PrTarget[];
   miniogSubcommand?: MiniogSubcommand;
   /**
    * Dossier-derived tone preference, populated by the router after looking up
