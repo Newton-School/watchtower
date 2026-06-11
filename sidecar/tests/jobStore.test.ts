@@ -686,3 +686,116 @@ describe('isPausedAwaitingPrUrl', () => {
     store.close();
   });
 });
+
+describe('findLatestReviewedPrHeadSha (issue #334 bug E)', () => {
+  const prUrl = 'https://github.com/Newton-School/newton-web/pull/8652';
+
+  function makeStore() {
+    return new JobStore(tempDbPath());
+  }
+
+  function seedJob(
+    store: JobStore,
+    id: string,
+    opts: {
+      workflow?: string;
+      status: 'SUCCESS' | 'FAILED' | 'CANCELLED';
+      executedWorkflow?: 'PR_REVIEW';
+      result?: Record<string, unknown>;
+    },
+  ) {
+    store.createJob({
+      id,
+      eventId: `event-${id}`,
+      dedupeKey: `C1:777:${id}`,
+      workflow: (opts.workflow ?? 'IMPLEMENTATION') as never,
+      channelId: 'C1',
+      threadTs: '777',
+      payload: {},
+    });
+    store.markJob(id, opts.status, {
+      result: opts.result,
+      executedWorkflow: opts.executedWorkflow,
+      errorMessage: opts.status === 'FAILED' ? 'boom' : undefined,
+    });
+  }
+
+  it('matches jobs whose review ran post-override (workflow seed != PR_REVIEW)', () => {
+    // The incident shape: jobs.workflow keeps the pre-classifier IMPLEMENTATION
+    // seed; the AI override lands only in executed_workflow. The old query
+    // filtered on the raw workflow column and never matched.
+    const store = makeStore();
+    seedJob(store, 'job-coalesce', {
+      workflow: 'IMPLEMENTATION',
+      status: 'SUCCESS',
+      executedWorkflow: 'PR_REVIEW',
+      result: { prUrl, prHeadSha: 'dda9039' },
+    });
+
+    const hit = store.findLatestReviewedPrHeadSha({ channelId: 'C1', threadTs: '777', prUrl });
+    expect(hit?.prHeadSha).toBe('dda9039');
+    store.close();
+  });
+
+  it('matches historical FAILED rows that carry a prHeadSha (pre-#334 completed reviews)', () => {
+    // Under the old status semantics, completed reviews with blocking findings
+    // were mislabeled FAILED but still persisted prUrl + prHeadSha. Genuine
+    // failures never persist a prHeadSha, so this cannot false-positive.
+    const store = makeStore();
+    seedJob(store, 'job-legacy-failed', {
+      workflow: 'IMPLEMENTATION',
+      status: 'FAILED',
+      executedWorkflow: 'PR_REVIEW',
+      result: { prUrl, prHeadSha: 'dda9039' },
+    });
+
+    const hit = store.findLatestReviewedPrHeadSha({ channelId: 'C1', threadTs: '777', prUrl });
+    expect(hit?.prHeadSha).toBe('dda9039');
+    store.close();
+  });
+
+  it('does not match genuinely failed jobs (no prHeadSha in result)', () => {
+    const store = makeStore();
+    seedJob(store, 'job-genuine-failure', {
+      workflow: 'IMPLEMENTATION',
+      status: 'FAILED',
+      executedWorkflow: 'PR_REVIEW',
+      result: undefined,
+    });
+
+    expect(store.findLatestReviewedPrHeadSha({ channelId: 'C1', threadTs: '777', prUrl })).toBeUndefined();
+    store.close();
+  });
+
+  it('does not match jobs that executed a different workflow', () => {
+    const store = makeStore();
+    seedJob(store, 'job-impl', {
+      workflow: 'IMPLEMENTATION',
+      status: 'SUCCESS',
+      result: { prUrl, prHeadSha: 'dda9039' },
+    });
+
+    expect(store.findLatestReviewedPrHeadSha({ channelId: 'C1', threadTs: '777', prUrl })).toBeUndefined();
+    store.close();
+  });
+
+  it('matches per-PR outcomes in the multi-PR result shape, including on partially-failed jobs', () => {
+    const store = makeStore();
+    const otherPrUrl = 'https://github.com/Newton-School/newton-api/pull/5781';
+    seedJob(store, 'job-multi', {
+      workflow: 'PR_REVIEW',
+      status: 'FAILED', // PR 2 failed; PR 1 completed and must still dedup
+      result: {
+        outcomes: [
+          { prUrl, status: 'SUCCESS', prHeadSha: 'feedface' },
+          { prUrl: otherPrUrl, status: 'FAILED', error: 'agent exit 1' },
+        ],
+      },
+    });
+
+    const hit = store.findLatestReviewedPrHeadSha({ channelId: 'C1', threadTs: '777', prUrl });
+    expect(hit?.prHeadSha).toBe('feedface');
+    expect(store.findLatestReviewedPrHeadSha({ channelId: 'C1', threadTs: '777', prUrl: otherPrUrl })).toBeUndefined();
+    store.close();
+  });
+});

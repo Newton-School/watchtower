@@ -2573,11 +2573,22 @@ export class JobStore {
     threadTs: string;
     prUrl: string;
   }): { jobId: string; prHeadSha: string; updatedAt: string } | undefined {
+    // COALESCE: review jobs are usually seeded as IMPLEMENTATION /
+    // OWNER_AUTOPILOT pre-classifier (jobs.workflow keeps that seed for
+    // pause-resume), so the workflow that actually ran lives in
+    // executed_workflow. Filtering on the raw column matched nothing
+    // (issue #334, bug E).
+    //
+    // FAILED is included because (a) under pre-#334 semantics completed
+    // reviews with blocking findings were mislabeled FAILED, and (b) a
+    // partially-failed multi-PR job still carries fully-reviewed PRs. The
+    // real invariant is the JSON guard below: only outcomes that persisted
+    // a prHeadSha count as reviewed — genuine failures never do.
     const stmt = this.db.prepare(
       `SELECT id, result_json, updated_at
        FROM jobs
-       WHERE workflow = 'PR_REVIEW'
-         AND status = 'SUCCESS'
+       WHERE COALESCE(executed_workflow, workflow) = 'PR_REVIEW'
+         AND status IN ('SUCCESS', 'FAILED')
          AND channel_id = ?
          AND thread_ts = ?
        ORDER BY updated_at DESC
@@ -2601,6 +2612,22 @@ export class JobStore {
 
       try {
         const parsed = JSON.parse(row.result_json) as Record<string, unknown>;
+
+        // Multi-PR shape: result.outcomes[] with per-PR status + head SHA.
+        if (Array.isArray(parsed.outcomes)) {
+          for (const candidate of parsed.outcomes) {
+            if (!candidate || typeof candidate !== 'object') continue;
+            const outcome = candidate as Record<string, unknown>;
+            const outcomeUrl = typeof outcome.prUrl === 'string' ? outcome.prUrl : '';
+            const outcomeSha = typeof outcome.prHeadSha === 'string' ? outcome.prHeadSha : '';
+            if (outcomeUrl === input.prUrl && outcome.status === 'SUCCESS' && outcomeSha) {
+              return { jobId: row.id, prHeadSha: outcomeSha, updatedAt: row.updated_at };
+            }
+          }
+          continue;
+        }
+
+        // Legacy single-PR shape: top-level prUrl + prHeadSha.
         const prUrl = typeof parsed.prUrl === 'string' ? parsed.prUrl : '';
         const prHeadSha = typeof parsed.prHeadSha === 'string' ? parsed.prHeadSha : '';
         if (prUrl === input.prUrl && prHeadSha) {
