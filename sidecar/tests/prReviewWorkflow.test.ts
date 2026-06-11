@@ -512,6 +512,104 @@ describe('prReviewWorkflow', () => {
     }
   });
 
+  it('returns SUCCESS with hasBlockingFindings when the completed review found high-severity issues', async () => {
+    // Status contract (issue #334 bug D): a COMPLETED review is SUCCESS regardless
+    // of finding severity — FAILED is reserved for the workflow itself failing.
+    // The verdict travels in `result` instead. Previously high/critical findings
+    // flipped status to FAILED, which put the success summary in error_message,
+    // added an :x: reaction, and broke the no-new-changes dedup guard.
+    const originalFetch = globalThis.fetch;
+    vi.mocked(runCodex).mockResolvedValue({
+      ok: true,
+      parsedJson: {
+        findings: [
+          {
+            severity: 'high',
+            category: 'logic',
+            message: 'Unvalidated payload reaches the ORM filter.',
+            file: 'src/a.ts',
+            line: 2,
+          },
+        ],
+      },
+      stdout: '{}',
+      stderr: '',
+      exitCode: 0,
+      timedOut: false,
+    } as any);
+
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const accept = (init?.headers as Record<string, string> | undefined)?.Accept ?? '';
+      if (accept.includes('application/vnd.github.diff')) {
+        return new Response('diff --git a/src/a.ts b/src/a.ts\n@@ -1,1 +1,2 @@\n line\n+added', { status: 200 });
+      }
+      if (url.includes('/reviews')) {
+        return new Response('{"id": 1}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }) as typeof fetch;
+
+    try {
+      const slack = {
+        conversations: {
+          replies: vi.fn().mockResolvedValue({
+            messages: [{ text: 'review https://github.com/Newton-School/newton-web/pull/777' }],
+          }),
+        },
+        chat: { postMessage: vi.fn().mockResolvedValue({ ok: true }) },
+      };
+
+      const task: NormalizedTask = {
+        event: {
+          eventId: 'EvBlocking',
+          channelId: 'C1',
+          threadTs: '666.77',
+          eventTs: '666.77',
+          userId: 'U_BLOCK',
+          text: '<@UBOT1> review https://github.com/Newton-School/newton-web/pull/777',
+          rawEvent: {},
+        },
+        mentionDetected: true,
+        mentionType: 'bot',
+        isOwnerAuthor: false,
+        isCoreDevAuthor: false,
+        intent: 'PR_REVIEW',
+        prContext: {
+          url: 'https://github.com/Newton-School/newton-web/pull/777',
+          owner: 'Newton-School',
+          repo: 'newton-web',
+          number: 777,
+        },
+      };
+
+      const result = await runPrReviewWorkflow({
+        task,
+        config: { ...config, multiAgentEnabled: true },
+        slack: slack as any,
+        store: {
+          findLatestReviewedPrHeadSha: () => undefined,
+          getChannelPolicyPack: () => undefined,
+        } as any,
+        resolvePrHeadSha: async () => 'beadfeed',
+      });
+
+      expect(result.status).toBe('SUCCESS');
+      expect(result.result?.hasBlockingFindings).toBe(true);
+      expect(result.result?.verdict).toBe('blocking_findings');
+      expect(result.result?.prUrl).toBe('https://github.com/Newton-School/newton-web/pull/777');
+      expect(result.result?.prHeadSha).toBe('beadfeed');
+      // The Slack summary warns about blockers without failing the job.
+      expect(slack.chat.postMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          text: expect.stringMatching(/blocking-severity finding/),
+        }),
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it('normalizes non-attachable findings into summary-only review notes', () => {
     const output = normalizePrReviewAgentOutput('reviewer', {
       ok: true,
