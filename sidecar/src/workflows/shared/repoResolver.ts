@@ -95,6 +95,8 @@ export async function resolveRepoOrAsk(params: {
     affinity: repoAffinity,
     planAffectedFiles,
     planMarkdown,
+    webPath: config.repoPaths.newtonWeb,
+    apiPath: config.repoPaths.newtonApi,
     logStep,
   });
   if (!classification.uncertain && classification.selectedRepo) {

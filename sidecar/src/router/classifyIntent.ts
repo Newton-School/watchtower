@@ -27,6 +27,7 @@ Classification rules:
 - If the user is just chatting, greeting, or thanking → CONVERSATIONAL
 - If the user wants something fixed/built/changed AND supplies a concrete anchor (error text, stack trace, file path, function name, failing request, reproduction step) → IMPLEMENTATION.
 - If the user wants something "checked", "investigated", "debugged", or reports a bug with only a screenshot/URL/video and no technical anchor → INVESTIGATION.
+- If the message contains a Metabase URL (e.g. \`metabase.com\`, or self-hosted instances whose hostname starts with \`metabase\` — paths like \`/question\`, \`/dashboard\`, \`/model\`) and asks to explain, describe, or understand a table/query/dashboard/column → INFORMATIONAL with HIGH confidence (≥ 0.85). miniOG cannot edit Metabase content, so these are almost never IMPLEMENTATION. Only classify as IMPLEMENTATION if the user explicitly asks to write or change *code* that uses this query/table.
 - When in doubt between IMPLEMENTATION and INVESTIGATION, prefer INVESTIGATION — confirming a diagnosis is cheap, shipping a bad fix is expensive.
 - When in doubt between INVESTIGATION and INFORMATIONAL, prefer INVESTIGATION if the user is reporting a problem with observed behaviour; prefer INFORMATIONAL if the user is just asking how something works.`;
 
