@@ -1228,6 +1228,24 @@ export class JobStore {
   }
 
   /**
+   * Sibling of isPausedAwaitingPrUrl for the multi-PR clarify pause: the
+   * agentic PR review found several PRs in the thread, no selector, and
+   * asked which to review (issue #334). Keyed on the same stage string the
+   * orchestrator logs before pausing.
+   */
+  isPausedAwaitingTargetChoice(jobId: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS hit
+         FROM job_logs
+         WHERE job_id = ? AND stage = 'agentic.pr_review.targets.ambiguous'
+         LIMIT 1`,
+      )
+      .get(jobId) as { hit?: number } | undefined;
+    return Boolean(row?.hit);
+  }
+
+  /**
    * Read a paused job's resume context from result_json. Returns undefined if
    * the job has no result, or if the stored payload doesn't match the
    * ResumeContext schema (caller should treat as a corrupt resume and fail

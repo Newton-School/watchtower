@@ -794,7 +794,13 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
   // that column as OWNER_AUTOPILOT even when the classifier later routed
   // them to PR_REVIEW. Read the actual pause cause from job_logs instead.
   const pausedJob = store.pausedJobForThread(event.channelId, event.threadTs);
-  const pauseSignal = pausedJob && store.isPausedAwaitingPrUrl(pausedJob.id) ? 'pr_review_awaiting_url' : undefined;
+  const pauseSignal = pausedJob
+    ? store.isPausedAwaitingPrUrl(pausedJob.id)
+      ? 'pr_review_awaiting_url'
+      : store.isPausedAwaitingTargetChoice(pausedJob.id)
+        ? 'pr_review_target_choice'
+        : undefined
+    : undefined;
   const resumeDecision = decidePausedResume({
     pausedJob: pausedJob ? { id: pausedJob.id, workflow: pausedJob.workflow } : undefined,
     pauseSignal,
@@ -816,7 +822,15 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
   // in-thread, synthesize the bot mention so the no-mention gate below does
   // not drop the reply, and mark the old paused job as superseded.
   if (resumeDecision.resume && resumeDecision.paused) {
-    task = { ...task, mentionDetected: true, mentionType: 'bot' };
+    // forceIntent: target-choice replies ("both", "web", "#123") carry no
+    // review verb or URL, so normalizeTask would seed IMPLEMENTATION and the
+    // classifier would have to guess — force PR_REVIEW deterministically.
+    task = {
+      ...task,
+      mentionDetected: true,
+      mentionType: 'bot',
+      ...(resumeDecision.forceIntent ? { intent: resumeDecision.forceIntent } : {}),
+    };
     store.markJob(resumeDecision.paused.id, 'SKIPPED', {
       result: {
         reason: 'resumed_by_followup',

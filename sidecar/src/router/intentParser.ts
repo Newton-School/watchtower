@@ -26,19 +26,6 @@ export function containsMetabaseUrl(text: string | undefined | null): boolean {
   return METABASE_URL_REGEX.test(text);
 }
 
-// Matches Metabase URLs across deployments — official `metabase.com` and
-// self-hosted instances whose hostname starts with `metabase` (e.g.
-// `metabase-lierhfgoeiwhr.newtonschool.co`). Used to short-circuit the
-// pre-classifier so "explain this table/query/dashboard" questions don't
-// seed as IMPLEMENTATION and trip the access-drop confidence guardrail
-// (see `router/taskRouter.ts` `router.classify.low_confidence_hold`).
-const METABASE_URL_REGEX = /https?:\/\/(?:[a-z0-9-]+\.)*metabase[a-z0-9-]*\.[a-z][a-z0-9.-]+\//i;
-
-export function containsMetabaseUrl(text: string | undefined | null): boolean {
-  if (!text) return false;
-  return METABASE_URL_REGEX.test(text);
-}
-
 /**
  * Deterministic check: does the message ask to deploy newton-web to production?
  * This runs before the AI classifier so deploy requests are never misrouted.

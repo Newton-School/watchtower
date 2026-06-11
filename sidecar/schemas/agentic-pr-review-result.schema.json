@@ -1,0 +1,34 @@
+{
+  "type": "object",
+  "required": ["findings", "summaryNotes", "summary"],
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["role", "severity", "category", "message", "file", "line"],
+        "properties": {
+          "role": {
+            "type": "string",
+            "enum": ["reviewer", "security", "performance"]
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["critical", "high", "medium", "low", "info"]
+          },
+          "category": { "type": "string" },
+          "message": { "type": "string" },
+          "file": { "type": "string" },
+          "line": { "type": "number" },
+          "suggestion": { "type": "string" }
+        }
+      }
+    },
+    "summaryNotes": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "summary": { "type": "string" }
+  },
+  "additionalProperties": false
+}
