@@ -330,21 +330,43 @@ export function getAdminUserIds(config: AppConfig): string[] {
   return uniqueList([...config.ownerSlackUserIds, ...(config.coreDevSlackUserIds ?? [])]);
 }
 
+/** Slack subteam IDs look like S02HXP05ZNJ — `<!subteam^…>` accepts nothing else. */
+const SLACK_SUBTEAM_ID_RE = /^S[A-Z0-9]{6,}$/;
+
 /**
  * Build a concise Slack mention string for an admin-approval prompt.
- * Prefers the core-dev Slack user group handle (a single `<!subteam^…>`
- * mention that pings the whole group) over tagging every individual admin,
- * which turns the thread into a wall of twenty `<@U…>` pings. Falls back to
- * tagging owners directly when the group handle isn't configured, and to
- * an empty string if nothing is available.
+ * Prefers the core-dev Slack user group (a single `<!subteam^…>` mention
+ * that pings the whole group) over tagging every individual admin, which
+ * turns the thread into a wall of twenty `<@U…>` pings.
+ *
+ * `<!subteam^…>` only accepts the subteam ID, never the handle — a raw
+ * handle renders as dead text and pings nobody (issue #334, bug C). The IDs
+ * are pre-resolved by the 30-min access refresh; a configured value that
+ * already looks like an ID is used as-is. When no ID is available
+ * (unresolved handle, cold start), fall back to tagging owners directly,
+ * and to an empty string if nothing is available.
  */
 export function formatAdminMention(config: AppConfig): string {
-  const group =
+  const adminIds = config.accessControl?.groups.admin.resolvedSubteamIds?.filter(Boolean) ?? [];
+  const coreDevIds = config.resolvedCoreDevSubteamIds?.filter(Boolean) ?? [];
+  const resolvedIds = adminIds.length > 0 ? adminIds : coreDevIds;
+  if (resolvedIds.length > 0) {
+    return resolvedIds.map(id => `<!subteam^${id}>`).join(' ');
+  }
+
+  // Back-compat: installs that configured the subteam ID directly where the
+  // handle goes keep working without a resolution round-trip.
+  const configured =
     (config.accessControl?.groups.admin.slackUserGroupHandle ?? '').trim() ||
     (config.coreDevSlackUserGroup ?? '').trim();
-  if (group) {
-    return `<!subteam^${group}>`;
+  const literalIds = configured
+    .split(',')
+    .map(part => part.trim().replace(/^@/, ''))
+    .filter(part => SLACK_SUBTEAM_ID_RE.test(part));
+  if (literalIds.length > 0) {
+    return literalIds.map(id => `<!subteam^${id}>`).join(' ');
   }
+
   const owners = (config.ownerSlackUserIds ?? []).filter(Boolean);
   if (owners.length > 0) {
     return owners.map(id => `<@${id}>`).join(' ');
@@ -368,6 +390,8 @@ export function setResolvedGroupMembers(params: {
   config: AppConfig;
   groupKey: AccessGroupKey;
   members: string[];
+  /** Slack subteam IDs backing this group's handle(s) — see formatAdminMention. */
+  subteamIds?: string[];
 }): void {
   const accessControl = getConfiguredAccessControl(params.config);
   // Post-D5 the `bundles` table is the source of truth for membership — the
@@ -384,14 +408,25 @@ export function setResolvedGroupMembers(params: {
     : uniqueList([...manualUserIds, ...params.members]);
 
   accessControl.groups[params.groupKey].resolvedUserIds = nextMembers;
+  if (params.subteamIds !== undefined) {
+    accessControl.groups[params.groupKey].resolvedSubteamIds = uniqueList(params.subteamIds);
+  }
   params.config.accessControl = accessControl;
 
   // Mirror into the capability-bundles view so live subteam-membership
   // changes (refreshed every 30 min) propagate to `evaluateCapability`
   // without a config reload. Bundle name == legacy tier key during the
   // migration, so the lookup is direct.
+  //
+  // Note: the bundle hot-reload path (index.ts, access cache signal) rebuilds
+  // config.bundles via hydrateBundleUserIds WITHOUT resolvedSubteamIds; that's
+  // harmless today because formatAdminMention reads accessControl, not
+  // bundles — keep it that way (or carry the IDs) if that read ever moves.
   if (bundle) {
     bundle.resolvedUserIds = [...nextMembers];
+    if (params.subteamIds !== undefined) {
+      bundle.resolvedSubteamIds = uniqueList(params.subteamIds);
+    }
   }
 }
 
