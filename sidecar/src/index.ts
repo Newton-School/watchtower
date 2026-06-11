@@ -35,7 +35,7 @@ import { configureVaultWatcher, shutdownVaultWatcher } from './vault/vaultWatche
 import { startProfileSynthesizerScheduler, stopProfileSynthesizerScheduler } from './learning/profileSynthesizer.js';
 import { loadWorkflowTemplates } from './workflows/registry.js';
 import { fetchThreadContext } from './slack/threadContext.js';
-import { resolveUserGroupMembers } from './slack/userGroupResolver.js';
+import { resolveUserGroup } from './slack/userGroupResolver.js';
 import { registerActiveJob, unregisterActiveJob, cancelJob } from './state/activeJobs.js';
 import { JobStore } from './state/jobStore.js';
 import type { AccessGroupKey, SlackEventEnvelope, SlackReactionEvent, WorkflowStepLog } from './types/contracts.js';
@@ -1454,6 +1454,9 @@ async function main(): Promise<void> {
 
   const refreshAccessGroups = async () => {
     const accessControl = getConfiguredAccessControl(config);
+    // handle → subteam ID, shared across groups and the legacy core-dev
+    // resolution below so each handle costs one Slack round-trip per tick.
+    const resolvedHandleIds = new Map<string, string>();
     for (const groupKey of Object.keys(accessControl.groups) as AccessGroupKey[]) {
       const group = accessControl.groups[groupKey];
       const handles = group.slackUserGroupHandle
@@ -1465,11 +1468,16 @@ async function main(): Promise<void> {
       }
 
       const allMembers: string[] = [];
+      const subteamIds: string[] = [];
       let anyHandleFailed = false;
       for (const handle of handles) {
         try {
-          const members = await resolveUserGroupMembers(client.webClient, handle);
-          allMembers.push(...members);
+          const resolved = await resolveUserGroup(client.webClient, handle);
+          if (resolved) {
+            allMembers.push(...resolved.members);
+            subteamIds.push(resolved.id);
+            resolvedHandleIds.set(resolved.handle, resolved.id);
+          }
         } catch (error) {
           logger.warn({ groupKey, handle, error: String(error) }, 'access group handle refresh failed');
           anyHandleFailed = true;
@@ -1492,15 +1500,37 @@ async function main(): Promise<void> {
         continue;
       }
 
-      setResolvedGroupMembers({ config, groupKey, members: allMembers });
+      setResolvedGroupMembers({ config, groupKey, members: allMembers, subteamIds });
       logger.info(
         {
           groupKey,
           handles,
           memberCount: getConfiguredAccessControl(config).groups[groupKey].resolvedUserIds.length,
+          subteamIds,
         },
         'access group resolved',
       );
+    }
+
+    // Legacy installs configure only core_dev_slack_user_group (no admin
+    // group row). Resolve its subteam ID too so formatAdminMention can emit
+    // a working mention; same last-known-good discipline on failure.
+    const legacyHandle = (config.coreDevSlackUserGroup ?? '').replace(/^@/, '').trim().toLowerCase();
+    if (legacyHandle) {
+      const cached = resolvedHandleIds.get(legacyHandle);
+      if (cached) {
+        config.resolvedCoreDevSubteamIds = [cached];
+      } else {
+        try {
+          const resolved = await resolveUserGroup(client.webClient, legacyHandle);
+          config.resolvedCoreDevSubteamIds = resolved ? [resolved.id] : [];
+        } catch (error) {
+          logger.warn(
+            { handle: legacyHandle, error: String(error) },
+            'core-dev subteam id refresh failed; retaining last-known-good',
+          );
+        }
+      }
     }
   };
 

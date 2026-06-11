@@ -56,6 +56,12 @@ export interface Bundle {
    * membership changes.
    */
   resolvedUserIds: string[];
+  /**
+   * Slack subteam IDs resolved from `slackUserGroupHandle` (refreshed
+   * alongside `resolvedUserIds`). Needed because `<!subteam^…>` mentions
+   * only accept the ID — a raw handle renders as dead text.
+   */
+  resolvedSubteamIds?: string[];
   capabilities: Capability[];
   allowedChannelIds: string[];
   allowIm: boolean;
@@ -129,6 +135,8 @@ export interface ResolvedAccessGroup extends AccessGroupSettings {
   key: AccessGroupKey;
   resolvedChannelIds: string[];
   resolvedUserIds: string[];
+  /** Slack subteam IDs for `slackUserGroupHandle` — see Bundle.resolvedSubteamIds. */
+  resolvedSubteamIds?: string[];
 }
 
 export interface AccessControlConfig {
@@ -142,6 +150,12 @@ export interface AppConfig {
   ownerSlackUserIds: string[];
   coreDevSlackUserIds: string[];
   coreDevSlackUserGroup: string;
+  /**
+   * Slack subteam IDs resolved from `coreDevSlackUserGroup` by the 30-min
+   * access refresh. Covers legacy installs without an accessControl admin
+   * group; `formatAdminMention` falls back to these.
+   */
+  resolvedCoreDevSubteamIds?: string[];
   botUserId: string;
   slackBotToken: string;
   slackAppToken: string;

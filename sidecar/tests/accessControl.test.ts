@@ -519,6 +519,139 @@ describe('formatAdminMention', () => {
     const config = baseConfig({ ownerSlackUserIds: [], coreDevSlackUserIds: [] });
     expect(formatAdminMention(config)).toBe('');
   });
+
+  it('never emits a raw handle as a subteam mention — falls back to owner tags (issue #334 bug C)', () => {
+    // The incident: coreDevSlackUserGroup='core-dev' produced
+    // '<!subteam^core-dev>' which Slack renders as dead text, so the
+    // admin-clarify prompt pinged nobody. Unresolved handles must fall
+    // through to owner tags.
+    const config = baseConfig({ coreDevSlackUserGroup: 'core-dev', ownerSlackUserIds: ['UOWNER1'] });
+    const mention = formatAdminMention(config);
+    expect(mention).toBe('<@UOWNER1>');
+    expect(mention).not.toContain('core-dev');
+  });
+
+  it('prefers pre-resolved admin-group subteam IDs over everything else', () => {
+    const config = baseConfig({ coreDevSlackUserGroup: 'core-dev' });
+    config.accessControl = toResolvedAccessControlConfig(
+      {
+        mode: 'enforce',
+        groups: {
+          viewer: {
+            slackUserGroupHandle: '',
+            manualUserIds: '',
+            allowedChannelIds: '',
+            allowIm: false,
+            allowMpim: false,
+          },
+          reviewer: {
+            slackUserGroupHandle: '',
+            manualUserIds: '',
+            allowedChannelIds: '',
+            allowIm: false,
+            allowMpim: false,
+          },
+          builder: {
+            slackUserGroupHandle: '',
+            manualUserIds: '',
+            allowedChannelIds: '',
+            allowIm: false,
+            allowMpim: false,
+          },
+          admin: {
+            slackUserGroupHandle: 'core-dev',
+            manualUserIds: '',
+            allowedChannelIds: '',
+            allowIm: true,
+            allowMpim: false,
+          },
+          owner: {
+            slackUserGroupHandle: '',
+            manualUserIds: '',
+            allowedChannelIds: '',
+            allowIm: false,
+            allowMpim: false,
+          },
+        },
+      },
+      ['UOWNER1'],
+    );
+    config.accessControl.groups.admin.resolvedSubteamIds = ['S02HXP05ZNJ'];
+    expect(formatAdminMention(config)).toBe('<!subteam^S02HXP05ZNJ>');
+  });
+
+  it('uses resolvedCoreDevSubteamIds for legacy installs without an admin group handle', () => {
+    const config = baseConfig({
+      coreDevSlackUserGroup: 'core-dev',
+      resolvedCoreDevSubteamIds: ['S0LEGACY99'],
+    });
+    expect(formatAdminMention(config)).toBe('<!subteam^S0LEGACY99>');
+  });
+
+  it('setResolvedGroupMembers stores subteam IDs on the group and mirrors them onto the bundle', () => {
+    const config = baseConfig();
+    config.accessControl = toResolvedAccessControlConfig(
+      {
+        mode: 'enforce',
+        groups: {
+          viewer: {
+            slackUserGroupHandle: '',
+            manualUserIds: '',
+            allowedChannelIds: '',
+            allowIm: false,
+            allowMpim: false,
+          },
+          reviewer: {
+            slackUserGroupHandle: '',
+            manualUserIds: '',
+            allowedChannelIds: '',
+            allowIm: false,
+            allowMpim: false,
+          },
+          builder: {
+            slackUserGroupHandle: '',
+            manualUserIds: '',
+            allowedChannelIds: '',
+            allowIm: false,
+            allowMpim: false,
+          },
+          admin: {
+            slackUserGroupHandle: 'core-dev',
+            manualUserIds: '',
+            allowedChannelIds: '',
+            allowIm: true,
+            allowMpim: false,
+          },
+          owner: {
+            slackUserGroupHandle: '',
+            manualUserIds: '',
+            allowedChannelIds: '',
+            allowIm: false,
+            allowMpim: false,
+          },
+        },
+      },
+      ['UOWNER1'],
+    );
+    config.bundles = [
+      {
+        name: 'admin',
+        slackUserGroupHandle: 'core-dev',
+        manualUserIds: '',
+        resolvedUserIds: [],
+        capabilities: [],
+        allowedChannelIds: [],
+        allowIm: true,
+        allowMpim: false,
+      },
+    ];
+
+    setResolvedGroupMembers({ config, groupKey: 'admin', members: ['UCORE2'], subteamIds: ['S02HXP05ZNJ'] });
+
+    expect(config.accessControl.groups.admin.resolvedSubteamIds).toEqual(['S02HXP05ZNJ']);
+    expect(config.bundles[0].resolvedSubteamIds).toEqual(['S02HXP05ZNJ']);
+    expect(formatAdminMention(config)).toBe('<!subteam^S02HXP05ZNJ>');
+  });
 });
 
 describe('capability-shaped access (D2 wrapper over legacy tiers)', () => {
