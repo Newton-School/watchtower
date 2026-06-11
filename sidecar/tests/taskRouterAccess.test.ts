@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { toResolvedAccessControlConfig } from '../src/access/control.js';
 import type { AppConfig, NormalizedTask } from '../src/types/contracts.js';
 
-const runPrReviewWorkflow = vi.fn();
+const runAgenticPrReview = vi.fn();
 const runImplementationWorkflow = vi.fn();
 const runDevAssistWorkflow = vi.fn();
 const runDeployWorkflow = vi.fn();
@@ -10,8 +10,8 @@ const runAgenticEntry = vi.fn();
 const runUnknownTaskWorkflow = vi.fn();
 const classifyWorkflowIntent = vi.fn();
 
-vi.mock('../src/workflows/prReviewWorkflow.js', () => ({
-  runPrReviewWorkflow,
+vi.mock('../src/agentic/agenticPrReview.js', () => ({
+  runAgenticPrReview: runAgenticPrReview,
 }));
 
 vi.mock('../src/workflows/implementationWorkflow.js', () => ({
@@ -167,7 +167,7 @@ beforeEach(() => {
     confidence: 0.91,
     reasoning: 'review request',
   });
-  runPrReviewWorkflow.mockResolvedValue({
+  runAgenticPrReview.mockResolvedValue({
     workflow: 'PR_REVIEW',
     status: 'SUCCESS',
     message: 'review ok',
@@ -232,7 +232,7 @@ describe('routeTask access control', () => {
     });
 
     expect(result.status).toBe('SUCCESS');
-    expect(runPrReviewWorkflow).toHaveBeenCalledOnce();
+    expect(runAgenticPrReview).toHaveBeenCalledOnce();
     expect(logStep).toHaveBeenCalledWith(
       expect.objectContaining({
         stage: 'access.audit.would_deny',
@@ -257,7 +257,7 @@ describe('routeTask access control', () => {
     });
 
     expect(result.status).toBe('SKIPPED');
-    expect(runPrReviewWorkflow).not.toHaveBeenCalled();
+    expect(runAgenticPrReview).not.toHaveBeenCalled();
     expect(slack.chat.postMessage).toHaveBeenCalledWith(
       expect.objectContaining({
         text: 'Sorry, this kind of request needs a higher access level than your role allows. Please contact an admin.',
@@ -303,7 +303,7 @@ describe('routeTask access control', () => {
     });
 
     expect(result.status).toBe('SKIPPED');
-    expect(runPrReviewWorkflow).not.toHaveBeenCalled();
+    expect(runAgenticPrReview).not.toHaveBeenCalled();
     expect(slack.chat.postMessage).toHaveBeenCalledWith(
       expect.objectContaining({
         channel: 'D-REVIEW',
@@ -667,7 +667,7 @@ describe('deterministic PR_REVIEW seed (issue #334 bug B)', () => {
 
     expect(result.status).toBe('SUCCESS');
     expect(classifyWorkflowIntent).not.toHaveBeenCalled();
-    expect(runPrReviewWorkflow).toHaveBeenCalledOnce();
+    expect(runAgenticPrReview).toHaveBeenCalledOnce();
     expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'router.pr_review.deterministic' }));
   });
 
@@ -702,6 +702,6 @@ describe('deterministic PR_REVIEW seed (issue #334 bug B)', () => {
 
     expect(result.status).toBe('SUCCESS');
     expect(classifyWorkflowIntent).not.toHaveBeenCalled();
-    expect(runPrReviewWorkflow).toHaveBeenCalledOnce();
+    expect(runAgenticPrReview).toHaveBeenCalledOnce();
   });
 });

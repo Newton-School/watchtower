@@ -13,12 +13,26 @@ export interface PausedJobSummary {
  * PR_REVIEW, so the column alone can't tell us what kind of follow-up to
  * accept as a resume signal.
  */
-export type PauseSignal = 'pr_review_awaiting_url' | undefined;
+export type PauseSignal = 'pr_review_awaiting_url' | 'pr_review_target_choice' | undefined;
+
+/**
+ * Selector vocabulary accepted as a target-choice reply — mirrors the
+ * qualifiers resolvePrReviewTargets understands ("both"/"all", repo names,
+ * "#123"), so whatever resumes the job will also resolve to targets.
+ */
+const TARGET_CHOICE_RE = /\b(both|all|frontend|front-end|web|newton-web|backend|back-end|api|newton-api)\b|#\d{2,}\b/i;
 
 export interface PausedResumeDecision {
   resume: boolean;
   reason: string;
   paused?: PausedJobSummary;
+  /**
+   * When set, the caller should force this intent on the synthesized task.
+   * Target-choice replies ("both", "web", "#123") carry no review verb or
+   * URL, so neither the deterministic gate nor the AI classifier can be
+   * trusted to route them back to PR_REVIEW.
+   */
+  forceIntent?: WorkflowIntent;
 }
 
 /**
@@ -52,6 +66,18 @@ export function decidePausedResume(params: {
       return { resume: true, reason: 'pr_review_url_reply', paused: pausedJob };
     }
     return { resume: false, reason: 'pr_review_no_url_in_reply' };
+  }
+
+  if (pauseSignal === 'pr_review_target_choice') {
+    if (extractPrContext([eventText]) || TARGET_CHOICE_RE.test(eventText)) {
+      return {
+        resume: true,
+        reason: 'pr_review_target_choice_reply',
+        paused: pausedJob,
+        forceIntent: 'PR_REVIEW',
+      };
+    }
+    return { resume: false, reason: 'pr_review_no_target_in_reply' };
   }
 
   return { resume: false, reason: `unhandled_pause_signal:${pauseSignal ?? 'unknown'}` };

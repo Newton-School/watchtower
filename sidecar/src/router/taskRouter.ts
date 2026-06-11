@@ -22,7 +22,7 @@ import { runDeployWorkflow } from '../workflows/deployWorkflow.js';
 import { runImplementationWorkflow } from '../workflows/implementationWorkflow.js';
 import { runInvestigationWorkflow } from '../workflows/investigationWorkflow.js';
 import { runAgenticEntry } from '../agentic/agenticEntry.js';
-import { runPrReviewWorkflow } from '../workflows/prReviewWorkflow.js';
+import { runAgenticPrReview } from '../agentic/agenticPrReview.js';
 import { runUnknownTaskWorkflow } from '../workflows/unknownTaskWorkflow.js';
 import { getWorkflowTemplates } from '../workflows/registry.js';
 import { matchWorkflowTemplate } from '../workflows/matcher.js';
@@ -311,7 +311,7 @@ export async function routeTask(params: {
   }
 
   if (resolvedIntent === 'PR_REVIEW') {
-    return runPrReviewWorkflow({ task: routedTask, config, slack, store, jobId, logStep, signal });
+    return runAgenticPrReview({ task: routedTask, config, slack, store, jobId, logStep, signal });
   }
 
   const lazyInvestigationStore =
