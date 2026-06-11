@@ -1,4 +1,5 @@
 import os from 'node:os';
+import { spawnSync } from 'node:child_process';
 import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
 import { lightweightProfile } from '../codex/modelProfiles.js';
 import type { RepoClassificationResult, WorkflowStepLogger } from '../types/contracts.js';
@@ -25,7 +26,110 @@ export interface ClassifyRepoParams {
    * than guessing from filenames. Highest-signal input when available.
    */
   planMarkdown?: string;
+  /**
+   * Absolute paths to the configured repo checkouts. When provided, the
+   * classifier runs a deterministic `git grep` for distinctive entities
+   * pulled from the task text (experiment names, function names, quoted
+   * identifiers). If one repo has matches and the other has none AND any
+   * matching entity is distinctive enough (≥ 12 chars), we short-circuit
+   * the LLM with confidence 0.95. Otherwise the hit counts are injected
+   * into the prompt as a high-signal hint. Added 2026-05-26 after a
+   * frontend A/B-test request was mis-routed to newton-api.
+   */
+  webPath?: string;
+  apiPath?: string;
   logStep?: WorkflowStepLogger;
+}
+
+const ENTITY_MAX_PER_REQUEST = 8;
+const ENTITY_MIN_LENGTH = 6;
+const ENTITY_DISTINCTIVE_LENGTH = 12;
+
+/**
+ * Pull distinctive identifiers out of a task message — experiment names,
+ * function names, quoted strings, file paths. These are the kinds of
+ * substrings that, when present in exactly one repo, deterministically
+ * disambiguate the target. Patterns are intentionally conservative; we
+ * filter to ≥ {@link ENTITY_MIN_LENGTH} chars and cap at
+ * {@link ENTITY_MAX_PER_REQUEST} (longest first) so the grep stays bounded.
+ */
+export function extractEntities(text: string): string[] {
+  if (!text) return [];
+  const entities = new Set<string>();
+
+  // Quoted strings — single, double, backtick.
+  for (const m of text.matchAll(/["'`]([^"'`\n]{4,80})["'`]/g)) {
+    entities.add(m[1]);
+  }
+  // kebab-case with 3+ segments — typical experiment/flag/route names.
+  for (const m of text.matchAll(/\b([a-z][a-z0-9]*(?:-[a-z0-9]+){2,})\b/g)) {
+    entities.add(m[1]);
+  }
+  // snake_case with 2+ segments — typical Python/SQL identifiers.
+  for (const m of text.matchAll(/\b([a-z][a-z0-9]*(?:_[a-z0-9]+){1,})\b/g)) {
+    entities.add(m[1]);
+  }
+  // CamelCase / PascalCase ≥ 6 chars — typical JS/TS / Django class names.
+  for (const m of text.matchAll(/\b([A-Z][a-z][A-Za-z0-9]{4,})\b/g)) {
+    entities.add(m[1]);
+  }
+
+  return [...entities]
+    .filter(e => e.length >= ENTITY_MIN_LENGTH)
+    .sort((a, b) => b.length - a.length)
+    .slice(0, ENTITY_MAX_PER_REQUEST);
+}
+
+export interface RepoGrepSignals {
+  entities: string[];
+  /** Entities that have at least one match in newton-web. */
+  webHittingEntities: string[];
+  /** Entities that have at least one match in newton-api. */
+  apiHittingEntities: string[];
+  /** True if any hitting entity is ≥ {@link ENTITY_DISTINCTIVE_LENGTH} chars. */
+  hasDistinctiveHit: boolean;
+}
+
+/**
+ * Internal seam — overridden by tests to avoid spawning real `git grep`.
+ */
+export const __gitGrepHasHit = {
+  fn(repoPath: string, pattern: string): boolean {
+    try {
+      const result = spawnSync('git', ['grep', '-q', '-F', '--', pattern], {
+        cwd: repoPath,
+        timeout: 5_000,
+      });
+      return result.status === 0;
+    } catch {
+      return false;
+    }
+  },
+};
+
+export function gatherRepoSignals(params: { entities: string[]; webPath?: string; apiPath?: string }): RepoGrepSignals {
+  const { entities, webPath, apiPath } = params;
+  const webHittingEntities: string[] = [];
+  const apiHittingEntities: string[] = [];
+
+  if (entities.length === 0) {
+    return { entities, webHittingEntities, apiHittingEntities, hasDistinctiveHit: false };
+  }
+
+  for (const entity of entities) {
+    if (webPath && __gitGrepHasHit.fn(webPath, entity)) {
+      webHittingEntities.push(entity);
+    }
+    if (apiPath && __gitGrepHasHit.fn(apiPath, entity)) {
+      apiHittingEntities.push(entity);
+    }
+  }
+
+  const hasDistinctiveHit = [...webHittingEntities, ...apiHittingEntities].some(
+    e => e.length >= ENTITY_DISTINCTIVE_LENGTH,
+  );
+
+  return { entities, webHittingEntities, apiHittingEntities, hasDistinctiveHit };
 }
 
 const CLASSIFY_PROMPT = `You are a repo classifier for miniOG, a developer productivity bot.
@@ -70,7 +174,8 @@ const FALLBACK: RepoClassificationResult = {
 };
 
 export async function classifyRepo(params: ClassifyRepoParams): Promise<RepoClassificationResult> {
-  const { task, threadMessages, threshold, affinity, planAffectedFiles, planMarkdown, logStep } = params;
+  const { task, threadMessages, threshold, affinity, planAffectedFiles, planMarkdown, webPath, apiPath, logStep } =
+    params;
 
   const trimmedTask = typeof task === 'string' ? task.trim() : '';
   if (!trimmedTask) {
@@ -80,6 +185,39 @@ export async function classifyRepo(params: ClassifyRepoParams): Promise<RepoClas
       level: 'WARN',
     });
     return { ...FALLBACK, reasoning: 'No task text to classify.' };
+  }
+
+  // Deterministic short-circuit before the LLM. If a distinctive identifier
+  // from the task text matches files in exactly one configured repo, that's
+  // higher signal than anything the LLM can derive from surface wording.
+  let grepSignals: RepoGrepSignals | undefined;
+  if (webPath || apiPath) {
+    const entities = extractEntities(`${trimmedTask}\n${planMarkdown ?? ''}`);
+    grepSignals = gatherRepoSignals({ entities, webPath, apiPath });
+
+    const webOnly = grepSignals.webHittingEntities.length > 0 && grepSignals.apiHittingEntities.length === 0;
+    const apiOnly = grepSignals.apiHittingEntities.length > 0 && grepSignals.webHittingEntities.length === 0;
+
+    if ((webOnly || apiOnly) && grepSignals.hasDistinctiveHit) {
+      const selectedRepo: 'newton-web' | 'newton-api' = webOnly ? 'newton-web' : 'newton-api';
+      const hits = webOnly ? grepSignals.webHittingEntities : grepSignals.apiHittingEntities;
+      const result: RepoClassificationResult = {
+        selectedRepo,
+        confidence: 0.95,
+        reasoning: `Deterministic grep: ${hits.slice(0, 3).join(', ')}${hits.length > 3 ? '…' : ''} matched only in ${selectedRepo}.`,
+        uncertain: false,
+      };
+      logStep?.({
+        stage: 'router.repo_classify.grep_shortcircuit',
+        message: `Repo resolved deterministically by grep — ${selectedRepo} (skipped LLM).`,
+        data: {
+          ...result,
+          webHittingEntities: grepSignals.webHittingEntities,
+          apiHittingEntities: grepSignals.apiHittingEntities,
+        },
+      });
+      return result;
+    }
   }
 
   const cleanThread = (threadMessages ?? [])
@@ -110,6 +248,17 @@ export async function classifyRepo(params: ClassifyRepoParams): Promise<RepoClas
     sections.push(
       `Requester's recent activity (advisory — current task wins over priors): ` +
         `newton-web=${affinity.newtonWebHits ?? 0} hits, newton-api=${affinity.newtonApiHits ?? 0} hits`,
+    );
+  }
+  if (grepSignals && (grepSignals.webHittingEntities.length > 0 || grepSignals.apiHittingEntities.length > 0)) {
+    // Both repos had hits (or only one side matched but no entity was
+    // distinctive enough to short-circuit). Either way, surface the evidence
+    // so the LLM weighs it instead of guessing from surface wording.
+    sections.push(
+      `Deterministic grep evidence (HIGH-SIGNAL — actual file matches in the configured checkouts):\n` +
+        `• newton-web matched entities: ${grepSignals.webHittingEntities.length > 0 ? grepSignals.webHittingEntities.join(', ') : '(none)'}\n` +
+        `• newton-api matched entities: ${grepSignals.apiHittingEntities.length > 0 ? grepSignals.apiHittingEntities.join(', ') : '(none)'}\n` +
+        `Lean toward the repo where the more distinctive identifiers matched.`,
     );
   }
 

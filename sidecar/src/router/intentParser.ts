@@ -12,6 +12,19 @@ import { hasDevAssistPrefix, hasNaturalDevAssistAlias } from './devAssistParser.
 
 const GITHUB_PR_REGEX = /https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)/g;
 
+// Matches Metabase URLs across deployments — official `metabase.com` and
+// self-hosted instances whose hostname starts with `metabase` (e.g.
+// `metabase-lierhfgoeiwhr.newtonschool.co`). Used to short-circuit the
+// pre-classifier so "explain this table/query/dashboard" questions don't
+// seed as IMPLEMENTATION and trip the access-drop confidence guardrail
+// (see `router/taskRouter.ts` `router.classify.low_confidence_hold`).
+const METABASE_URL_REGEX = /https?:\/\/(?:[a-z0-9-]+\.)*metabase[a-z0-9-]*\.[a-z][a-z0-9.-]+\//i;
+
+export function containsMetabaseUrl(text: string | undefined | null): boolean {
+  if (!text) return false;
+  return METABASE_URL_REGEX.test(text);
+}
+
 /**
  * Deterministic check: does the message ask to deploy newton-web to production?
  * This runs before the AI classifier so deploy requests are never misrouted.
@@ -185,9 +198,25 @@ function inferIntent(
   // - Non-owners: IMPLEMENTATION. Both intents map to the same required access level
   //   (builder) and the same downstream workflow, but the IMPLEMENTATION label avoids
   //   tagging non-owner jobs with an owner-implying name.
+  //
+  // Exception — Metabase URLs from non-owners seed as INFORMATIONAL. RCA of
+  // Saksham's "explain this table" denial (2026-05-25 thread p1779707644097049)
+  // showed that seeding IMPLEMENTATION here forces the AI classifier to *drop*
+  // the tier (IMPLEMENTATION → INFORMATIONAL), which trips the access-drop
+  // confidence guardrail at `router.classify.low_confidence_hold` when the
+  // classifier lands below 0.75 confidence. Pre-seeding INFORMATIONAL avoids
+  // the drop entirely; the guardrail allows upward overrides at any confidence
+  // so a genuine "modify this Metabase query" request can still upgrade. Owners
+  // are unaffected (their access check is bypassed), so we keep OWNER_AUTOPILOT.
   if (mention.detected && mention.type === 'bot') {
     const isOwner = config.ownerSlackUserIds.includes(event.userId);
-    return { intent: isOwner ? 'OWNER_AUTOPILOT' : 'IMPLEMENTATION' };
+    if (isOwner) {
+      return { intent: 'OWNER_AUTOPILOT' };
+    }
+    if (containsMetabaseUrl(event.text)) {
+      return { intent: 'INFORMATIONAL' };
+    }
+    return { intent: 'IMPLEMENTATION' };
   }
 
   return { intent: 'UNKNOWN' };

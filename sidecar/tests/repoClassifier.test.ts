@@ -10,7 +10,8 @@ vi.mock('../src/codex/modelProfiles.js', () => ({
 }));
 
 const { runCodex } = await import('../src/codex/runCodex.js');
-const { classifyRepo } = await import('../src/router/repoClassifier.js');
+const { classifyRepo, extractEntities, gatherRepoSignals, __gitGrepHasHit } =
+  await import('../src/router/repoClassifier.js');
 
 function aiReply(parsedJson: Record<string, unknown>): any {
   return { ok: true, exitCode: 0, parsedJson };
@@ -107,5 +108,180 @@ describe('classifyRepo (agent-based)', () => {
     const args = vi.mocked(runCodex).mock.calls[0][0];
     expect(args.prompt).toContain('newton-api=20 hits');
     expect(args.prompt).toContain('handlers/create.py');
+  });
+});
+
+describe('extractEntities', () => {
+  it('extracts long kebab-case experiment / flag names', () => {
+    const out = extractEntities(
+      'stop the experiment share-payment-link-nsat-timeline-v2-experiment and set distribution to 0:100',
+    );
+    expect(out).toContain('share-payment-link-nsat-timeline-v2-experiment');
+  });
+
+  it('extracts snake_case Django identifiers', () => {
+    const out = extractEntities(
+      'what is the difference between content_management_contentcreationcoursestructuretask and users_userprofile',
+    );
+    expect(out).toContain('content_management_contentcreationcoursestructuretask');
+    expect(out).toContain('users_userprofile');
+  });
+
+  it('extracts PascalCase class names', () => {
+    const out = extractEntities('the ContentCreationCourseStructureTask model is broken');
+    expect(out).toContain('ContentCreationCourseStructureTask');
+  });
+
+  it('extracts quoted strings', () => {
+    const out = extractEntities('the flag is named "feature-flag-xyz-quoted" and it is broken');
+    expect(out).toContain('feature-flag-xyz-quoted');
+  });
+
+  it('filters out short noise and de-dupes', () => {
+    const out = extractEntities('fix the the the api api api now');
+    // "the", "fix", "api", "now" are all < 6 chars → filtered.
+    expect(out).toEqual([]);
+  });
+
+  it('caps the result so a long message does not produce an unbounded grep', () => {
+    const noisy = Array.from({ length: 50 }, (_, i) => `entity-name-num-${i}`).join(' ');
+    const out = extractEntities(noisy);
+    expect(out.length).toBeLessThanOrEqual(8);
+  });
+
+  it('returns empty for empty / non-string input', () => {
+    expect(extractEntities('')).toEqual([]);
+    expect(extractEntities(undefined as unknown as string)).toEqual([]);
+  });
+});
+
+describe('gatherRepoSignals', () => {
+  beforeEach(() => {
+    __gitGrepHasHit.fn = () => false;
+  });
+
+  it('returns empty signals when no entities or paths', () => {
+    const out = gatherRepoSignals({ entities: [], webPath: '/x', apiPath: '/y' });
+    expect(out.webHittingEntities).toEqual([]);
+    expect(out.apiHittingEntities).toEqual([]);
+    expect(out.hasDistinctiveHit).toBe(false);
+  });
+
+  it('records which side matched each entity and flags distinctive (≥12-char) hits', () => {
+    __gitGrepHasHit.fn = (repoPath: string, entity: string) => {
+      if (repoPath === '/web' && entity === 'share-payment-link-experiment') return true;
+      if (repoPath === '/api' && entity === 'ViewSet') return true;
+      return false;
+    };
+    const out = gatherRepoSignals({
+      entities: ['share-payment-link-experiment', 'ViewSet'],
+      webPath: '/web',
+      apiPath: '/api',
+    });
+    expect(out.webHittingEntities).toEqual(['share-payment-link-experiment']);
+    expect(out.apiHittingEntities).toEqual(['ViewSet']);
+    // share-payment-link-experiment is 29 chars → distinctive.
+    expect(out.hasDistinctiveHit).toBe(true);
+  });
+
+  it('does NOT flag distinctive when only short entities hit', () => {
+    __gitGrepHasHit.fn = (_: string, entity: string) => entity === 'short1';
+    const out = gatherRepoSignals({
+      entities: ['short1'],
+      webPath: '/web',
+      apiPath: '/api',
+    });
+    expect(out.hasDistinctiveHit).toBe(false);
+  });
+});
+
+describe('classifyRepo grep short-circuit', () => {
+  beforeEach(() => {
+    vi.mocked(runCodex).mockReset();
+    __gitGrepHasHit.fn = () => false;
+  });
+
+  it('short-circuits to newton-web when a distinctive entity hits only in newton-web', async () => {
+    __gitGrepHasHit.fn = (repoPath: string, entity: string) =>
+      repoPath === '/web' && entity === 'share-payment-link-nsat-timeline-v2-experiment';
+
+    const out = await classifyRepo({
+      task: 'stop the experiment share-payment-link-nsat-timeline-v2-experiment, set distribution to 0:100',
+      threshold: 0.75,
+      webPath: '/web',
+      apiPath: '/api',
+    });
+
+    expect(out.selectedRepo).toBe('newton-web');
+    expect(out.uncertain).toBe(false);
+    expect(out.confidence).toBe(0.95);
+    expect(out.reasoning).toMatch(/Deterministic grep/);
+    // LLM must NOT be called when grep short-circuits.
+    expect(runCodex).not.toHaveBeenCalled();
+  });
+
+  it('short-circuits to newton-api when a distinctive entity hits only in newton-api', async () => {
+    __gitGrepHasHit.fn = (repoPath: string, entity: string) =>
+      repoPath === '/api' && entity === 'content_management_contentcreationcoursestructuretask';
+
+    const out = await classifyRepo({
+      task: 'describe the table content_management_contentcreationcoursestructuretask please',
+      threshold: 0.75,
+      webPath: '/web',
+      apiPath: '/api',
+    });
+
+    expect(out.selectedRepo).toBe('newton-api');
+    expect(out.uncertain).toBe(false);
+    expect(runCodex).not.toHaveBeenCalled();
+  });
+
+  it('does NOT short-circuit when both repos have hits — falls through to the LLM with the hint injected', async () => {
+    __gitGrepHasHit.fn = (_: string, entity: string) => entity === 'shared-identifier-foo';
+    vi.mocked(runCodex).mockResolvedValueOnce(aiReply({ selectedRepo: 'newton-web', confidence: 0.8, reasoning: 'x' }));
+
+    await classifyRepo({
+      task: 'investigate shared-identifier-foo it appears in both repos',
+      threshold: 0.75,
+      webPath: '/web',
+      apiPath: '/api',
+    });
+
+    expect(runCodex).toHaveBeenCalledTimes(1);
+    const args = vi.mocked(runCodex).mock.calls[0][0];
+    expect(args.prompt).toContain('Deterministic grep evidence');
+    expect(args.prompt).toContain('shared-identifier-foo');
+  });
+
+  it('does NOT short-circuit when only a short (non-distinctive) entity matches', async () => {
+    __gitGrepHasHit.fn = (repoPath: string, entity: string) => repoPath === '/web' && entity === 'short1';
+    vi.mocked(runCodex).mockResolvedValueOnce(aiReply({ selectedRepo: 'newton-web', confidence: 0.8, reasoning: 'x' }));
+
+    await classifyRepo({
+      task: 'do short1 thing',
+      threshold: 0.75,
+      webPath: '/web',
+      apiPath: '/api',
+    });
+
+    // Falls through to LLM — non-distinctive short identifier shouldn't be enough to skip the agent.
+    expect(runCodex).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips grep entirely when no repo paths are configured', async () => {
+    let grepCalls = 0;
+    __gitGrepHasHit.fn = () => {
+      grepCalls += 1;
+      return false;
+    };
+    vi.mocked(runCodex).mockResolvedValueOnce(aiReply({ selectedRepo: 'newton-web', confidence: 0.8, reasoning: 'x' }));
+
+    await classifyRepo({
+      task: 'something with share-payment-link-nsat-timeline-v2-experiment in it',
+      threshold: 0.75,
+    });
+
+    expect(grepCalls).toBe(0);
+    expect(runCodex).toHaveBeenCalledTimes(1);
   });
 });

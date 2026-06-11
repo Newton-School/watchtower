@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { detectMention, extractPrContext, normalizeTask } from '../src/router/intentParser.js';
+import { containsMetabaseUrl, detectMention, extractPrContext, normalizeTask } from '../src/router/intentParser.js';
 import type { AppConfig, SlackEventEnvelope } from '../src/types/contracts.js';
 
 const config: AppConfig = {
@@ -306,5 +306,70 @@ describe('intentParser', () => {
     const task = normalizeTask({ ...baseEvent, userId: 'URANDOM', text: '<@UBOT1> do something' }, config, []);
     expect(task.isOwnerAuthor).toBe(false);
     expect(task.isCoreDevAuthor).toBe(false);
+  });
+
+  describe('Metabase URL pre-classifier', () => {
+    it('containsMetabaseUrl detects self-hosted and metabase.com hostnames', () => {
+      expect(containsMetabaseUrl('https://metabase-lierhfgoeiwhr.newtonschool.co/question#abc')).toBe(true);
+      expect(containsMetabaseUrl('https://metabase.com/dashboard/42')).toBe(true);
+      expect(containsMetabaseUrl('https://app.metabase.com/q/123')).toBe(true);
+      expect(containsMetabaseUrl('https://github.com/org/repo/pull/1')).toBe(false);
+      expect(containsMetabaseUrl('no url here')).toBe(false);
+      expect(containsMetabaseUrl(undefined)).toBe(false);
+    });
+
+    it('seeds non-owner Metabase-URL bot mentions as INFORMATIONAL', () => {
+      const task = normalizeTask(
+        {
+          ...baseEvent,
+          text: '<@UBOT1> explain this table https://metabase-lierhfgoeiwhr.newtonschool.co/question#eyJxIjoi',
+        },
+        config,
+        [],
+      );
+      expect(task.intent).toBe('INFORMATIONAL');
+      expect(task.isOwnerAuthor).toBe(false);
+    });
+
+    it('keeps owner Metabase-URL bot mentions on OWNER_AUTOPILOT (owner bypasses access)', () => {
+      const task = normalizeTask(
+        {
+          ...baseEvent,
+          userId: 'UOWNER1',
+          text: '<@UBOT1> what is this https://metabase-lierhfgoeiwhr.newtonschool.co/question#abc',
+        },
+        config,
+        [],
+      );
+      expect(task.intent).toBe('OWNER_AUTOPILOT');
+    });
+
+    it('seeds non-owner Metabase-URL message as INFORMATIONAL even with code-change verbs (AI classifier may upgrade)', () => {
+      // The router-level guardrail only holds *downward* overrides at low
+      // confidence. Upward overrides (INFORMATIONAL → IMPLEMENTATION) have no
+      // floor, so a genuine code-change request seeded as INFORMATIONAL can
+      // still upgrade. Seeding INFORMATIONAL is therefore safe here.
+      const task = normalizeTask(
+        {
+          ...baseEvent,
+          text: '<@UBOT1> fix the bug shown in this query https://metabase.com/question/123',
+        },
+        config,
+        [],
+      );
+      expect(task.intent).toBe('INFORMATIONAL');
+    });
+
+    it('non-Metabase URLs from non-owners still seed as IMPLEMENTATION', () => {
+      const task = normalizeTask(
+        {
+          ...baseEvent,
+          text: '<@UBOT1> look at https://example.com/something',
+        },
+        config,
+        [],
+      );
+      expect(task.intent).toBe('IMPLEMENTATION');
+    });
   });
 });
