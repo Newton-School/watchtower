@@ -582,6 +582,23 @@ export class JobStore {
       /* column already exists */
     }
 
+    // Launchpad on-behalf-of + origin-thread anchoring (issue #343).
+    try {
+      this.db.exec(`ALTER TABLE launchpad_requests ADD COLUMN requested_for_user_id TEXT`);
+    } catch {
+      /* column already exists */
+    }
+    try {
+      this.db.exec(`ALTER TABLE launchpad_requests ADD COLUMN origin_channel_id TEXT`);
+    } catch {
+      /* column already exists */
+    }
+    try {
+      this.db.exec(`ALTER TABLE launchpad_requests ADD COLUMN origin_thread_ts TEXT`);
+    } catch {
+      /* column already exists */
+    }
+
     try {
       // Slack ts of the "Want me to fix this?" prompt — needed so the reaction
       // handler can match a ✅ on the prompt message back to the saved
@@ -936,13 +953,17 @@ export class JobStore {
     status?: Extract<LaunchpadRequestStatus, 'PENDING' | 'CLAIMED' | 'QUEUED' | 'RUNNING'>;
     slackChannelId?: string;
     anchorTs?: string;
+    requestedForUserId?: string;
+    originChannelId?: string;
+    originThreadTs?: string;
   }): void {
     const now = new Date().toISOString();
     this.db
       .prepare(
         `INSERT INTO launchpad_requests(
-           id, target, prompt, owner_user_id, status, slack_channel_id, anchor_ts, created_at, updated_at
-         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           id, target, prompt, owner_user_id, status, slack_channel_id, anchor_ts,
+           requested_for_user_id, origin_channel_id, origin_thread_ts, created_at, updated_at
+         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.id,
@@ -952,6 +973,9 @@ export class JobStore {
         input.status ?? 'PENDING',
         input.slackChannelId ?? null,
         input.anchorTs ?? null,
+        input.requestedForUserId ?? null,
+        input.originChannelId ?? null,
+        input.originThreadTs ?? null,
         now,
         now,
       );
@@ -963,6 +987,7 @@ export class JobStore {
     const rows = (
       this.db.prepare(
         `SELECT id, target, prompt, owner_user_id, status, job_id, slack_channel_id, anchor_ts,
+                requested_for_user_id, origin_channel_id, origin_thread_ts,
                 result_json, error_message, created_at, updated_at
          FROM launchpad_requests
          WHERE status = 'PENDING'
@@ -978,6 +1003,9 @@ export class JobStore {
           job_id?: string | null;
           slack_channel_id?: string | null;
           anchor_ts?: string | null;
+          requested_for_user_id?: string | null;
+          origin_channel_id?: string | null;
+          origin_thread_ts?: string | null;
           result_json?: string | null;
           error_message?: string | null;
           created_at: string;
@@ -1009,6 +1037,9 @@ export class JobStore {
         jobId: row.job_id ?? undefined,
         slackChannelId: row.slack_channel_id ?? undefined,
         anchorTs: row.anchor_ts ?? undefined,
+        requestedForUserId: row.requested_for_user_id ?? undefined,
+        originChannelId: row.origin_channel_id ?? undefined,
+        originThreadTs: row.origin_thread_ts ?? undefined,
         resultJson: row.result_json ?? undefined,
         errorMessage: row.error_message ?? undefined,
         createdAt: row.created_at,

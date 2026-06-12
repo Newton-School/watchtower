@@ -217,6 +217,12 @@ export interface SlackEventEnvelope {
   ingestSource?: EventIngestSource;
   launchpadRequestId?: string;
   /**
+   * On-behalf-of user for launchpad retriggers (issue #343): the person whose
+   * request this really is. Attribution (PR title/body, dossier recall) uses
+   * this; permissions still evaluate `userId` (the owner who retriggered).
+   */
+  requestedForUserId?: string;
+  /**
    * For `message_deleted` subtypes: the ts of the message that was deleted
    * (Slack puts the deletion event itself in `event.ts`, and the original
    * message's ts in `event.deleted_ts` / `event.previous_message.ts`).
@@ -247,6 +253,19 @@ export interface LaunchpadRequestRecord {
   jobId?: string;
   slackChannelId?: string;
   anchorTs?: string;
+  /**
+   * On-behalf-of user (issue #343). Drives PR attribution and dossier recall;
+   * access control still evaluates ownerUserId. Optional — owner-only
+   * requests behave exactly as before.
+   */
+  requestedForUserId?: string;
+  /**
+   * When set (with originThreadTs), the synthetic event anchors in this
+   * channel/thread instead of the owner DM, so progress, approvals, and the
+   * PR link land where the original request lives.
+   */
+  originChannelId?: string;
+  originThreadTs?: string;
   resultJson?: string;
   errorMessage?: string;
   createdAt: string;

@@ -183,4 +183,85 @@ describe('launchpadIntake', () => {
     store.close();
     fs.rmSync(dbPath, { force: true });
   });
+
+  it('anchors at the origin thread with on-behalf-of attribution when origin fields are set (issue #343)', async () => {
+    const { dbPath, store } = createStore();
+    store.createLaunchpadRequest({
+      id: 'req-origin',
+      target: 'miniog',
+      prompt: 'Make the due date mandatory',
+      ownerUserId: 'UOWNER1',
+      requestedForUserId: 'U_ARSHIYA',
+      originChannelId: 'C0AQMNHHUE9',
+      originThreadTs: '1781276720.916409',
+    });
+
+    const webClient = {
+      conversations: { open: vi.fn() },
+      chat: { postMessage: vi.fn() },
+    };
+    const enqueue = vi
+      .fn<(event: SlackEventEnvelope, client: typeof webClient, source: 'launchpad') => Promise<void>>()
+      .mockResolvedValue(undefined);
+
+    await runLaunchpadRequestPoller({
+      webClient: webClient as any,
+      config,
+      store,
+      enqueue,
+    });
+
+    // No DM anchor: the origin thread IS the anchor.
+    expect(webClient.conversations.open).not.toHaveBeenCalled();
+    expect(webClient.chat.postMessage).not.toHaveBeenCalled();
+
+    const request = store.getLaunchpadRequest('req-origin');
+    expect(request?.status).toBe('QUEUED');
+    expect(request?.slackChannelId).toBe('C0AQMNHHUE9');
+    expect(request?.anchorTs).toBe('1781276720.916409');
+
+    expect(enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channelId: 'C0AQMNHHUE9',
+        channelType: 'channel',
+        threadTs: '1781276720.916409',
+        eventTs: '1781276720.916409',
+        // Permissions stay with the owner; attribution carries the requester.
+        userId: 'UOWNER1',
+        requestedForUserId: 'U_ARSHIYA',
+        ingestSource: 'launchpad',
+        launchpadRequestId: 'req-origin',
+      }),
+      webClient,
+      'launchpad',
+    );
+
+    store.close();
+    fs.rmSync(dbPath, { force: true });
+  });
+
+  it('round-trips the new launchpad columns through create + claim', async () => {
+    const { dbPath, store } = createStore();
+    store.createLaunchpadRequest({
+      id: 'req-cols',
+      target: 'miniog',
+      prompt: 'p',
+      ownerUserId: 'UOWNER1',
+      requestedForUserId: 'U_REQ',
+      originChannelId: 'C_ORIG',
+      originThreadTs: '1.2',
+    });
+
+    const claimed = store.claimPendingLaunchpadRequests();
+    expect(claimed).toHaveLength(1);
+    expect(claimed[0]).toMatchObject({
+      id: 'req-cols',
+      requestedForUserId: 'U_REQ',
+      originChannelId: 'C_ORIG',
+      originThreadTs: '1.2',
+    });
+
+    store.close();
+    fs.rmSync(dbPath, { force: true });
+  });
 });

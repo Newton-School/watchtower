@@ -226,10 +226,16 @@ export async function prepareWorkflowContext(params: {
   const { task, config, slack, logStep, resolveRepo = true, store } = params;
   const isOwnerAuthor = config.ownerSlackUserIds.includes(task.event.userId);
 
+  // Attribution user: launchpad retriggers carry the real requester in
+  // requestedForUserId (issue #343) — PR titles/bodies and the dossier
+  // capture should credit them, not the owner who queued the retrigger.
+  // Permissions are unaffected (they evaluate task.event.userId upstream).
+  const attributionUserId = task.event.requestedForUserId ?? task.event.userId;
+
   // Resolve Slack display name
   let requestedBy: string | undefined;
   try {
-    const userInfo = await slack.users.info({ user: task.event.userId });
+    const userInfo = await slack.users.info({ user: attributionUserId });
     requestedBy =
       userInfo.user?.profile?.display_name ||
       userInfo.user?.profile?.real_name ||
@@ -239,14 +245,14 @@ export async function prepareWorkflowContext(params: {
     if (!requestedBy) {
       logStep?.({
         stage: 'workflow.user.resolve',
-        message: `Could not resolve display name for Slack user ${task.event.userId}`,
+        message: `Could not resolve display name for Slack user ${attributionUserId}`,
       });
     }
     // Piggyback on the users.info we already paid for: capture the user into the dossier.
-    if (store?.dossierStore && task.event.userId) {
+    if (store?.dossierStore && attributionUserId) {
       try {
         store.dossierStore().firstSeen({
-          userId: task.event.userId,
+          userId: attributionUserId,
           displayName: userInfo.user?.profile?.display_name || undefined,
           realName: userInfo.user?.real_name || userInfo.user?.profile?.real_name || undefined,
           tz: userInfo.user?.tz || undefined,
@@ -264,7 +270,7 @@ export async function prepareWorkflowContext(params: {
   } catch (err) {
     logStep?.({
       stage: 'workflow.user.resolve',
-      message: `Failed to fetch Slack user info for ${task.event.userId}: ${String(err)}`,
+      message: `Failed to fetch Slack user info for ${attributionUserId}: ${String(err)}`,
     });
   }
 
