@@ -139,4 +139,30 @@ describe('decidePausedResume', () => {
       expect(decision.reason).toBe('unhandled_pause_signal:unknown');
     });
   });
+
+  describe('usage_limit_retry signal (issue #342)', () => {
+    const pausedJob = { id: 'job-limit', workflow: 'IMPLEMENTATION' as const };
+
+    it('resumes on resume/retry keywords', () => {
+      for (const text of ['resume', 'retry please', 'ok continue', 'try again now']) {
+        const decision = decidePausedResume({
+          pausedJob,
+          pauseSignal: 'usage_limit_retry',
+          eventText: text,
+        });
+        expect(decision.resume).toBe(true);
+        expect(decision.reason).toBe('usage_limit_retry_reply');
+      }
+    });
+
+    it('ignores unrelated chatter in the paused thread', () => {
+      const decision = decidePausedResume({
+        pausedJob,
+        pauseSignal: 'usage_limit_retry',
+        eventText: 'ugh, limits again',
+      });
+      expect(decision.resume).toBe(false);
+      expect(decision.reason).toBe('usage_limit_no_resume_keyword');
+    });
+  });
 });

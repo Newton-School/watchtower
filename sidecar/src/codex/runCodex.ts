@@ -167,6 +167,24 @@ function extractFirstTopLevelJsonObject(raw: string): string | undefined {
   return undefined;
 }
 
+const USAGE_LIMIT_RE =
+  /\b(?:you'?ve hit your (?:session|usage|weekly) limit|(?:session|usage) limit (?:reached|exceeded)|rate.?limit(?:ed| reached| exceeded))\b/i;
+const LIMIT_RESETS_RE = /\bresets?\s+(?:at\s+)?([^"\n}]{1,80})/i;
+
+/**
+ * Classify a failed CLI run as a usage/session-limit hit (issue #342). The
+ * limit envelope arrives as a normal JSON result whose text is e.g.
+ * "You've hit your session limit · resets 9:40pm (Asia/Calcutta)" — exit
+ * code 1, zero API tokens. Callers must treat this as retryable-at-a-known-
+ * time, never as an agent verdict.
+ */
+export function detectUsageLimit(text: string): { resetsAtText?: string } | undefined {
+  if (!text || !USAGE_LIMIT_RE.test(text)) return undefined;
+  const resetsMatch = LIMIT_RESETS_RE.exec(text);
+  const resetsAtText = resetsMatch?.[1]?.replace(/\\u00b7|·/g, '').trim();
+  return { resetsAtText: resetsAtText && resetsAtText.length > 0 ? resetsAtText : undefined };
+}
+
 export function parseCodexStructuredOutput(raw: string): ParsedCodexOutput {
   const attempts: Array<'direct' | 'fenced_block' | 'first_object'> = [];
   const preview = previewOutput(raw);
@@ -419,6 +437,18 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
 
     const ok = !timedOut && !cancelled && exitCode === 0;
 
+    // Classify limit hits on failed runs so callers can pause/retry at the
+    // stated reset instead of burning retries on doomed spawns (issue #342).
+    const usageLimit = !ok && !timedOut && !cancelled ? detectUsageLimit(lastMessage) : undefined;
+    if (usageLimit) {
+      request.onLog?.({
+        stage: 'agent.usage_limit',
+        message: `${backend.displayName} hit the account usage limit${usageLimit.resetsAtText ? ` (resets ${usageLimit.resetsAtText})` : ''}.`,
+        level: 'WARN',
+        data: { resetsAtText: usageLimit.resetsAtText },
+      });
+    }
+
     const callContext = agentCallContext.getStore();
     if (callContext) {
       try {
@@ -451,6 +481,7 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
       stderr,
       lastMessage,
       parsedJson,
+      ...(usageLimit ? { errorKind: 'USAGE_LIMIT' as const, limitResetsAtText: usageLimit.resetsAtText } : {}),
       durationMs,
       usage,
       costUsd,

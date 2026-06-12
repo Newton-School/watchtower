@@ -134,4 +134,22 @@ describe('failureDoctor', () => {
 
     expect(diagnosis?.errorKind).toBe('CODEX_OUTPUT_SCHEMA');
   });
+
+  it('diagnoses a Claude usage-limit hit as USAGE_LIMIT (issue #342)', () => {
+    const diagnosis = diagnoseFailure({
+      workflow: 'IMPLEMENTATION',
+      message: 'Paused on Claude usage limit (resets 9:40pm (Asia/Calcutta)).',
+      logs: [
+        {
+          stage: 'pipeline.usage_limit',
+          message: 'Claude usage limit hit during coder — aborting the pipeline (resets 9:40pm (Asia/Calcutta)).',
+          level: 'ERROR',
+          createdAt: '2026-06-12T16:03:56Z',
+        } as never,
+      ],
+    });
+
+    expect(diagnosis?.errorKind).toBe('USAGE_LIMIT');
+    expect(diagnosis?.actions.join(' ')).toContain('resume');
+  });
 });

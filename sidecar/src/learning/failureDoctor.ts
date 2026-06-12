@@ -21,6 +21,24 @@ export function diagnoseFailure(input: {
       entry.stage === 'codex.output.schema_invalid',
   ).length;
 
+  if (
+    haystack.includes('hit your session limit') ||
+    haystack.includes('hit your usage limit') ||
+    haystack.includes('usage limit reached') ||
+    haystack.includes('pipeline.usage_limit') ||
+    haystack.includes('agent.usage_limit')
+  ) {
+    return {
+      errorKind: 'USAGE_LIMIT',
+      summary: 'The Claude account hit its session/usage limit — agent runs exited before any API call.',
+      actions: [
+        'Wait for the reset time quoted in the limit message, then reply "resume" in the thread.',
+        'No code or plan state was lost; the workflow re-runs cleanly after the reset.',
+        'If this recurs at the same hour daily, stagger heavy jobs away from interactive usage.',
+      ],
+    };
+  }
+
   if (haystack.includes('spawn codex enoent') || haystack.includes('codex executable not found')) {
     return {
       errorKind: 'CODEX_BIN_NOT_FOUND',

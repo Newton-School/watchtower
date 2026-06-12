@@ -780,6 +780,8 @@ export async function runAgentPipeline(params: {
   let aborted = false;
   let pendingNeedsInput = false;
   let needsInputQuestion: string | undefined;
+  let usageLimitHit = false;
+  let usageLimitResetsAt: string | undefined;
 
   const pipelineRunId = randomUUID();
   if (store && jobId) {
@@ -880,6 +882,30 @@ export async function runAgentPipeline(params: {
     );
 
     const durationMs = Date.now() - agentStart;
+
+    // Usage-limit hit: the CLI died pre-API with a known reset time. This is
+    // not an agent verdict — abort the whole run instead of letting the
+    // feedback loop burn more doomed spawns (issue #342; RCA: job 264ea287
+    // failed coder→reviewer→2 loops→verifier in 23s, all 0-token exits).
+    if (result.errorKind === 'USAGE_LIMIT') {
+      usageLimitHit = true;
+      usageLimitResetsAt = result.limitResetsAtText;
+      logStep({
+        stage: 'pipeline.usage_limit',
+        message: `Claude usage limit hit during ${role} — aborting the pipeline${usageLimitResetsAt ? ` (resets ${usageLimitResetsAt})` : ''}.`,
+        level: 'ERROR',
+        data: { role, resetsAtText: usageLimitResetsAt },
+      });
+      steps.push({
+        role,
+        status: 'failed',
+        output: result.parsedJson ?? { status: 'error', summary: result.lastMessage.slice(0, 300) },
+        findings: [],
+        durationMs,
+      });
+      break;
+    }
+
     const output = result.parsedJson ?? {};
     const findings = extractFindings(output);
     let status = result.ok ? determineStepStatus(output, findings) : 'failed';
@@ -1091,6 +1117,29 @@ export async function runAgentPipeline(params: {
         );
 
         const coderRetryDuration = Date.now() - coderStart;
+
+        if (coderRetryResult.errorKind === 'USAGE_LIMIT') {
+          usageLimitHit = true;
+          usageLimitResetsAt = coderRetryResult.limitResetsAtText;
+          logStep({
+            stage: 'pipeline.usage_limit',
+            message: `Claude usage limit hit during coder retry — aborting the pipeline${usageLimitResetsAt ? ` (resets ${usageLimitResetsAt})` : ''}.`,
+            level: 'ERROR',
+            data: { role: 'coder', retryLoops, resetsAtText: usageLimitResetsAt },
+          });
+          steps.push({
+            role: 'coder',
+            status: 'failed',
+            output: coderRetryResult.parsedJson ?? {
+              status: 'error',
+              summary: coderRetryResult.lastMessage.slice(0, 300),
+            },
+            findings: [],
+            durationMs: coderRetryDuration,
+          });
+          break;
+        }
+
         const coderOutput = coderRetryResult.parsedJson ?? {};
         const coderFindings = extractFindings(coderOutput);
         let coderStatus = coderRetryResult.ok ? determineStepStatus(coderOutput, coderFindings) : 'failed';
@@ -1170,13 +1219,15 @@ export async function runAgentPipeline(params: {
     latestByRole.set(step.role, step);
   }
   const hasFailedStep = Array.from(latestByRole.values()).some(s => s.status === 'failed');
-  const finalStatus: PipelineResult['finalStatus'] = pendingNeedsInput
-    ? 'needs-input'
-    : aborted
-      ? 'aborted'
-      : hasFailedStep
-        ? 'failed'
-        : 'passed';
+  const finalStatus: PipelineResult['finalStatus'] = usageLimitHit
+    ? 'usage-limit'
+    : pendingNeedsInput
+      ? 'needs-input'
+      : aborted
+        ? 'aborted'
+        : hasFailedStep
+          ? 'failed'
+          : 'passed';
 
   logStep({
     stage: 'pipeline.finish',
@@ -1191,9 +1242,11 @@ export async function runAgentPipeline(params: {
       ? `Done in ${durationSec}s. Preparing the summary.`
       : finalStatus === 'needs-input'
         ? `Paused after ${durationSec}s — I need a bit more info before I can code a fix.`
-        : finalStatus === 'aborted'
-          ? `Finished in ${durationSec}s. Review flagged some concerns — see the summary below.`
-          : `Finished in ${durationSec}s with some issues flagged — details below.`;
+        : finalStatus === 'usage-limit'
+          ? `Paused — Claude usage limit hit${usageLimitResetsAt ? ` (resets ${usageLimitResetsAt})` : ''}. No code was lost.`
+          : finalStatus === 'aborted'
+            ? `Finished in ${durationSec}s. Review flagged some concerns — see the summary below.`
+            : `Finished in ${durationSec}s with some issues flagged — details below.`;
   await postSlackProgress({ slack, ctx, text: finishText });
 
   if (store && jobId) {
@@ -1216,5 +1269,6 @@ export async function runAgentPipeline(params: {
     retryLoops,
     aggregatedFindings,
     needsInputQuestion,
+    usageLimitResetsAt,
   };
 }

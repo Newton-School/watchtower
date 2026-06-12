@@ -799,7 +799,9 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
       ? 'pr_review_awaiting_url'
       : store.isPausedAwaitingTargetChoice(pausedJob.id)
         ? 'pr_review_target_choice'
-        : undefined
+        : store.isPausedAwaitingUsageLimitRetry(pausedJob.id)
+          ? 'usage_limit_retry'
+          : undefined
     : undefined;
   const resumeDecision = decidePausedResume({
     pausedJob: pausedJob ? { id: pausedJob.id, workflow: pausedJob.workflow } : undefined,

@@ -13,7 +13,10 @@ export interface PausedJobSummary {
  * PR_REVIEW, so the column alone can't tell us what kind of follow-up to
  * accept as a resume signal.
  */
-export type PauseSignal = 'pr_review_awaiting_url' | 'pr_review_target_choice' | undefined;
+export type PauseSignal = 'pr_review_awaiting_url' | 'pr_review_target_choice' | 'usage_limit_retry' | undefined;
+
+/** Replies that resume a job paused on a Claude usage limit (issue #342). */
+const USAGE_LIMIT_RESUME_RE = /\b(resume|retry|continue|go|try again)\b/i;
 
 /**
  * Selector vocabulary accepted as a target-choice reply — mirrors the
@@ -66,6 +69,13 @@ export function decidePausedResume(params: {
       return { resume: true, reason: 'pr_review_url_reply', paused: pausedJob };
     }
     return { resume: false, reason: 'pr_review_no_url_in_reply' };
+  }
+
+  if (pauseSignal === 'usage_limit_retry') {
+    if (USAGE_LIMIT_RESUME_RE.test(eventText)) {
+      return { resume: true, reason: 'usage_limit_retry_reply', paused: pausedJob };
+    }
+    return { resume: false, reason: 'usage_limit_no_resume_keyword' };
   }
 
   if (pauseSignal === 'pr_review_target_choice') {

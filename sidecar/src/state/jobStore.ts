@@ -1246,6 +1246,23 @@ export class JobStore {
   }
 
   /**
+   * Pause cause: the implementation pipeline hit the Claude usage limit and
+   * parked itself until the reset (issue #342). A "resume"/"retry" reply in
+   * the thread restarts the workflow via decidePausedResume.
+   */
+  isPausedAwaitingUsageLimitRetry(jobId: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS hit
+         FROM job_logs
+         WHERE job_id = ? AND stage = 'implementation.usage_limit.paused'
+         LIMIT 1`,
+      )
+      .get(jobId) as { hit?: number } | undefined;
+    return Boolean(row?.hit);
+  }
+
+  /**
    * Read a paused job's resume context from result_json. Returns undefined if
    * the job has no result, or if the stored payload doesn't match the
    * ResumeContext schema (caller should treat as a corrupt resume and fail

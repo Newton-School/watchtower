@@ -222,4 +222,33 @@ describe('claudeCodeBackend.buildArgs', () => {
     expect(idx).toBeGreaterThanOrEqual(0);
     expect(args[idx + 1]).toBe('plan');
   });
+
+  it('marks plain-text output from an error envelope as status error, not success (issue #342)', () => {
+    const wrapper = JSON.stringify({
+      type: 'result',
+      subtype: 'error_during_execution',
+      is_error: true,
+      result: "You've hit your session limit · resets 9:40pm (Asia/Calcutta)",
+      session_id: 'sess-limit',
+    });
+
+    const parsed = claudeCodeBackend.parseOutput(wrapper);
+
+    expect(parsed.parsedJson?.status).toBe('error');
+    expect(parsed.parsedJson?.summary).toContain('session limit');
+  });
+
+  it('keeps plain-text output from a success envelope as status success', () => {
+    const wrapper = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: 'All done, nothing structured to report.',
+      session_id: 'sess-ok',
+    });
+
+    const parsed = claudeCodeBackend.parseOutput(wrapper);
+
+    expect(parsed.parsedJson?.status).toBe('success');
+  });
 });

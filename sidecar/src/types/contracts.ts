@@ -355,6 +355,15 @@ export interface CodexRunResult {
   stderr: string;
   lastMessage: string;
   parsedJson?: Record<string, unknown>;
+  /**
+   * Set when a failed run is classified as a known retryable condition.
+   * USAGE_LIMIT = the CLI hit the account's session/usage cap before any
+   * API tokens were consumed (issue #342) — callers should pause/retry at
+   * the reset time instead of treating the output as an agent verdict.
+   */
+  errorKind?: 'USAGE_LIMIT';
+  /** Verbatim reset clause from the limit message, e.g. "9:40pm (Asia/Calcutta)". */
+  limitResetsAtText?: string;
   /** Wall-clock duration from process spawn to exit, in milliseconds. */
   durationMs: number;
   /** Token usage extracted from backend output, when available. */

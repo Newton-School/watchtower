@@ -749,6 +749,83 @@ describe('agentPipeline', () => {
     expect(result.finalStatus).toBe('needs-input');
     expect(result.needsInputQuestion).toBeDefined();
   });
+
+  it('aborts immediately on a usage-limit hit — no feedback loops, no further spawns (issue #342)', async () => {
+    // Incident shape (job 264ea287): every CLI spawn exits 1 in ~3s with the
+    // limit message and zero API tokens. The old behavior treated each exit
+    // as a reviewer verdict and burned coder->reviewer x2 retry loops in 23s.
+    const ctx = makeContext({
+      pipelineConfig: makePipelineConfig({ agents: ['coder', 'reviewer', 'verifier'] }),
+    });
+
+    vi.mocked(runCodex).mockResolvedValue({
+      ok: false,
+      exitCode: 1,
+      timedOut: false,
+      stdout: '',
+      stderr: '',
+      lastMessage:
+        '{"type":"result","subtype":"error_during_execution","result":"You\'ve hit your session limit · resets 9:40pm (Asia/Calcutta)"}',
+      parsedJson: { status: 'error', summary: "You've hit your session limit · resets 9:40pm (Asia/Calcutta)" },
+      errorKind: 'USAGE_LIMIT',
+      limitResetsAtText: '9:40pm (Asia/Calcutta)',
+    } as any);
+
+    const result = await runAgentPipeline({ ctx, slack: slack as any, logStep });
+
+    expect(result.finalStatus).toBe('usage-limit');
+    expect(result.usageLimitResetsAt).toBe('9:40pm (Asia/Calcutta)');
+    // One spawn only: the coder. No reviewer, no verifier, no retry loops.
+    expect(runCodex).toHaveBeenCalledTimes(1);
+    expect(result.retryLoops).toBe(0);
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'pipeline.usage_limit' }));
+  });
+
+  it('aborts on a usage-limit hit during the coder retry inside the feedback loop', async () => {
+    const ctx = makeContext({
+      pipelineConfig: makePipelineConfig({ agents: ['coder', 'reviewer'] }),
+    });
+
+    vi.mocked(runCodex)
+      // coder: ok
+      .mockResolvedValueOnce({
+        ok: true,
+        exitCode: 0,
+        timedOut: false,
+        stdout: '',
+        stderr: '',
+        lastMessage: '',
+        parsedJson: { status: 'success', summary: 'done', filesChanged: ['a.ts'] },
+      } as any)
+      // reviewer: rejects -> triggers feedback loop
+      .mockResolvedValueOnce({
+        ok: true,
+        exitCode: 0,
+        timedOut: false,
+        stdout: '',
+        stderr: '',
+        lastMessage: '',
+        parsedJson: { approved: false, findings: [], blockers: ['needs work'] },
+      } as any)
+      // coder retry: limit hit
+      .mockResolvedValueOnce({
+        ok: false,
+        exitCode: 1,
+        timedOut: false,
+        stdout: '',
+        stderr: '',
+        lastMessage: "You've hit your usage limit · resets 11:00am (Asia/Calcutta)",
+        parsedJson: { status: 'error', summary: 'limit' },
+        errorKind: 'USAGE_LIMIT',
+        limitResetsAtText: '11:00am (Asia/Calcutta)',
+      } as any);
+
+    const result = await runAgentPipeline({ ctx, slack: slack as any, logStep });
+
+    expect(result.finalStatus).toBe('usage-limit');
+    expect(result.usageLimitResetsAt).toBe('11:00am (Asia/Calcutta)');
+    expect(runCodex).toHaveBeenCalledTimes(3);
+  });
 });
 
 vi.mock('../src/slack/threadContext.js', () => ({

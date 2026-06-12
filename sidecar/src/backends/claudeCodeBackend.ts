@@ -231,9 +231,14 @@ export const claudeCodeBackend: AgentBackend = {
           sessionId,
         };
       }
-      // Inner text is plain text (not JSON) — surface it as a summary so workflows can use it
+      // Inner text is plain text (not JSON) — surface it as a summary so
+      // workflows can use it. Honor the envelope's own error signals: a
+      // failed run (e.g. a usage-limit hit) must not persist as
+      // status:"success" with the error text as its summary (issue #342).
+      const envelopeIsError =
+        envelope.is_error === true || (typeof envelope.subtype === 'string' && envelope.subtype !== 'success');
       return {
-        parsedJson: { status: 'success', summary: innerText, actions: [], prUrl: '' },
+        parsedJson: { status: envelopeIsError ? 'error' : 'success', summary: innerText, actions: [], prUrl: '' },
         strategy: 'claude_unwrap+plain_text',
         usage,
         costUsd,
