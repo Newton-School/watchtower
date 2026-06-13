@@ -1433,6 +1433,41 @@ Write your response as a ready-to-post Slack message describing what you did.
       };
     }
 
+    if (fullResult.finalStatus === 'usage-limit') {
+      // The CLI hit the account's session/usage cap — nothing the agents did
+      // was wrong and nothing useful can run until the limit resets. Pause
+      // with a truthful message instead of failing the job (issue #342).
+      // The stage string below is the pause-resume key consumed by
+      // jobStore.isPausedAwaitingUsageLimitRetry — a "resume"/"retry" reply
+      // in-thread restarts the workflow (which re-plans; the prior plan and
+      // approval remain in thread context, so re-approval is one word).
+      logStep?.({
+        stage: 'implementation.usage_limit.paused',
+        message: `Pipeline hit the Claude usage limit — pausing${fullResult.usageLimitResetsAt ? ` until reset (${fullResult.usageLimitResetsAt})` : ''}.`,
+        level: 'WARN',
+        data: { resetsAtText: fullResult.usageLimitResetsAt },
+      });
+
+      const resetsClause = fullResult.usageLimitResetsAt
+        ? ` It resets ${fullResult.usageLimitResetsAt}.`
+        : ' It usually resets within a few hours.';
+      await slack.chat
+        .postMessage({
+          channel: task.event.channelId,
+          thread_ts: task.event.threadTs,
+          text: `Claude usage limit hit before I could finish.${resetsClause} Reply "resume" in this thread after the reset and I'll pick this up.`,
+        })
+        .catch(() => {});
+
+      return {
+        workflow: 'IMPLEMENTATION',
+        status: 'PAUSED',
+        message: `Paused on Claude usage limit${fullResult.usageLimitResetsAt ? ` (resets ${fullResult.usageLimitResetsAt})` : ''}.`,
+        notifyDesktop: true,
+        slackPosted: true,
+      };
+    }
+
     if (fullResult.finalStatus !== 'passed') {
       // Refuse to publish a PR or report SUCCESS when the pipeline did not
       // pass. createPrFromWorkspace is willing to push & open a PR off any

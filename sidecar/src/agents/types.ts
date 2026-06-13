@@ -47,9 +47,11 @@ export interface PipelineConfig {
 
 export interface PipelineResult {
   steps: AgentStepResult[];
-  finalStatus: 'passed' | 'failed' | 'aborted' | 'needs-input';
+  finalStatus: 'passed' | 'failed' | 'aborted' | 'needs-input' | 'usage-limit';
   totalDurationMs: number;
   retryLoops: number;
   aggregatedFindings: AgentFinding[];
   needsInputQuestion?: string;
+  /** Verbatim reset clause when finalStatus === 'usage-limit' (issue #342). */
+  usageLimitResetsAt?: string;
 }
