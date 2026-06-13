@@ -312,6 +312,59 @@ describe('intentParser', () => {
     expect(task.isOwnerAuthor).toBe(true);
   });
 
+  it('does not fire the review gate on a noun "review" in banter even with a thread PR URL (RCA 2026-06-12)', () => {
+    const task = normalizeTask(
+      {
+        ...baseEvent,
+        text: '<@UBOT1> - <@U05EUC842KD> is undermining ur review - can u let that happen?',
+      },
+      config,
+      ['https://github.com/Newton-School/newton-web/pull/8664'],
+    );
+
+    // Noun "review" must defer to the AI classifier (which calls this CONVERSATIONAL),
+    // not hard-route to PR_REVIEW. The pre-classifier seed for a non-owner is IMPLEMENTATION.
+    expect(task.intent).toBe('IMPLEMENTATION');
+  });
+
+  it.each([
+    'thanks for the review',
+    'great review',
+    'ur thoughts on his review',
+    "what's your review of this comment?",
+    'the review process is slow',
+  ])('does not fire the review gate on noun usage: "%s"', phrase => {
+    const task = normalizeTask({ ...baseEvent, text: `<@UBOT1> ${phrase}` }, config, [
+      'https://github.com/Newton-School/newton-web/pull/8652',
+    ]);
+
+    expect(task.intent).toBe('IMPLEMENTATION');
+  });
+
+  it.each(['pls review', 'can you review the PR', 'review again'])(
+    'still fires the review gate on an imperative request: "%s"',
+    phrase => {
+      const task = normalizeTask({ ...baseEvent, text: `<@UBOT1> ${phrase}` }, config, [
+        'https://github.com/Newton-School/newton-web/pull/8652',
+      ]);
+
+      expect(task.intent).toBe('PR_REVIEW');
+    },
+  );
+
+  it('still fires on "re-review <url>" (Tier 1)', () => {
+    const task = normalizeTask(
+      {
+        ...baseEvent,
+        text: '<@UBOT1> re-review https://github.com/Newton-School/newton-web/pull/8652',
+      },
+      config,
+      [],
+    );
+
+    expect(task.intent).toBe('PR_REVIEW');
+  });
+
   it('defaults non-owner bot mentions to IMPLEMENTATION (no owner-implying label)', () => {
     const task = normalizeTask(
       {

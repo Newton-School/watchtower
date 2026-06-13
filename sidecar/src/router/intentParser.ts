@@ -95,7 +95,35 @@ export function extractPrContext(texts: string[]): PrContext | undefined {
   return { url: first.url, owner: first.owner, repo: first.repo, number: first.number };
 }
 
-const REVIEW_VERB_RE = /\b(re-?review|review)\b/;
+// Recognize "review" only as a request/imperative VERB, never as a noun. The
+// old /\b(re-?review|review)\b/ matched any "review" (e.g. "undermining ur
+// review"), tripping the deterministic PR_REVIEW gate on banter (RCA 2026-06-12,
+// C01GRTNND8R/1781263290.623249).
+const RE_REVIEW_RE = /\bre-?review\b/; // "re-review" is only ever a verb
+const REVIEW_LEADIN = '(?:please|pls|plz|kindly|can|could|would|will|lets|you)';
+// Objects that can only follow the VERB "review". Trailing \b on bare words so
+// "review pr" doesn't match inside "review process"; URLs and "#123" carry
+// their own delimiters.
+const REVIEW_OBJECT =
+  '(?:(?:this|it|that|again|the\\s+(?:pr|pull|frontend|backend|change|changes|diff|code)|prs?|pull)\\b|#\\d+|https?:\\/\\/)';
+const REVIEW_VERB_OBJECT_RE = new RegExp('\\breview\\s+' + REVIEW_OBJECT);
+// Bare imperative at START (after optional polite/modal lead-ins), with "review"
+// as the final meaningful token: "review", "pls review", "can you review".
+const REVIEW_BARE_IMPERATIVE_RE = new RegExp('^(?:' + REVIEW_LEADIN + '\\s+){0,3}review\\b\\s*$');
+
+/**
+ * True when "review" is used as a request/imperative VERB; false for noun usage
+ * ("ur review", "great review", "thanks for the review"). `normalized` must be
+ * mention-stripped + lowercased + whitespace-collapsed (as in isPrReviewRequest).
+ */
+function isReviewRequestVerb(normalized: string): boolean {
+  return (
+    RE_REVIEW_RE.test(normalized) ||
+    REVIEW_VERB_OBJECT_RE.test(normalized) ||
+    REVIEW_BARE_IMPERATIVE_RE.test(normalized)
+  );
+}
+
 const CONFLICTING_CHANGE_VERB_RE =
   /\b(create|open|raise|fix|implement|merge|close|revert|rebase|update|address|resolve)\b/;
 
@@ -121,7 +149,7 @@ export function isPrReviewRequest(triggerText: string, threadTexts: string[] = [
     .replace(/\s+/g, ' ')
     .toLowerCase()
     .trim();
-  const hasReviewVerb = REVIEW_VERB_RE.test(normalized);
+  const hasReviewVerb = isReviewRequestVerb(normalized);
   const hasConflictingVerb = CONFLICTING_CHANGE_VERB_RE.test(normalized);
 
   if (GITHUB_PR_URL_TEST_RE.test(triggerText)) {
