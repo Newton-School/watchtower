@@ -1,4 +1,5 @@
 import path from 'node:path';
+import os from 'node:os';
 import type { WebClient } from '@slack/web-api';
 import type { AgentFinding } from '../agents/types.js';
 import type { AppConfig, CodexRunResult, NormalizedTask, PrContext, WorkflowStepLogger } from '../types/contracts.js';
@@ -162,7 +163,8 @@ export async function reviewSinglePr(params: {
   config: AppConfig;
   slack: WebClient;
   prContext: PrContext;
-  baseRepoPath: string;
+  /** Local clone path, or null when the repo isn't cloned locally (diff-only review). */
+  baseRepoPath: string | null;
   recallBlock: string;
   policyBlock: string;
   threadContext: string;
@@ -226,9 +228,12 @@ export async function reviewSinglePr(params: {
     };
   }
 
-  // 2. Per-PR worktree. Keyed by threadTs + PR number so two same-repo PRs in
-  //    one thread can't clobber each other's checkout.
-  const repoPath = deps.resolveWorkspaceFn(baseRepoPath, `${task.event.threadTs}--pr-${prContext.number}`);
+  // 2. Per-PR worktree (when the repo is cloned locally). Repos without a local
+  //    clone are reviewed from the diff alone — no checkout, tmp cwd (#10).
+  const hasLocalRepo = Boolean(baseRepoPath);
+  const repoPath = hasLocalRepo
+    ? deps.resolveWorkspaceFn(baseRepoPath as string, `${task.event.threadTs}--pr-${prContext.number}`)
+    : os.tmpdir();
 
   // 3. Diff fetch (TS-side: the same bytes feed the agent prompt AND the
   //    submitPrReview hunk validator, eliminating agent/validator drift).
@@ -270,7 +275,10 @@ export async function reviewSinglePr(params: {
 
   // 4. Checkout so the agent's verification reads see the actual PR code.
   //    Non-fatal: on failure the agent still has the full diff in-prompt.
-  await deps.checkoutPr(repoPath, prContext.number, logStep);
+  //    Skipped for diff-only repos (no local clone).
+  if (hasLocalRepo) {
+    await deps.checkoutPr(repoPath, prContext.number, logStep);
+  }
 
   // 5. Agentic run with the deterministic failure ladder.
   const profile = highReasoningProfile(getActiveBackendId());
@@ -283,12 +291,14 @@ export async function reviewSinglePr(params: {
     threadContext,
     diff: diffResult.diff,
   };
+  // No local clone → the agent has no repo to explore, so start diff-only.
+  const forceDiffOnly = !hasLocalRepo;
 
   let agentResult: CodexRunResult | undefined;
   try {
     agentResult = await deps.runAgent({
       cwd: repoPath,
-      prompt: buildAgenticPrReviewPrompt(promptParams),
+      prompt: buildAgenticPrReviewPrompt({ ...promptParams, oneShot: forceDiffOnly }),
       outputSchemaPath: schemaPath,
       githubToken,
       ...profile,
@@ -323,7 +333,7 @@ export async function reviewSinglePr(params: {
     try {
       agentResult = await deps.runAgent({
         cwd: repoPath,
-        prompt: buildAgenticPrReviewPrompt(promptParams),
+        prompt: buildAgenticPrReviewPrompt({ ...promptParams, oneShot: forceDiffOnly }),
         outputSchemaPath: schemaPath,
         githubToken,
         ...profile,

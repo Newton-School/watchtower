@@ -582,5 +582,5 @@ export const NO_NEW_CHANGES_TEXT =
   'No new commits since the last review. Same diff, same verdict. Push an update and I will rerun.';
 
 export function buildOutOfScopePrReply(userId: string, allowedPrOrg: string): string {
-  return `<@${userId}> this PR is outside supported review scope. I can review \`${allowedPrOrg}/newton-web\` and \`${allowedPrOrg}/newton-api\`.`;
+  return `<@${userId}> this PR is outside supported review scope. I can only review PRs in the \`${allowedPrOrg}\` org.`;
 }
