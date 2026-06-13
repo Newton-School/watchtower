@@ -252,3 +252,52 @@ describe('claudeCodeBackend.buildArgs', () => {
     expect(parsed.parsedJson?.status).toBe('success');
   });
 });
+
+describe('claudeCodeBackend MCP + env wiring (scoped investigation)', () => {
+  const baseRequest = {
+    cwd: '/tmp/repo',
+    prompt: 'investigate',
+  } as Parameters<typeof claudeCodeBackend.buildArgs>[0];
+
+  it('emits --mcp-config + --strict-mcp-config when mcpServers is set', () => {
+    const args = claudeCodeBackend.buildArgs(
+      { ...baseRequest, mcpServers: { metabase: { type: 'http', url: 'https://mb/api/mcp' } } },
+      '/tmp/out.json',
+    );
+    const idx = args.indexOf('--mcp-config');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(JSON.parse(args[idx + 1])).toEqual({
+      mcpServers: { metabase: { type: 'http', url: 'https://mb/api/mcp' } },
+    });
+    expect(args).toContain('--strict-mcp-config');
+  });
+
+  it('omits MCP flags when no mcpServers are provided', () => {
+    const args = claudeCodeBackend.buildArgs(baseRequest, '/tmp/out.json');
+    expect(args).not.toContain('--mcp-config');
+    expect(args).not.toContain('--strict-mcp-config');
+  });
+
+  it('omits MCP flags for an empty mcpServers object', () => {
+    const args = claudeCodeBackend.buildArgs({ ...baseRequest, mcpServers: {} }, '/tmp/out.json');
+    expect(args).not.toContain('--mcp-config');
+  });
+
+  it('passes HOME (and USER) in buildEnv so the MCP OAuth keychain resolves', () => {
+    const prevHome = process.env.HOME;
+    const prevUser = process.env.USER;
+    process.env.HOME = '/Users/tester';
+    process.env.USER = 'tester';
+    try {
+      const env = claudeCodeBackend.buildEnv(baseRequest, '/usr/bin');
+      expect(env.HOME).toBe('/Users/tester');
+      expect(env.USER).toBe('tester');
+      expect(env.PATH).toBe('/usr/bin');
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      if (prevUser === undefined) delete process.env.USER;
+      else process.env.USER = prevUser;
+    }
+  });
+});

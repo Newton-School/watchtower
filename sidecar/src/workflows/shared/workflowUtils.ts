@@ -206,6 +206,23 @@ export function buildSlackThreadLink(channelId: string, threadTs: string): strin
   return `https://${SLACK_WORKSPACE_DOMAIN}.slack.com/archives/${channelId}/${messageId}`;
 }
 
+/**
+ * Working directory that spans BOTH newton-web and newton-api so a single
+ * agent can Grep/Read across them. When the two repos are siblings (the
+ * normal layout) this is their common parent; otherwise we fall back to the
+ * newton-web parent (callers that need the api repo too should pass both
+ * absolute paths in the prompt). Generalizes the former owner-only helper.
+ */
+export function resolveCombinedWorkspaceRoot(config: AppConfig): string {
+  const webParent = path.dirname(config.repoPaths.newtonWeb);
+  const apiParent = path.dirname(config.repoPaths.newtonApi);
+  if (webParent === apiParent) {
+    return webParent;
+  }
+  return webParent;
+}
+
+/** @deprecated use resolveCombinedWorkspaceRoot — kept as a thin alias. */
 export function resolveOwnerWorkspaceRoot(config: AppConfig): string {
   const webParent = path.dirname(config.repoPaths.newtonWeb);
   const apiParent = path.dirname(config.repoPaths.newtonApi);
@@ -222,8 +239,15 @@ export async function prepareWorkflowContext(params: {
   logStep?: WorkflowStepLogger;
   resolveRepo?: boolean;
   store?: DossierAware;
+  /**
+   * Bypass repo classification and pin the workspace directly (issue: scoped
+   * investigation). 'newton-web' / 'newton-api' → that repo's worktree;
+   * 'broad' → the combined parent dir so the agent spans both repos. When set,
+   * resolveRepoOrAsk is skipped entirely (no admin "web or api?" round-trip).
+   */
+  repoOverride?: 'newton-web' | 'newton-api' | 'broad';
 }): Promise<WorkflowContext> {
-  const { task, config, slack, logStep, resolveRepo = true, store } = params;
+  const { task, config, slack, logStep, resolveRepo = true, store, repoOverride } = params;
   const isOwnerAuthor = config.ownerSlackUserIds.includes(task.event.userId);
 
   // Attribution user: launchpad retriggers carry the real requester in
@@ -288,6 +312,16 @@ export async function prepareWorkflowContext(params: {
 
   if (!resolveRepo) {
     cwd = os.tmpdir();
+  } else if (repoOverride) {
+    // Scope decided by the caller (e.g. investigation scope) — pin the
+    // workspace directly, no classification or admin clarify.
+    if (repoOverride === 'broad') {
+      cwd = resolveCombinedWorkspaceRoot(config);
+    } else {
+      repoName = repoOverride;
+      const repoPath = repoOverride === 'newton-web' ? config.repoPaths.newtonWeb : config.repoPaths.newtonApi;
+      cwd = resolveWorkspace(repoPath, task.event.threadTs);
+    }
   } else if (isOwnerAuthor) {
     cwd = resolveOwnerWorkspaceRoot(config);
   } else {

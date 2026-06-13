@@ -193,6 +193,14 @@ export interface AppConfig {
   prReviewTimeoutMs: number;
   bugFixTimeoutMs: number;
   pmTaskTimeoutMs: number;
+  /**
+   * HTTP MCP endpoint for the Metabase (read-only DB) server. Used by the
+   * broad-scope investigation to inspect the data layer alongside the repos.
+   * Empty string disables it (broad mode then runs repos-only). Only the
+   * claude-code backend can use it (via --mcp-config); the OAuth token is
+   * the headless CLI's Keychain-cached session.
+   */
+  metabaseMcpUrl: string;
   accessControl?: AccessControlConfig;
   /**
    * Capability-bundles view of access control. Derived from `accessControl`
@@ -354,6 +362,19 @@ export interface CodexRunRequest {
    * (adds `--permission-mode plan`). The Codex backend ignores this.
    */
   planMode?: boolean;
+  /**
+   * MCP servers to expose to the agent for this run. Only honored by the
+   * claude-code backend (adds `--mcp-config <inline JSON>` + `--strict-mcp-config`
+   * so ONLY these servers load). HTTP/OAuth servers reuse the headless CLI's
+   * Keychain-cached token (requires HOME in the spawn env). The Codex backend
+   * ignores this. Used by the broad-scope investigation to reach Metabase.
+   */
+  mcpServers?: Record<string, McpServerConfig>;
+}
+
+export interface McpServerConfig {
+  type: 'http';
+  url: string;
 }
 
 export interface TokenUsage {

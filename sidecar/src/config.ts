@@ -10,6 +10,8 @@ import {
 } from './access/control.js';
 import type { AccessControlSettings, AgentBackendId, AppConfig } from './types/contracts.js';
 
+export const METABASE_MCP_URL_DEFAULT = 'https://metabase-lierhfgoeiwhr.newtonschool.co/api/mcp';
+
 const settingsSchema = z.object({
   slack_bot_token: z.string(),
   slack_app_token: z.string(),
@@ -30,6 +32,7 @@ const settingsSchema = z.object({
   core_dev_slack_user_group: z.string().default(''),
   mini_og_repo_root: z.string().default('/Users/dipesh/code/mini-og'),
   watchtower_path: z.string().default(''),
+  metabase_mcp_url: z.string().default(METABASE_MCP_URL_DEFAULT),
 });
 
 type SettingsRow = z.infer<typeof settingsSchema>;
@@ -180,6 +183,13 @@ export function loadConfigFromDb(dbPath: string): AppConfig {
     } catch {
       /* column already exists */
     }
+    try {
+      db.exec(
+        `ALTER TABLE app_settings ADD COLUMN metabase_mcp_url TEXT NOT NULL DEFAULT '${METABASE_MCP_URL_DEFAULT}'`,
+      );
+    } catch {
+      /* column already exists */
+    }
 
     const row = db
       .prepare(
@@ -202,7 +212,8 @@ export function loadConfigFromDb(dbPath: string): AppConfig {
           COALESCE(core_dev_slack_user_ids, '') AS core_dev_slack_user_ids,
           COALESCE(core_dev_slack_user_group, '') AS core_dev_slack_user_group,
           COALESCE(mini_og_repo_root, '/Users/dipesh/code/mini-og') AS mini_og_repo_root,
-          COALESCE(watchtower_path, '') AS watchtower_path
+          COALESCE(watchtower_path, '') AS watchtower_path,
+          COALESCE(metabase_mcp_url, '${METABASE_MCP_URL_DEFAULT}') AS metabase_mcp_url
          FROM app_settings
          WHERE id = 1
          LIMIT 1`,
@@ -367,6 +378,7 @@ function mapSettingsToConfig(settings: SettingsRow, accessControlSettings?: Acce
     prReviewTimeoutMs: settings.pr_review_timeout_ms,
     bugFixTimeoutMs: settings.bug_fix_timeout_ms,
     pmTaskTimeoutMs: settings.pm_task_timeout_ms,
+    metabaseMcpUrl: settings.metabase_mcp_url.trim(),
     accessControl,
     bundles: deriveBundlesFromLegacy(accessControl),
   };

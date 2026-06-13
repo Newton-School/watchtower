@@ -156,6 +156,16 @@ export const claudeCodeBackend: AgentBackend = {
         args.push('--image', imagePath);
       }
     }
+    // Expose only the requested MCP servers (issue: scoped investigation
+    // reaching Metabase). `--strict-mcp-config` makes the headless run ignore
+    // the user's global/project MCP config and load ONLY these — so a bug
+    // investigation can't accidentally pull in unrelated servers. Inline JSON
+    // avoids a temp file. `--dangerously-skip-permissions` (set above in
+    // non-plan mode) auto-allows the MCP tools; OAuth HTTP servers reuse the
+    // CLI's Keychain-cached token, which requires HOME in buildEnv.
+    if (request.mcpServers && Object.keys(request.mcpServers).length > 0) {
+      args.push('--mcp-config', JSON.stringify({ mcpServers: request.mcpServers }), '--strict-mcp-config');
+    }
     // Claude Code writes JSON to stdout when --output-format json is set.
     // The generic runner captures stdout and falls back to it when the
     // output file is missing, so we do not pass an --output flag here.
@@ -165,6 +175,17 @@ export const claudeCodeBackend: AgentBackend = {
   buildEnv(request: AgentRunRequest, basePath: string): Record<string, string> {
     const env: Record<string, string> = {};
     env.PATH = basePath;
+    // HOME (and USER) are required for Claude Code to find its config and the
+    // Keychain/credentials store where MCP OAuth tokens live — without HOME an
+    // HTTP/OAuth MCP server (e.g. Metabase) silently fails to connect in the
+    // headless spawn. Passing them is also more correct for every other run.
+    const home = process.env.HOME;
+    if (home) {
+      env.HOME = home;
+    }
+    if (process.env.USER) {
+      env.USER = process.env.USER;
+    }
     if (process.env.ANTHROPIC_API_KEY) {
       env.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
     }
