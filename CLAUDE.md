@@ -74,10 +74,13 @@ The sidecar (`sidecar/src/`) is a long-running Node.js process supervised by Tau
 
 ## Version Bumping
 
-When bumping the version, update all four files:
-1. `package.json` — `"version"`
-2. `src-tauri/Cargo.toml` — `version`
-3. `src-tauri/Cargo.lock` — `version` under `[[package]] name = "watchtower"`
-4. `src-tauri/tauri.conf.json` — `"version"`
+Use the script — it edits all four files, branches off the latest `origin/main`, commits, pushes, and opens (optionally merges) the PR:
 
-Branch convention: `chore/bump-v{X.Y.Z}`.
+```bash
+node scripts/bump-version.mjs [patch|minor|major|X.Y.Z] [--merge] [--dry-run]
+# e.g. node scripts/bump-version.mjs patch --merge
+```
+
+`--dry-run` validates the four edits without touching anything; `--merge` squash-merges the PR and syncs `main`. It aborts on uncommitted tracked changes. Branch convention: `chore/bump-v{X.Y.Z}`.
+
+The four files it keeps in sync (if ever bumping by hand): `package.json` `"version"`, `src-tauri/Cargo.toml` `version`, `src-tauri/Cargo.lock` `version` under `[[package]] name = "watchtower"`, `src-tauri/tauri.conf.json` `"version"`.
