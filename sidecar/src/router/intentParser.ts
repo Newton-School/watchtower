@@ -163,6 +163,58 @@ export function isPrReviewRequest(triggerText: string, threadTexts: string[] = [
   return false;
 }
 
+// Any http(s) URL. The QA gate narrows this to non-GitHub, non-Metabase
+// targets so a PR link still routes to PR_REVIEW and a Metabase link to
+// INFORMATIONAL.
+const ANY_URL_RE = /https?:\/\/[^\s<>|]+/i;
+
+// QA verbs — an explicit ask to exercise a running web app in a browser.
+// Deliberately narrow (precision over recall): a bare "test it" with no URL
+// or a "fix"/"build" ask falls through to the classifier / IMPLEMENTATION.
+const QA_VERB_RE =
+  /\b(qa|smoke[- ]?test|e2e|end[- ]?to[- ]?end|browser[- ]?test|test (?:the|this|that|out|flow|page|feature|login|signup|sign[- ]?up|checkout|form|ui)|verify (?:the|this) (?:flow|page|ui|feature|form)|click[- ]?through|walk through)\b/;
+
+// A QA request mixed with a build/ship verb is ambiguous — let the classifier
+// or IMPLEMENTATION own it rather than firing the deterministic QA gate.
+const QA_CONFLICTING_VERB_RE = /\b(fix|implement|build|deploy|ship|merge|create|add|refactor|migrate)\b/;
+
+/**
+ * Returns the first http(s) URL in `text` that is a valid webapp-QA target —
+ * i.e. not a GitHub PR URL (those belong to PR_REVIEW) and not a Metabase URL
+ * (those belong to INFORMATIONAL). Trailing punctuation is trimmed.
+ */
+export function extractQaTargetUrl(text: string | undefined | null): string | undefined {
+  if (!text) return undefined;
+  const matches = text.match(new RegExp(ANY_URL_RE, 'gi')) ?? [];
+  for (const raw of matches) {
+    const url = raw.replace(/[)\]}.,!?'"]+$/, '');
+    if (GITHUB_PR_URL_TEST_RE.test(url)) continue;
+    if (containsMetabaseUrl(url)) continue;
+    return url;
+  }
+  return undefined;
+}
+
+/**
+ * Deterministic check: is the message asking miniOG to QA / browser-test a
+ * running web app? Runs before the AI classifier (pattern: isPrReviewRequest /
+ * isDeployRequest) so "QA the login flow on <url>" never misroutes to
+ * INVESTIGATION or IMPLEMENTATION. Fires only when there is a QA verb AND a
+ * non-PR, non-Metabase target URL in the trigger message, and no conflicting
+ * build/ship verb.
+ */
+export function isWebappQaRequest(triggerText: string): boolean {
+  if (!triggerText) return false;
+  if (!extractQaTargetUrl(triggerText)) return false;
+  const normalized = triggerText
+    .replace(/<@[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .toLowerCase()
+    .trim();
+  if (QA_CONFLICTING_VERB_RE.test(normalized)) return false;
+  return QA_VERB_RE.test(normalized);
+}
+
 /**
  * Parse a `/miniog <subcommand>` style message into a structured subcommand.
  * Returns null if the text is not a recognized dossier subcommand.
@@ -263,6 +315,14 @@ function inferIntent(
   // override for the confidence guardrail to hold.
   if (mention.detected && mention.type === 'bot' && isPrReviewRequest(event.text ?? '', threadTexts)) {
     return { intent: 'PR_REVIEW' };
+  }
+
+  // Deterministic webapp-QA detection — before the owner/default seeding so
+  // owners get it too. "QA the login flow on <url>" carries all its routing
+  // signal in plain text (a QA verb + a non-PR/Metabase URL), so it skips the
+  // AI classifier in routeTask and never misroutes to INVESTIGATION.
+  if (mention.detected && mention.type === 'bot' && isWebappQaRequest(event.text ?? '')) {
+    return { intent: 'WEBAPP_QA' };
   }
 
   // Intent classification (PR_REVIEW, INFORMATIONAL, etc.) is handled by the

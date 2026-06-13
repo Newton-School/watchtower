@@ -105,7 +105,8 @@ export async function routeTask(params: {
     task.intent !== 'DEV_ASSIST' &&
     task.intent !== 'DEPLOY' &&
     task.intent !== 'MINIOG_DOSSIER' &&
-    task.intent !== 'PR_REVIEW'
+    task.intent !== 'PR_REVIEW' &&
+    task.intent !== 'WEBAPP_QA'
   ) {
     if (isPresencePing(userMessage)) {
       resolvedIntent = 'CONVERSATIONAL';
@@ -367,6 +368,10 @@ export async function routeTask(params: {
 
   if (resolvedIntent === 'CONVERSATIONAL') {
     return runAgenticEntry({ mode: 'conversational', task: routedTask, config, slack, store, jobId, logStep, signal });
+  }
+
+  if (resolvedIntent === 'WEBAPP_QA') {
+    return runAgenticEntry({ mode: 'qa', task: routedTask, config, slack, store, jobId, logStep, signal });
   }
 
   if (resolvedIntent === 'DEV_ASSIST') {

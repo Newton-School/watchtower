@@ -2,6 +2,7 @@ import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
 import { highReasoningProfile } from '../codex/modelProfiles.js';
 import { extractReplyFromCodexResult } from '../workflows/shared/workflowUtils.js';
 import type { WorkflowStepLogger } from '../types/contracts.js';
+import type { AgentBackendId } from '../backends/types.js';
 
 export interface RunClaudeAgenticRequest {
   systemPrompt: string;
@@ -10,6 +11,14 @@ export interface RunClaudeAgenticRequest {
   githubToken?: string;
   logStep?: WorkflowStepLogger;
   signal?: AbortSignal;
+  /**
+   * Pin a backend for this run instead of the global active backend. The
+   * webapp-QA mode forces `claude-code` so it can shell out to Playwright and
+   * accept image input regardless of the deployed default (often `codex`).
+   */
+  forceBackend?: AgentBackendId;
+  /** Hard timeout for the spawned agent. Defaults to none (outer signal only). */
+  timeoutMs?: number;
 }
 
 export interface RunClaudeAgenticResult {
@@ -32,16 +41,19 @@ export interface RunClaudeAgenticResult {
  * wrapping.
  */
 export async function runClaudeAgentic(request: RunClaudeAgenticRequest): Promise<RunClaudeAgenticResult> {
-  const { systemPrompt, userMessage, cwd, githubToken, logStep, signal } = request;
+  const { systemPrompt, userMessage, cwd, githubToken, logStep, signal, forceBackend, timeoutMs } = request;
 
   const prompt = `${systemPrompt}\n\n---\n\nUser message:\n${userMessage}`;
+  const backendId = forceBackend ?? getActiveBackendId();
 
   try {
     const result = await runCodex({
       cwd,
       prompt,
       githubToken,
-      ...highReasoningProfile(getActiveBackendId()),
+      ...highReasoningProfile(backendId),
+      backendOverride: forceBackend,
+      timeoutMs,
       onLog: logStep,
       signal,
     });

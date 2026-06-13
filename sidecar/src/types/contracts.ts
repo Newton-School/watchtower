@@ -91,6 +91,7 @@ export type WorkflowIntent =
   | 'DEV_ASSIST'
   | 'DEPLOY'
   | 'MINIOG_DOSSIER'
+  | 'WEBAPP_QA'
   | 'UNKNOWN';
 export type WorkflowStatus = 'SUCCESS' | 'FAILED' | 'PAUSED' | 'SKIPPED' | 'CANCELLED';
 export type JobLogLevel = 'INFO' | 'WARN' | 'ERROR';
@@ -370,6 +371,13 @@ export interface CodexRunRequest {
    * ignores this. Used by the broad-scope investigation to reach Metabase.
    */
   mcpServers?: Record<string, McpServerConfig>;
+  /**
+   * Force a specific backend for this run, overriding the global active
+   * backend. Used by the webapp-QA flow, which must run on `claude-code`
+   * (native Bash to drive Playwright + image support) regardless of the
+   * deployed default. `runCodex` resolves `backendOverride ?? activeBackendId`.
+   */
+  backendOverride?: AgentBackendId;
 }
 
 export interface McpServerConfig {
