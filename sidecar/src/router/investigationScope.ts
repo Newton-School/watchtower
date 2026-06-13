@@ -23,7 +23,7 @@ export interface InvestigationScopeResult {
 const SCOPE_PROMPT = `You are a bug-triage classifier for a developer assistant. Given a bug report, decide WHERE the bug most likely originates so the right codebase(s) get investigated. You have NO repo access — classify purely from the report and thread context.
 
 The two codebases:
-- newton-web: the React/TypeScript FRONTEND. Owns rendering, layout, styling, client-side state, routing, form/interaction behaviour, what the user sees and clicks.
+- newton-web: the React/JavaScript FRONTEND. Owns rendering, layout, styling, client-side state, routing, form/interaction behaviour, what the user sees and clicks.
 - newton-api: the Django/Python BACKEND. Owns API endpoints, business logic, server-side computation, and the data returned to the frontend.
 
 Classify the bug into exactly one scope:

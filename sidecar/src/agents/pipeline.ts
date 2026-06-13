@@ -466,7 +466,7 @@ async function classifyRepoChoice(
   if (CANCEL_SHORTHAND.test(trimmed)) return 'cancel';
 
   const prompt = `You are a classifier for miniOG, a developer bot. miniOG asked an admin which repo to work in for an ambiguous task. The choices are:
-- "newton-web" — the frontend repo (React/TypeScript, pages, components, UI)
+- "newton-web" — the frontend repo (React/JavaScript, pages, components, UI)
 - "newton-api" — the backend repo (Python/Django, endpoints, models, serializers)
 
 Classify the admin's reply into one of four categories:
