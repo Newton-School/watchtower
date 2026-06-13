@@ -834,6 +834,10 @@ export async function runImplementationWorkflow(params: {
         logStep: logStep ?? (() => {}),
         botUserId: config.botUserId,
         nudgeText: "Still waiting on that clarification to build the plan. Reply here or say 'cancel' to stop.",
+        // Thread the job's abort signal so cancelJob() actually terminates this
+        // wait. Without it a "cancelled" job stays parked and can zombie-resume
+        // on a later thread reply against an already-aborted signal (#348 RC3).
+        signal,
       });
 
       if (outcome.outcome === 'cancelled') {
@@ -1385,6 +1389,10 @@ Write your response as a ready-to-post Slack message describing what you did.
         botUserId: config.botUserId,
         nudgeText:
           "Still waiting on more info for the fix — reply here with the error text, failing request, or file scope. Say 'cancel' to stop.",
+        // Thread the job's abort signal so cancelJob() actually terminates this
+        // wait. Without it a "cancelled" job stays parked and can zombie-resume
+        // on a later thread reply against an already-aborted signal (#348 RC3).
+        signal,
       });
 
       if (clarification.outcome === 'cancelled') {
