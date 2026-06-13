@@ -10,6 +10,9 @@ declare module 'better-sqlite3' {
       pragma(statement: string): unknown;
       exec(sql: string): unknown;
       prepare(sql: string): Statement;
+      // Wraps `fn` in a SQLite transaction, returning a function with the same
+      // signature; better-sqlite3 commits on return and rolls back on throw.
+      transaction<Args extends unknown[], R>(fn: (...args: Args) => R): (...args: Args) => R;
       close(): void;
     }
   }
