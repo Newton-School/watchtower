@@ -564,5 +564,8 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
 }
 
 export async function runCodex(request: CodexRunRequest): Promise<CodexRunResult> {
-  return runAgent(request, getBackend(activeBackendId));
+  // `backendOverride` lets a single run pin a backend (e.g. webapp-QA forces
+  // `claude-code` for Bash-driven Playwright) without flipping the global
+  // active backend that every other workflow relies on.
+  return runAgent(request, getBackend(request.backendOverride ?? activeBackendId));
 }

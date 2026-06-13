@@ -262,6 +262,10 @@ export function intentToCapability(intent: WorkflowIntent): Capability {
     case 'IMPLEMENTATION':
     case 'OWNER_AUTOPILOT':
       return 'start_implementation';
+    // Webapp-QA drives a live app but ships no code — builder-tier, reusing
+    // the implementation capability rather than minting a new one for the MVP.
+    case 'WEBAPP_QA':
+      return 'start_implementation';
     case 'INVESTIGATION':
       return 'investigate';
     case 'DEPLOY':
@@ -319,6 +323,7 @@ export function workflowSideEffect(intent: WorkflowIntent): WorkflowSideEffect {
     case 'INVESTIGATION':
     case 'DEV_ASSIST':
     case 'MINIOG_DOSSIER':
+    case 'WEBAPP_QA': // QA reports findings against a running app; it cannot imply code shipped.
     case 'UNKNOWN':
     default:
       return 'answer';
@@ -337,6 +342,7 @@ export function resolveRequiredAccessLevel(intent: WorkflowIntent): AccessLevel 
       return 'reviewer';
     case 'IMPLEMENTATION':
     case 'OWNER_AUTOPILOT':
+    case 'WEBAPP_QA':
       return 'builder';
     case 'DEPLOY':
     case 'DEV_ASSIST':
