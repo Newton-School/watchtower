@@ -265,9 +265,14 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
-  // Listen for abort signal to support task cancellation
+  // Abort-signal handling for task cancellation. The force-kill timer and abort
+  // listener are tracked at function scope so the finally block can release
+  // them: otherwise a cancelled run leaves a 5s timer pending (holding a
+  // reference to `child`), and the listener's closure keeps `child` reachable.
+  let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
   if (request.signal) {
-    const onAbort = (): void => {
+    onAbort = (): void => {
       cancelled = true;
       request.onLog?.({
         stage: 'agent.cancelled',
@@ -276,7 +281,7 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
       });
       child.kill('SIGTERM');
       // Force kill after 5 seconds if SIGTERM doesn't work
-      setTimeout(() => {
+      forceKillTimer = setTimeout(() => {
         if (!child.killed) {
           child.kill('SIGKILL');
         }
@@ -536,6 +541,17 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
       modelUsed,
     };
   } finally {
+    // Release the abort wiring and per-process listeners. By the time we reach
+    // here the child has already closed (the try awaited childDone), so the 5s
+    // force-kill timer is moot — clearing it stops a dead-process SIGKILL and
+    // frees the `child` reference it (and the abort listener) captured.
+    if (forceKillTimer) {
+      clearTimeout(forceKillTimer);
+    }
+    if (request.signal && onAbort) {
+      request.signal.removeEventListener('abort', onAbort);
+    }
+    child.removeAllListeners();
     request.onLog?.({
       stage: 'agent.cleanup',
       message: `Cleaning up temporary ${backend.displayName} output directory.`,
