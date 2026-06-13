@@ -19,6 +19,7 @@ import {
   NO_NEW_CHANGES_TEXT,
 } from '../github/prReviewSupport.js';
 import type { PrMetadata, PrDiffResult } from '../github/prReviewSupport.js';
+import { isAnchorInDiff, parseDiffHunks } from '../github/diffHunks.js';
 import { resolveWorkspace } from '../workspaces/workspaceManager.js';
 
 /**
@@ -309,6 +310,43 @@ export async function reviewSinglePr(params: {
     return failedOutcome(prContext, 'Review aborted before completion.', prHeadSha);
   }
 
+  // Tier 2: medium-reasoning, tools still available. A transient tier-1 failure
+  // shouldn't immediately cost the review its file-context verification — only
+  // drop to the diff-only one-shot (tier 3) if medium+tools also fails.
+  if (!agentResult?.ok || !agentResult.parsedJson) {
+    logStep?.({
+      stage: 'agentic.pr_review.fallback.medium',
+      message: 'Tier-1 review failed — retrying at medium reasoning (tools still available).',
+      level: 'WARN',
+      data: { prUrl: prContext.url, ok: agentResult?.ok ?? false, exitCode: agentResult?.exitCode ?? null },
+    });
+    try {
+      agentResult = await deps.runAgent({
+        cwd: repoPath,
+        prompt: buildAgenticPrReviewPrompt(promptParams),
+        outputSchemaPath: schemaPath,
+        githubToken,
+        ...profile,
+        reasoningEffort: 'medium',
+        timeoutMs: config.prReviewTimeoutMs,
+        onLog: logStep,
+        signal,
+      });
+    } catch (error) {
+      agentResult = undefined;
+      logStep?.({
+        stage: 'agentic.pr_review.pr.agent_threw',
+        message: `Tier-2 (medium) retry threw: ${String(error)}`,
+        level: 'WARN',
+        data: { prUrl: prContext.url },
+      });
+    }
+  }
+
+  if (signal?.aborted) {
+    return failedOutcome(prContext, 'Review aborted before completion.', prHeadSha);
+  }
+
   if (!agentResult?.ok || !agentResult.parsedJson) {
     logStep?.({
       stage: 'agentic.pr_review.fallback.one_shot',
@@ -361,6 +399,39 @@ export async function reviewSinglePr(params: {
   //    and summary formatters expect. All severity validation and
   //    attachable/unattachable splitting is unchanged from the legacy path.
   const normalizedOutputs = splitAgenticOutputByRole(agentResult);
+
+  // Enforce "changed code only" for security/performance findings: the prompt
+  // restricts them to changed code, but nothing validated that their anchor
+  // actually lands in a diff hunk. If it falls on pre-existing (unchanged)
+  // code, demote it to a summary note rather than posting an inline comment on
+  // code this PR didn't touch. reviewer-role findings are untouched.
+  const hunkIndex = parseDiffHunks(diffResult.diff);
+  let downgradedChangedCode = 0;
+  for (const output of normalizedOutputs) {
+    if (output.role !== 'security' && output.role !== 'performance') continue;
+    const kept: AgentFinding[] = [];
+    for (const f of output.findings) {
+      if (typeof f.line === 'number' && f.file && !isAnchorInDiff(hunkIndex, f.file, f.line)) {
+        downgradedChangedCode++;
+        output.summaryNotes.push(
+          `[${output.role.toUpperCase()} - ${f.severity.toUpperCase()}] ${f.message} (flagged at ${f.file}:${f.line}, outside the PR diff — confirm it applies to changed code)`,
+        );
+        continue;
+      }
+      kept.push(f);
+    }
+    output.findings = kept;
+    output.attachableFindings = output.attachableFindings.filter(a => kept.includes(a));
+    output.unattachableFindings = output.unattachableFindings.filter(u => kept.includes(u));
+  }
+  if (downgradedChangedCode > 0) {
+    logStep?.({
+      stage: 'agentic.pr_review.pr.changed_code_downgraded',
+      message: `Downgraded ${downgradedChangedCode} security/performance finding(s) anchored outside the PR diff to summary notes.`,
+      data: { prUrl: prContext.url, downgradedChangedCode },
+    });
+  }
+
   const allFindings = normalizedOutputs.flatMap(output => output.findings);
   const summaryNotesCount = normalizedOutputs.reduce((sum, output) => sum + output.summaryNotes.length, 0);
 

@@ -113,7 +113,7 @@ function makeDeps(overrides: Record<string, unknown> = {}) {
   return {
     fetchMetadata: vi.fn().mockResolvedValue({ title: 'Add FIB sub-type', headSha: 'metasha' }),
     fetchDiff: vi.fn().mockResolvedValue({
-      diff: 'diff --git a/src/a.ts b/src/a.ts\n@@ -1,1 +1,2 @@\n line\n+added',
+      diff: 'diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,1 +1,2 @@\n line\n+added',
       truncated: false,
       reason: 'ok',
     }),
@@ -346,14 +346,51 @@ describe('agenticPrReview', () => {
     );
   });
 
-  it('retries as a degraded one-shot when the agentic run fails, then succeeds', async () => {
+  it('downgrades a security finding anchored outside the diff to a summary note (#7)', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const deps = makeDeps({
+      runAgent: vi.fn().mockResolvedValue(
+        agentOk([
+          {
+            role: 'security',
+            severity: 'high',
+            category: 'authz',
+            message: 'pre-existing issue',
+            file: 'src/a.ts',
+            line: 999, // outside the mock diff hunk (which covers lines 1-2)
+          },
+        ]),
+      ),
+    });
+    const logStep = vi.fn();
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+      logStep,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    const outcomes = (result.result as any).outcomes;
+    // The off-diff security finding is demoted to a note — not a blocking finding.
+    expect(outcomes[0].hasBlockingFindings).toBe(false);
+    expect(outcomes[0].totalFindings).toBe(0);
+    expect(logStep).toHaveBeenCalledWith(
+      expect.objectContaining({ stage: 'agentic.pr_review.pr.changed_code_downgraded' }),
+    );
+  });
+
+  it('recovers at tier-2 (medium + tools) without dropping to the diff-only one-shot', async () => {
     const slack = makeSlack([`review ${WEB_PR}`]);
     const runAgent = vi
       .fn()
-      .mockResolvedValueOnce(agentDead())
+      .mockResolvedValueOnce(agentDead()) // tier 1: high + tools
       .mockResolvedValueOnce(
         agentOk([{ role: 'reviewer', severity: 'low', category: 'style', message: 'nit', file: 'src/a.ts', line: 2 }]),
-      );
+      ); // tier 2: medium + tools
     const deps = makeDeps({ runAgent });
     const logStep = vi.fn();
 
@@ -368,7 +405,37 @@ describe('agenticPrReview', () => {
 
     expect(result.status).toBe('SUCCESS');
     expect(runAgent).toHaveBeenCalledTimes(2);
-    expect(runAgent.mock.calls[1][0].prompt).toContain('Do not explore the repository');
+    // Tier 2 keeps tools (full prompt) — it is NOT the diff-only one-shot.
+    expect(runAgent.mock.calls[1][0].prompt).not.toContain('Do not explore the repository');
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'agentic.pr_review.fallback.medium' }));
+    expect(logStep).not.toHaveBeenCalledWith(expect.objectContaining({ stage: 'agentic.pr_review.fallback.one_shot' }));
+  });
+
+  it('escalates tier-1 → medium → diff-only one-shot when the first two tiers fail, then succeeds', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const runAgent = vi
+      .fn()
+      .mockResolvedValueOnce(agentDead()) // tier 1: high + tools
+      .mockResolvedValueOnce(agentDead()) // tier 2: medium + tools
+      .mockResolvedValueOnce(
+        agentOk([{ role: 'reviewer', severity: 'low', category: 'style', message: 'nit', file: 'src/a.ts', line: 2 }]),
+      ); // tier 3: diff-only one-shot
+    const deps = makeDeps({ runAgent });
+    const logStep = vi.fn();
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+      logStep,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    expect(runAgent).toHaveBeenCalledTimes(3);
+    expect(runAgent.mock.calls[2][0].prompt).toContain('Do not explore the repository');
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'agentic.pr_review.fallback.medium' }));
     expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'agentic.pr_review.fallback.one_shot' }));
   });
 
