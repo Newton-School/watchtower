@@ -232,7 +232,7 @@ export async function reviewSinglePr(params: {
   //    clone are reviewed from the diff alone — no checkout, tmp cwd (#10).
   const hasLocalRepo = Boolean(baseRepoPath);
   const repoPath = hasLocalRepo
-    ? deps.resolveWorkspaceFn(baseRepoPath as string, `${task.event.threadTs}--pr-${prContext.number}`)
+    ? await deps.resolveWorkspaceFn(baseRepoPath as string, `${task.event.threadTs}--pr-${prContext.number}`)
     : os.tmpdir();
 
   // 3. Diff fetch (TS-side: the same bytes feed the agent prompt AND the
