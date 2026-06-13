@@ -1613,6 +1613,33 @@ async function main(): Promise<void> {
     5 * 60 * 1000,
   );
 
+  // Retention sweep — nothing else prunes the high-growth tables (job_logs,
+  // learning_signals, agent_calls, reaction_feedback, events, terminal jobs),
+  // so over a multi-day lifetime they grow unbounded and slow every query.
+  // Prune once at startup, then hourly. RUNNING/PAUSED jobs and per-user dossier
+  // data are preserved. Window defaults to 30 days; override via
+  // WATCHTOWER_RETENTION_DAYS (clamped to >= 1 inside pruneOldRows).
+  const retentionDays = Number(process.env.WATCHTOWER_RETENTION_DAYS ?? 30) || 30;
+  const runRetentionSweep = (): void => {
+    try {
+      const pruned = store.pruneOldRows(retentionDays);
+      const total =
+        pruned.jobLogs +
+        pruned.learningSignals +
+        pruned.agentCalls +
+        pruned.reactionFeedback +
+        pruned.events +
+        pruned.jobs;
+      if (total > 0) {
+        logger.info({ retentionDays, total, ...pruned }, 'retention sweep pruned old rows');
+      }
+    } catch (err) {
+      logger.warn({ err: String(err) }, 'retention sweep tick failed');
+    }
+  };
+  runRetentionSweep();
+  setInterval(runRetentionSweep, 60 * 60 * 1000);
+
   startMentionCatchup({
     webClient: client.webClient,
     config,

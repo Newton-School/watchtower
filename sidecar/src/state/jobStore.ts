@@ -1527,6 +1527,42 @@ export class JobStore {
   }
 
   /**
+   * Age-based retention sweep. Nothing else prunes the high-growth tables, so
+   * over a multi-day process lifetime `job_logs`, `learning_signals`,
+   * `agent_calls`, `reaction_feedback`, `events` and terminal `jobs` grow
+   * without bound — bloating the DB file and slowing every query and startup.
+   *
+   * Deletes rows older than `retentionDays` (clamped to >= 1) in a single
+   * transaction. RUNNING/PAUSED jobs are never deleted (a PAUSED job is swept to
+   * FAILED within 24h, so by the cutoff every surviving job is terminal anyway);
+   * dossier / user-memory / pinned-fact tables are intentionally preserved —
+   * they carry long-term per-user value, not operational churn. Returns the
+   * per-table deletion counts.
+   */
+  pruneOldRows(retentionDays: number): {
+    jobLogs: number;
+    learningSignals: number;
+    agentCalls: number;
+    reactionFeedback: number;
+    events: number;
+    jobs: number;
+  } {
+    const days = Math.max(1, Math.floor(retentionDays));
+    const cutoff = isoSince(days * DAY_MS);
+    const sweep = this.db.transaction((cutoffIso: string) => ({
+      jobLogs: this.db.prepare('DELETE FROM job_logs WHERE created_at < ?').run(cutoffIso).changes,
+      learningSignals: this.db.prepare('DELETE FROM learning_signals WHERE created_at < ?').run(cutoffIso).changes,
+      agentCalls: this.db.prepare('DELETE FROM agent_calls WHERE created_at < ?').run(cutoffIso).changes,
+      reactionFeedback: this.db.prepare('DELETE FROM reaction_feedback WHERE created_at < ?').run(cutoffIso).changes,
+      events: this.db.prepare('DELETE FROM events WHERE created_at < ?').run(cutoffIso).changes,
+      jobs: this.db
+        .prepare(`DELETE FROM jobs WHERE created_at < ? AND status IN ('SUCCESS', 'FAILED', 'CANCELLED', 'SKIPPED')`)
+        .run(cutoffIso).changes,
+    }));
+    return sweep(cutoff);
+  }
+
+  /**
    * On startup, revert any launchpad requests stranded in CLAIMED or QUEUED
    * back to PENDING so the next intake poll picks them up. These rows can
    * stick if the sidecar crashes after claiming a request but before
