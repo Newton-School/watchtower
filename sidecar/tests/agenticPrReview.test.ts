@@ -244,9 +244,10 @@ describe('agenticPrReview', () => {
     );
   });
 
-  it('tags requester and skips when PR repo is not newton-web/newton-api', async () => {
+  it('reviews any Newton-School repo without a local clone from the diff alone (#10)', async () => {
     const slack = makeSlack(['review https://github.com/Newton-School/random-repo/pull/9']);
     const deps = makeDeps();
+    const logStep = vi.fn();
 
     const result = await runAgenticPrReview({
       task: makeTask('<@UBOT1> review https://github.com/Newton-School/random-repo/pull/9'),
@@ -254,13 +255,15 @@ describe('agenticPrReview', () => {
       slack: slack as any,
       store: emptyStore,
       deps: deps as any,
+      logStep,
     });
 
-    expect(result.status).toBe('SKIPPED');
-    expect(deps.runAgent).not.toHaveBeenCalled();
-    expect(slack.chat.postMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ text: expect.stringContaining('outside supported review scope') }),
-    );
+    expect(result.status).toBe('SUCCESS');
+    expect(deps.runAgent).toHaveBeenCalledTimes(1);
+    // No local clone → diff-only prompt and no checkout.
+    expect(deps.runAgent.mock.calls[0][0].prompt).toContain('Do not explore the repository');
+    expect(deps.checkoutPr).not.toHaveBeenCalled();
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'agentic.pr_review.repo_diff_only' }));
   });
 
   it('skips with no-new-changes when the PR head SHA is unchanged', async () => {

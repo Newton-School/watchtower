@@ -14,8 +14,7 @@ import { assertThreadParentExists, fetchThreadContext } from '../slack/threadCon
 import { resolvePrReviewTargets } from '../router/prTargetResolver.js';
 import { assembleRecall } from '../codex/recallAssembler.js';
 import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
-import { notifyDesktop } from '../notify/desktopNotifier.js';
-import { buildOutOfScopePrReply, mapRepoPath, SUPPORTED_PR_REPOS, fetchPrHeadSha } from '../github/prReviewSupport.js';
+import { buildOutOfScopePrReply, mapRepoPath, fetchPrHeadSha } from '../github/prReviewSupport.js';
 import { reviewSinglePr, type PrReviewDeps, type PrReviewOutcome } from './prReviewAgent.js';
 
 export type AgenticPrReviewStore = Pick<JobStore, 'findLatestReviewedPrHeadSha' | 'getChannelPolicyPack'> &
@@ -164,7 +163,7 @@ export async function runAgenticPrReview(params: {
   // Per-target guards: org allowlist, supported repos, local path mapping.
   // Out-of-scope targets are skipped with a per-PR notice instead of
   // aborting the whole batch.
-  const reviewable: Array<{ target: PrTarget; baseRepoPath: string }> = [];
+  const reviewable: Array<{ target: PrTarget; baseRepoPath: string | null }> = [];
   let outOfScopeNotified = false;
   for (const target of resolution.targets) {
     if (target.owner !== config.allowedPrOrg) {
@@ -180,32 +179,16 @@ export async function runAgenticPrReview(params: {
       }
       continue;
     }
-    if (!SUPPORTED_PR_REPOS.includes(target.repo as (typeof SUPPORTED_PR_REPOS)[number])) {
-      logStep?.({
-        stage: 'agentic.pr_review.guard.repo_out_of_scope',
-        message: `PR repo ${target.repo} is outside supported review scope.`,
-        level: 'WARN',
-        data: { prUrl: target.url, supportedRepos: [...SUPPORTED_PR_REPOS] },
-      });
-      if (!outOfScopeNotified) {
-        await postToThread(buildOutOfScopePrReply(task.event.userId, config.allowedPrOrg));
-        outOfScopeNotified = true;
-      }
-      continue;
-    }
+    // Any repo in the allowed org is reviewable. Repos with a configured local
+    // clone (newton-web/newton-api) get full file-context review; every other
+    // Newton-School repo is reviewed from the diff alone (no local checkout).
     const baseRepoPath = mapRepoPath(config, target as PrContext);
     if (!baseRepoPath) {
       logStep?.({
-        stage: 'agentic.pr_review.guard.repo_unmapped',
-        message: `PR repo ${target.repo} is not mapped to a configured local path.`,
-        level: 'WARN',
+        stage: 'agentic.pr_review.repo_diff_only',
+        message: `PR repo ${target.repo} has no local clone — reviewing from the diff alone (no file-context verification).`,
         data: { prUrl: target.url },
       });
-      notifyDesktop(
-        'Watchtower unmapped PR repo',
-        `No local repo mapping for ${target.owner}/${target.repo}; skipping auto execution.`,
-      );
-      continue;
     }
     reviewable.push({ target, baseRepoPath });
   }
