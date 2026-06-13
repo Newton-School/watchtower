@@ -8,7 +8,14 @@ import type { JobStore } from '../state/jobStore.js';
 const CATCHUP_STATE_KEY = 'mention_catchup_cursor_ts';
 const CATCHUP_INTERVAL_MS = 2 * 60 * 1000;
 const CATCHUP_LOOKBACK_SECONDS = 60 * 60 * 24;
-const CATCHUP_MAX_MESSAGES_PER_CHANNEL = 200;
+const CATCHUP_PAGE_SIZE = 200;
+// Hard ceiling on how many messages we accumulate in memory per channel per
+// scan. Steady-state ticks cover ~2-minute windows (far below this), so the cap
+// only ever engages on the first run or after a long downtime in a very busy
+// channel — exactly the case where unbounded `do/while(cursor)` pagination
+// would balloon the array. conversations.history returns newest-first, so the
+// most recent (most likely still-actionable) mentions are the ones we keep.
+const CATCHUP_MAX_MESSAGES_PER_CHANNEL = 1000;
 // Catchup is a recovery scanner — it walks `conversations.history` and replays
 // mentions whose live socket delivery we may have missed. Deletions only flow
 // through the live socket path (where processMessageDeleted reacts); a
@@ -188,7 +195,8 @@ async function discoverChannels(client: WebClient, store: JobStore, config: AppC
   return Array.from(channelSet);
 }
 
-async function fetchChannelHistory(
+// Exported for unit testing of the per-channel accumulation cap.
+export async function fetchChannelHistory(
   client: WebClient,
   channelId: string,
   oldestTs: number,
@@ -203,7 +211,7 @@ async function fetchChannelHistory(
         channel: channelId,
         oldest,
         inclusive: false,
-        limit: CATCHUP_MAX_MESSAGES_PER_CHANNEL,
+        limit: CATCHUP_PAGE_SIZE,
         cursor,
       });
 
@@ -212,6 +220,24 @@ async function fetchChannelHistory(
       }
 
       cursor = response.response_metadata?.next_cursor || undefined;
+
+      // Bound the in-memory accumulation. Once we hit the per-channel cap, stop
+      // paginating rather than walking the entire backlog of a busy channel
+      // into a single array. Newest-first ordering means we've kept the most
+      // recent messages; older ones are left for the live socket (or are stale
+      // anyway, since the cursor advances to "now" after every scan).
+      if (cursor && messages.length >= CATCHUP_MAX_MESSAGES_PER_CHANNEL) {
+        logger.warn(
+          {
+            component: 'slack-catchup',
+            channelId,
+            accumulated: messages.length,
+            cap: CATCHUP_MAX_MESSAGES_PER_CHANNEL,
+          },
+          'channel history hit per-channel cap during catch-up; stopping pagination',
+        );
+        break;
+      }
     } while (cursor);
   } catch (error) {
     logger.warn(
