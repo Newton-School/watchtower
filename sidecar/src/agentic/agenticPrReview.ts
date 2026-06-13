@@ -260,7 +260,9 @@ export async function runAgenticPrReview(params: {
   // batch (and names anything dropped by the target cap — never silent).
   const truncationNote =
     resolution.truncated && resolution.truncated.length > 0
-      ? ` (capped at ${resolution.targets.length} — skipping ${resolution.truncated.map(t => `${t.repo}#${t.number}`).join(', ')}; re-trigger for those separately)`
+      ? ` (capped at ${resolution.targets.length} per request — deferring ${resolution.truncated
+          .map(t => `${t.repo}#${t.number}`)
+          .join(', ')}; reply with a PR link or "#number" to review those next)`
       : '';
   await postToThread(
     reviewable.length === 1
@@ -309,6 +311,8 @@ export async function runAgenticPrReview(params: {
   }
 
   const failed = outcomes.filter(o => o.status === 'FAILED');
+  const completed = outcomes.filter(o => o.status === 'SUCCESS');
+  const skipped = outcomes.filter(o => o.status === 'SKIPPED');
   const aborted = Boolean(signal?.aborted) && outcomes.length < reviewable.length;
   const firstWithSha = outcomes.find(o => o.prHeadSha);
 
@@ -326,6 +330,8 @@ export async function runAgenticPrReview(params: {
     outcomes,
     prUrl: outcomes[0]?.prUrl ?? reviewable[0].target.url,
     ...(firstWithSha?.prHeadSha ? { prHeadSha: firstWithSha.prHeadSha } : {}),
+    failedCount: failed.length,
+    failedUrls: failed.map(o => o.prUrl),
   };
 
   if (aborted) {
@@ -334,6 +340,22 @@ export async function runAgenticPrReview(params: {
       status: 'CANCELLED',
       message: `Review batch aborted after ${outcomes.length}/${reviewable.length} PR(s); completed reviews are recorded.`,
       notifyDesktop: false,
+      slackPosted: true,
+      result,
+    };
+  }
+
+  // SUCCESS wins as long as ANY PR reviewed cleanly — a mixed batch is not a
+  // batch failure (issue #348 follow-up). FAILED only when nothing completed
+  // AND something failed. SKIPPED otherwise (all dedup-skipped / none reviewable).
+  if (completed.length > 0) {
+    const failedClause = failed.length > 0 ? `, ${failed.length} failed` : '';
+    const skippedClause = skipped.length > 0 ? `, ${skipped.length} skipped (no new commits)` : '';
+    return {
+      workflow: 'PR_REVIEW',
+      status: 'SUCCESS',
+      message: `Reviewed ${completed.length} PR(s)${skippedClause}${failedClause}.`,
+      notifyDesktop: failed.length > 0,
       slackPosted: true,
       result,
     };
@@ -352,17 +374,12 @@ export async function runAgenticPrReview(params: {
     };
   }
 
-  const completed = outcomes.filter(o => o.status === 'SUCCESS');
-  const skipped = outcomes.filter(o => o.status === 'SKIPPED');
   // All targets dedup-skipped → SKIPPED, matching the legacy single-PR
   // no-new-changes behavior (reaction + learning semantics unchanged).
   return {
     workflow: 'PR_REVIEW',
-    status: completed.length > 0 ? 'SUCCESS' : 'SKIPPED',
-    message:
-      completed.length > 0
-        ? `Reviewed ${completed.length} PR(s)${skipped.length > 0 ? `, ${skipped.length} skipped (no new commits)` : ''}.`
-        : 'No new changes since last review.',
+    status: 'SKIPPED',
+    message: 'No new changes since last review.',
     notifyDesktop: false,
     slackPosted: true,
     result,

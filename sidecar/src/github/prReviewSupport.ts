@@ -523,9 +523,14 @@ export function formatSlackReviewSummary(
   const resolvedEvent = deriveReviewEvent(allFindings, reviewResult?.event, totalSummaryNotes);
   const verdict = resolvedEvent === 'APPROVE' ? '✅' : resolvedEvent === 'REQUEST_CHANGES' ? '🚫' : '💬';
 
+  // When the GitHub token is missing, findings are computed but never posted —
+  // surface that explicitly so a skip reads as "couldn't post" not "all clear".
+  const noToken = reviewResult?.fallbackReason === 'no_token';
+  const skippedReason = noToken ? ' (no GitHub token — nothing was posted to the PR)' : '';
+
   if (totalFindings === 0 && totalSummaryNotes === 0) {
     if (reviewResult?.submissionMode === 'skipped') {
-      return `*PR Review Complete* - No actionable findings. GitHub review submission was skipped. ${verdict}\n${prUrl}`;
+      return `*PR Review Complete* - No actionable findings. GitHub review submission was skipped${skippedReason}. ${verdict}\n${prUrl}`;
     }
     return `*PR Review Complete* - No actionable findings. Good to go. ${verdict}\n${prUrl}`;
   }
@@ -534,13 +539,13 @@ export function formatSlackReviewSummary(
 
   if (totalFindings === 0) {
     if (reviewResult?.submissionMode === 'skipped') {
-      return `*PR Review Complete* - ${totalSummaryNotes} review note(s) identified, but GitHub review submission was skipped. ${verdict}\n${prUrl}`;
+      return `*PR Review Complete* - ${totalSummaryNotes} review note(s) identified, but GitHub review submission was skipped${skippedReason}. ${verdict}\n${prUrl}`;
     }
     return `*PR Review Complete* - ${totalSummaryNotes} review note(s) were posted in the review summary. No inline comments were attached. ${verdict}\n${prUrl}`;
   }
 
   if (!reviewResult || reviewResult.submissionMode === 'skipped') {
-    return `*PR Review Complete* - ${totalFindings} findings identified, but GitHub review submission was skipped${breakdown} ${verdict}\n${prUrl}`;
+    return `*PR Review Complete* - ${totalFindings} findings identified, but GitHub review submission was skipped${skippedReason}${breakdown} ${verdict}\n${prUrl}`;
   }
 
   const placedParts: string[] = [];
@@ -558,6 +563,12 @@ export function formatSlackReviewSummary(
   }
 
   if (totalPlaced === 0) {
+    // Every finding was dropped because its anchor fell outside the diff — the
+    // review summary posts but ZERO findings reach the PR inline. Make that loud.
+    const allOutsideDiff = reviewResult.droppedOutsideDiff > 0 && reviewResult.droppedOutsideDiff === totalFindings;
+    if (allOutsideDiff) {
+      return `*PR Review Complete* - ⚠️ all ${totalFindings} finding(s) fell outside the PR diff and could NOT be posted inline; only the review summary was posted${breakdown} ${verdict}\n${prUrl}`;
+    }
     const reason = dropReasons.length > 0 ? ` — ${dropReasons.join(', ')}` : '';
     return `*PR Review Complete* - ${totalFindings} findings identified; review summary posted, no inline comments attached${reason}${breakdown} ${verdict}\n${prUrl}`;
   }

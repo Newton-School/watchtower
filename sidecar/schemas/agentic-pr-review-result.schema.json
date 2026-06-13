@@ -6,7 +6,7 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["role", "severity", "category", "message", "file", "line"],
+        "required": ["role", "severity", "category", "message"],
         "properties": {
           "role": {
             "type": "string",

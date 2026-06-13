@@ -170,6 +170,71 @@ describe('prReviewSupport', () => {
     expect(summary).toContain('1 outside the PR diff dropped');
   });
 
+  it('surfaces a no-token skip so findings are not silently dropped (#4)', () => {
+    const outputs = [
+      normalizePrReviewAgentOutput(
+        'reviewer',
+        codexResult({
+          findings: [{ severity: 'high', category: 'logic', message: 'real issue', file: 'src/a.ts', line: 5 }],
+          summaryNotes: [],
+        }),
+      ),
+    ];
+    const reviewResult: SubmitPrReviewResult = {
+      submitted: false,
+      event: 'COMMENT',
+      attemptedComments: 0,
+      commentsPosted: 0,
+      droppedOutsideDiff: 0,
+      fileLevelAttempted: 0,
+      fileLevelPosted: 0,
+      submissionMode: 'skipped',
+      fallbackReason: 'no_token',
+    };
+
+    const summary = formatSlackReviewSummary(
+      outputs,
+      'https://github.com/Newton-School/newton-web/pull/9001',
+      reviewResult,
+    );
+
+    expect(summary).toContain('submission was skipped');
+    expect(summary).toMatch(/no GitHub token/i);
+  });
+
+  it('warns when every finding fell outside the PR diff (#4)', () => {
+    const outputs = [
+      normalizePrReviewAgentOutput(
+        'reviewer',
+        codexResult({
+          findings: [
+            { severity: 'high', category: 'logic', message: 'A', file: 'src/a.ts', line: 5 },
+            { severity: 'medium', category: 'logic', message: 'B', file: 'src/b.ts', line: 9 },
+          ],
+          summaryNotes: [],
+        }),
+      ),
+    ];
+    const reviewResult: SubmitPrReviewResult = {
+      submitted: true,
+      event: 'COMMENT',
+      attemptedComments: 2,
+      commentsPosted: 0,
+      droppedOutsideDiff: 2,
+      fileLevelAttempted: 0,
+      fileLevelPosted: 0,
+      submissionMode: 'summary_only',
+    };
+
+    const summary = formatSlackReviewSummary(
+      outputs,
+      'https://github.com/Newton-School/newton-web/pull/9002',
+      reviewResult,
+    );
+
+    expect(summary).toMatch(/all 2 finding\(s\) fell outside the PR diff/i);
+  });
+
   it('builds GitHub summary text for summary-only findings and notes', () => {
     const outputs = [
       normalizePrReviewAgentOutput(

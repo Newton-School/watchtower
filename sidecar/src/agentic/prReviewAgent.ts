@@ -110,12 +110,18 @@ Review across three lenses; tag every finding with its "role":
 Rules:
 - Findings MUST anchor to the diff: exact file path plus the "+"-side (new file) line number.
   Real observations that cannot be mapped to an exact diff location go in "summaryNotes" — never invent a location.
-- Severity: critical | high | medium | low | info. Only report issues actually present in the diff — do not flag pre-existing code.
+- Severity — calibrate against this rubric (web/api review); only report issues actually present in the diff, never pre-existing code:
+  - critical: exploitable or data-destroying in production — auth bypass, SQL/command injection, secret/PII leak, an unguarded destructive query (e.g. user input concatenated into a raw SQL string).
+  - high: a likely runtime break or security/perf regression on a real path — unhandled rejection on the happy path, missing authz on a new mutating endpoint, an N+1 added inside a request handler.
+  - medium: a real bug behind a narrower condition or a meaningful gap — edge case mishandled, missing validation on a non-critical field, absent error handling, missing test for new branching logic.
+  - low: localized correctness/maintainability nits with little blast radius — a narrow off-by-one in a bounded loop, minor readability/naming, a redundant re-render.
+  - info: non-actionable observations or style notes that don't require a change.
 - You must NOT post anything to GitHub or Slack. Do not run \`gh\`, \`git push\`, \`curl\`, or any network command — submission is handled for you.
 - Your final message must be ONLY this JSON object (no prose, no code fences):
 
 {
-  "findings": [{ "role": "reviewer"|"security"|"performance", "severity": "critical"|"high"|"medium"|"low"|"info", "category": string, "message": string, "file": string, "line": number, "suggestion": string }],
+  "findings": [{ "role": "reviewer"|"security"|"performance", "severity": "critical"|"high"|"medium"|"low"|"info", "category": string, "message": string, "file"?: string, "line"?: number, "suggestion"?: string }],
+  // file + line are OPTIONAL: omit them for summary-level findings instead of inventing a location (those become summaryNotes).
   "summaryNotes": string[],
   "summary": string
 }
@@ -189,6 +195,17 @@ export async function reviewSinglePr(params: {
 
   // 1. No-new-changes dedup, per PR.
   const currentPrHeadSha = await deps.resolveHeadSha({ prContext, githubToken, logStep });
+  if (!currentPrHeadSha && previousReview) {
+    // Head SHA didn't resolve (fetch threw / returned undefined), so the dedup
+    // guard below can't fire — we'll do a full re-review even though one may not
+    // be needed. Log it so the silent re-review is observable. Behavior unchanged.
+    logStep?.({
+      stage: 'agentic.pr_review.pr.dedup_skipped_no_head_sha',
+      message: `Could not resolve head SHA for ${prContext.repo}#${prContext.number}; bypassing no-new-changes dedup and re-reviewing in full.`,
+      level: 'WARN',
+      data: { prUrl: prContext.url, previousJobId: previousReview.jobId, previousPrHeadSha: previousReview.prHeadSha },
+    });
+  }
   if (currentPrHeadSha && previousReview && previousReview.prHeadSha === currentPrHeadSha) {
     await postToThread(`${NO_NEW_CHANGES_TEXT}\n${prContext.url}`);
     logStep?.({

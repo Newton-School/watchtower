@@ -391,8 +391,13 @@ describe('agenticPrReview', () => {
       deps: deps as any,
     });
 
-    expect(result.status).toBe('FAILED');
-    expect(result.message).toContain('1/2 PR review(s) failed');
+    // Mixed batch: one PR reviewed cleanly → SUCCESS (a partial failure is not
+    // a batch failure), with the failure surfaced via failedCount/failedUrls (#1).
+    expect(result.status).toBe('SUCCESS');
+    expect(result.message).toContain('Reviewed 1 PR(s)');
+    expect(result.message).toContain('1 failed');
+    expect((result.result as any).failedCount).toBe(1);
+    expect((result.result as any).failedUrls).toEqual([WEB_PR]);
     const outcomes = (result.result as any).outcomes;
     expect(outcomes).toHaveLength(2);
     expect(outcomes[0].status).toBe('SUCCESS');
@@ -402,6 +407,24 @@ describe('agenticPrReview', () => {
     const texts = slack.chat.postMessage.mock.calls.map(c => c[0].text as string);
     expect(texts.some(t => t.includes('*PR Review Complete*'))).toBe(true);
     expect(texts.some(t => t.includes('failed (agent error'))).toBe(true);
+  });
+
+  it('marks the batch FAILED only when every PR fails (reorder preserves the all-failed path)', async () => {
+    const slack = makeSlack([]);
+    const runAgent = vi.fn().mockResolvedValue(agentDead());
+    const deps = makeDeps({ runAgent });
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+    });
+
+    expect(result.status).toBe('FAILED');
+    expect((result.result as any).failedCount).toBe(1);
+    expect(result.message).toMatch(/PR review\(s\) failed/);
   });
 
   it('forbids the agent from posting and submits through the hunk-validating path only', async () => {
