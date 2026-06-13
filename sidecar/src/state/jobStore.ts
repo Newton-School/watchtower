@@ -1,5 +1,8 @@
 import Database from 'better-sqlite3';
+import fsSync from 'node:fs';
+import pathMod from 'node:path';
 import { z } from 'zod';
+import { logger } from '../logging/logger.js';
 import type {
   AgentBackendId,
   AgentCallRecord,
@@ -521,14 +524,18 @@ export class JobStore {
     } catch {
       /* column already exists */
     }
-    // One-time vault default-on (Phase D): if both fields are still default-
-    // empty/zero, flip the operator into the new vault experience with a
-    // sensible path under ~/Documents/miniog-memory. Idempotent — only runs
-    // when the operator has never touched the setting.
+    // One-time vault default-on: if both fields are still default-empty/zero,
+    // flip the operator into the vault experience. The default lives under
+    // ~/.watchtower/vault — NOT ~/Documents — so the app never touches a
+    // macOS TCC-protected folder (Documents/Desktop/Downloads) by default and
+    // never triggers the per-install permission prompt. Idempotent.
     try {
       const home = process.env.HOME ?? '';
       if (home) {
-        const defaultPath = `${home}/Documents/miniog-memory`;
+        const oldDefault = `${home}/Documents/miniog-memory`;
+        const defaultPath = `${home}/.watchtower/vault`;
+
+        // Fresh install: seed the new, non-protected default.
         this.db
           .prepare(
             `UPDATE app_settings
@@ -538,6 +545,51 @@ export class JobStore {
                AND COALESCE(vault_enabled, 0) = 0`,
           )
           .run(defaultPath);
+
+        // Migration: an existing install whose vault_path is still the old
+        // auto-set Documents default gets relocated off the protected folder.
+        // We only repoint vault_path AFTER the data is safely at the new path
+        // (or there was never any data to move) — so the DB and filesystem
+        // never diverge, and a crash mid-migration self-heals on next boot
+        // (old gone → repoint). Best-effort; on failure the vault keeps working
+        // where it is.
+        const row = this.db.prepare(`SELECT COALESCE(vault_path,'') AS vp FROM app_settings WHERE id = 1`).get() as
+          | { vp?: string }
+          | undefined;
+        if (row?.vp === oldDefault) {
+          const oldExists = fsSync.existsSync(oldDefault);
+          const newExists = fsSync.existsSync(defaultPath);
+          if (oldExists && newExists) {
+            // Two vaults present — don't auto-pick a winner or orphan data.
+            // Keep the existing Documents vault; the operator can merge and
+            // repoint manually.
+            logger.warn(
+              { oldDefault, defaultPath },
+              'vault relocation skipped: both the old (~/Documents) and new (~/.watchtower) vaults exist — merge them and set vault_path manually',
+            );
+          } else {
+            try {
+              if (oldExists) {
+                fsSync.mkdirSync(pathMod.dirname(defaultPath), { recursive: true });
+                try {
+                  fsSync.renameSync(oldDefault, defaultPath);
+                } catch {
+                  // Cross-volume (EXDEV) or similar — copy then remove.
+                  fsSync.cpSync(oldDefault, defaultPath, { recursive: true });
+                  fsSync.rmSync(oldDefault, { recursive: true, force: true });
+                }
+              }
+              this.db
+                .prepare(`UPDATE app_settings SET vault_path = ? WHERE id = 1 AND vault_path = ?`)
+                .run(defaultPath, oldDefault);
+            } catch (err) {
+              logger.warn(
+                { oldDefault, defaultPath, error: String(err) },
+                'vault relocation failed; leaving the vault at its current path',
+              );
+            }
+          }
+        }
       }
     } catch {
       /* row may not exist yet on a fresh install; harmless */
