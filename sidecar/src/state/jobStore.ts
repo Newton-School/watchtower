@@ -101,10 +101,41 @@ export class JobStore {
   private _investigationStore?: InvestigationStore;
   private _dossierStore?: DossierStore;
 
+  // Hot-path statements compiled once. better-sqlite3 does NOT cache prepared
+  // statements (every .prepare() compiles a fresh one), so re-preparing on each
+  // call was needless compile churn for the frequent paths: hasEvent runs on
+  // every Slack message and popPendingCancels on a 2s timer. Mirrors the
+  // closure-cached statement pattern already used in dossierStore.
+  private hasEventStmt!: Database.Statement;
+  private recordEventStmt!: Database.Statement;
+  private selectPendingCancelsStmt!: Database.Statement;
+  private deletePendingCancelsStmt!: Database.Statement;
+  private getStateStmt!: Database.Statement;
+  private setStateStmt!: Database.Statement;
+
   constructor(dbPath: string) {
     this.db = new Database(dbPath);
     this.db.pragma('journal_mode = WAL');
     this.migrate();
+    this.prepareHotStatements();
+  }
+
+  private prepareHotStatements(): void {
+    this.hasEventStmt = this.db.prepare('SELECT event_id FROM events WHERE event_id = ? LIMIT 1');
+    this.recordEventStmt = this.db.prepare(
+      `INSERT OR IGNORE INTO events(event_id, channel_id, thread_ts, created_at)
+         VALUES(?, ?, ?, ?)`,
+    );
+    this.selectPendingCancelsStmt = this.db.prepare('SELECT job_id FROM pending_cancel_jobs');
+    this.deletePendingCancelsStmt = this.db.prepare('DELETE FROM pending_cancel_jobs');
+    this.getStateStmt = this.db.prepare('SELECT value FROM sidecar_state WHERE key = ? LIMIT 1');
+    this.setStateStmt = this.db.prepare(
+      `INSERT INTO sidecar_state(key, value, updated_at)
+         VALUES(?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET
+           value = excluded.value,
+           updated_at = excluded.updated_at`,
+    );
   }
 
   investigationStore(): InvestigationStore {
@@ -714,9 +745,9 @@ export class JobStore {
 
   /** Atomically fetch and delete all pending cancel requests (written by Tauri UI). */
   popPendingCancels(): string[] {
-    const rows = this.db.prepare('SELECT job_id FROM pending_cancel_jobs').all() as Array<{ job_id: string }>;
+    const rows = this.selectPendingCancelsStmt.all() as Array<{ job_id: string }>;
     if (rows.length > 0) {
-      this.db.prepare('DELETE FROM pending_cancel_jobs').run();
+      this.deletePendingCancelsStmt.run();
     }
     return rows.map(r => r.job_id);
   }
@@ -914,19 +945,12 @@ export class JobStore {
   }
 
   hasEvent(eventId: string): boolean {
-    const row = this.db.prepare('SELECT event_id FROM events WHERE event_id = ? LIMIT 1').get(eventId) as
-      | { event_id?: string }
-      | undefined;
+    const row = this.hasEventStmt.get(eventId) as { event_id?: string } | undefined;
     return Boolean(row?.event_id);
   }
 
   recordEvent(eventId: string, channelId: string, threadTs: string): void {
-    this.db
-      .prepare(
-        `INSERT OR IGNORE INTO events(event_id, channel_id, thread_ts, created_at)
-         VALUES(?, ?, ?, ?)`,
-      )
-      .run(eventId, channelId, threadTs, new Date().toISOString());
+    this.recordEventStmt.run(eventId, channelId, threadTs, new Date().toISOString());
   }
 
   hasJobForEventTs(channelId: string, eventTs: string): boolean {
@@ -999,23 +1023,12 @@ export class JobStore {
   }
 
   getState(key: string): string | undefined {
-    const row = this.db.prepare('SELECT value FROM sidecar_state WHERE key = ? LIMIT 1').get(key) as
-      | { value?: string }
-      | undefined;
+    const row = this.getStateStmt.get(key) as { value?: string } | undefined;
     return row?.value;
   }
 
   setState(key: string, value: string): void {
-    const now = new Date().toISOString();
-    this.db
-      .prepare(
-        `INSERT INTO sidecar_state(key, value, updated_at)
-         VALUES(?, ?, ?)
-         ON CONFLICT(key) DO UPDATE SET
-           value = excluded.value,
-           updated_at = excluded.updated_at`,
-      )
-      .run(key, value, now);
+    this.setStateStmt.run(key, value, new Date().toISOString());
   }
 
   createLaunchpadRequest(input: {
