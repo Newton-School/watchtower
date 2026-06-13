@@ -150,6 +150,29 @@ describe('normalizePlannerOutput', () => {
       expect(second.scope).toBe('large');
     });
 
+    it('reads "Requires code changes: no" from the plan markdown as false (#348 RC2)', () => {
+      const summary = '# Plan\n1. Explain the tracking rules\nScope: small\nRequires code changes: no';
+      const result = normalizePlannerOutput({ summary }, 'claude-code');
+      expect(result.requiresCodeChanges).toBe(false);
+    });
+
+    it('reads "Requires code changes: yes" from the plan markdown as true', () => {
+      const summary = '# Plan\n1. Add a field\nScope: small\nRequires code changes: yes';
+      const result = normalizePlannerOutput({ summary }, 'claude-code');
+      expect(result.requiresCodeChanges).toBe(true);
+    });
+
+    it('defaults requiresCodeChanges to true when the marker is absent (backward-safe)', () => {
+      const result = normalizePlannerOutput({ summary: '# Plan\n1. Do thing\nScope: small' }, 'claude-code');
+      expect(result.requiresCodeChanges).toBe(true);
+    });
+
+    it('prefers an already-carried requiresCodeChanges boolean over the markdown marker (idempotency)', () => {
+      const augmented = { planMarkdown: 'Requires code changes: yes', requiresCodeChanges: false };
+      const result = normalizePlannerOutput(augmented, 'claude-code');
+      expect(result.requiresCodeChanges).toBe(false);
+    });
+
     it('defaults scope to medium when the markdown has no Scope: tag', () => {
       const result = normalizePlannerOutput({ summary: 'do some things' }, 'claude-code');
       expect(result.scope).toBe('medium');

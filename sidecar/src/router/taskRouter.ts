@@ -14,6 +14,7 @@ import {
   evaluateAccess,
   getConfiguredAccessControl,
   resolveRequiredAccessLevel,
+  workflowSideEffect,
 } from '../access/control.js';
 import type { JobStore } from '../state/jobStore.js';
 import { runDevAssistWorkflow } from '../workflows/devAssistWorkflow.js';
@@ -156,25 +157,36 @@ export async function routeTask(params: {
       });
       classificationReasoning = classification.reasoning;
 
-      // Confidence floor on access-dropping overrides. RCA (Slack thread
+      // Confidence floor on DANGEROUS classifier downgrades. RCA (Slack thread
       // p1779086230428739, 2026-05-18) showed a 0.60-confidence
-      // IMPLEMENTATION → CONVERSATIONAL reclassification of a bare "yes" —
-      // the conversational workflow then hallucinated a "fix done" reply
-      // and the user thought the bug was fixed. Typical successful
-      // classifications run 0.85+; 0.60 is too noisy to trust when it
-      // would also reduce the workflow's required access tier (and thus
-      // the safety guardrails downstream).
+      // IMPLEMENTATION → CONVERSATIONAL reclassification of a bare "yes" — the
+      // conversational workflow then hallucinated a "fix done" reply and the
+      // user thought the bug was fixed.
       //
-      // Rule: if the proposed intent requires a strictly lower access tier
-      // than the original AND confidence < 0.75, reject the override and
-      // keep the original intent. Sideways or upward overrides (same or
-      // higher access) accept regardless of confidence.
+      // The original guard held ANY access-tier drop below the floor, but
+      // access tier is the wrong axis: INVESTIGATION, INFORMATIONAL, and
+      // CONVERSATIONAL all resolve to the `viewer` tier, so a safe downgrade to
+      // a read-only ANSWER workflow was vetoed identically to the dangerous
+      // hallucinating CHAT downgrade (#348 RC1). The real risk is whether the
+      // PROPOSED workflow can act on / imply completion of work it didn't do.
+      //
+      // Rule (a pure relaxation of the old one — it never holds anything the
+      // old guard accepted): hold the override only when it drops the access
+      // tier AND confidence < floor AND the proposed workflow can claim
+      // completion ('mutating' opens PRs/deploys/posts a verdict, or 'chat' is
+      // free-form and has hallucinated "fix done"). Downgrades to a read-only
+      // 'answer' workflow (INFORMATIONAL, INVESTIGATION, …) are honored at any
+      // confidence — they only read and report. Upgrades/sideways are
+      // unaffected (accessDropping is false for them).
       const originalRequiredLevel = resolveRequiredAccessLevel(task.intent);
       const proposedRequiredLevel = resolveRequiredAccessLevel(classification.intent);
       const accessDropping = ACCESS_RANK[proposedRequiredLevel] < ACCESS_RANK[originalRequiredLevel];
+      const proposedSideEffect = workflowSideEffect(classification.intent);
+      const proposedCanClaimCompletion = proposedSideEffect === 'mutating' || proposedSideEffect === 'chat';
       const lowConfidence = classification.confidence < CLASSIFIER_CONFIDENCE_FLOOR;
-      // (Floor constant declared at module scope below for easy override in tests.)
-      const holdOverride = classification.intent !== task.intent && accessDropping && lowConfidence;
+      // (Floor constant declared at module scope above for easy override in tests.)
+      const holdOverride =
+        classification.intent !== task.intent && accessDropping && proposedCanClaimCompletion && lowConfidence;
 
       if (holdOverride) {
         logStep?.({
@@ -183,13 +195,15 @@ export async function routeTask(params: {
           message:
             `AI classifier proposed ${task.intent} → ${classification.intent} at ` +
             `confidence=${classification.confidence.toFixed(2)} (below ${CLASSIFIER_CONFIDENCE_FLOOR.toFixed(2)}); ` +
-            `override drops required access from ${originalRequiredLevel} to ${proposedRequiredLevel}. Holding original intent.`,
+            `proposed workflow is ${proposedSideEffect} (can act on / imply completion of work) and drops access ` +
+            `from ${originalRequiredLevel} to ${proposedRequiredLevel}. Holding original intent.`,
           data: {
             originalIntent: task.intent,
             classifiedIntent: classification.intent,
             confidence: classification.confidence,
             originalRequiredLevel,
             proposedRequiredLevel,
+            proposedSideEffect,
             reasoning: classification.reasoning,
           },
         });
@@ -203,6 +217,10 @@ export async function routeTask(params: {
               originalIntent: task.intent,
               classifiedIntent: classification.intent,
               confidence: classification.confidence,
+              proposedSideEffect,
+              // True when a sub-floor access-dropping override was accepted
+              // *because* the proposed workflow is read-only (#348 RC1 change).
+              acceptedLowConfidenceSafeDowngrade: accessDropping && lowConfidence && !proposedCanClaimCompletion,
               reasoning: classification.reasoning,
             },
           });

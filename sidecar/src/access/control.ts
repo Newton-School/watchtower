@@ -282,6 +282,50 @@ export function intentToCapability(intent: WorkflowIntent): Capability {
 }
 
 /**
+ * Side-effect class of a workflow — a separate axis from `Capability` /
+ * `resolveRequiredAccessLevel`. Answers "can a low-confidence switch INTO this
+ * workflow act on, or falsely imply completion of, work it did not do?" and
+ * drives the classifier-confidence guard in `router/taskRouter.ts` (#348 RC1).
+ *
+ *  - 'mutating' : opens PRs / writes code / deploys / posts a review verdict.
+ *  - 'chat'     : free-form conversation. Historically hallucinated a
+ *                 "fix done" reply (RCA p1779086230428739) — treated as risky
+ *                 on a downgrade even though agenticEntry now forbids
+ *                 completion claims (defense in depth).
+ *  - 'answer'   : read-only diagnose/answer. Reports findings and stops; it
+ *                 cannot imply work shipped, so it is always a safe downgrade
+ *                 target. (INFORMATIONAL, INVESTIGATION, DEV_ASSIST, …)
+ *  - 'none'     : silent, no surface output.
+ *
+ * Kept distinct from `intentToCapability` / `resolveRequiredAccessLevel` on
+ * purpose: INVESTIGATION and INFORMATIONAL share this class but differ in
+ * capability; collapsing the two axes is what made the old tier-rank guard
+ * direction/tier-blind.
+ */
+export type WorkflowSideEffect = 'mutating' | 'answer' | 'chat' | 'none';
+
+export function workflowSideEffect(intent: WorkflowIntent): WorkflowSideEffect {
+  switch (intent) {
+    case 'IMPLEMENTATION':
+    case 'OWNER_AUTOPILOT':
+    case 'PR_REVIEW':
+    case 'DEPLOY':
+      return 'mutating';
+    case 'CONVERSATIONAL':
+      return 'chat';
+    case 'NONE':
+      return 'none';
+    case 'INFORMATIONAL':
+    case 'INVESTIGATION':
+    case 'DEV_ASSIST':
+    case 'MINIOG_DOSSIER':
+    case 'UNKNOWN':
+    default:
+      return 'answer';
+  }
+}
+
+/**
  * @deprecated Maps a workflow intent to a tier in the legacy hierarchy. The
  * agent-owned arch will check capabilities directly via `evaluateCapability`;
  * this mapping is the bridge so the router (`router/taskRouter.ts:221`) keeps

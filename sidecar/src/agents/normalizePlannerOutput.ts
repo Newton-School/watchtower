@@ -51,6 +51,21 @@ function extractScopeFromMarkdown(markdown: string): PlanScope {
   return 'medium';
 }
 
+/**
+ * Reads the `Requires code changes: yes|no` tag the plan-mode planner is asked
+ * to emit (see `buildPlannerPlanModePrompt`). Mirrors `extractScopeFromMarkdown`
+ * and rides the same plan-markdown channel. Defaults to `true` when the marker
+ * is absent so older plans / planners still run the full pipeline (#348 RC2).
+ */
+function extractRequiresCodeChangesFromMarkdown(markdown: string): boolean {
+  const match = markdown.match(/requires?\s+code\s+changes?\s*[:=]\s*(yes|no|true|false)/i);
+  if (match) {
+    const value = match[1].toLowerCase();
+    return value === 'yes' || value === 'true';
+  }
+  return true;
+}
+
 const FILE_EXTENSION_PATTERN =
   /\.(ts|tsx|js|jsx|mjs|cjs|json|md|mdx|css|scss|sass|less|html|htm|xml|yml|yaml|toml|ini|env|rs|go|py|rb|java|kt|swift|m|mm|c|cc|cpp|h|hpp|sh|bash|zsh|sql|prisma|graphql|gql|proto|tf|tfvars|vue|svelte|astro|lock|conf|cfg|gradle|properties)$/i;
 
@@ -126,8 +141,15 @@ export function normalizePlannerOutput(raw: unknown, backendId: AgentBackendId):
     return {
       planMarkdown: markdown,
       scope: extractScopeFromMarkdown(markdown),
-      requiresCodeChanges: true,
-      clarificationNeeded: null,
+      // Prefer an already-normalized boolean (idempotent re-normalize), else
+      // read the planner's `Requires code changes:` tag from the plan markdown.
+      // Defaults to true when neither is present (#348 RC2 — was hardcoded true,
+      // which destroyed the planner's "no code needed" verdict on this backend).
+      requiresCodeChanges:
+        typeof rawObj?.requiresCodeChanges === 'boolean'
+          ? rawObj.requiresCodeChanges
+          : extractRequiresCodeChangesFromMarkdown(markdown),
+      clarificationNeeded: coerceClarification(rawObj?.clarificationNeeded),
       affectedFiles,
     };
   }

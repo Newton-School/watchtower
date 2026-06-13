@@ -4,6 +4,7 @@ import type { AppConfig, NormalizedTask } from '../src/types/contracts.js';
 
 const runAgenticPrReview = vi.fn();
 const runImplementationWorkflow = vi.fn();
+const runInvestigationWorkflow = vi.fn();
 const runDevAssistWorkflow = vi.fn();
 const runDeployWorkflow = vi.fn();
 const runAgenticEntry = vi.fn();
@@ -16,6 +17,10 @@ vi.mock('../src/agentic/agenticPrReview.js', () => ({
 
 vi.mock('../src/workflows/implementationWorkflow.js', () => ({
   runImplementationWorkflow,
+}));
+
+vi.mock('../src/workflows/investigationWorkflow.js', () => ({
+  runInvestigationWorkflow,
 }));
 
 vi.mock('../src/workflows/devAssistWorkflow.js', () => ({
@@ -178,6 +183,13 @@ beforeEach(() => {
     workflow: 'IMPLEMENTATION',
     status: 'SUCCESS',
     message: 'impl ok',
+    notifyDesktop: false,
+    slackPosted: true,
+  });
+  runInvestigationWorkflow.mockResolvedValue({
+    workflow: 'INVESTIGATION',
+    status: 'SUCCESS',
+    message: 'investigation ok',
     notifyDesktop: false,
     slackPosted: true,
   });
@@ -608,6 +620,79 @@ describe('routeTask investigation resume gate', () => {
 
     expect(runImplementationWorkflow).toHaveBeenCalledOnce();
     expect(runAgenticEntry).not.toHaveBeenCalled();
+  });
+
+  it('accepts a low-confidence IMPLEMENTATION → INFORMATIONAL downgrade (#348 RC1)', async () => {
+    // INFORMATIONAL is a read-only ANSWER workflow — it only reads and reports,
+    // so it can't imply work was shipped. A sub-floor downgrade is safe to
+    // honor. The old tier-rank guard wrongly held this (the two differ only by
+    // tier), forcing a plain question into the implementation pipeline (#348).
+    const config = makeConfig('enforce');
+    const slack = makeSlack();
+    const logStep = vi.fn();
+    classifyWorkflowIntent.mockResolvedValueOnce({
+      intent: 'INFORMATIONAL',
+      confidence: 0.72,
+      reasoning: 'this is a how-does-it-work question',
+    });
+
+    await routeTask({
+      task: makeTask({
+        userId: 'UBUILDER',
+        channelId: 'C-BUILD',
+        text: '<@UBOT1> check PR #8666 and tell me what changed and the rules',
+        intent: 'IMPLEMENTATION',
+      }),
+      config,
+      slack: slack as never,
+      store: {} as never,
+      logStep,
+    });
+
+    expect(runImplementationWorkflow).not.toHaveBeenCalled();
+    expect(runAgenticEntry).toHaveBeenCalledOnce();
+    expect(runAgenticEntry).toHaveBeenCalledWith(expect.objectContaining({ mode: 'informational' }));
+    expect(logStep).not.toHaveBeenCalledWith(expect.objectContaining({ stage: 'router.classify.low_confidence_hold' }));
+    expect(logStep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stage: 'router.classify.override',
+        data: expect.objectContaining({
+          classifiedIntent: 'INFORMATIONAL',
+          proposedSideEffect: 'answer',
+          acceptedLowConfidenceSafeDowngrade: true,
+        }),
+      }),
+    );
+  });
+
+  it('accepts a low-confidence IMPLEMENTATION → INVESTIGATION downgrade (#348 RC1)', async () => {
+    // INVESTIGATION is also a read-only ANSWER workflow (diagnose, then ask
+    // before fixing) — safe to honor below the floor.
+    const config = makeConfig('enforce');
+    const slack = makeSlack();
+    const logStep = vi.fn();
+    classifyWorkflowIntent.mockResolvedValueOnce({
+      intent: 'INVESTIGATION',
+      confidence: 0.72,
+      reasoning: 'reported odd behavior, no anchor — diagnose first',
+    });
+
+    await routeTask({
+      task: makeTask({
+        userId: 'UBUILDER',
+        channelId: 'C-BUILD',
+        text: "<@UBOT1> something's off with the checkout page",
+        intent: 'IMPLEMENTATION',
+      }),
+      config,
+      slack: slack as never,
+      store: {} as never,
+      logStep,
+    });
+
+    expect(runImplementationWorkflow).not.toHaveBeenCalled();
+    expect(runInvestigationWorkflow).toHaveBeenCalledOnce();
+    expect(logStep).not.toHaveBeenCalledWith(expect.objectContaining({ stage: 'router.classify.low_confidence_hold' }));
   });
 
   it('falls through to the classifier when text is not an affirmation, even with pending findings', async () => {

@@ -10,6 +10,7 @@ import {
   resolveRequiredAccessLevel,
   setResolvedGroupMembers,
   toResolvedAccessControlConfig,
+  workflowSideEffect,
 } from '../src/access/control.js';
 import type { AppConfig, Capability, WorkflowIntent } from '../src/types/contracts.js';
 
@@ -671,6 +672,25 @@ describe('capability-shaped access (D2 wrapper over legacy tiers)', () => {
     ];
     for (const [intent, expected] of cases) {
       expect(intentToCapability(intent)).toBe(expected);
+    }
+  });
+
+  it('workflowSideEffect classifies every WorkflowIntent (#348 RC1)', () => {
+    const cases: Array<[WorkflowIntent, ReturnType<typeof workflowSideEffect>]> = [
+      ['IMPLEMENTATION', 'mutating'],
+      ['OWNER_AUTOPILOT', 'mutating'],
+      ['PR_REVIEW', 'mutating'],
+      ['DEPLOY', 'mutating'],
+      ['CONVERSATIONAL', 'chat'],
+      ['NONE', 'none'],
+      ['INFORMATIONAL', 'answer'],
+      ['INVESTIGATION', 'answer'],
+      ['DEV_ASSIST', 'answer'],
+      ['MINIOG_DOSSIER', 'answer'],
+      ['UNKNOWN', 'answer'],
+    ];
+    for (const [intent, expected] of cases) {
+      expect(workflowSideEffect(intent)).toBe(expected);
     }
   });
 

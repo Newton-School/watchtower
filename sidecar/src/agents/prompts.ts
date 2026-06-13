@@ -75,6 +75,7 @@ What to produce in your ExitPlanMode plan (markdown is fine; the downstream code
 - The concrete files you expect to touch, with brief rationale per file.
 - An ordered list of implementation steps.
 - A scope tag on its own line, exactly one of: \`Scope: small\`, \`Scope: medium\`, or \`Scope: large\`. Treat anything under ~50 lines across 1–2 files as small; multi-file feature work as medium; cross-cutting refactors or new subsystems as large. Coder agent uses this to decide whether to include tests in the PR.
+- A code-changes tag on its own line, exactly one of: \`Requires code changes: yes\` or \`Requires code changes: no\`. Set \`no\` ONLY for purely informational requests (explain, describe, list, check status, answer a question) or operational/lifecycle actions that do NOT modify source (merge PR, close PR, deploy, run tests, restart service). For ANY implementation, feature, fix, change, or modification of source files set \`yes\`; when in doubt, \`yes\`.
 - Anything the coder MUST avoid (existing patterns, deprecated APIs, owner conventions).
 
 Use the read tools (grep, file reads) to ground every claim — do not guess at file paths or function signatures. If the task is genuinely ambiguous and you cannot safely pick a direction, say so at the top of the plan with a short clarifying question; otherwise commit to a direction.

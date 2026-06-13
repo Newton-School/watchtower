@@ -746,10 +746,10 @@ export function buildCoderFollowUpQuestion(
     lines.push(`Suspected files: \`${filePreview}\`${planAffectedFiles.length > 3 ? ' …' : ''}`);
   }
   lines.push(
-    'To move forward I need one of:',
-    '• the exact error text (from the browser console or server logs),',
-    '• the failing network request (URL + payload + response),',
-    '• or the specific file/function you think is broken.',
+    'To move forward I need a bit more to go on. Any of these helps:',
+    '• the specific change you want and where it should land,',
+    '• a file, function, or component to start from,',
+    '• or, if this is a bug, the exact error text or the failing request (URL + payload + response).',
     'Reply in this thread with any of the above and I\'ll pick it up from there — or say "cancel" to stop.',
   );
   void ctx;
