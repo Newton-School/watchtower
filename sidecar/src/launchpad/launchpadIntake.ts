@@ -6,12 +6,13 @@ import type { AppConfig, SlackEventEnvelope } from '../types/contracts.js';
 
 const LAUNCHPAD_POLL_INTERVAL_MS = 5_000;
 
-function buildLaunchpadEnvelope(params: {
+export function buildLaunchpadEnvelope(params: {
   config: AppConfig;
   request: {
     id: string;
     ownerUserId: string;
     prompt: string;
+    requestedForUserId?: string;
   };
   channelId: string;
   anchorTs: string;
@@ -21,10 +22,15 @@ function buildLaunchpadEnvelope(params: {
   return {
     eventId: `launchpad:${request.id}:${anchorTs}`,
     channelId,
-    channelType: 'im',
+    // Origin-thread anchors (issue #343) land in real channels; the legacy
+    // anchor is always the owner DM.
+    channelType: channelId.startsWith('D') ? 'im' : 'channel',
     threadTs: anchorTs,
     eventTs: anchorTs,
+    // Permissions evaluate the owner who queued the retrigger; the real
+    // requester travels separately for attribution + dossier recall.
     userId: request.ownerUserId,
+    requestedForUserId: request.requestedForUserId,
     text: `<@${config.botUserId}> ${request.prompt}`.trim(),
     ingestSource: 'launchpad',
     launchpadRequestId: request.id,
@@ -32,6 +38,7 @@ function buildLaunchpadEnvelope(params: {
       type: 'launchpad_request',
       requestId: request.id,
       ownerUserId: request.ownerUserId,
+      requestedForUserId: request.requestedForUserId,
       prompt: request.prompt,
       anchorTs,
     },
@@ -146,10 +153,17 @@ export async function runLaunchpadRequestPoller(params: {
 
   for (const request of requests) {
     try {
-      const { channelId, anchorTs } = await postLaunchpadAnchor({
-        webClient,
-        request,
-      });
+      // Origin-thread anchoring (issue #343): when the request names the
+      // thread it came from, run there — progress, approvals, and the PR
+      // link land where the original requester is, and no DM anchor is
+      // posted. Falls back to the legacy owner-DM anchor otherwise.
+      const { channelId, anchorTs } =
+        request.originChannelId && request.originThreadTs
+          ? { channelId: request.originChannelId, anchorTs: request.originThreadTs }
+          : await postLaunchpadAnchor({
+              webClient,
+              request,
+            });
 
       store.markLaunchpadRequestQueued({
         id: request.id,

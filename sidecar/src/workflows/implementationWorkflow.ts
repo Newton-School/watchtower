@@ -685,10 +685,13 @@ export async function runImplementationWorkflow(params: {
     const plannerProfile = profileForAgentRole('planner', plannerBackend);
     const plannerPlanMode = plannerBackend === 'claude-code';
     let plannerPrompt = plannerPlanMode ? buildPlannerPlanModePrompt(plannerCtx) : buildPlannerPrompt(plannerCtx);
-    if (store?.dossierStore && store.recentSignalsForUser && task.event.userId) {
+    // Recall personalizes the plan to whoever the work is FOR — launchpad
+    // retriggers carry the real requester in requestedForUserId (issue #343).
+    const recallUserId = task.event.requestedForUserId ?? task.event.userId;
+    if (store?.dossierStore && store.recentSignalsForUser && recallUserId) {
       try {
         const recall = await assembleRecall({
-          userId: task.event.userId,
+          userId: recallUserId,
           workflow: 'IMPLEMENTATION',
           store: store as unknown as import('../state/jobStore.js').JobStore,
           vaultRoot: store.readVaultSettings?.().vaultPath ?? null,
