@@ -13,7 +13,8 @@ const ORIGINAL_HOME = process.env.HOME;
 const TEST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'wt-home-'));
 process.env.HOME = TEST_HOME;
 
-const { resolveWorkspace, cleanupThreadWorkspaces } = await import('../src/workspaces/workspaceManager.js');
+const { resolveWorkspace, cleanupThreadWorkspaces, refreshSharedRepoToDefaultBranch } =
+  await import('../src/workspaces/workspaceManager.js');
 
 const WS_ROOT = path.join(TEST_HOME, '.watchtower', 'workspaces');
 const execFileAsync = promisify(execFile);
@@ -145,5 +146,76 @@ describe('resolveWorkspace refresh-on-reuse', () => {
     // reset --hard restored the tracked file; clean -fd removed the untracked one.
     expect(fs.readFileSync(path.join(ws2, 'file.txt'), 'utf8')).toBe('A\n');
     expect(fs.existsSync(path.join(ws2, 'scratch.tmp'))).toBe(false);
+  });
+});
+
+describe('refreshSharedRepoToDefaultBranch', () => {
+  let bare: string;
+  let seed: string;
+  let repo: string;
+
+  beforeEach(async () => {
+    // Bare "remote" + a seed clone that pushes the first commit.
+    bare = await mkdtemp(path.join(os.tmpdir(), 'wt-bare-'));
+    await git(bare, ['init', '--bare', '-q', '-b', 'main']);
+
+    seed = await mkdtemp(path.join(os.tmpdir(), 'wt-seed-'));
+    await git(seed, ['init', '-q', '-b', 'main']);
+    await git(seed, ['config', 'user.email', 'test@example.com']);
+    await git(seed, ['config', 'user.name', 'Test']);
+    await writeFile(path.join(seed, 'file.txt'), 'A\n');
+    await git(seed, ['add', '.']);
+    await git(seed, ['commit', '-q', '-m', 'commit A']);
+    await git(seed, ['remote', 'add', 'origin', bare]);
+    await git(seed, ['push', '-q', '-u', 'origin', 'main']);
+
+    // The shared clone miniOG reads directly (no worktree).
+    repo = await mkdtemp(path.join(os.tmpdir(), 'wt-repo-'));
+    await git(path.dirname(repo), ['clone', '-q', bare, repo]);
+    await git(repo, ['config', 'user.email', 'test@example.com']);
+    await git(repo, ['config', 'user.name', 'Test']);
+  });
+
+  afterEach(async () => {
+    await Promise.all([bare, seed, repo].map(d => rm(d, { recursive: true, force: true })));
+  });
+
+  it('fast-forwards a clone that has drifted behind origin to the latest default branch', async () => {
+    // origin/main advances to B after the clone was made.
+    await writeFile(path.join(seed, 'file.txt'), 'B\n');
+    await git(seed, ['commit', '-aqm', 'commit B']);
+    await git(seed, ['push', '-q', 'origin', 'main']);
+    const commitB = await git(seed, ['rev-parse', 'HEAD']);
+
+    const state = refreshSharedRepoToDefaultBranch(repo);
+
+    expect(await git(repo, ['rev-parse', 'HEAD'])).toBe(commitB);
+    expect(fs.readFileSync(path.join(repo, 'file.txt'), 'utf8')).toBe('B\n');
+    expect(state?.branch).toBe('main');
+    expect(commitB.startsWith(state!.head)).toBe(true); // short SHA is a prefix of B
+  });
+
+  it('never clobbers an unpushed local commit (refuses a non-fast-forward)', async () => {
+    // Local commit C on the clone, not pushed.
+    await writeFile(path.join(repo, 'local.txt'), 'local work\n');
+    await git(repo, ['add', '.']);
+    await git(repo, ['commit', '-qm', 'commit C (local, unpushed)']);
+    const commitC = await git(repo, ['rev-parse', 'HEAD']);
+
+    // origin/main diverges to B.
+    await writeFile(path.join(seed, 'file.txt'), 'B\n');
+    await git(seed, ['commit', '-aqm', 'commit B']);
+    await git(seed, ['push', '-q', 'origin', 'main']);
+
+    const state = refreshSharedRepoToDefaultBranch(repo);
+
+    // ff-only refused: the local commit survives, HEAD unchanged.
+    expect(await git(repo, ['rev-parse', 'HEAD'])).toBe(commitC);
+    expect(fs.existsSync(path.join(repo, 'local.txt'))).toBe(true);
+    expect(state?.branch).toBe('main');
+  });
+
+  it('is a non-throwing no-op for a directory that is not a git repo', () => {
+    expect(refreshSharedRepoToDefaultBranch(TEST_HOME)).toBeNull();
   });
 });

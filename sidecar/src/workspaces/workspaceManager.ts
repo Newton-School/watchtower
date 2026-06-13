@@ -127,6 +127,56 @@ export function resolveWorkspace(repoPath: string, threadTs: string): string {
 }
 
 /**
+ * Fast-forwards a SHARED repo clone to its default remote branch so an agent
+ * that reads the clone directly — the informational Q&A path, which (unlike the
+ * PR/implementation pipeline) does NOT operate in an isolated worktree — sees
+ * freshly-merged code instead of a checkout that has drifted behind origin.
+ *
+ * Safety: this mutates the user's real clone, so it ONLY ever fast-forwards.
+ * `git merge --ff-only` advances the working tree when the local branch is a
+ * strict ancestor of origin's, and refuses (non-fatal) on divergence, a feature
+ * branch, or a dirty tree that would be overwritten — so uncommitted edits and
+ * unpushed local commits are never clobbered. The `reset --hard` used for the
+ * throwaway worktrees in `resolveWorkspace` would NOT be safe on a shared clone.
+ *
+ * Best-effort: returns the resolved `{ branch, head }` for telemetry, or null if
+ * the repo couldn't be inspected. Never throws.
+ */
+export function refreshSharedRepoToDefaultBranch(repoPath: string): { branch: string; head: string } | null {
+  try {
+    execSync('git fetch origin --quiet', { cwd: repoPath, stdio: 'pipe', timeout: 30_000 });
+    const defaultBranch = resolveDefaultRemoteBranch(repoPath);
+    try {
+      execSync(`git merge --ff-only ${defaultBranch}`, { cwd: repoPath, stdio: 'pipe', timeout: 30_000 });
+    } catch {
+      // Not fast-forwardable (feature branch, diverged history, or a dirty tree
+      // that would be overwritten) — leave the checkout untouched and answer
+      // against it rather than risk the user's local work.
+      logger.warn(
+        { repoPath, defaultBranch },
+        'could not fast-forward shared repo to default branch; answering against current checkout',
+      );
+    }
+  } catch (error) {
+    logger.warn(
+      { repoPath, error: String(error) },
+      'git fetch failed before agent read; answering against local repo state',
+    );
+  }
+  try {
+    const head = execSync('git rev-parse --short HEAD', { cwd: repoPath, stdio: 'pipe', timeout: 10_000 })
+      .toString()
+      .trim();
+    const branch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: repoPath, stdio: 'pipe', timeout: 10_000 })
+      .toString()
+      .trim();
+    return { branch, head };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Removes a single managed worktree directory. Prefers `git worktree remove`
  * via the parent repo (resolved from the worktree's `.git` gitdir pointer) so
  * git's worktree registry stays consistent; falls back to a plain recursive

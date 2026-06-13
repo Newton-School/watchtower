@@ -1,8 +1,10 @@
+import path from 'node:path';
 import type { WebClient } from '@slack/web-api';
 import type { AppConfig, NormalizedTask, WorkflowResult, WorkflowStepLogger } from '../types/contracts.js';
 import type { JobStore } from '../state/jobStore.js';
 import { runClaudeAgentic } from './runClaude.js';
 import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
+import { refreshSharedRepoToDefaultBranch } from '../workspaces/workspaceManager.js';
 
 export type AgenticMode = 'informational' | 'conversational';
 
@@ -76,6 +78,24 @@ export async function runAgenticEntry(params: RunAgenticEntryParams): Promise<Wo
   }
 
   const githubToken = await resolveGithubTokenForCodex();
+
+  // Informational answers read the shared newton-web / newton-api clones
+  // directly (the cwd below is their parent, NOT an isolated worktree), so the
+  // clones must be fast-forwarded to origin first — otherwise a clone that has
+  // drifted behind origin yields answers that contradict freshly-merged code
+  // (e.g. "feature X isn't implemented" the day after the PR adding it merged).
+  // Conversational replies don't read code, so we skip the fetch cost there.
+  if (mode === 'informational') {
+    for (const repoPath of [config.repoPaths.newtonWeb, config.repoPaths.newtonApi]) {
+      const state = refreshSharedRepoToDefaultBranch(repoPath);
+      logStep?.({
+        stage: 'agentic.repo_refresh',
+        message: `Refreshed ${path.basename(repoPath)} to ${state?.branch ?? 'unknown'} @ ${state?.head ?? 'unknown'}.`,
+        data: { repoPath, branch: state?.branch, head: state?.head },
+      });
+    }
+  }
+
   const cwd = config.miniOgRepoRoot ?? config.repoPaths.newtonWeb;
 
   const result = await runClaudeAgentic({
