@@ -5,7 +5,9 @@ import { assembleRecall } from '../codex/recallAssembler.js';
 import { highReasoningProfile } from '../codex/modelProfiles.js';
 import { buildMentionSystemPrompt } from '../codex/mentionSystemPrompt.js';
 import { prepareWorkflowContext } from './shared/workflowUtils.js';
-import { assertThreadParentExists } from '../slack/threadContext.js';
+import { assertThreadParentExists, fetchThreadContext } from '../slack/threadContext.js';
+import { classifyInvestigationScope, type InvestigationScope } from '../router/investigationScope.js';
+import type { McpServerConfig } from '../types/contracts.js';
 import type { PipelineStore } from '../agents/pipeline.js';
 import type { InvestigationStore } from '../state/investigationStore.js';
 import type { RecallCapableStore } from '../state/dossierStore.js';
@@ -25,7 +27,20 @@ export async function runInvestigationWorkflow(params: {
 
   logStep?.({ stage: 'investigation.start', message: 'Running investigation workflow.' });
 
-  const ctx = await prepareWorkflowContext({ task, config, slack, logStep });
+  // Decide WHERE to look before resolving the workspace: a frontend symptom →
+  // newton-web only, a backend/data symptom → newton-api only, ambiguous →
+  // broad sweep of both repos + Metabase. This replaces the old
+  // resolveRepoOrAsk path for investigations (no admin "web or api?" gate).
+  const scopeThread = await fetchThreadContext(slack, task.event.channelId, task.event.threadTs).catch(() => []);
+  const scope = await classifyInvestigationScope({
+    bugReport: task.event.text ?? '',
+    threadMessages: scopeThread.map(m => m.text),
+    webPath: config.repoPaths.newtonWeb,
+    apiPath: config.repoPaths.newtonApi,
+    logStep,
+  });
+
+  const ctx = await prepareWorkflowContext({ task, config, slack, logStep, repoOverride: scope.scope });
 
   if (ctx.desktopOnly) {
     await slack.chat
@@ -76,6 +91,36 @@ export async function runInvestigationWorkflow(params: {
     }
   }
 
+  // Broad scope sweeps both repos and (on the claude-code backend, when an
+  // endpoint is configured) the read-only Metabase MCP for the data layer.
+  const useMetabase =
+    scope.scope === 'broad' && getActiveBackendId() === 'claude-code' && (config.metabaseMcpUrl ?? '').length > 0;
+  const mcpServers: Record<string, McpServerConfig> | undefined = useMetabase
+    ? { metabase: { type: 'http', url: config.metabaseMcpUrl } }
+    : undefined;
+  logStep?.({
+    stage: useMetabase ? 'investigation.metabase.enabled' : 'investigation.metabase.skipped',
+    message: useMetabase
+      ? 'Broad investigation — Metabase read-only DB inspection enabled.'
+      : `Metabase not used (scope=${scope.scope}, backend=${getActiveBackendId()}, url=${(config.metabaseMcpUrl ?? '').length > 0 ? 'set' : 'unset'}).`,
+    data: { scope: scope.scope },
+  });
+
+  const environmentBlock =
+    scope.scope === 'broad'
+      ? `- Working directory: ${repoPath} — this directory contains BOTH the newton-web (frontend) and newton-api (backend) repos. Grep/Read across BOTH to trace the bug end-to-end.
+- The bug could not be localized to one layer, so investigate the full stack: correlate the UI symptom → the API contract/response → the underlying data.${
+          useMetabase
+            ? `
+- A Metabase MCP server is connected (tools named \`mcp__metabase__*\`). Use it to inspect the read-only database — check whether the suspect data is correct at the source vs. what the API returns vs. what the UI renders. Use ONLY read/query tools; never invoke any mutating Metabase tool.
+- If the Metabase tools are unavailable (not connected), proceed with the two repos and explicitly note in \`requiresMoreInfo\`/\`summary\` that the data layer was not inspected.`
+            : `
+- No database access is available this run; investigate the repos only and note in \`summary\` if a data-layer check would help confirm the diagnosis.`
+        }
+- Read-only mode: Read, Grep, Glob, read-only git/bash (git log, git show, git blame, git diff)${useMetabase ? ', and read-only Metabase queries' : ''}. Do NOT invoke Edit, Write, any worktree-mutating bash, or any mutating MCP tool.`
+      : `- Working directory: ${repoPath}${repoName ? ` (${repoName})` : ''}
+- Read-only mode: you may use Read, Grep, Glob, and read-only git/bash (git log, git show, git blame, git diff). Do NOT invoke Edit, Write, or any bash command that mutates the worktree.`;
+
   const investigatorPrompt = `${recallBlock}${`
 ${buildMentionSystemPrompt({ task, workflow: 'INVESTIGATION', toneMode: task.toneMode, dossierRole: task.dossierRole })}
 
@@ -84,8 +129,7 @@ You are the INVESTIGATOR agent.
 Your job is to DIAGNOSE — not to fix. Read code, run read-only queries (git log / git show / grep / ls), and form a concrete hypothesis about what is wrong. Do NOT modify any files. Do NOT create branches. Do NOT run destructive commands. If you cannot form a hypothesis because the user's report is too vague, say so in \`requiresMoreInfo\` and list what you'd need.
 
 Environment:
-- Working directory: ${repoPath}${repoName ? ` (${repoName})` : ''}
-- Read-only mode: you may use Read, Grep, Glob, and read-only git/bash (git log, git show, git blame, git diff). Do NOT invoke Edit, Write, or any bash command that mutates the worktree.
+${environmentBlock}
 
 Slack thread context (includes the bug report and any evidence the user has shared):
 ${ctx.threadContext}${ctx.imageContext}
@@ -122,6 +166,15 @@ Return strict JSON:
     };
   }
 
+  // Tell the user what we're digging into — investigations can run a while.
+  await slack.chat
+    .postMessage({
+      channel: task.event.channelId,
+      thread_ts: task.event.threadTs,
+      text: scopeAckText(scope.scope, useMetabase),
+    })
+    .catch(() => {});
+
   const profile = highReasoningProfile(getActiveBackendId());
   const investigatorResult = await runCodex({
     cwd: repoPath,
@@ -129,6 +182,7 @@ Return strict JSON:
     githubToken: ctx.githubToken,
     model: profile.model,
     reasoningEffort: profile.reasoningEffort,
+    mcpServers,
     // No per-agent timeoutMs. Substantive investigations on Claude Opus at
     // max reasoning routinely exceed a fractional sub-budget (e.g. 40% of
     // bugFixTimeoutMs = 18 min) on real feature scoping, and a forced
@@ -240,6 +294,18 @@ Return strict JSON:
     notifyDesktop: false,
     slackPosted: true,
   };
+}
+
+function scopeAckText(scope: InvestigationScope, useMetabase: boolean): string {
+  if (scope === 'newton-web') {
+    return 'Looks like a frontend issue — digging into *newton-web*. I’ll share what I find.';
+  }
+  if (scope === 'newton-api') {
+    return 'Looks data/backend-related — digging into *newton-api*. I’ll share what I find.';
+  }
+  return useMetabase
+    ? 'Couldn’t localize this to one layer — sweeping *newton-web* + *newton-api* + Metabase (read-only) to trace it end-to-end.'
+    : 'Couldn’t localize this to one layer — sweeping *newton-web* + *newton-api* to trace it end-to-end.';
 }
 
 function formatInvestigationMessage(findings: {
