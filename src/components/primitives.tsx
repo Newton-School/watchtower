@@ -362,15 +362,15 @@ export function TraceList({ logs, selectedRun }: { logs: JobLogEntry[]; selected
   );
 }
 
-export function LiveLogConsole({ lines }: { lines: string[] }) {
+export function LiveLogConsole({ lines }: { lines: Array<{ id: number; content: string }> }) {
   if (lines.length === 0) {
     return <EmptyState>Waiting for sidecar log output.</EmptyState>;
   }
 
   return (
     <div className="live-log-console" role="log" aria-live="polite">
-      {lines.map((line, index) => (
-        <div key={`${index}-${line.slice(0, 30)}`}>{line}</div>
+      {lines.map(line => (
+        <div key={line.id}>{line.content}</div>
       ))}
     </div>
   );

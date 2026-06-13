@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -108,7 +108,10 @@ function App() {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const [selectedRunPipeline, setSelectedRunPipeline] = useState<any>(null);
   const [selectedRunLogs, setSelectedRunLogs] = useState<JobLogEntry[]>([]);
-  const [liveSidecarLogs, setLiveSidecarLogs] = useState<string[]>([]);
+  const [liveSidecarLogs, setLiveSidecarLogs] = useState<Array<{ id: number; content: string }>>([]);
+  // Monotonic id per ingested log line so LiveLogConsole keys are stable across
+  // the 400-line trim (index-based keys shift on every trim, remounting rows).
+  const sidecarLogSeq = useRef(0);
   const [error, setError] = useState<string | null>(null);
   const [settingsMessage, setSettingsMessage] = useState<string | null>(null);
   const [savingSettings, setSavingSettings] = useState(false);
@@ -320,9 +323,10 @@ function App() {
     let disposed = false;
 
     void listen<string>('sidecar-log', event => {
-      const line = formatSidecarLine(event.payload);
+      const content = formatSidecarLine(event.payload);
+      const id = (sidecarLogSeq.current += 1);
       setLiveSidecarLogs(previous => {
-        const next = [...previous, line];
+        const next = [...previous, { id, content }];
         if (next.length > 400) {
           return next.slice(next.length - 400);
         }
