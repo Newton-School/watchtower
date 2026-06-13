@@ -47,10 +47,38 @@ function resolveDefaultRemoteBranch(repoPath: string): string {
 export function resolveWorkspace(repoPath: string, threadTs: string): string {
   const wsPath = workspacePath(repoPath, threadTs);
 
-  // If workspace already exists, reuse it
+  // If workspace already exists, refresh it to the current default branch
+  // before reuse. Worktrees are keyed by (repo, thread) and the fresh-fetch
+  // on first creation does NOT run on reuse, so a follow-up task in the same
+  // thread (or a paused→resumed job) would otherwise branch from the base
+  // commit captured days earlier. Reset is safe here: resumes re-run the
+  // pipeline fresh, one-active-job-per-thread prevents concurrent work, and
+  // any prior task's commits live on its already-pushed PR branch. `git clean
+  // -fd` drops untracked leftovers but NOT ignored paths (the symlinked
+  // node_modules survives).
   if (fs.existsSync(wsPath)) {
-    logger.info({ repoPath, threadTs, wsPath }, 'reusing existing workspace');
-    return wsPath;
+    try {
+      execSync('git fetch origin --quiet', { cwd: wsPath, stdio: 'pipe', timeout: 30_000 });
+      const defaultBranch = resolveDefaultRemoteBranch(repoPath);
+      execSync(`git reset --hard ${defaultBranch}`, { cwd: wsPath, stdio: 'pipe', timeout: 15_000 });
+      execSync('git clean -fd', { cwd: wsPath, stdio: 'pipe', timeout: 15_000 });
+      logger.info(
+        { repoPath, threadTs, wsPath, startPoint: defaultBranch },
+        'refreshed reused workspace to default branch',
+      );
+      return wsPath;
+    } catch (error) {
+      // Couldn't guarantee a clean, current base (fetch or reset failed).
+      // Don't hand back a possibly-stale/dirty worktree — discard it and fall
+      // through to fresh creation below, which is itself fetch-guarded. If the
+      // teardown also fails, the creation path's own failure handling returns
+      // the shared repo path.
+      logger.warn(
+        { repoPath, threadTs, wsPath, error: String(error) },
+        'failed to refresh reused workspace; recreating it fresh',
+      );
+      removeWorktreeByPath(wsPath);
+    }
   }
 
   try {
@@ -99,37 +127,94 @@ export function resolveWorkspace(repoPath: string, threadTs: string): string {
 }
 
 /**
- * Removes the workspace worktree for a given repo + thread.
- * Non-fatal — errors are logged but do not propagate.
+ * Removes a single managed worktree directory. Prefers `git worktree remove`
+ * via the parent repo (resolved from the worktree's `.git` gitdir pointer) so
+ * git's worktree registry stays consistent; falls back to a plain recursive
+ * delete. Best-effort — returns true if the directory is gone afterwards.
  */
-export function cleanupWorkspace(repoPath: string, threadTs: string): void {
-  const wsPath = workspacePath(repoPath, threadTs);
-
-  if (!fs.existsSync(wsPath)) {
-    return;
-  }
-
+function removeWorktreeByPath(wsPath: string): boolean {
   try {
-    execSync(`git worktree remove --force "${wsPath}"`, {
-      cwd: repoPath,
-      stdio: 'pipe',
-      timeout: 15_000,
-    });
-    logger.info({ repoPath, threadTs, wsPath }, 'cleaned up workspace');
-  } catch (error) {
-    logger.warn({ repoPath, threadTs, wsPath, error: String(error) }, 'failed to remove workspace worktree');
-    // Best-effort fallback: remove directory
+    const gitDir = path.join(wsPath, '.git');
+    if (fs.existsSync(gitDir)) {
+      const gitContent = fs.readFileSync(gitDir, 'utf8').trim();
+      const gitdirMatch = gitContent.match(/^gitdir:\s*(.+)$/);
+      if (gitdirMatch) {
+        // <repo>/.git/worktrees/<name> → up three levels is the parent repo root.
+        const parentGitDir = path.resolve(gitdirMatch[1], '..', '..', '..');
+        if (fs.existsSync(parentGitDir)) {
+          execSync(`git worktree remove --force "${wsPath}"`, {
+            cwd: parentGitDir,
+            stdio: 'pipe',
+            timeout: 15_000,
+          });
+          return true;
+        }
+      }
+    }
+    fs.rmSync(wsPath, { recursive: true, force: true });
+    return true;
+  } catch {
+    // Last resort: a plain delete so the stale dir can't be reused stale.
     try {
       fs.rmSync(wsPath, { recursive: true, force: true });
+      return true;
     } catch {
-      // silently ignore
+      return false;
     }
   }
 }
 
 /**
- * Removes workspaces that haven't been modified in over 24 hours.
- * Intended to be called periodically (e.g., on startup or on a timer).
+ * Removes every managed worktree for a Slack thread once its job reaches a
+ * terminal state — so the next task in the thread creates a fresh worktree
+ * (which fetches and branches from the current default branch) instead of
+ * reusing a base captured earlier. Matches both the plain `<thread>` key
+ * (implementation / single-repo investigation) and per-PR `<thread>--pr-N`
+ * keys (PR review), across both repo directories. Best-effort and non-fatal.
+ */
+export function cleanupThreadWorkspaces(threadTs: string): void {
+  if (!fs.existsSync(WORKSPACES_ROOT)) {
+    return;
+  }
+  const safeThread = sanitizeThreadTs(threadTs);
+  let cleaned = 0;
+
+  try {
+    for (const repoDir of fs.readdirSync(WORKSPACES_ROOT)) {
+      const repoWorkspacesDir = path.join(WORKSPACES_ROOT, repoDir);
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(repoWorkspacesDir);
+      } catch {
+        continue;
+      }
+      if (!stat.isDirectory()) continue;
+
+      for (const key of fs.readdirSync(repoWorkspacesDir)) {
+        // Exact thread key, or a per-PR variant `<thread>--pr-N`. The `--`
+        // boundary prevents matching a different thread that merely shares a
+        // prefix.
+        if (key === safeThread || key.startsWith(`${safeThread}--`)) {
+          if (removeWorktreeByPath(path.join(repoWorkspacesDir, key))) {
+            cleaned++;
+          }
+        }
+      }
+    }
+  } catch (error) {
+    logger.warn({ threadTs, error: String(error) }, 'error during per-thread workspace cleanup');
+  }
+
+  if (cleaned > 0) {
+    logger.info({ threadTs, cleaned }, 'cleaned up workspaces for completed thread');
+  }
+}
+
+/**
+ * Removes workspaces that haven't been modified in over 7 days. Backstop for
+ * the per-thread cleanup above (e.g. threads that paused and never resumed, or
+ * cleanup hooks that didn't run). Intended to be called periodically (e.g. on
+ * startup).
  */
 export function cleanupStaleWorkspaces(): void {
   if (!fs.existsSync(WORKSPACES_ROOT)) {
@@ -151,32 +236,8 @@ export function cleanupStaleWorkspaces(): void {
         if (!wsStat.isDirectory()) continue;
 
         if (now - wsStat.mtimeMs > STALE_THRESHOLD_MS) {
-          try {
-            // Try git worktree remove first
-            const gitDir = path.join(wsPath, '.git');
-            if (fs.existsSync(gitDir)) {
-              // Read the gitdir pointer to find the parent repo
-              const gitContent = fs.readFileSync(gitDir, 'utf8').trim();
-              const gitdirMatch = gitContent.match(/^gitdir:\s*(.+)$/);
-              if (gitdirMatch) {
-                const worktreeGitDir = gitdirMatch[1];
-                const parentGitDir = path.resolve(worktreeGitDir, '..', '..', '..');
-                if (fs.existsSync(parentGitDir)) {
-                  execSync(`git worktree remove --force "${wsPath}"`, {
-                    cwd: parentGitDir,
-                    stdio: 'pipe',
-                    timeout: 15_000,
-                  });
-                  cleaned++;
-                  continue;
-                }
-              }
-            }
-            // Fallback: just remove the directory
-            fs.rmSync(wsPath, { recursive: true, force: true });
+          if (removeWorktreeByPath(wsPath)) {
             cleaned++;
-          } catch {
-            // silently ignore individual cleanup failures
           }
         }
       }

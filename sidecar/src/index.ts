@@ -29,7 +29,7 @@ import { classifyProduct } from './router/productClassifier.js';
 import { routeTask } from './router/taskRouter.js';
 import { startMentionCatchup } from './slack/mentionCatchup.js';
 import { SocketSlackClient } from './slack/socketClient.js';
-import { cleanupStaleWorkspaces } from './workspaces/workspaceManager.js';
+import { cleanupStaleWorkspaces, cleanupThreadWorkspaces } from './workspaces/workspaceManager.js';
 import { configureVaultWriter, shutdownVaultWriter } from './vault/vaultWriter.js';
 import { configureVaultWatcher, shutdownVaultWatcher } from './vault/vaultWatcher.js';
 import { startProfileSynthesizerScheduler, stopProfileSynthesizerScheduler } from './learning/profileSynthesizer.js';
@@ -1168,6 +1168,18 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
           logStep,
         });
 
+        // Tear down the thread's git worktrees once the job is terminal, so the
+        // next task in this thread creates a fresh worktree (fetched + branched
+        // from current origin/<default-branch>) rather than reusing a stale
+        // base. Done BEFORE unregisterActiveJob so the thread is still locked —
+        // a queued same-thread event can't start a new job (and create a
+        // worktree) that this cleanup would then delete. PAUSED jobs keep their
+        // worktree (they may resume in-thread); resolveWorkspace also refreshes
+        // any reused worktree as a backstop.
+        if (result.status !== 'PAUSED') {
+          cleanupThreadWorkspaces(event.threadTs);
+        }
+
         unregisterActiveJob(jobId);
 
         // Swap :eyes: for outcome reaction. PAUSED gets a distinct emoji so a
@@ -1252,6 +1264,11 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
       level: 'ERROR',
     });
 
+    // Terminal failure — tear down the thread's worktrees (same rationale as
+    // the success path); the next task starts fresh. Before unregister so the
+    // thread stays locked during cleanup.
+    cleanupThreadWorkspaces(event.threadTs);
+
     unregisterActiveJob(jobId);
     notifyDesktop('Watchtower workflow failed', errorMessage);
     failLaunchpadWorkflow({
@@ -1324,6 +1341,11 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
         data: diagnosis,
       });
     }
+
+    // Terminal (unexpected) failure — tear down the thread's worktrees before
+    // releasing the lock, same as the other terminal paths, so the next task
+    // starts fresh and no concurrent same-thread job's worktree is deleted.
+    cleanupThreadWorkspaces(event.threadTs);
 
     unregisterActiveJob(jobId);
     logger.error({ jobId, eventId: event.eventId, error: errorMessage }, 'unexpected processEvent failure');
