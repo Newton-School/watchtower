@@ -32,6 +32,8 @@ import type { AgentStepResult, PipelineConfig } from '../agents/types.js';
 import type { InvestigationStore } from '../state/investigationStore.js';
 import { prepareWorkflowContext, sanitizeOwnerSummary, extractReplyFromCodexResult } from './shared/workflowUtils.js';
 import { assertThreadParentExists } from '../slack/threadContext.js';
+import { runAgenticEntry } from '../agentic/agenticEntry.js';
+import type { JobStore } from '../state/jobStore.js';
 
 function buildOwnerPrimaryPrompt(params: {
   task: NormalizedTask;
@@ -987,6 +989,35 @@ export async function runImplementationWorkflow(params: {
             }
           }
         }
+      }
+
+      // Distinguish a genuine operational action (merge/close/deploy/run/etc.)
+      // from an informational ask the planner also flags as no-code (explain /
+      // summarize / "what changed"). The quick-action prompt below frames the
+      // task as an operation; routing a question through it produced the
+      // bug-fix dead-end in #348. Hand questions to the tuned read-only
+      // INFORMATIONAL path instead. Default to informational — both misroute
+      // directions are non-destructive (a misrouted op just gets explained).
+      const operationalAction =
+        /\b(merge|close|reopen|revert|deploy|release|ship|rollback|restart|rerun|re-run|run (?:the )?tests?|approve|assign)\b/i.test(
+          task.event.text,
+        );
+      if (!operationalAction) {
+        logStep?.({
+          stage: 'implementation.no_code_needed.informational',
+          message: 'Planner says no code changes and this is not an operational action — answering as informational.',
+          data: { plan: plannerOutput.plan },
+        });
+        return runAgenticEntry({
+          mode: 'informational',
+          task,
+          config,
+          slack,
+          store: store as unknown as JobStore,
+          jobId,
+          logStep,
+          signal,
+        });
       }
 
       const quickPrompt = `
