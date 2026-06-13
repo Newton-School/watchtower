@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "tauri:dev": "node scripts/run-tauri.mjs dev",
     "tauri:build:mac": "node scripts/run-tauri.mjs build --bundles app,dmg",
+    "bump": "node scripts/bump-version.mjs",
     "sidecar:dev": "npm --prefix sidecar run dev",
     "sidecar:test": "npm --prefix sidecar run test",
     "lint": "eslint . --max-warnings 0",
