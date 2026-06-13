@@ -28,6 +28,21 @@ function normalizeStoredPersonalityMode(mode: unknown): PersonalityMode {
   return mode === 'terse' || mode === 'technical' || mode === 'casual' ? mode : 'normal';
 }
 
+const MINUTE_MS = 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * ISO-8601 timestamp for `now - offsetMs`. Timestamps are persisted via
+ * `new Date().toISOString()`, so a `created_at >= ?` comparison against this
+ * threshold is both chronologically correct (ISO-8601 sorts lexically) AND
+ * sargable — SQLite can use an index on `created_at`. This replaces the old
+ * `julianday(created_at) >= julianday('now', ...)` form, which wraps the column
+ * in a function and forces a full table scan on every call.
+ */
+function isoSince(offsetMs: number): string {
+  return new Date(Date.now() - offsetMs).toISOString();
+}
+
 const implementationApprovalResumeSchema = z.object({
   workflow: z.enum(['IMPLEMENTATION', 'OWNER_AUTOPILOT']),
   stage: z.literal('awaiting_approval'),
@@ -126,6 +141,12 @@ export class JobStore {
       CREATE INDEX IF NOT EXISTS idx_jobs_event_id ON jobs(event_id);
       CREATE INDEX IF NOT EXISTS idx_jobs_dedupe_key ON jobs(dedupe_key);
       CREATE INDEX IF NOT EXISTS idx_jobs_channel_thread ON jobs(channel_id, thread_ts);
+      -- Sargable time-window snapshots (getDevStatusSnapshot / getIncidentSnapshot /
+      -- getDevChannelHeat). These back the dashboard, which polls; without them the
+      -- count/group queries full-scan the jobs table and degrade as it grows.
+      CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at);
+      CREATE INDEX IF NOT EXISTS idx_jobs_status_created_at ON jobs(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_jobs_channel_status_created_at ON jobs(channel_id, status, created_at);
 
       CREATE TABLE IF NOT EXISTS job_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2553,9 +2574,9 @@ export class JobStore {
            FROM jobs
            WHERE channel_id = ?
              AND status = 'FAILED'
-             AND julianday(created_at) >= julianday('now', '-60 minute')`,
+             AND created_at >= ?`,
           )
-          .get(channelId) as { count?: number } | undefined
+          .get(channelId, isoSince(60 * MINUTE_MS)) as { count?: number } | undefined
       )?.count ?? 0,
     );
 
@@ -2567,9 +2588,9 @@ export class JobStore {
            FROM jobs
            WHERE channel_id = ?
              AND status = 'PAUSED'
-             AND julianday(created_at) >= julianday('now', '-60 minute')`,
+             AND created_at >= ?`,
           )
-          .get(channelId) as { count?: number } | undefined
+          .get(channelId, isoSince(60 * MINUTE_MS)) as { count?: number } | undefined
       )?.count ?? 0,
     );
 
@@ -2581,12 +2602,12 @@ export class JobStore {
              FROM jobs
              WHERE channel_id = ?
                AND status IN ('FAILED', 'PAUSED')
-               AND julianday(created_at) >= julianday('now', '-60 minute')
+               AND created_at >= ?
              GROUP BY workflow
              ORDER BY COUNT(*) DESC, workflow ASC
              LIMIT 1`,
           )
-          .get(channelId) as { workflow?: string } | undefined
+          .get(channelId, isoSince(60 * MINUTE_MS)) as { workflow?: string } | undefined
       )?.workflow ?? 'none';
 
     return {
@@ -2779,9 +2800,9 @@ export class JobStore {
 
     const runs24h = Number(
       (
-        this.db
-          .prepare(`SELECT COUNT(*) as count FROM jobs WHERE julianday(created_at) >= julianday('now', '-1 day')`)
-          .get() as { count?: number } | undefined
+        this.db.prepare(`SELECT COUNT(*) as count FROM jobs WHERE created_at >= ?`).get(isoSince(DAY_MS)) as
+          | { count?: number }
+          | undefined
       )?.count ?? 0,
     );
 
@@ -2792,9 +2813,9 @@ export class JobStore {
             `SELECT COUNT(*) as count
            FROM jobs
            WHERE status = 'FAILED'
-             AND julianday(created_at) >= julianday('now', '-1 day')`,
+             AND created_at >= ?`,
           )
-          .get() as { count?: number } | undefined
+          .get(isoSince(DAY_MS)) as { count?: number } | undefined
       )?.count ?? 0,
     );
 
@@ -2805,9 +2826,9 @@ export class JobStore {
             `SELECT COUNT(*) as count
            FROM jobs
            WHERE status = 'SUCCESS'
-             AND julianday(created_at) >= julianday('now', '-1 day')`,
+             AND created_at >= ?`,
           )
-          .get() as { count?: number } | undefined
+          .get(isoSince(DAY_MS)) as { count?: number } | undefined
       )?.count ?? 0,
     );
 
@@ -3061,10 +3082,8 @@ export class JobStore {
     const signals24h = Number(
       (
         this.db
-          .prepare(
-            `SELECT COUNT(*) as count FROM learning_signals WHERE julianday(created_at) >= julianday('now', '-1 day')`,
-          )
-          .get() as { count?: number } | undefined
+          .prepare(`SELECT COUNT(*) as count FROM learning_signals WHERE created_at >= ?`)
+          .get(isoSince(DAY_MS)) as { count?: number } | undefined
       )?.count ?? 0,
     );
 
@@ -3080,9 +3099,9 @@ export class JobStore {
             `SELECT COUNT(*) as count
            FROM learning_signals
            WHERE correction_applied = 1
-             AND julianday(created_at) >= julianday('now', '-1 day')`,
+             AND created_at >= ?`,
           )
-          .get() as { count?: number } | undefined
+          .get(isoSince(DAY_MS)) as { count?: number } | undefined
       )?.count ?? 0,
     );
 
@@ -3125,19 +3144,22 @@ export class JobStore {
               COUNT(*) as runs,
               SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as failures
        FROM jobs
-       WHERE julianday(created_at) >= julianday('now', '-7 day')
+       WHERE created_at >= ?
        GROUP BY channel_id
        ORDER BY runs DESC, failures DESC, channel_id ASC
        LIMIT ?`,
     ) as unknown as {
-      all: (limitArg: number) => Array<{
+      all: (
+        sinceIso: string,
+        limitArg: number,
+      ) => Array<{
         channel_id: string;
         runs: number;
         failures: number;
       }>;
     };
 
-    return stmt.all(safeLimit).map(row => ({
+    return stmt.all(isoSince(7 * DAY_MS), safeLimit).map(row => ({
       channelId: row.channel_id,
       runs: Number(row.runs),
       failures: Number(row.failures),

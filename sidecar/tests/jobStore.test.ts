@@ -799,3 +799,75 @@ describe('findLatestReviewedPrHeadSha (issue #334 bug E)', () => {
     store.close();
   });
 });
+
+describe('time-window snapshots (julianday → sargable ISO-threshold rewrite)', () => {
+  function seed(store: JobStore, id: string, status: 'SUCCESS' | 'FAILED' | 'PAUSED', channelId = 'C1'): void {
+    store.createJob({
+      id,
+      eventId: `e-${id}`,
+      dedupeKey: `dk-${id}`,
+      workflow: 'PR_REVIEW',
+      channelId,
+      threadTs: `t-${id}`,
+      payload: {},
+    });
+    store.markJob(id, status);
+  }
+
+  // created_at is stored via new Date().toISOString(); backdate the same way so
+  // the ISO-vs-ISO comparison in the snapshot queries is exercised realistically.
+  function backdateCreatedAt(store: JobStore, id: string, offsetMs: number): void {
+    const iso = new Date(Date.now() - offsetMs).toISOString();
+    store['db'].prepare('UPDATE jobs SET created_at = ? WHERE id = ?').run(iso, id);
+  }
+
+  it('getDevStatusSnapshot counts only jobs within the 24h window', () => {
+    const store = new JobStore(tempDbPath());
+    seed(store, 'recent-success', 'SUCCESS');
+    seed(store, 'recent-failed', 'FAILED');
+    seed(store, 'old-success', 'SUCCESS');
+    backdateCreatedAt(store, 'old-success', 2 * 24 * 60 * 60 * 1000); // 2 days ago — excluded
+
+    const snap = store.getDevStatusSnapshot();
+    expect(snap.runs24h).toBe(2);
+    expect(snap.failures24h).toBe(1);
+    expect(snap.successRate24h).toBe(50); // 1 success of 2 in-window runs
+    store.close();
+  });
+
+  it('getIncidentSnapshot counts only the last 60 minutes', () => {
+    const store = new JobStore(tempDbPath());
+    seed(store, 'fail-recent', 'FAILED');
+    seed(store, 'fail-old', 'FAILED');
+    backdateCreatedAt(store, 'fail-old', 2 * 60 * 60 * 1000); // 2h ago — excluded
+    seed(store, 'pause-recent', 'PAUSED');
+
+    const snap = store.getIncidentSnapshot('C1');
+    expect(snap.failed60m).toBe(1);
+    expect(snap.paused60m).toBe(1);
+    expect(snap.topWorkflow).toBe('PR_REVIEW');
+    store.close();
+  });
+
+  it('getDevChannelHeat counts only the last 7 days', () => {
+    const store = new JobStore(tempDbPath());
+    seed(store, 'heat-recent', 'SUCCESS', 'CHEAT');
+    seed(store, 'heat-old', 'SUCCESS', 'CHEAT');
+    backdateCreatedAt(store, 'heat-old', 8 * 24 * 60 * 60 * 1000); // 8 days ago — excluded
+
+    const heat = store.getDevChannelHeat(5).find(h => h.channelId === 'CHEAT');
+    expect(heat?.runs).toBe(1);
+    store.close();
+  });
+
+  it('the 24h jobs count uses an index (sargable), not a full table scan', () => {
+    const store = new JobStore(tempDbPath());
+    const plan = store['db']
+      .prepare('EXPLAIN QUERY PLAN SELECT COUNT(*) as count FROM jobs WHERE created_at >= ?')
+      .all(new Date().toISOString()) as Array<{ detail: string }>;
+    const detail = plan.map(r => r.detail).join(' ');
+    expect(detail).toContain('idx_jobs_created_at');
+    expect(detail).not.toMatch(/SCAN jobs(?! USING)/i);
+    store.close();
+  });
+});
