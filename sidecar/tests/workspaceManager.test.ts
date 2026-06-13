@@ -39,13 +39,13 @@ describe('cleanupThreadWorkspaces', () => {
     fs.mkdirSync(path.join(WS_ROOT, repo, key), { recursive: true });
   }
 
-  it('removes the thread worktree and its per-PR variants across repos, keeping other threads', () => {
+  it('removes the thread worktree and its per-PR variants across repos, keeping other threads', async () => {
     mkWorkspace('newton-web', '111.22');
     mkWorkspace('newton-web', '111.22--pr-5');
     mkWorkspace('newton-api', '111.22');
     mkWorkspace('newton-web', '999.88'); // unrelated thread
 
-    cleanupThreadWorkspaces('111.22');
+    await cleanupThreadWorkspaces('111.22');
 
     expect(fs.existsSync(path.join(WS_ROOT, 'newton-web', '111.22'))).toBe(false);
     expect(fs.existsSync(path.join(WS_ROOT, 'newton-web', '111.22--pr-5'))).toBe(false);
@@ -53,15 +53,15 @@ describe('cleanupThreadWorkspaces', () => {
     expect(fs.existsSync(path.join(WS_ROOT, 'newton-web', '999.88'))).toBe(true);
   });
 
-  it('does not match a different thread that merely shares a string prefix', () => {
+  it('does not match a different thread that merely shares a string prefix', async () => {
     mkWorkspace('newton-web', '111.222'); // not '111.22' and not '111.22--*'
-    cleanupThreadWorkspaces('111.22');
+    await cleanupThreadWorkspaces('111.22');
     expect(fs.existsSync(path.join(WS_ROOT, 'newton-web', '111.222'))).toBe(true);
   });
 
-  it('is a safe no-op when the workspaces root does not exist', () => {
+  it('is a safe no-op when the workspaces root does not exist', async () => {
     fs.rmSync(WS_ROOT, { recursive: true, force: true });
-    expect(() => cleanupThreadWorkspaces('111.22')).not.toThrow();
+    await expect(cleanupThreadWorkspaces('111.22')).resolves.toBeUndefined();
   });
 });
 
@@ -103,7 +103,7 @@ describe('resolveWorkspace refresh-on-reuse', () => {
     const commitA = await git(seed, ['rev-parse', 'HEAD']);
 
     // First task: creates the worktree from origin/main @ A.
-    const ws1 = resolveWorkspace(repo, thread);
+    const ws1 = await resolveWorkspace(repo, thread);
     expect(ws1).not.toBe(repo); // worktree created, not the fallback shared path
     expect(await git(ws1, ['rev-parse', 'HEAD'])).toBe(commitA);
 
@@ -116,7 +116,7 @@ describe('resolveWorkspace refresh-on-reuse', () => {
 
     // Second task in the same thread reuses the worktree — it MUST refresh to B,
     // not stay pinned at A (the stale-base bug).
-    const ws2 = resolveWorkspace(repo, thread);
+    const ws2 = await resolveWorkspace(repo, thread);
     expect(ws2).toBe(ws1);
     expect(await git(ws2, ['rev-parse', 'HEAD'])).toBe(commitB);
   });
@@ -128,7 +128,7 @@ describe('resolveWorkspace refresh-on-reuse', () => {
     fs.mkdirSync(wsPath, { recursive: true });
     fs.writeFileSync(path.join(wsPath, 'junk.txt'), 'not a git repo\n');
 
-    const ws = resolveWorkspace(repo, thread);
+    const ws = await resolveWorkspace(repo, thread);
 
     expect(ws).toBe(wsPath); // recreated, not the shared-repo fallback
     expect(fs.existsSync(path.join(ws, 'junk.txt'))).toBe(false); // junk discarded
@@ -136,12 +136,12 @@ describe('resolveWorkspace refresh-on-reuse', () => {
   });
 
   it('reuse discards stale tracked + untracked leftovers from a prior run', async () => {
-    const ws1 = resolveWorkspace(repo, thread);
+    const ws1 = await resolveWorkspace(repo, thread);
     // Simulate a prior coder run that dirtied the worktree.
     await writeFile(path.join(ws1, 'file.txt'), 'locally edited\n');
     await writeFile(path.join(ws1, 'scratch.tmp'), 'untracked junk\n');
 
-    const ws2 = resolveWorkspace(repo, thread);
+    const ws2 = await resolveWorkspace(repo, thread);
     expect(ws2).toBe(ws1);
     // reset --hard restored the tracked file; clean -fd removed the untracked one.
     expect(fs.readFileSync(path.join(ws2, 'file.txt'), 'utf8')).toBe('A\n');
@@ -187,7 +187,7 @@ describe('refreshSharedRepoToDefaultBranch', () => {
     await git(seed, ['push', '-q', 'origin', 'main']);
     const commitB = await git(seed, ['rev-parse', 'HEAD']);
 
-    const state = refreshSharedRepoToDefaultBranch(repo);
+    const state = await refreshSharedRepoToDefaultBranch(repo);
 
     expect(await git(repo, ['rev-parse', 'HEAD'])).toBe(commitB);
     expect(fs.readFileSync(path.join(repo, 'file.txt'), 'utf8')).toBe('B\n');
@@ -207,7 +207,7 @@ describe('refreshSharedRepoToDefaultBranch', () => {
     await git(seed, ['commit', '-aqm', 'commit B']);
     await git(seed, ['push', '-q', 'origin', 'main']);
 
-    const state = refreshSharedRepoToDefaultBranch(repo);
+    const state = await refreshSharedRepoToDefaultBranch(repo);
 
     // ff-only refused: the local commit survives, HEAD unchanged.
     expect(await git(repo, ['rev-parse', 'HEAD'])).toBe(commitC);
@@ -215,7 +215,7 @@ describe('refreshSharedRepoToDefaultBranch', () => {
     expect(state?.branch).toBe('main');
   });
 
-  it('is a non-throwing no-op for a directory that is not a git repo', () => {
-    expect(refreshSharedRepoToDefaultBranch(TEST_HOME)).toBeNull();
+  it('is a non-throwing no-op for a directory that is not a git repo', async () => {
+    expect(await refreshSharedRepoToDefaultBranch(TEST_HOME)).toBeNull();
   });
 });

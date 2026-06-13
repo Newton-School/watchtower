@@ -87,7 +87,7 @@ export async function runAgenticEntry(params: RunAgenticEntryParams): Promise<Wo
   // Conversational replies don't read code, so we skip the fetch cost there.
   if (mode === 'informational') {
     for (const repoPath of [config.repoPaths.newtonWeb, config.repoPaths.newtonApi]) {
-      const state = refreshSharedRepoToDefaultBranch(repoPath);
+      const state = await refreshSharedRepoToDefaultBranch(repoPath);
       logStep?.({
         stage: 'agentic.repo_refresh',
         message: `Refreshed ${path.basename(repoPath)} to ${state?.branch ?? 'unknown'} @ ${state?.head ?? 'unknown'}.`,

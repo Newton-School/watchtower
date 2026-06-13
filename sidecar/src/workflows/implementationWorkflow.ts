@@ -509,7 +509,7 @@ Return the JSON now.`;
       // the affectedFiles exist there.
       const desiredRepo = inferRepoFromAffectedFiles(planAffectedFiles);
       if (desiredRepo) {
-        const desiredCwd = resolveWorkspace(repoPathFor(desiredRepo, config), task.event.threadTs);
+        const desiredCwd = await resolveWorkspace(repoPathFor(desiredRepo, config), task.event.threadTs);
         if (desiredCwd !== pipelineCwd) {
           logStep?.({
             stage: 'implementation.workspace.switched',
@@ -1164,7 +1164,7 @@ Write your response as a ready-to-post Slack message describing what you did.
         };
       }
 
-      pipelineCwd = resolveWorkspace(resolution.path, task.event.threadTs);
+      pipelineCwd = await resolveWorkspace(resolution.path, task.event.threadTs);
       logStep?.({
         stage: 'implementation.workspace.resolved',
         message: 'Resolved implementation workspace to isolated worktree.',

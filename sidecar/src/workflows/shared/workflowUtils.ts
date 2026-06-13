@@ -320,7 +320,7 @@ export async function prepareWorkflowContext(params: {
     } else {
       repoName = repoOverride;
       const repoPath = repoOverride === 'newton-web' ? config.repoPaths.newtonWeb : config.repoPaths.newtonApi;
-      cwd = resolveWorkspace(repoPath, task.event.threadTs);
+      cwd = await resolveWorkspace(repoPath, task.event.threadTs);
     }
   } else if (isOwnerAuthor) {
     cwd = resolveOwnerWorkspaceRoot(config);
@@ -348,7 +348,7 @@ export async function prepareWorkflowContext(params: {
     });
     if (resolution.outcome === 'resolved') {
       repoName = resolution.name;
-      cwd = resolveWorkspace(resolution.path, task.event.threadTs);
+      cwd = await resolveWorkspace(resolution.path, task.event.threadTs);
     } else {
       // Either no admin reply within the idle window, or the admin cancelled.
       // Don't silently default — honor AppConfig.uncertainRepoPolicy by

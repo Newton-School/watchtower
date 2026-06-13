@@ -1,11 +1,32 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { execSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { logger } from '../logging/logger.js';
+
+const execFileAsync = promisify(execFile);
 
 const WORKSPACES_ROOT = path.join(os.homedir(), '.watchtower', 'workspaces');
 const STALE_THRESHOLD_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+/**
+ * Run a git command without blocking the event loop. Replaces the old
+ * `execSync` calls: those froze the single-threaded sidecar for the full
+ * duration of every git invocation — up to 30s for a network `git fetch` —
+ * stalling all concurrent jobs, Slack acks and the cancel poller. Args are
+ * passed as a list (no shell), so paths with spaces need no quoting and there's
+ * no shell-injection surface. Mirrors the previous semantics: stdout/stderr are
+ * piped, a per-call timeout kills the process, and a non-zero exit rejects.
+ */
+async function git(args: string[], opts: { cwd: string; timeoutMs: number }): Promise<string> {
+  const { stdout } = await execFileAsync('git', args, {
+    cwd: opts.cwd,
+    timeout: opts.timeoutMs,
+    maxBuffer: 10 * 1024 * 1024,
+  });
+  return stdout.toString().trim();
+}
 
 function sanitizeThreadTs(threadTs: string): string {
   return threadTs.replace(/[^a-zA-Z0-9.-]/g, '_');
@@ -21,17 +42,10 @@ function workspacePath(repoPath: string, threadTs: string): string {
   return path.join(WORKSPACES_ROOT, repoName, safeThread);
 }
 
-function resolveDefaultRemoteBranch(repoPath: string): string {
+async function resolveDefaultRemoteBranch(repoPath: string): Promise<string> {
   try {
-    const ref = execSync('git symbolic-ref refs/remotes/origin/HEAD --short', {
-      cwd: repoPath,
-      stdio: 'pipe',
-      timeout: 10_000,
-    })
-      .toString()
-      .trim();
     // ref is like "origin/master" or "origin/main"
-    return ref;
+    return await git(['symbolic-ref', 'refs/remotes/origin/HEAD', '--short'], { cwd: repoPath, timeoutMs: 10_000 });
   } catch {
     return 'origin/master';
   }
@@ -44,7 +58,7 @@ function resolveDefaultRemoteBranch(repoPath: string): string {
  * the local HEAD which may be on an unrelated feature branch.
  * Returns the original repoPath if worktree creation fails.
  */
-export function resolveWorkspace(repoPath: string, threadTs: string): string {
+export async function resolveWorkspace(repoPath: string, threadTs: string): Promise<string> {
   const wsPath = workspacePath(repoPath, threadTs);
 
   // If workspace already exists, refresh it to the current default branch
@@ -58,10 +72,10 @@ export function resolveWorkspace(repoPath: string, threadTs: string): string {
   // node_modules survives).
   if (fs.existsSync(wsPath)) {
     try {
-      execSync('git fetch origin --quiet', { cwd: wsPath, stdio: 'pipe', timeout: 30_000 });
-      const defaultBranch = resolveDefaultRemoteBranch(repoPath);
-      execSync(`git reset --hard ${defaultBranch}`, { cwd: wsPath, stdio: 'pipe', timeout: 15_000 });
-      execSync('git clean -fd', { cwd: wsPath, stdio: 'pipe', timeout: 15_000 });
+      await git(['fetch', 'origin', '--quiet'], { cwd: wsPath, timeoutMs: 30_000 });
+      const defaultBranch = await resolveDefaultRemoteBranch(repoPath);
+      await git(['reset', '--hard', defaultBranch], { cwd: wsPath, timeoutMs: 15_000 });
+      await git(['clean', '-fd'], { cwd: wsPath, timeoutMs: 15_000 });
       logger.info(
         { repoPath, threadTs, wsPath, startPoint: defaultBranch },
         'refreshed reused workspace to default branch',
@@ -77,7 +91,7 @@ export function resolveWorkspace(repoPath: string, threadTs: string): string {
         { repoPath, threadTs, wsPath, error: String(error) },
         'failed to refresh reused workspace; recreating it fresh',
       );
-      removeWorktreeByPath(wsPath);
+      await removeWorktreeByPath(wsPath);
     }
   }
 
@@ -86,22 +100,14 @@ export function resolveWorkspace(repoPath: string, threadTs: string): string {
 
     // Fetch latest from origin so the worktree starts from up-to-date code
     try {
-      execSync('git fetch origin --quiet', {
-        cwd: repoPath,
-        stdio: 'pipe',
-        timeout: 30_000,
-      });
+      await git(['fetch', 'origin', '--quiet'], { cwd: repoPath, timeoutMs: 30_000 });
     } catch {
       logger.warn({ repoPath }, 'git fetch failed before worktree creation, proceeding with local state');
     }
 
     // Create a detached worktree from the default remote branch (not local HEAD)
-    const defaultBranch = resolveDefaultRemoteBranch(repoPath);
-    execSync(`git worktree add --detach "${wsPath}" ${defaultBranch}`, {
-      cwd: repoPath,
-      stdio: 'pipe',
-      timeout: 30_000,
-    });
+    const defaultBranch = await resolveDefaultRemoteBranch(repoPath);
+    await git(['worktree', 'add', '--detach', wsPath, defaultBranch], { cwd: repoPath, timeoutMs: 30_000 });
 
     // Symlink parent node_modules so tools (Jest, ESLint, etc.) are available in the worktree
     const parentNodeModules = path.join(repoPath, 'node_modules');
@@ -142,12 +148,14 @@ export function resolveWorkspace(repoPath: string, threadTs: string): string {
  * Best-effort: returns the resolved `{ branch, head }` for telemetry, or null if
  * the repo couldn't be inspected. Never throws.
  */
-export function refreshSharedRepoToDefaultBranch(repoPath: string): { branch: string; head: string } | null {
+export async function refreshSharedRepoToDefaultBranch(
+  repoPath: string,
+): Promise<{ branch: string; head: string } | null> {
   try {
-    execSync('git fetch origin --quiet', { cwd: repoPath, stdio: 'pipe', timeout: 30_000 });
-    const defaultBranch = resolveDefaultRemoteBranch(repoPath);
+    await git(['fetch', 'origin', '--quiet'], { cwd: repoPath, timeoutMs: 30_000 });
+    const defaultBranch = await resolveDefaultRemoteBranch(repoPath);
     try {
-      execSync(`git merge --ff-only ${defaultBranch}`, { cwd: repoPath, stdio: 'pipe', timeout: 30_000 });
+      await git(['merge', '--ff-only', defaultBranch], { cwd: repoPath, timeoutMs: 30_000 });
     } catch {
       // Not fast-forwardable (feature branch, diverged history, or a dirty tree
       // that would be overwritten) — leave the checkout untouched and answer
@@ -164,12 +172,8 @@ export function refreshSharedRepoToDefaultBranch(repoPath: string): { branch: st
     );
   }
   try {
-    const head = execSync('git rev-parse --short HEAD', { cwd: repoPath, stdio: 'pipe', timeout: 10_000 })
-      .toString()
-      .trim();
-    const branch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: repoPath, stdio: 'pipe', timeout: 10_000 })
-      .toString()
-      .trim();
+    const head = await git(['rev-parse', '--short', 'HEAD'], { cwd: repoPath, timeoutMs: 10_000 });
+    const branch = await git(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repoPath, timeoutMs: 10_000 });
     return { branch, head };
   } catch {
     return null;
@@ -182,7 +186,7 @@ export function refreshSharedRepoToDefaultBranch(repoPath: string): { branch: st
  * git's worktree registry stays consistent; falls back to a plain recursive
  * delete. Best-effort — returns true if the directory is gone afterwards.
  */
-function removeWorktreeByPath(wsPath: string): boolean {
+async function removeWorktreeByPath(wsPath: string): Promise<boolean> {
   try {
     const gitDir = path.join(wsPath, '.git');
     if (fs.existsSync(gitDir)) {
@@ -192,11 +196,7 @@ function removeWorktreeByPath(wsPath: string): boolean {
         // <repo>/.git/worktrees/<name> → up three levels is the parent repo root.
         const parentGitDir = path.resolve(gitdirMatch[1], '..', '..', '..');
         if (fs.existsSync(parentGitDir)) {
-          execSync(`git worktree remove --force "${wsPath}"`, {
-            cwd: parentGitDir,
-            stdio: 'pipe',
-            timeout: 15_000,
-          });
+          await git(['worktree', 'remove', '--force', wsPath], { cwd: parentGitDir, timeoutMs: 15_000 });
           return true;
         }
       }
@@ -222,7 +222,7 @@ function removeWorktreeByPath(wsPath: string): boolean {
  * (implementation / single-repo investigation) and per-PR `<thread>--pr-N`
  * keys (PR review), across both repo directories. Best-effort and non-fatal.
  */
-export function cleanupThreadWorkspaces(threadTs: string): void {
+export async function cleanupThreadWorkspaces(threadTs: string): Promise<void> {
   if (!fs.existsSync(WORKSPACES_ROOT)) {
     return;
   }
@@ -245,7 +245,7 @@ export function cleanupThreadWorkspaces(threadTs: string): void {
         // boundary prevents matching a different thread that merely shares a
         // prefix.
         if (key === safeThread || key.startsWith(`${safeThread}--`)) {
-          if (removeWorktreeByPath(path.join(repoWorkspacesDir, key))) {
+          if (await removeWorktreeByPath(path.join(repoWorkspacesDir, key))) {
             cleaned++;
           }
         }
@@ -266,7 +266,7 @@ export function cleanupThreadWorkspaces(threadTs: string): void {
  * cleanup hooks that didn't run). Intended to be called periodically (e.g. on
  * startup).
  */
-export function cleanupStaleWorkspaces(): void {
+export async function cleanupStaleWorkspaces(): Promise<void> {
   if (!fs.existsSync(WORKSPACES_ROOT)) {
     return;
   }
@@ -286,7 +286,7 @@ export function cleanupStaleWorkspaces(): void {
         if (!wsStat.isDirectory()) continue;
 
         if (now - wsStat.mtimeMs > STALE_THRESHOLD_MS) {
-          if (removeWorktreeByPath(wsPath)) {
+          if (await removeWorktreeByPath(wsPath)) {
             cleaned++;
           }
         }

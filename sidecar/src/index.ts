@@ -1177,7 +1177,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
         // worktree (they may resume in-thread); resolveWorkspace also refreshes
         // any reused worktree as a backstop.
         if (result.status !== 'PAUSED') {
-          cleanupThreadWorkspaces(event.threadTs);
+          await cleanupThreadWorkspaces(event.threadTs);
         }
 
         unregisterActiveJob(jobId);
@@ -1267,7 +1267,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     // Terminal failure — tear down the thread's worktrees (same rationale as
     // the success path); the next task starts fresh. Before unregister so the
     // thread stays locked during cleanup.
-    cleanupThreadWorkspaces(event.threadTs);
+    await cleanupThreadWorkspaces(event.threadTs);
 
     unregisterActiveJob(jobId);
     notifyDesktop('Watchtower workflow failed', errorMessage);
@@ -1345,7 +1345,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     // Terminal (unexpected) failure — tear down the thread's worktrees before
     // releasing the lock, same as the other terminal paths, so the next task
     // starts fresh and no concurrent same-thread job's worktree is deleted.
-    cleanupThreadWorkspaces(event.threadTs);
+    await cleanupThreadWorkspaces(event.threadTs);
 
     unregisterActiveJob(jobId);
     logger.error({ jobId, eventId: event.eventId, error: errorMessage }, 'unexpected processEvent failure');
@@ -1402,7 +1402,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
 
 async function main(): Promise<void> {
   logger.info({ dbPath, maxConcurrentJobs: config.maxConcurrentJobs }, 'watchtower sidecar starting');
-  cleanupStaleWorkspaces();
+  await cleanupStaleWorkspaces();
 
   // Boot the optional Obsidian-compatible vault writer. When disabled (or no
   // path configured), scheduleVaultRender calls become no-ops; the dossier
