@@ -1,12 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
+import { promisify } from 'node:util';
 import type { PrContext, WorkflowStepLogger } from '../types/contracts.js';
 import { resolveWorkspace, removeWorktreeByPath } from '../workspaces/workspaceManager.js';
 import { checkoutPrBranch, fetchPrDiff } from '../github/prReviewSupport.js';
 import { buildCodexPath } from '../backends/codexBackend.js';
+
+const execFileAsync = promisify(execFile);
 
 /** A booted dev server serving a PR's code locally, with a teardown handle. */
 export interface PrDevServer {
@@ -158,6 +161,27 @@ export async function startPrDevServer(params: StartPrDevServerParams): Promise<
           /* non-fatal */
         }
       }
+    }
+
+    // 3b. Initialise git submodules. newton-web vendors `content_platform` as a
+    //     submodule that form pages (study-buddy, register, …) import at COMPILE
+    //     time; it's absent from a fresh worktree, so those pages 500 without it.
+    //     Must run before `next dev` boots — the server compiles the page on the
+    //     first request, before the QA agent navigates. Best-effort: relies on the
+    //     same ambient git credentials as the PR checkout; on failure we proceed
+    //     and the QA agent reports the compile error.
+    try {
+      await execFileAsync('git', ['-C', worktreePath, 'submodule', 'update', '--init', '--recursive'], {
+        timeout: 180_000,
+        maxBuffer: 10 * 1024 * 1024,
+      });
+      logStep?.({ stage: 'qa.pr.submodules_ready', message: 'Initialised git submodules in the worktree.' });
+    } catch (err) {
+      logStep?.({
+        stage: 'qa.pr.submodules_failed',
+        level: 'WARN',
+        message: `Couldn't init git submodules (pages that import them may 500): ${String(err)}`,
+      });
     }
 
     // 4. Diff → changed paths (focuses the QA pass) + deps-changed signal.
