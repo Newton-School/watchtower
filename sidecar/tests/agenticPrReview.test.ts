@@ -98,6 +98,49 @@ function agentDead() {
   };
 }
 
+function agentVerify(verdict: 'confirmed' | 'refuted', severity?: string) {
+  return {
+    ok: true,
+    exitCode: 0,
+    timedOut: false,
+    stdout: '{}',
+    stderr: '',
+    lastMessage: '',
+    parsedJson: { verdict, ...(severity ? { severity } : {}) },
+    durationMs: 5,
+    backend: 'codex',
+  };
+}
+
+/**
+ * Fan-out makes 3 lens calls (reviewer/security/performance) then N verifier
+ * calls, all through the same injected `runAgent`. Route the mock by prompt
+ * substring so tests are robust to the (non-deterministic) interleave of the
+ * parallel lenses. `oneShot` matches the collapse fallback (the combined
+ * buildAgenticPrReviewPrompt, which has no "specialist" marker).
+ */
+function routedRunAgent(routes: {
+  reviewer?: unknown;
+  security?: unknown;
+  performance?: unknown;
+  verifier?: (req: any) => unknown;
+  oneShot?: unknown;
+}) {
+  return vi.fn().mockImplementation((req: any) => {
+    const p = req.prompt as string;
+    if (p.includes('skeptical PR-review verifier')) {
+      return Promise.resolve(routes.verifier ? routes.verifier(req) : agentVerify('confirmed'));
+    }
+    if (p.includes('reviewer specialist')) return Promise.resolve(routes.reviewer ?? agentOk([]));
+    if (p.includes('security specialist')) return Promise.resolve(routes.security ?? agentOk([]));
+    if (p.includes('performance specialist')) return Promise.resolve(routes.performance ?? agentOk([]));
+    return Promise.resolve(routes.oneShot ?? agentDead());
+  });
+}
+
+const verifierCalls = (runAgent: any) =>
+  runAgent.mock.calls.filter((c: any[]) => (c[0].prompt as string).includes('skeptical PR-review verifier')).length;
+
 const SUBMIT_OK = {
   submitted: true,
   event: 'COMMENT' as const,
@@ -196,7 +239,8 @@ describe('agenticPrReview', () => {
     });
 
     expect(result.status).toBe('SUCCESS');
-    expect(deps.runAgent).toHaveBeenCalledTimes(1);
+    // Fan-out runs one agent per lens (reviewer/security/performance).
+    expect(deps.runAgent).toHaveBeenCalledTimes(3);
     const outcomes = (result.result as any).outcomes;
     expect(outcomes).toHaveLength(1);
     expect(outcomes[0].prUrl).toBe(WEB_PR);
@@ -216,7 +260,8 @@ describe('agenticPrReview', () => {
     });
 
     expect(result.status).toBe('SUCCESS');
-    expect(deps.runAgent).toHaveBeenCalledTimes(2);
+    // 2 PRs × 3 lenses (default low-severity findings → no verifier calls).
+    expect(deps.runAgent).toHaveBeenCalledTimes(6);
     const outcomes = (result.result as any).outcomes;
     expect(outcomes.map((o: any) => o.prUrl).sort()).toEqual([API_PR, WEB_PR].sort());
     // One ack listing both + one '*PR Review Complete*' summary per PR.
@@ -259,8 +304,8 @@ describe('agenticPrReview', () => {
     });
 
     expect(result.status).toBe('SUCCESS');
-    expect(deps.runAgent).toHaveBeenCalledTimes(1);
-    // No local clone → diff-only prompt and no checkout.
+    // No local clone → diff-only fan-out, one agent per lens, no checkout.
+    expect(deps.runAgent).toHaveBeenCalledTimes(3);
     expect(deps.runAgent.mock.calls[0][0].prompt).toContain('Do not explore the repository');
     expect(deps.checkoutPr).not.toHaveBeenCalled();
     expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'agentic.pr_review.repo_diff_only' }));
@@ -386,14 +431,17 @@ describe('agenticPrReview', () => {
     );
   });
 
-  it('recovers at tier-2 (medium + tools) without dropping to the diff-only one-shot', async () => {
+  it('a lens recovers at medium reasoning without collapsing the whole review', async () => {
     const slack = makeSlack([`review ${WEB_PR}`]);
-    const runAgent = vi
-      .fn()
-      .mockResolvedValueOnce(agentDead()) // tier 1: high + tools
-      .mockResolvedValueOnce(
-        agentOk([{ role: 'reviewer', severity: 'low', category: 'style', message: 'nit', file: 'src/a.ts', line: 2 }]),
-      ); // tier 2: medium + tools
+    // Security lens fails its tier-1 (non-medium) run, recovers at medium.
+    const runAgent = vi.fn().mockImplementation((req: any) => {
+      const p = req.prompt as string;
+      if (p.includes('security specialist')) {
+        return Promise.resolve(req.reasoningEffort === 'medium' ? agentOk([]) : agentDead());
+      }
+      if (p.includes('skeptical PR-review verifier')) return Promise.resolve(agentVerify('confirmed'));
+      return Promise.resolve(agentOk([]));
+    });
     const deps = makeDeps({ runAgent });
     const logStep = vi.fn();
 
@@ -407,22 +455,31 @@ describe('agenticPrReview', () => {
     });
 
     expect(result.status).toBe('SUCCESS');
-    expect(runAgent).toHaveBeenCalledTimes(2);
-    // Tier 2 keeps tools (full prompt) — it is NOT the diff-only one-shot.
-    expect(runAgent.mock.calls[1][0].prompt).not.toContain('Do not explore the repository');
-    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'agentic.pr_review.fallback.medium' }));
+    // Security lens ran twice (tier-1 + medium); reviewer & performance once each.
+    const securityCalls = runAgent.mock.calls.filter((c: any[]) =>
+      (c[0].prompt as string).includes('security specialist'),
+    );
+    expect(securityCalls).toHaveLength(2);
+    expect(logStep).toHaveBeenCalledWith(
+      expect.objectContaining({ stage: 'agentic.pr_review.lens.security.fallback_medium' }),
+    );
+    expect(logStep).not.toHaveBeenCalledWith(
+      expect.objectContaining({ stage: 'agentic.pr_review.fallback.fanout_collapsed' }),
+    );
     expect(logStep).not.toHaveBeenCalledWith(expect.objectContaining({ stage: 'agentic.pr_review.fallback.one_shot' }));
   });
 
-  it('escalates tier-1 → medium → diff-only one-shot when the first two tiers fail, then succeeds', async () => {
+  it('collapses to a diff-only one-shot when every lens fails, then succeeds', async () => {
     const slack = makeSlack([`review ${WEB_PR}`]);
-    const runAgent = vi
-      .fn()
-      .mockResolvedValueOnce(agentDead()) // tier 1: high + tools
-      .mockResolvedValueOnce(agentDead()) // tier 2: medium + tools
-      .mockResolvedValueOnce(
-        agentOk([{ role: 'reviewer', severity: 'low', category: 'style', message: 'nit', file: 'src/a.ts', line: 2 }]),
-      ); // tier 3: diff-only one-shot
+    // Every lens (both tiers) dies; the combined one-shot fallback succeeds.
+    const runAgent = routedRunAgent({
+      reviewer: agentDead(),
+      security: agentDead(),
+      performance: agentDead(),
+      oneShot: agentOk([
+        { role: 'reviewer', severity: 'low', category: 'style', message: 'nit', file: 'src/a.ts', line: 2 },
+      ]),
+    });
     const deps = makeDeps({ runAgent });
     const logStep = vi.fn();
 
@@ -436,10 +493,366 @@ describe('agenticPrReview', () => {
     });
 
     expect(result.status).toBe('SUCCESS');
-    expect(runAgent).toHaveBeenCalledTimes(3);
-    expect(runAgent.mock.calls[2][0].prompt).toContain('Do not explore the repository');
-    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'agentic.pr_review.fallback.medium' }));
+    // The one-shot fallback is the only diff-only prompt (lenses had a clone).
+    const oneShotCalls = runAgent.mock.calls.filter((c: any[]) =>
+      (c[0].prompt as string).includes('Do not explore the repository'),
+    );
+    expect(oneShotCalls).toHaveLength(1);
+    expect(logStep).toHaveBeenCalledWith(
+      expect.objectContaining({ stage: 'agentic.pr_review.fallback.fanout_collapsed' }),
+    );
     expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'agentic.pr_review.fallback.one_shot' }));
+  });
+
+  it('fan-out: runs three focused lens specialists, each forbidden from posting', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const runAgent = routedRunAgent({});
+    const deps = makeDeps({ runAgent });
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    const callFor = (marker: string) =>
+      runAgent.mock.calls.find((c: any[]) => (c[0].prompt as string).includes(marker))?.[0];
+    expect(callFor('reviewer specialist')).toBeDefined();
+    expect(callFor('security specialist')).toBeDefined();
+    expect(callFor('performance specialist')).toBeDefined();
+    // Per-role tiering: reviewer/security get high-reasoning, performance is lightweight.
+    expect(callFor('security specialist')).toMatchObject({ model: 'gpt-5.4', reasoningEffort: 'xhigh' });
+    expect(callFor('reviewer specialist')).toMatchObject({ model: 'gpt-5.4', reasoningEffort: 'xhigh' });
+    expect(callFor('performance specialist')).toMatchObject({ model: 'gpt-5.2-codex', reasoningEffort: 'low' });
+    // Pinned invariant: every lens prompt forbids posting.
+    const prompts = runAgent.mock.calls.map((c: any[]) => c[0].prompt as string);
+    for (const p of prompts) expect(p).toContain('You must NOT post anything to GitHub or Slack');
+  });
+
+  it('graceful degradation: one dead lens still posts the others (partial fan-out)', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const runAgent = routedRunAgent({
+      security: agentDead(), // both tiers dead via the default route fallback
+      reviewer: agentOk([
+        {
+          role: 'reviewer',
+          severity: 'high',
+          category: 'bug',
+          message: 'surviving lens bug',
+          file: 'src/a.ts',
+          line: 2,
+        },
+      ]),
+      performance: agentOk([]),
+      verifier: () => agentVerify('confirmed'),
+    });
+    const deps = makeDeps({ runAgent });
+    const logStep = vi.fn();
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+      logStep,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    expect(logStep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stage: 'agentic.pr_review.fanout.partial',
+        data: expect.objectContaining({ failedLenses: ['security'] }),
+      }),
+    );
+    expect(logStep).not.toHaveBeenCalledWith(
+      expect.objectContaining({ stage: 'agentic.pr_review.fallback.fanout_collapsed' }),
+    );
+    // A surviving lens's blocking finding is still verified and posted.
+    expect(verifierCalls(runAgent)).toBe(1);
+    const outcomes = (result.result as any).outcomes;
+    expect(outcomes[0].totalFindings).toBe(1);
+    expect(outcomes[0].hasBlockingFindings).toBe(true);
+  });
+
+  it('adversarial verify drops a refuted high finding (no blocking finding reaches the PR)', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const runAgent = routedRunAgent({
+      security: agentOk([
+        { role: 'security', severity: 'high', category: 'authz', message: 'missing check', file: 'src/a.ts', line: 2 },
+      ]),
+      verifier: () => agentVerify('refuted'),
+    });
+    const deps = makeDeps({ runAgent });
+    const logStep = vi.fn();
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+      logStep,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    expect(verifierCalls(runAgent)).toBe(1);
+    const outcomes = (result.result as any).outcomes;
+    expect(outcomes[0].hasBlockingFindings).toBe(false);
+    expect(outcomes[0].totalFindings).toBe(0);
+    expect(logStep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stage: 'agentic.pr_review.verify.done',
+        data: expect.objectContaining({ refuted: 1 }),
+      }),
+    );
+  });
+
+  it('adversarial verify keeps a confirmed high finding', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const runAgent = routedRunAgent({
+      security: agentOk([
+        { role: 'security', severity: 'high', category: 'authz', message: 'missing check', file: 'src/a.ts', line: 2 },
+      ]),
+      verifier: () => agentVerify('confirmed'),
+    });
+    const deps = makeDeps({ runAgent });
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    expect(verifierCalls(runAgent)).toBe(1);
+    const outcomes = (result.result as any).outcomes;
+    expect(outcomes[0].hasBlockingFindings).toBe(true);
+    expect(outcomes[0].totalFindings).toBe(1);
+  });
+
+  it('verifier downgrade lowers severity and clears the blocking signal', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const runAgent = routedRunAgent({
+      security: agentOk([
+        { role: 'security', severity: 'high', category: 'authz', message: 'overstated', file: 'src/a.ts', line: 2 },
+      ]),
+      verifier: () => agentVerify('confirmed', 'medium'),
+    });
+    const deps = makeDeps({ runAgent });
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    const outcomes = (result.result as any).outcomes;
+    // Kept, but downgraded high → medium, so it no longer blocks.
+    expect(outcomes[0].totalFindings).toBe(1);
+    expect(outcomes[0].hasBlockingFindings).toBe(false);
+    expect(outcomes[0].severityCounts).toEqual({ medium: 1 });
+    const texts = slack.chat.postMessage.mock.calls.map((c: any) => c[0].text as string);
+    expect(texts.some(t => t.includes('blocking-severity finding'))).toBe(false);
+  });
+
+  it('verifier severity escalation is ignored (no high → critical promotion)', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const runAgent = routedRunAgent({
+      security: agentOk([
+        { role: 'security', severity: 'high', category: 'authz', message: 'missing check', file: 'src/a.ts', line: 2 },
+      ]),
+      verifier: () => agentVerify('confirmed', 'critical'),
+    });
+    const deps = makeDeps({ runAgent });
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    const outcomes = (result.result as any).outcomes;
+    // Escalation refused — severity stays high (a single vote can't mint a critical).
+    expect(outcomes[0].severityCounts).toEqual({ high: 1 });
+  });
+
+  it('verifier failure fails open — the finding is kept', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const runAgent = routedRunAgent({
+      security: agentOk([
+        { role: 'security', severity: 'high', category: 'authz', message: 'missing check', file: 'src/a.ts', line: 2 },
+      ]),
+      verifier: () => agentDead(),
+    });
+    const deps = makeDeps({ runAgent });
+    const logStep = vi.fn();
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+      logStep,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    const outcomes = (result.result as any).outcomes;
+    expect(outcomes[0].hasBlockingFindings).toBe(true);
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'agentic.pr_review.verify.inconclusive' }));
+  });
+
+  it('severity gate: non-blocking findings are not verified', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const runAgent = routedRunAgent({
+      reviewer: agentOk([
+        { role: 'reviewer', severity: 'medium', category: 'bug', message: 'edge case', file: 'src/a.ts', line: 2 },
+      ]),
+    });
+    const deps = makeDeps({ runAgent });
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    expect(verifierCalls(runAgent)).toBe(0);
+    const outcomes = (result.result as any).outcomes;
+    expect(outcomes[0].totalFindings).toBe(1);
+  });
+
+  it('critical findings get a best-of-3 majority vote and drop on ≥2 refutes', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    let verify = 0;
+    const runAgent = routedRunAgent({
+      security: agentOk([
+        { role: 'security', severity: 'critical', category: 'injection', message: 'sqli', file: 'src/a.ts', line: 2 },
+      ]),
+      verifier: () => {
+        verify += 1;
+        // refute, refute, confirm → 2 refutes → dropped.
+        return verify <= 2 ? agentVerify('refuted') : agentVerify('confirmed');
+      },
+    });
+    const deps = makeDeps({ runAgent });
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    expect(verifierCalls(runAgent)).toBe(3); // best-of-3
+    const outcomes = (result.result as any).outcomes;
+    expect(outcomes[0].hasBlockingFindings).toBe(false);
+  });
+
+  it('caps verification at 20 blocking findings; the overflow passes through unverified', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const many = Array.from({ length: 21 }, (_v, i) => ({
+      role: 'security',
+      severity: 'high',
+      category: 'authz',
+      message: `issue number ${i}`,
+      file: 'src/a.ts',
+      line: 2,
+    }));
+    const runAgent = routedRunAgent({ security: agentOk(many), verifier: () => agentVerify('confirmed') });
+    const deps = makeDeps({ runAgent });
+    const logStep = vi.fn();
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+      logStep,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    expect(verifierCalls(runAgent)).toBe(20);
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'agentic.pr_review.verify.capped' }));
+    // The 21st (overflow) finding is KEPT unverified, not dropped.
+    const outcomes = (result.result as any).outcomes;
+    expect(outcomes[0].totalFindings).toBe(21);
+  });
+
+  it('cross-lens dedup: the same file:line:message collapses, higher severity wins', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const runAgent = routedRunAgent({
+      reviewer: agentOk([
+        { role: 'reviewer', severity: 'medium', category: 'bug', message: 'same issue', file: 'src/a.ts', line: 2 },
+      ]),
+      security: agentOk([
+        { role: 'security', severity: 'high', category: 'authz', message: 'same issue', file: 'src/a.ts', line: 2 },
+      ]),
+      verifier: () => agentVerify('confirmed'),
+    });
+    const deps = makeDeps({ runAgent });
+    const logStep = vi.fn();
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+      logStep,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    const outcomes = (result.result as any).outcomes;
+    expect(outcomes[0].totalFindings).toBe(1); // collapsed to one
+    // The HIGHER-severity (security/high) finding wins the tiebreak, not the medium one —
+    // which also means the survivor is blocking and goes through verification.
+    expect(outcomes[0].severityCounts).toEqual({ high: 1 });
+    expect(verifierCalls(runAgent)).toBe(1);
+    expect(logStep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stage: 'agentic.pr_review.synth.done',
+        data: expect.objectContaining({ beforeDedupe: 2, afterDedupe: 1 }),
+      }),
+    );
+  });
+
+  it('honors an aborted signal — no agent runs, batch cancelled', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const runAgent = routedRunAgent({});
+    const deps = makeDeps({ runAgent });
+    const ac = new AbortController();
+    ac.abort();
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+      signal: ac.signal,
+    });
+
+    expect(result.status).toBe('CANCELLED');
+    expect(runAgent).not.toHaveBeenCalled();
   });
 
   it('isolates per-PR failures: one PR fails after retry, the other completes and is recorded', async () => {
