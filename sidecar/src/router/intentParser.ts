@@ -216,6 +216,28 @@ export function isWebappQaRequest(triggerText: string): boolean {
 }
 
 /**
+ * Deterministic check: is the message asking miniOG to browser-QA a GitHub PR
+ * (vs. code-review it)? "test this PR <url>" should drive a browser against the
+ * PR's running code, but a bare PR URL otherwise routes to PR_REVIEW. This gate
+ * must run BEFORE `isPrReviewRequest` in `inferIntent` (a PR URL with no
+ * conflicting verb makes that gate fire). Fires only on a QA verb + a GitHub PR
+ * URL, with NO review verb (so "review this PR" stays PR_REVIEW) and NO
+ * build/ship verb (so "test and fix this PR" falls through to implementation).
+ */
+export function isWebappQaOnPrRequest(triggerText: string): boolean {
+  if (!triggerText) return false;
+  if (!GITHUB_PR_URL_TEST_RE.test(triggerText)) return false;
+  const normalized = triggerText
+    .replace(/<@[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .toLowerCase()
+    .trim();
+  if (isReviewRequestVerb(normalized)) return false;
+  if (QA_CONFLICTING_VERB_RE.test(normalized)) return false;
+  return QA_VERB_RE.test(normalized);
+}
+
+/**
  * Parse a `/miniog <subcommand>` style message into a structured subcommand.
  * Returns null if the text is not a recognized dossier subcommand.
  *
@@ -313,6 +335,16 @@ function inferIntent(
   // identically whether the classifier CLI is healthy or down (issue #334
   // bug B), and the access check evaluates reviewer tier directly with no
   // override for the confidence guardrail to hold.
+  // Deterministic webapp-QA-on-PR detection — MUST run before the PR-review
+  // gate below, which fires on any PR URL without a conflicting verb. "test
+  // this PR <url>" means "browser-test the PR's running code", not "code-review
+  // it"; this gate steers it to WEBAPP_QA while "review this PR" / a bare PR
+  // paste still fall through to PR_REVIEW. prContext is populated by
+  // normalizeTask regardless, so runWebappQa can resolve the PR downstream.
+  if (mention.detected && mention.type === 'bot' && isWebappQaOnPrRequest(event.text ?? '')) {
+    return { intent: 'WEBAPP_QA' };
+  }
+
   if (mention.detected && mention.type === 'bot' && isPrReviewRequest(event.text ?? '', threadTexts)) {
     return { intent: 'PR_REVIEW' };
   }

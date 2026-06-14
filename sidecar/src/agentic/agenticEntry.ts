@@ -8,6 +8,7 @@ import { refreshSharedRepoToDefaultBranch } from '../workspaces/workspaceManager
 import { getBackend } from '../backends/registry.js';
 import { extractQaTargetUrl } from '../router/intentParser.js';
 import { parseScreenshotManifest, uploadScreenshots } from '../slack/imageUploader.js';
+import { startPrDevServer } from '../devServer/devServerManager.js';
 
 export type AgenticMode = 'informational' | 'conversational' | 'qa';
 
@@ -55,11 +56,27 @@ Keep replies short — one or two sentences usually. Slack markdown is fine but 
  * Code backend, which shells out to Playwright directly instead of relying on
  * the Codex-only `js_repl` + `playwright-interactive` runtime.
  */
-function qaSystemPrompt(targetUrl: string): string {
+function qaSystemPrompt(targetUrl: string, opts?: { changedPaths?: string[]; depsChanged?: boolean }): string {
+  const changed = opts?.changedPaths ?? [];
+  const prFocus =
+    changed.length > 0
+      ? `
+
+PR SCOPE — this is a QA pass for a specific pull request running locally at the TARGET URL. Focus on the pages/components affected by the changed files below; navigate to the routes that render them and exercise them hard. Spot-check unrelated areas only briefly.
+Changed files:
+${changed
+  .slice(0, 40)
+  .map(p => `- ${p}`)
+  .join('\n')}${changed.length > 40 ? `\n- …and ${changed.length - 40} more` : ''}${
+          opts?.depsChanged
+            ? `\nNOTE: this PR also changed dependencies (package.json/lockfile), but the server runs against the base clone's installed deps. Treat anything that looks dependency-related as a caveat in *Risk / not covered*, not a confirmed bug.`
+            : ''
+        }`
+      : '';
   return `You are miniOG's web-QA agent. You drive a REAL browser to test a running web app and return an evidence-backed QA report to Slack.
 
 TARGET URL: ${targetUrl}
-The user's message (below) describes the feature/flow to test and the expected behavior. If the scope is vague, pick the most important happy path plus its obvious failure modes.
+The user's message (below) describes the feature/flow to test and the expected behavior. If the scope is vague, pick the most important happy path plus its obvious failure modes.${prFocus}
 
 EXECUTION (use your Bash tool):
 1. Ensure Playwright is available in the current working directory. Try \`node -e "require('playwright')"\`; if it fails, run \`npm i -D playwright\` then \`npx playwright install chromium\`. Do this quietly — do not put install logs in the report.
@@ -204,14 +221,6 @@ async function runWebappQa(params: RunAgenticEntryParams): Promise<WorkflowResul
     }
   };
 
-  const targetUrl = extractQaTargetUrl(task.event.text);
-  if (!targetUrl) {
-    const text =
-      'I can QA a running web app, but I need a URL. Try: *@miniOG QA the login flow on* `https://staging.example.com/login`.';
-    const slackPosted = await postReply(text);
-    return { workflow: 'WEBAPP_QA', status: 'SKIPPED', message: text, notifyDesktop: false, slackPosted };
-  }
-
   // QA needs the claude-code backend (native Bash → Playwright). The deployed
   // default is often `codex`, so guard before spawning a doomed run.
   if (!getBackend('claude-code').isAvailable()) {
@@ -220,50 +229,108 @@ async function runWebappQa(params: RunAgenticEntryParams): Promise<WorkflowResul
     return { workflow: 'WEBAPP_QA', status: 'FAILED', message: text, notifyDesktop: true, slackPosted };
   }
 
-  // Pre-run ack — browser QA takes minutes; let the user know it's working.
-  await postReply(`:test_tube: Running browser QA on \`${targetUrl}\` — this can take a few minutes.`);
+  // Drive the QA agent against a reachable URL, then post the report + upload
+  // screenshots. Shared by the literal-URL and PR paths.
+  const runQaAgainstUrl = async (
+    targetUrl: string,
+    resultMeta: Record<string, unknown>,
+    promptOpts?: { changedPaths?: string[]; depsChanged?: boolean },
+  ): Promise<WorkflowResult> => {
+    const result = await runClaudeAgentic({
+      systemPrompt: qaSystemPrompt(targetUrl, promptOpts),
+      userMessage: task.event.text || `QA the web app at ${targetUrl}`,
+      cwd: config.repoPaths.newtonWeb,
+      forceBackend: 'claude-code',
+      timeoutMs: QA_TIMEOUT_MS,
+      logStep,
+      signal,
+    });
 
-  const result = await runClaudeAgentic({
-    systemPrompt: qaSystemPrompt(targetUrl),
-    userMessage: task.event.text || `QA the web app at ${targetUrl}`,
-    cwd: config.repoPaths.newtonWeb,
-    forceBackend: 'claude-code',
-    timeoutMs: QA_TIMEOUT_MS,
-    logStep,
-    signal,
-  });
+    logStep?.({
+      stage: 'qa.done',
+      message: `Webapp-QA run finished: ${result.reason}.`,
+      level: result.ok ? 'INFO' : 'WARN',
+      data: { reason: result.reason, error: result.error, targetUrl, ...resultMeta },
+    });
 
-  logStep?.({
-    stage: 'qa.done',
-    message: `Webapp-QA run finished: ${result.reason}.`,
-    level: result.ok ? 'INFO' : 'WARN',
-    data: { reason: result.reason, error: result.error, targetUrl },
-  });
+    if (!result.ok) {
+      const text = result.reply || result.error || 'Browser QA run failed.';
+      const slackPosted = await postReply(text);
+      return { workflow: 'WEBAPP_QA', status: 'FAILED', message: text, notifyDesktop: true, slackPosted };
+    }
 
-  if (!result.ok) {
-    const text = result.reply || result.error || 'Browser QA run failed.';
-    const slackPosted = await postReply(text);
-    return { workflow: 'WEBAPP_QA', status: 'FAILED', message: text, notifyDesktop: true, slackPosted };
+    const { visibleText, screenshots } = parseScreenshotManifest(result.reply);
+    const reportText = visibleText || 'QA run completed but produced no report text.';
+    const slackPosted = await postReply(reportText);
+
+    const uploaded = await uploadScreenshots({
+      slack,
+      channelId: task.event.channelId,
+      threadTs: task.event.threadTs,
+      screenshots,
+      logStep,
+    });
+
+    return {
+      workflow: 'WEBAPP_QA',
+      status: 'SUCCESS',
+      message: reportText,
+      notifyDesktop: false,
+      slackPosted,
+      result: { targetUrl, ...resultMeta, screenshotsCaptured: screenshots.length, screenshotsUploaded: uploaded },
+    };
+  };
+
+  // Path 1 — a literal URL in the message: QA it directly.
+  const literalUrl = extractQaTargetUrl(task.event.text);
+  if (literalUrl) {
+    await postReply(`:test_tube: Running browser QA on \`${literalUrl}\` — this can take a few minutes.`);
+    return runQaAgainstUrl(literalUrl, {});
   }
 
-  const { visibleText, screenshots } = parseScreenshotManifest(result.reply);
-  const reportText = visibleText || 'QA run completed but produced no report text.';
-  const slackPosted = await postReply(reportText);
+  // Path 2 — a PR link ("test this PR <url>"): check out the PR head, boot a
+  // local dev server, QA the changed pages, then always tear it down.
+  if (task.prContext) {
+    const pr = task.prContext;
+    await postReply(
+      `:test_tube: Checking out PR #${pr.number} (\`${pr.repo}\`) and booting a dev server to QA it — this can take several minutes.`,
+    );
 
-  const uploaded = await uploadScreenshots({
-    slack,
-    channelId: task.event.channelId,
-    threadTs: task.event.threadTs,
-    screenshots,
-    logStep,
-  });
+    const githubToken = await resolveGithubTokenForCodex();
+    let devServer: Awaited<ReturnType<typeof startPrDevServer>>;
+    try {
+      devServer = await startPrDevServer({
+        baseRepoPath: config.repoPaths.newtonWeb,
+        prContext: pr,
+        threadTs: task.event.threadTs,
+        githubToken,
+        signal,
+        logStep,
+      });
+    } catch (err) {
+      const text =
+        err instanceof Error && err.message === 'aborted'
+          ? 'QA cancelled before the dev server was ready.'
+          : `Couldn't set up PR #${pr.number} for QA: ${err instanceof Error ? err.message : String(err)}`;
+      const slackPosted = await postReply(text);
+      return { workflow: 'WEBAPP_QA', status: 'FAILED', message: text, notifyDesktop: true, slackPosted };
+    }
 
-  return {
-    workflow: 'WEBAPP_QA',
-    status: 'SUCCESS',
-    message: reportText,
-    notifyDesktop: false,
-    slackPosted,
-    result: { targetUrl, screenshotsCaptured: screenshots.length, screenshotsUploaded: uploaded },
-  };
+    try {
+      await postReply(`Dev server up at \`${devServer.url}\` — testing the pages this PR touches…`);
+      return await runQaAgainstUrl(
+        devServer.url,
+        { prNumber: pr.number, repo: pr.repo, changedPaths: devServer.changedPaths.length },
+        { changedPaths: devServer.changedPaths, depsChanged: devServer.depsChanged },
+      );
+    } finally {
+      await devServer.stop();
+    }
+  }
+
+  // Neither a literal URL nor a PR link.
+  const text =
+    'I can QA a running web app, but I need a URL or a PR link. Try *@miniOG QA the login flow on* `https://staging.example.com/login` or *@miniOG test this PR* `<github PR url>`.';
+  const slackPosted = await postReply(text);
+  return { workflow: 'WEBAPP_QA', status: 'SKIPPED', message: text, notifyDesktop: false, slackPosted };
 }
