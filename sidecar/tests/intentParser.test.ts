@@ -74,6 +74,35 @@ describe('intentParser', () => {
     expect(task.prContext?.repo).toBe('newton-web');
   });
 
+  it('routes "test this PR <url>" to WEBAPP_QA, beating the PR_REVIEW gate, with prContext set', () => {
+    const task = normalizeTask(
+      {
+        ...baseEvent,
+        text: '<@UBOT1> test this PR https://github.com/Newton-School/newton-web/pull/123',
+      },
+      config,
+      [],
+    );
+
+    // The QA-on-PR gate runs before isPrReviewRequest so a "test this PR"
+    // ask drives a browser instead of a code review; prContext still resolves
+    // so runWebappQa can check out the PR downstream.
+    expect(task.intent).toBe('WEBAPP_QA');
+    expect(task.prContext?.number).toBe(123);
+  });
+
+  it('keeps "review this PR <url>" on PR_REVIEW (QA gate must not steal it)', () => {
+    const task = normalizeTask(
+      {
+        ...baseEvent,
+        text: '<@UBOT1> review this PR https://github.com/Newton-School/newton-web/pull/123',
+      },
+      config,
+      [],
+    );
+    expect(task.intent).toBe('PR_REVIEW');
+  });
+
   it('routes any bot-mentioned bug request from a non-owner to implementation', () => {
     const task = normalizeTask(
       {

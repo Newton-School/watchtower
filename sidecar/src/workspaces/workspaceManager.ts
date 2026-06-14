@@ -186,7 +186,7 @@ export async function refreshSharedRepoToDefaultBranch(
  * git's worktree registry stays consistent; falls back to a plain recursive
  * delete. Best-effort — returns true if the directory is gone afterwards.
  */
-async function removeWorktreeByPath(wsPath: string): Promise<boolean> {
+export async function removeWorktreeByPath(wsPath: string): Promise<boolean> {
   try {
     const gitDir = path.join(wsPath, '.git');
     if (fs.existsSync(gitDir)) {

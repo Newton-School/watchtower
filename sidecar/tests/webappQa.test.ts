@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { extractQaTargetUrl, isWebappQaRequest } from '../src/router/intentParser.js';
+import { extractQaTargetUrl, isWebappQaRequest, isWebappQaOnPrRequest } from '../src/router/intentParser.js';
 import { parseScreenshotManifest } from '../src/slack/imageUploader.js';
+import { changedPathsFromDiff, findFreePort } from '../src/devServer/devServerManager.js';
+
+const PR_URL = 'https://github.com/Newton-School/newton-web/pull/8399';
 
 describe('extractQaTargetUrl', () => {
   it('returns a generic http(s) target URL', () => {
@@ -49,6 +52,63 @@ describe('isWebappQaRequest', () => {
 
   it('does not fire on a bare PR URL paste', () => {
     expect(isWebappQaRequest('test this https://github.com/Newton-School/newton-web/pull/42')).toBe(false);
+  });
+});
+
+describe('isWebappQaOnPrRequest', () => {
+  it('fires on a QA verb + a GitHub PR URL', () => {
+    expect(isWebappQaOnPrRequest(`<@U1> test this PR ${PR_URL}`)).toBe(true);
+    expect(isWebappQaOnPrRequest(`QA ${PR_URL}`)).toBe(true);
+    expect(isWebappQaOnPrRequest(`smoke-test ${PR_URL} on staging`)).toBe(true);
+  });
+
+  it('does NOT fire for a review request (stays PR_REVIEW)', () => {
+    expect(isWebappQaOnPrRequest(`<@U1> review this PR ${PR_URL}`)).toBe(false);
+    expect(isWebappQaOnPrRequest(`please re-review ${PR_URL}`)).toBe(false);
+  });
+
+  it('does NOT fire for a bare PR paste (no QA verb)', () => {
+    expect(isWebappQaOnPrRequest(PR_URL)).toBe(false);
+    expect(isWebappQaOnPrRequest(`<@U1> ${PR_URL}`)).toBe(false);
+  });
+
+  it('falls through when a build/ship verb muddies the ask', () => {
+    expect(isWebappQaOnPrRequest(`test and fix this PR ${PR_URL}`)).toBe(false);
+    expect(isWebappQaOnPrRequest(`test then merge ${PR_URL}`)).toBe(false);
+  });
+
+  it('requires a PR URL (a plain webapp URL is not QA-on-PR)', () => {
+    expect(isWebappQaOnPrRequest('test the login flow on https://staging.example.com/login')).toBe(false);
+  });
+});
+
+describe('changedPathsFromDiff', () => {
+  it('extracts changed file paths from a unified diff', () => {
+    const diff = [
+      'diff --git a/src/pages/study-buddy.tsx b/src/pages/study-buddy.tsx',
+      'index abc..def 100644',
+      '--- a/src/pages/study-buddy.tsx',
+      '+++ b/src/pages/study-buddy.tsx',
+      '@@ -1 +1 @@',
+      '-old',
+      '+new',
+      'diff --git a/src/components/Cta.tsx b/src/components/Cta.tsx',
+      '--- a/src/components/Cta.tsx',
+      '+++ b/src/components/Cta.tsx',
+    ].join('\n');
+    expect(changedPathsFromDiff(diff)).toEqual(['src/pages/study-buddy.tsx', 'src/components/Cta.tsx']);
+  });
+
+  it('returns an empty array for an empty diff', () => {
+    expect(changedPathsFromDiff('')).toEqual([]);
+  });
+});
+
+describe('findFreePort', () => {
+  it('returns a usable port number', async () => {
+    const port = await findFreePort();
+    expect(port).toBeGreaterThan(0);
+    expect(port).toBeLessThan(65536);
   });
 });
 
