@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "required": ["verdict"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["confirmed", "refuted"]
+    },
+    "severity": {
+      "type": "string",
+      "enum": ["critical", "high", "medium", "low", "info"]
+    },
+    "reason": { "type": "string" }
+  },
+  "additionalProperties": false
+}

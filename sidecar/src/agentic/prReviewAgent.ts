@@ -2,9 +2,16 @@ import path from 'node:path';
 import os from 'node:os';
 import type { WebClient } from '@slack/web-api';
 import type { AgentFinding } from '../agents/types.js';
-import type { AppConfig, CodexRunResult, NormalizedTask, PrContext, WorkflowStepLogger } from '../types/contracts.js';
+import type {
+  AppConfig,
+  CodexReasoningEffort,
+  CodexRunResult,
+  NormalizedTask,
+  PrContext,
+  WorkflowStepLogger,
+} from '../types/contracts.js';
 import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
-import { highReasoningProfile } from '../codex/modelProfiles.js';
+import { highReasoningProfile, lightweightProfile, profileForAgentRole } from '../codex/modelProfiles.js';
 import { submitPrReview } from '../github/submitPrReview.js';
 import type { ReviewEvent, SubmitPrReviewResult } from '../github/submitPrReview.js';
 import {
@@ -16,12 +23,20 @@ import {
   fetchPrHeadSha,
   fetchPrMetadata,
   formatSlackReviewSummary,
+  normalizePrReviewAgentOutput,
   splitAgenticOutputByRole,
+  PR_REVIEW_ROLES,
   NO_NEW_CHANGES_TEXT,
 } from '../github/prReviewSupport.js';
-import type { PrMetadata, PrDiffResult } from '../github/prReviewSupport.js';
+import type {
+  NormalizedPrReviewAgentOutput,
+  PrMetadata,
+  PrDiffResult,
+  PrReviewRole,
+} from '../github/prReviewSupport.js';
 import { isAnchorInDiff, parseDiffHunks } from '../github/diffHunks.js';
 import { resolveWorkspace } from '../workspaces/workspaceManager.js';
+import { withAgentCallContext } from '../state/runContext.js';
 
 /**
  * Per-PR review outcome. A job reviewing N PRs carries N of these in
@@ -132,6 +147,606 @@ PR Diff:
 \`\`\`diff
 ${diff}
 \`\`\``.trim();
+}
+
+// ---------------------------------------------------------------------------
+// Multi-agent fan-out review ("ultracode" pattern): three parallel lens
+// specialists (reviewer / security / performance), an adversarial skeptic that
+// re-reads the code to refute blocking-severity findings, and a synthesis pass
+// that dedups across lenses. Emits the SAME NormalizedPrReviewAgentOutput[] the
+// legacy single-agent path produced, so the submit + summary code is unchanged.
+// ---------------------------------------------------------------------------
+
+type ReviewPromptParams = {
+  recallBlock: string;
+  prContext: PrContext;
+  prMeta: PrMetadata;
+  policyBlock: string;
+  threadContext: string;
+  diff: string;
+};
+
+const SEVERITY_RANK: Record<AgentFinding['severity'], number> = {
+  critical: 4,
+  high: 3,
+  medium: 2,
+  low: 1,
+  info: 0,
+};
+
+/** On a cross-lens collision the higher-severity finding wins; ties break by
+ * lens — security framing is the most actionable, performance the least. */
+const LENS_PRIORITY: Record<PrReviewRole, number> = { security: 2, reviewer: 1, performance: 0 };
+
+const LENS_DIRECTIVE: Record<PrReviewRole, string> = {
+  reviewer: 'logic errors, bugs, edge cases, missing error handling, test coverage, regressions, readability, naming',
+  security:
+    'SQL/command injection, XSS, broken authn/authz, secrets or PII exposure, insecure deserialization, CSRF/SSRF, path traversal, unsafe eval, missing input validation — changed code only',
+  performance:
+    'N+1 queries, unbounded loops/recursion, memory leaks, unnecessary re-renders, heavy imports, missing indexes or pagination, sync blocking in async paths — changed code only',
+};
+
+/** Only blocking-severity findings (these drive the ⚠️ Slack warning and the
+ * REQUEST_CHANGES signal) go through adversarial verification. */
+const VERIFY_FLOOR_RANK = SEVERITY_RANK.high;
+/** Hard cap on verifier CLI runs per PR so a finding-heavy PR can't spawn dozens
+ * of subprocesses. Budgeted by run cost (a critical spends 3 — best-of-3 vote —
+ * and a high spends 1), so the true subprocess ceiling stays at this number
+ * regardless of severity mix. Findings beyond the budget pass through unverified. */
+const MAX_VERIFICATIONS = 20;
+/** Verifier runs in flight at a time. A critical's best-of-3 votes run together,
+ * so a batch of criticals can briefly exceed this — acceptable, criticals are rare. */
+const VERIFY_CONCURRENCY = 3;
+
+/** Verifier CLI runs a finding spends: critical → best-of-3, everything else → single. */
+function verificationCost(finding: AgentFinding): number {
+  return finding.severity === 'critical' ? 3 : 1;
+}
+
+const VERIFIER_PROMPT_MARKER = 'skeptical PR-review verifier';
+
+function severityRank(severity: AgentFinding['severity']): number {
+  return SEVERITY_RANK[severity];
+}
+
+/**
+ * Single-lens prompt. Reuses the preamble / policy / thread / tool-guidance and
+ * the severity rubric verbatim from buildAgenticPrReviewPrompt, but instructs
+ * the agent to review through ONE lens only — so security gets its own
+ * high-reasoning run instead of sharing one prompt's budget with two other
+ * lenses. The pinned "MUST NOT post" invariant is preserved in every lens.
+ */
+export function buildLensPrompt(params: {
+  lens: PrReviewRole;
+  recallBlock: string;
+  prContext: PrContext;
+  prMeta: PrMetadata;
+  policyBlock: string;
+  threadContext: string;
+  diff: string;
+  /** When true, omit tool-use instructions (no local clone / degraded retry). */
+  oneShot?: boolean;
+}): string {
+  const { lens, recallBlock, prContext, prMeta, policyBlock, threadContext, diff, oneShot } = params;
+
+  const toolGuidance = oneShot
+    ? 'Analyze the diff below directly. Do not explore the repository — produce your findings from the diff alone.'
+    : `You are running inside a git worktree of ${prContext.repo} with PR #${prContext.number} checked out.
+The full unified diff is included below, and the entire repository is available — use your native
+Read/Grep/Glob tools to open surrounding code, callers, and tests to VERIFY each suspicion before
+reporting it. Do not report a finding you could have disproven by reading the file.`;
+
+  return `${recallBlock}You are miniOG's PR ${lens} specialist.
+
+PR: ${prContext.url}
+${prMeta.title ? `Title: ${prMeta.title}` : ''}
+${prMeta.body ? `Description: ${prMeta.body}` : ''}
+
+Policy:
+${policyBlock}
+
+Thread context:
+${threadContext}
+
+${toolGuidance}
+
+Review ONLY through the "${lens}" lens: ${LENS_DIRECTIVE[lens]}.
+Do not report findings that belong to other lenses — another specialist covers them. Set "role": "${lens}" on every finding.
+
+Rules:
+- Findings MUST anchor to the diff: exact file path plus the "+"-side (new file) line number.
+  Real observations that cannot be mapped to an exact diff location go in "summaryNotes" — never invent a location.
+- Severity — calibrate against this rubric (web/api review); only report issues actually present in the diff, never pre-existing code:
+  - critical: exploitable or data-destroying in production — auth bypass, SQL/command injection, secret/PII leak, an unguarded destructive query (e.g. user input concatenated into a raw SQL string).
+  - high: a likely runtime break or security/perf regression on a real path — unhandled rejection on the happy path, missing authz on a new mutating endpoint, an N+1 added inside a request handler.
+  - medium: a real bug behind a narrower condition or a meaningful gap — edge case mishandled, missing validation on a non-critical field, absent error handling, missing test for new branching logic.
+  - low: localized correctness/maintainability nits with little blast radius — a narrow off-by-one in a bounded loop, minor readability/naming, a redundant re-render.
+  - info: non-actionable observations or style notes that don't require a change.
+- You must NOT post anything to GitHub or Slack. Do not run \`gh\`, \`git push\`, \`curl\`, or any network command — submission is handled for you.
+- Your final message must be ONLY this JSON object (no prose, no code fences):
+
+{
+  "findings": [{ "role": "${lens}", "severity": "critical"|"high"|"medium"|"low"|"info", "category": string, "message": string, "file"?: string, "line"?: number, "suggestion"?: string }],
+  // file + line are OPTIONAL: omit them for summary-level findings instead of inventing a location (those become summaryNotes).
+  "summaryNotes": string[],
+  "summary": string
+}
+
+PR Diff:
+\`\`\`diff
+${diff}
+\`\`\``.trim();
+}
+
+/** Adversarial skeptic prompt for one finding — default to refuting. */
+function buildVerifierPrompt(params: {
+  finding: AgentFinding & { lens: PrReviewRole };
+  diff: string;
+  oneShot: boolean;
+}): string {
+  const { finding, diff, oneShot } = params;
+  const evidence = oneShot
+    ? 'You have ONLY the diff below, not the repository. Refute the finding if the diff alone does not substantiate it.'
+    : `Open ${finding.file ?? 'the referenced file'}${
+        typeof finding.line === 'number' ? ` around line ${finding.line}` : ''
+      } with your Read/Grep tools and read the REAL code plus its callers and guards — not the diff summary, not the claim's wording.`;
+
+  return `You are a ${VERIFIER_PROMPT_MARKER}. Another agent (the "${finding.lens}" lens) made the claim below about a PR. Your job is to REFUTE it. Default to REFUTED unless you can positively confirm the issue from the actual code.
+
+Finding under scrutiny:
+- lens: ${finding.lens}
+- severity: ${finding.severity}
+- category: ${finding.category}
+- message: ${finding.message}
+${finding.file ? `- file: ${finding.file}\n` : ''}${typeof finding.line === 'number' ? `- line: ${finding.line}\n` : ''}${finding.suggestion ? `- suggestion: ${finding.suggestion}\n` : ''}
+${evidence}
+
+Confirm ALL of the following, or REFUTE:
+1. The issue is real in the actual code (not a misreading of the diff).
+2. It lives in code THIS PR changed (anchored in the diff below).
+3. The stated severity is justified by the rubric — if it is overstated, return verdict "confirmed" with a corrected, lower "severity".
+
+You must NOT post anything to GitHub or Slack. Do not run \`gh\`, \`git push\`, \`curl\`, or any network command.
+
+Your final message must be ONLY this JSON object (no prose, no code fences):
+{ "verdict": "confirmed" | "refuted", "severity"?: "critical"|"high"|"medium"|"low"|"info", "reason"?: string }
+
+PR Diff:
+\`\`\`diff
+${diff}
+\`\`\``.trim();
+}
+
+/**
+ * Run one lens specialist with a per-lens degradation ladder: tier-1 at the
+ * role's profile + tools, tier-2 at medium reasoning + tools. A lens that fails
+ * both tiers simply contributes nothing — the other lenses still post (graceful
+ * degradation, the improvement over the legacy all-or-nothing single agent).
+ */
+async function runReviewLens(params: {
+  lens: PrReviewRole;
+  deps: PrReviewDeps;
+  cwd: string;
+  promptParams: ReviewPromptParams;
+  schemaPath: string;
+  githubToken?: string;
+  timeoutMs?: number;
+  forceDiffOnly: boolean;
+  logStep?: WorkflowStepLogger;
+  signal?: AbortSignal;
+}): Promise<{ lens: PrReviewRole; result?: CodexRunResult; ok: boolean }> {
+  const { lens, deps, cwd, promptParams, schemaPath, githubToken, timeoutMs, forceDiffOnly, logStep, signal } = params;
+  const prUrl = promptParams.prContext.url;
+  const profile = profileForAgentRole(lens, getActiveBackendId());
+  const prompt = buildLensPrompt({ lens, ...promptParams, oneShot: forceDiffOnly });
+
+  const run = (reasoningEffort?: CodexReasoningEffort) =>
+    withAgentCallContext({ role: lens }, () =>
+      deps.runAgent({
+        cwd,
+        prompt,
+        outputSchemaPath: schemaPath,
+        githubToken,
+        ...profile,
+        ...(reasoningEffort ? { reasoningEffort } : {}),
+        timeoutMs,
+        onLog: logStep,
+        signal,
+      }),
+    );
+
+  let result: CodexRunResult | undefined;
+  try {
+    result = await run();
+  } catch (error) {
+    result = undefined;
+    logStep?.({
+      stage: `agentic.pr_review.lens.${lens}.threw`,
+      level: 'WARN',
+      message: `Lens ${lens} threw: ${String(error)}`,
+      data: { prUrl },
+    });
+  }
+
+  if (signal?.aborted) return { lens, ok: false };
+
+  if (!result?.ok || !result.parsedJson) {
+    logStep?.({
+      stage: `agentic.pr_review.lens.${lens}.fallback_medium`,
+      level: 'WARN',
+      message: `Lens ${lens} tier-1 failed — retrying at medium reasoning (tools still available).`,
+      data: { prUrl, exitCode: result?.exitCode ?? null },
+    });
+    try {
+      result = await run('medium');
+    } catch (error) {
+      result = undefined;
+      logStep?.({
+        stage: `agentic.pr_review.lens.${lens}.threw`,
+        level: 'WARN',
+        message: `Lens ${lens} medium retry threw: ${String(error)}`,
+        data: { prUrl },
+      });
+    }
+  }
+
+  const ok = Boolean(result?.ok && result.parsedJson);
+  logStep?.({
+    stage: `agentic.pr_review.lens.${lens}.done`,
+    level: ok ? 'INFO' : 'WARN',
+    message: `Lens ${lens} ${ok ? 'produced output' : 'failed after medium retry'}.`,
+    data: { prUrl, ok },
+  });
+  return { lens, result: ok ? result : undefined, ok };
+}
+
+/** One verifier run. FAILS OPEN — a crashed/timed-out skeptic keeps the finding
+ * (verdict 'confirmed', inconclusive true); only an explicit refute drops it. */
+async function runVerifier(params: {
+  deps: PrReviewDeps;
+  cwd: string;
+  finding: AgentFinding & { lens: PrReviewRole };
+  diff: string;
+  oneShot: boolean;
+  githubToken?: string;
+  timeoutMs?: number;
+  verifierSchemaPath: string;
+  logStep?: WorkflowStepLogger;
+  signal?: AbortSignal;
+}): Promise<{ verdict: 'confirmed' | 'refuted'; severityOverride?: AgentFinding['severity']; inconclusive: boolean }> {
+  const { deps, cwd, finding, diff, oneShot, githubToken, timeoutMs, verifierSchemaPath, logStep, signal } = params;
+  const profile = lightweightProfile(getActiveBackendId());
+
+  let result: CodexRunResult | undefined;
+  try {
+    result = await withAgentCallContext({ role: 'verifier' }, () =>
+      deps.runAgent({
+        cwd,
+        prompt: buildVerifierPrompt({ finding, diff, oneShot }),
+        outputSchemaPath: verifierSchemaPath,
+        githubToken,
+        ...profile,
+        timeoutMs,
+        onLog: logStep,
+        signal,
+      }),
+    );
+  } catch (error) {
+    logStep?.({
+      stage: 'agentic.pr_review.verify.inconclusive',
+      level: 'WARN',
+      message: `Verifier threw — keeping finding (fail-open): ${String(error)}`,
+      data: {},
+    });
+    return { verdict: 'confirmed', inconclusive: true };
+  }
+
+  if (!result?.ok || !result.parsedJson) {
+    logStep?.({
+      stage: 'agentic.pr_review.verify.inconclusive',
+      level: 'WARN',
+      message: 'Verifier produced no parseable verdict — keeping finding (fail-open).',
+      data: {},
+    });
+    return { verdict: 'confirmed', inconclusive: true };
+  }
+
+  const verdict = result.parsedJson.verdict === 'refuted' ? 'refuted' : 'confirmed';
+  // Only honor a DOWNGRADE (the prompt asks the verifier to lower an overstated
+  // severity). Ignore an escalation — it would otherwise promote a single-vote
+  // 'high' to 'critical' behind the best-of-3 gate that real criticals get.
+  const rawSeverity = result.parsedJson.severity;
+  const severityOverride =
+    typeof rawSeverity === 'string' &&
+    rawSeverity in SEVERITY_RANK &&
+    SEVERITY_RANK[rawSeverity as AgentFinding['severity']] < SEVERITY_RANK[finding.severity]
+      ? (rawSeverity as AgentFinding['severity'])
+      : undefined;
+  return { verdict, severityOverride, inconclusive: false };
+}
+
+/** Verify one finding. high → single vote; critical → best-of-3 majority
+ * (dropped on ≥2 refutes), since a false critical is the most costly. */
+async function verifyOneFinding(params: {
+  deps: PrReviewDeps;
+  cwd: string;
+  finding: AgentFinding & { lens: PrReviewRole };
+  diff: string;
+  oneShot: boolean;
+  githubToken?: string;
+  timeoutMs?: number;
+  verifierSchemaPath: string;
+  logStep?: WorkflowStepLogger;
+  signal?: AbortSignal;
+}): Promise<{ verdict: 'confirmed' | 'refuted'; severityOverride?: AgentFinding['severity']; inconclusive: boolean }> {
+  if (params.finding.severity !== 'critical') {
+    return runVerifier(params);
+  }
+  const votes = await Promise.all([0, 1, 2].map(() => runVerifier(params)));
+  const refutes = votes.filter(v => v.verdict === 'refuted').length;
+  const inconclusive = votes.some(v => v.inconclusive);
+  if (refutes >= 2) {
+    return { verdict: 'refuted', inconclusive };
+  }
+  const severityOverride = votes.find(v => v.verdict === 'confirmed' && v.severityOverride)?.severityOverride;
+  return { verdict: 'confirmed', severityOverride, inconclusive };
+}
+
+/**
+ * Adversarial verify phase. Bounded: only the candidates passed in (blocking
+ * severity), capped at MAX_VERIFICATIONS, VERIFY_CONCURRENCY at a time. Returns
+ * the survivors (refuted findings dropped, severity overrides applied). The
+ * capped overflow is kept unverified rather than silently dropped.
+ */
+async function verifyFindings(params: {
+  deps: PrReviewDeps;
+  cwd: string;
+  candidates: Array<AgentFinding & { lens: PrReviewRole }>;
+  diff: string;
+  oneShot: boolean;
+  githubToken?: string;
+  timeoutMs?: number;
+  verifierSchemaPath: string;
+  logStep?: WorkflowStepLogger;
+  signal?: AbortSignal;
+}): Promise<Array<AgentFinding & { lens: PrReviewRole }>> {
+  const { candidates, logStep, signal } = params;
+  // Fill the verifier-run budget greedily (criticals cost 3, others 1) so the
+  // total subprocess count never exceeds MAX_VERIFICATIONS for any severity mix.
+  const toVerify: Array<AgentFinding & { lens: PrReviewRole }> = [];
+  const overflow: Array<AgentFinding & { lens: PrReviewRole }> = [];
+  let budget = MAX_VERIFICATIONS;
+  for (const finding of candidates) {
+    const cost = verificationCost(finding);
+    if (cost <= budget) {
+      toVerify.push(finding);
+      budget -= cost;
+    } else {
+      overflow.push(finding);
+    }
+  }
+  const capped = overflow.length > 0;
+  if (capped) {
+    logStep?.({
+      stage: 'agentic.pr_review.verify.capped',
+      level: 'WARN',
+      message: `Verification budget (${MAX_VERIFICATIONS} runs) reached; ${overflow.length} of ${candidates.length} blocking finding(s) pass through unverified.`,
+      data: { cap: MAX_VERIFICATIONS, total: candidates.length, unverified: overflow.length },
+    });
+  }
+
+  const survivors: Array<AgentFinding & { lens: PrReviewRole }> = [...overflow];
+  let refuted = 0;
+  let inconclusive = 0;
+
+  for (let i = 0; i < toVerify.length; i += VERIFY_CONCURRENCY) {
+    if (signal?.aborted) {
+      // On abort keep the remaining unverified candidates (fail-open).
+      survivors.push(...toVerify.slice(i));
+      break;
+    }
+    const batch = toVerify.slice(i, i + VERIFY_CONCURRENCY);
+    const verdicts = await Promise.all(batch.map(finding => verifyOneFinding({ ...params, finding })));
+    batch.forEach((finding, idx) => {
+      const v = verdicts[idx];
+      if (v.inconclusive) inconclusive += 1;
+      if (v.verdict === 'refuted') {
+        refuted += 1;
+        return;
+      }
+      survivors.push(v.severityOverride ? { ...finding, severity: v.severityOverride } : finding);
+    });
+  }
+
+  const confirmed = toVerify.length - refuted;
+  logStep?.({
+    stage: 'agentic.pr_review.verify.done',
+    message: `Verify: ${survivors.length} kept (${confirmed} confirmed + ${overflow.length} unverified), ${refuted} refuted, ${inconclusive} inconclusive of ${toVerify.length} checked.`,
+    data: {
+      candidates: candidates.length,
+      checked: toVerify.length,
+      confirmed,
+      refuted,
+      inconclusive,
+      unverifiedKept: overflow.length,
+      kept: survivors.length,
+    },
+  });
+  return survivors;
+}
+
+/** Collapse cross-lens duplicates: same file:line:message (or, for
+ * summary-level findings, same message). The higher-severity finding wins;
+ * ties break by lens priority (security > reviewer > performance). */
+function dedupeFindings(
+  findings: Array<AgentFinding & { lens: PrReviewRole }>,
+): Array<AgentFinding & { lens: PrReviewRole }> {
+  const norm = (message: string) => message.toLowerCase().replace(/\s+/g, ' ').trim();
+  const keyOf = (f: AgentFinding & { lens: PrReviewRole }) =>
+    typeof f.line === 'number' && f.file ? `${f.file}:${f.line}:${norm(f.message)}` : `note:${norm(f.message)}`;
+
+  const byKey = new Map<string, AgentFinding & { lens: PrReviewRole }>();
+  for (const finding of findings) {
+    const key = keyOf(finding);
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, finding);
+      continue;
+    }
+    const better =
+      severityRank(finding.severity) > severityRank(existing.severity) ||
+      (severityRank(finding.severity) === severityRank(existing.severity) &&
+        LENS_PRIORITY[finding.lens] > LENS_PRIORITY[existing.lens]);
+    if (better) byKey.set(key, finding);
+  }
+  return [...byKey.values()];
+}
+
+/**
+ * The fan-out → verify → synthesize orchestrator. Returns the per-role outputs
+ * the downstream submit/summary code consumes, plus a representative
+ * CodexRunResult (for the existing agent_done durationMs log). Returns
+ * `undefined` only when ALL THREE lenses fail — the caller then runs the
+ * legacy diff-only one-shot so a review never goes silent (issue #334).
+ */
+async function runMultiAgentReview(params: {
+  deps: PrReviewDeps;
+  config: AppConfig;
+  cwd: string;
+  promptParams: ReviewPromptParams;
+  schemaPath: string;
+  verifierSchemaPath: string;
+  githubToken?: string;
+  hasLocalRepo: boolean;
+  logStep?: WorkflowStepLogger;
+  signal?: AbortSignal;
+}): Promise<{ outputs: NormalizedPrReviewAgentOutput[]; agentResult: CodexRunResult } | undefined> {
+  const {
+    deps,
+    config,
+    cwd,
+    promptParams,
+    schemaPath,
+    verifierSchemaPath,
+    githubToken,
+    hasLocalRepo,
+    logStep,
+    signal,
+  } = params;
+  const prUrl = promptParams.prContext.url;
+  const forceDiffOnly = !hasLocalRepo;
+  const timeoutMs = config.prReviewTimeoutMs;
+
+  if (signal?.aborted) return undefined;
+
+  // Phase 1: fan out the three lenses in parallel (reads only on the worktree).
+  logStep?.({
+    stage: 'agentic.pr_review.fanout.start',
+    message: 'Fanning out 3 review lenses (reviewer, security, performance).',
+    data: { prUrl, lenses: PR_REVIEW_ROLES },
+  });
+  const lensResults = await Promise.all(
+    PR_REVIEW_ROLES.map(lens =>
+      runReviewLens({
+        lens,
+        deps,
+        cwd,
+        promptParams,
+        schemaPath,
+        githubToken,
+        timeoutMs,
+        forceDiffOnly,
+        logStep,
+        signal,
+      }),
+    ),
+  );
+
+  const okLenses = lensResults.filter(r => r.ok && r.result);
+  const failedLenses = lensResults.filter(r => !r.ok).map(r => r.lens);
+  logStep?.({
+    stage: 'agentic.pr_review.fanout.done',
+    message: `Fan-out: ${okLenses.length}/${PR_REVIEW_ROLES.length} lenses ok.`,
+    data: { prUrl, okLenses: okLenses.map(r => r.lens), failedLenses },
+  });
+
+  if (okLenses.length === 0) {
+    logStep?.({
+      stage: 'agentic.pr_review.fallback.fanout_collapsed',
+      level: 'WARN',
+      message: 'All review lenses failed — falling back to a diff-only one-shot.',
+      data: { prUrl },
+    });
+    return undefined;
+  }
+  if (failedLenses.length > 0) {
+    logStep?.({
+      stage: 'agentic.pr_review.fanout.partial',
+      level: 'WARN',
+      message: `Partial fan-out: lens(es) [${failedLenses.join(', ')}] failed; continuing with the rest.`,
+      data: { prUrl, failedLenses },
+    });
+  }
+
+  if (signal?.aborted) return undefined;
+
+  // Phase 2: collect findings (tagged with their lens) + per-lens summary notes.
+  const collected: Array<AgentFinding & { lens: PrReviewRole }> = [];
+  const summaryNotesByLens: Partial<Record<PrReviewRole, string[]>> = {};
+  for (const { lens, result } of okLenses) {
+    const norm = normalizePrReviewAgentOutput(lens, result as CodexRunResult);
+    for (const finding of norm.findings) collected.push({ ...finding, lens });
+    if (norm.summaryNotes.length > 0) summaryNotesByLens[lens] = norm.summaryNotes;
+  }
+
+  const beforeDedupe = collected.length;
+  const deduped = dedupeFindings(collected);
+
+  // Phase 3: adversarially verify blocking-severity findings only.
+  const blocking = deduped.filter(f => severityRank(f.severity) >= VERIFY_FLOOR_RANK);
+  const nonBlocking = deduped.filter(f => severityRank(f.severity) < VERIFY_FLOOR_RANK);
+  let finalFindings = deduped;
+  if (blocking.length > 0) {
+    logStep?.({
+      stage: 'agentic.pr_review.verify.start',
+      message: `Verifying ${blocking.length} blocking finding(s).`,
+      data: { prUrl, candidates: blocking.length },
+    });
+    const survivors = await verifyFindings({
+      deps,
+      cwd,
+      candidates: blocking,
+      diff: promptParams.diff,
+      oneShot: forceDiffOnly,
+      githubToken,
+      timeoutMs,
+      verifierSchemaPath,
+      logStep,
+      signal,
+    });
+    finalFindings = [...nonBlocking, ...survivors];
+  }
+
+  logStep?.({
+    stage: 'agentic.pr_review.synth.done',
+    message: `Synthesized ${finalFindings.length} finding(s) from ${beforeDedupe} (deduped to ${deduped.length}).`,
+    data: { prUrl, beforeDedupe, afterDedupe: deduped.length, final: finalFindings.length },
+  });
+
+  // Phase 4: re-bucket per role and normalize, so attachable/unattachable
+  // splitting stays identical to the legacy path.
+  const representative = okLenses[0].result as CodexRunResult;
+  const outputs = PR_REVIEW_ROLES.map(role =>
+    normalizePrReviewAgentOutput(role, {
+      ...representative,
+      parsedJson: {
+        findings: finalFindings.filter(f => f.lens === role),
+        summaryNotes: summaryNotesByLens[role] ?? [],
+      },
+    }),
+  );
+
+  return { outputs, agentResult: representative };
 }
 
 function failedOutcome(prContext: PrContext, error: string, prHeadSha?: string): PrReviewOutcome {
@@ -280,9 +895,15 @@ export async function reviewSinglePr(params: {
     await deps.checkoutPr(repoPath, prContext.number, logStep);
   }
 
-  // 5. Agentic run with the deterministic failure ladder.
+  // 5. Multi-agent fan-out review (the "ultracode" pattern). Three lens
+  //    specialists (reviewer/security/performance) run in parallel, blocking
+  //    findings are adversarially verified, and the survivors are synthesized
+  //    into the per-role outputs the submission + summary code already
+  //    consumes. If all three lenses fail, collapse to the legacy diff-only
+  //    one-shot so a review never goes silent (issue #334).
   const profile = highReasoningProfile(getActiveBackendId());
   const schemaPath = path.resolve(process.cwd(), 'schemas', 'agentic-pr-review-result.schema.json');
+  const verifierSchemaPath = path.resolve(process.cwd(), 'schemas', 'pr-review-verifier.schema.json');
   const promptParams = {
     recallBlock,
     prContext,
@@ -291,84 +912,31 @@ export async function reviewSinglePr(params: {
     threadContext,
     diff: diffResult.diff,
   };
-  // No local clone → the agent has no repo to explore, so start diff-only.
-  const forceDiffOnly = !hasLocalRepo;
-
+  let normalizedOutputs: NormalizedPrReviewAgentOutput[] | undefined;
   let agentResult: CodexRunResult | undefined;
-  try {
-    agentResult = await deps.runAgent({
-      cwd: repoPath,
-      prompt: buildAgenticPrReviewPrompt({ ...promptParams, oneShot: forceDiffOnly }),
-      outputSchemaPath: schemaPath,
-      githubToken,
-      ...profile,
-      timeoutMs: config.prReviewTimeoutMs,
-      onLog: logStep,
-      signal,
-    });
-  } catch (error) {
-    agentResult = undefined;
-    logStep?.({
-      stage: 'agentic.pr_review.pr.agent_threw',
-      message: `Agentic review run threw: ${String(error)}`,
-      level: 'WARN',
-      data: { prUrl: prContext.url },
-    });
-  }
+
+  const multi = await runMultiAgentReview({
+    deps,
+    config,
+    cwd: repoPath,
+    promptParams,
+    schemaPath,
+    verifierSchemaPath,
+    githubToken,
+    hasLocalRepo,
+    logStep,
+    signal,
+  });
 
   if (signal?.aborted) {
     return failedOutcome(prContext, 'Review aborted before completion.', prHeadSha);
   }
 
-  // Tier 2: medium-reasoning, tools still available. A transient tier-1 failure
-  // shouldn't immediately cost the review its file-context verification — only
-  // drop to the diff-only one-shot (tier 3) if medium+tools also fails.
-  if (!agentResult?.ok || !agentResult.parsedJson) {
-    logStep?.({
-      stage: 'agentic.pr_review.fallback.medium',
-      message: 'Tier-1 review failed — retrying at medium reasoning (tools still available).',
-      level: 'WARN',
-      data: { prUrl: prContext.url, ok: agentResult?.ok ?? false, exitCode: agentResult?.exitCode ?? null },
-    });
-    try {
-      agentResult = await deps.runAgent({
-        cwd: repoPath,
-        prompt: buildAgenticPrReviewPrompt({ ...promptParams, oneShot: forceDiffOnly }),
-        outputSchemaPath: schemaPath,
-        githubToken,
-        ...profile,
-        reasoningEffort: 'medium',
-        timeoutMs: config.prReviewTimeoutMs,
-        onLog: logStep,
-        signal,
-      });
-    } catch (error) {
-      agentResult = undefined;
-      logStep?.({
-        stage: 'agentic.pr_review.pr.agent_threw',
-        message: `Tier-2 (medium) retry threw: ${String(error)}`,
-        level: 'WARN',
-        data: { prUrl: prContext.url },
-      });
-    }
-  }
-
-  if (signal?.aborted) {
-    return failedOutcome(prContext, 'Review aborted before completion.', prHeadSha);
-  }
-
-  if (!agentResult?.ok || !agentResult.parsedJson) {
-    logStep?.({
-      stage: 'agentic.pr_review.fallback.one_shot',
-      message: 'Agentic run failed — retrying as a degraded diff-only one-shot.',
-      level: 'WARN',
-      data: {
-        prUrl: prContext.url,
-        ok: agentResult?.ok ?? false,
-        exitCode: agentResult?.exitCode ?? null,
-        parsedJson: Boolean(agentResult?.parsedJson),
-      },
-    });
+  if (multi) {
+    normalizedOutputs = multi.outputs;
+    agentResult = multi.agentResult;
+  } else {
+    // Collapse fallback: every lens failed → one degraded diff-only one-shot.
     try {
       agentResult = await deps.runAgent({
         cwd: repoPath,
@@ -389,26 +957,34 @@ export async function reviewSinglePr(params: {
         data: { prUrl: prContext.url },
       });
     }
-  }
-
-  if (!agentResult?.ok || !agentResult.parsedJson) {
-    const failureMessage =
-      `Review of ${prContext.url} failed (agent error${agentResult?.exitCode != null ? `, exit ${agentResult.exitCode}` : ''}, retried once). ` +
-      'Re-trigger with another mention to retry.';
     logStep?.({
-      stage: 'agentic.pr_review.pr.failed',
-      message: `Review failed after one-shot retry for ${prContext.repo}#${prContext.number}.`,
-      level: 'ERROR',
-      data: { prUrl: prContext.url, exitCode: agentResult?.exitCode ?? null },
+      stage: 'agentic.pr_review.fallback.one_shot',
+      message: 'Fan-out collapsed (all lenses failed) — ran a degraded diff-only one-shot.',
+      level: 'WARN',
+      data: { prUrl: prContext.url, ok: agentResult?.ok ?? false, exitCode: agentResult?.exitCode ?? null },
     });
-    await postToThread(failureMessage);
-    return failedOutcome(prContext, failureMessage, prHeadSha);
-  }
 
-  // 6. Normalize role-tagged findings into the per-role shape the submission
-  //    and summary formatters expect. All severity validation and
-  //    attachable/unattachable splitting is unchanged from the legacy path.
-  const normalizedOutputs = splitAgenticOutputByRole(agentResult);
+    if (signal?.aborted) {
+      return failedOutcome(prContext, 'Review aborted before completion.', prHeadSha);
+    }
+
+    if (!agentResult?.ok || !agentResult.parsedJson) {
+      const failureMessage =
+        `Review of ${prContext.url} failed (agent error${agentResult?.exitCode != null ? `, exit ${agentResult.exitCode}` : ''}, retried once). ` +
+        'Re-trigger with another mention to retry.';
+      logStep?.({
+        stage: 'agentic.pr_review.pr.failed',
+        message: `Review failed after one-shot retry for ${prContext.repo}#${prContext.number}.`,
+        level: 'ERROR',
+        data: { prUrl: prContext.url, exitCode: agentResult?.exitCode ?? null },
+      });
+      await postToThread(failureMessage);
+      return failedOutcome(prContext, failureMessage, prHeadSha);
+    }
+
+    // Normalize the one-shot's role-tagged findings into the per-role shape.
+    normalizedOutputs = splitAgenticOutputByRole(agentResult);
+  }
 
   // Enforce "changed code only" for security/performance findings: the prompt
   // restricts them to changed code, but nothing validated that their anchor
