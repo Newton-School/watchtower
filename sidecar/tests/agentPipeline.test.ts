@@ -26,6 +26,7 @@ vi.mock('../src/workspaces/gitState.js', () => ({
   getDefaultBranch: vi.fn().mockResolvedValue('main'),
   hasCommitsAheadOfBase: vi.fn().mockResolvedValue(false),
   diffFilesVsBase: vi.fn().mockResolvedValue([]),
+  getDiffVsBase: vi.fn().mockResolvedValue({ diff: '--- a/a.ts\n+++ b/a.ts\n+changed', truncated: false }),
   currentBranch: vi.fn().mockResolvedValue('main'),
 }));
 
@@ -231,6 +232,96 @@ describe('agentPipeline', () => {
 
     expect(result.retryLoops).toBe(1);
     expect(result.finalStatus).toBe('passed');
+    expect(runCodex).toHaveBeenCalledTimes(5);
+  });
+
+  it('plan-mismatch (high, not critical) self-heals via coder re-run instead of aborting (#388)', async () => {
+    const ctx = makeContext({
+      pipelineConfig: makePipelineConfig({
+        agents: ['planner', 'coder', 'reviewer'],
+        maxRetryLoops: 1,
+        abortOnCriticalFinding: true,
+      }),
+    });
+
+    vi.mocked(runCodex)
+      // planner
+      .mockResolvedValueOnce({
+        ok: true,
+        exitCode: 0,
+        timedOut: false,
+        stdout: '',
+        stderr: '',
+        lastMessage: '',
+        parsedJson: {
+          plan: ['remove the experiment'],
+          risks: [],
+          affectedFiles: [],
+          scope: 'medium',
+          requiresCodeChanges: true,
+        },
+      })
+      // coder (implements the WRONG thing)
+      .mockResolvedValueOnce({
+        ok: true,
+        exitCode: 0,
+        timedOut: false,
+        stdout: '',
+        stderr: '',
+        lastMessage: '',
+        parsedJson: { filesChanged: ['a.ts'], summary: 'Changed the ratio', testsAdded: [], branch: 'codex/fix' },
+      })
+      // reviewer flags plan-mismatch (high, NOT critical) and rejects
+      .mockResolvedValueOnce({
+        ok: true,
+        exitCode: 0,
+        timedOut: false,
+        stdout: '',
+        stderr: '',
+        lastMessage: '',
+        parsedJson: {
+          approved: false,
+          findings: [
+            {
+              severity: 'high',
+              category: 'plan-mismatch',
+              message: 'Plan asked to remove the experiment; diff only changed the ratio',
+            },
+          ],
+          blockers: ['Does not match the approved plan'],
+        },
+      })
+      // coder retry (corrects)
+      .mockResolvedValueOnce({
+        ok: true,
+        exitCode: 0,
+        timedOut: false,
+        stdout: '',
+        stderr: '',
+        lastMessage: '',
+        parsedJson: {
+          filesChanged: ['a.ts'],
+          summary: 'Removed the experiment per plan',
+          testsAdded: [],
+          branch: 'codex/fix',
+        },
+      })
+      // reviewer retry (approves)
+      .mockResolvedValueOnce({
+        ok: true,
+        exitCode: 0,
+        timedOut: false,
+        stdout: '',
+        stderr: '',
+        lastMessage: '',
+        parsedJson: { approved: true, findings: [], blockers: [] },
+      });
+
+    const result = await runAgentPipeline({ ctx, slack: slack as any, logStep });
+
+    // 'high' plan-mismatch must NOT abort (critical would); it self-heals.
+    expect(result.finalStatus).toBe('passed');
+    expect(result.retryLoops).toBe(1);
     expect(runCodex).toHaveBeenCalledTimes(5);
   });
 

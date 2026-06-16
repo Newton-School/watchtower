@@ -11,7 +11,7 @@ import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
 import { normalizePlannerOutput, type NormalizedPlannerOutput } from './normalizePlannerOutput.js';
 import { withAgentCallContext } from '../state/runContext.js';
 import { fetchThreadContext } from '../slack/threadContext.js';
-import { currentHead, checkCoderProducedChanges } from '../workspaces/gitState.js';
+import { currentHead, checkCoderProducedChanges, getDiffVsBase } from '../workspaces/gitState.js';
 
 export type PipelineStore = {
   createPipelineRun(input: {
@@ -815,6 +815,11 @@ export async function runAgentPipeline(params: {
   // the worktree afterwards so a hallucinated coder JSON can't pass the guard.
   let coderBaseSha: string | undefined;
 
+  // The coder's actual diff (vs coderBaseSha), captured after each coder run and
+  // fed to the reviewer/verifier so they assess the real changes against the
+  // approved plan rather than the coder's self-reported summary (#388).
+  let coderDiff: { diff: string; truncated: boolean } | undefined;
+
   for (let i = 0; i < agents.length; i++) {
     if (totalTimeoutMs) {
       const elapsed = Date.now() - pipelineStart;
@@ -847,6 +852,7 @@ export async function runAgentPipeline(params: {
     const prompt = buildPromptForRole(role, {
       ...ctx,
       previousSteps: steps,
+      coderDiff,
     });
 
     const backendId = getActiveBackendId();
@@ -949,6 +955,8 @@ export async function runAgentPipeline(params: {
           );
         } else {
           output.filesChanged = changes.filesChanged;
+          // Capture the real diff for the downstream reviewer/verifier (#388).
+          coderDiff = await getDiffVsBase(ctx.repoPath, coderBaseSha);
         }
       } catch (err) {
         logStep({
@@ -1174,6 +1182,8 @@ export async function runAgentPipeline(params: {
               );
             } else {
               coderOutput.filesChanged = changes.filesChanged;
+              // Refresh the diff so the re-running reviewer sees the corrected changes (#388).
+              coderDiff = await getDiffVsBase(ctx.repoPath, coderBaseSha);
             }
           } catch (err) {
             logStep({

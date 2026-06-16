@@ -8,6 +8,7 @@ import {
   checkCoderProducedChanges,
   currentHead,
   diffFilesVsBase,
+  getDiffVsBase,
   hasUncommittedChanges,
 } from '../src/workspaces/gitState.js';
 
@@ -89,6 +90,24 @@ describe('gitState', () => {
     expect(check.headMoved).toBe(true);
     expect(check.newCommits).toBe(1);
     expect(check.filesChanged).toContain('committed.ts');
+  });
+
+  it('getDiffVsBase returns the textual diff for committed and uncommitted changes', async () => {
+    const base = await currentHead(repo);
+    await writeFile(path.join(repo, 'seed.txt'), 'seed\nmore\n');
+    const { diff, truncated } = await getDiffVsBase(repo, base);
+    expect(truncated).toBe(false);
+    expect(diff).toContain('seed.txt');
+    expect(diff).toContain('+more');
+  });
+
+  it('getDiffVsBase truncates a large diff past maxBytes', async () => {
+    const base = await currentHead(repo);
+    // Modify a tracked file so the change shows in `git diff <base>`.
+    await writeFile(path.join(repo, 'seed.txt'), 'x\n'.repeat(5000));
+    const { diff, truncated } = await getDiffVsBase(repo, base, 200);
+    expect(truncated).toBe(true);
+    expect(diff.length).toBe(200);
   });
 
   it('checkCoderProducedChanges handles a mix of committed and uncommitted files', async () => {
