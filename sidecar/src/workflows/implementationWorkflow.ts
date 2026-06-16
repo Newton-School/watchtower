@@ -173,6 +173,27 @@ type ApprovalLoopOutcome =
   | { kind: 'paused'; resumeContext: ImplementationApprovalResume };
 
 /**
+ * Stamps the admin-approved plan (the values rendered in Slack) onto the planner
+ * output the downstream pipeline consumes.
+ *
+ * #388: the approval loop's feedback-revision path replaces plannerOutput with the
+ * raw codex JSON (`{ plan: string[], ... }`) which has no `planMarkdown`/`scope`/
+ * `affectedFiles` — the exact fields the coder, reviewer, and verifier read. Without
+ * re-stamping, a revised plan is silently dropped and the coder falls back to the
+ * original request. The initial-plan path already surfaces these fields; this keeps
+ * both paths consistent at the single point where the planner step is built.
+ */
+export function stampApprovedPlan(
+  plannerOutput: Record<string, unknown>,
+  approved: { planMarkdown: string; scope: string; affectedFiles: string[] },
+): Record<string, unknown> {
+  plannerOutput.planMarkdown = approved.planMarkdown;
+  plannerOutput.scope = approved.scope;
+  plannerOutput.affectedFiles = approved.affectedFiles;
+  return plannerOutput;
+}
+
+/**
  * Runs the iterative plan-approval loop. Used by both the fresh-start path and
  * the pause-resume path. On any "wait" message in the thread, returns kind:'paused'
  * with a serializable resume context the dispatcher persists into result_json.
@@ -1293,6 +1314,22 @@ Write your response as a ready-to-post Slack message describing what you did.
     planAffectedFiles = loopOutcome.planAffectedFiles;
     planScope = loopOutcome.planScope;
     plannerOutput = loopOutcome.plannerOutput;
+    // #388: re-stamp the admin-approved plan onto plannerOutput so the planner step
+    // the pipeline consumes matches what was approved \u2014 covers both the initial plan
+    // and any feedback-revised plan (whose raw codex shape lacks these fields).
+    stampApprovedPlan(plannerOutput, {
+      planMarkdown,
+      scope: planScope,
+      affectedFiles: planAffectedFiles,
+    });
+    if (!planMarkdown || planMarkdown.trim().length === 0) {
+      logStep?.({
+        stage: 'implementation.plan.empty',
+        message: 'Approved plan has empty planMarkdown \u2014 coder will lack a concrete plan.',
+        level: 'WARN',
+        data: { feedbackRounds: loopOutcome.feedbackRounds },
+      });
+    }
     plannerSessionId = loopOutcome.plannerSessionId;
     planMessageTs = loopOutcome.planMessageTs;
     feedbackRounds = loopOutcome.feedbackRounds;
