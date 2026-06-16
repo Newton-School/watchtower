@@ -52,6 +52,26 @@ export async function diffFilesVsBase(cwd: string, baseSha: string): Promise<str
   }
 }
 
+/**
+ * Full textual diff from `baseSha` to the current working tree (committed +
+ * uncommitted), capped at `maxBytes` so a large change can't blow the agent
+ * prompt budget. Used to feed the reviewer/verifier the ACTUAL changes instead
+ * of relying on the coder's self-reported summary (#388).
+ */
+export async function getDiffVsBase(
+  cwd: string,
+  baseSha: string,
+  maxBytes = 60_000,
+): Promise<{ diff: string; truncated: boolean }> {
+  try {
+    const out = await git(cwd, ['diff', baseSha]);
+    if (out.length <= maxBytes) return { diff: out, truncated: false };
+    return { diff: out.slice(0, maxBytes), truncated: true };
+  } catch {
+    return { diff: '', truncated: false };
+  }
+}
+
 export type CoderChangesCheck = {
   producedChanges: boolean;
   filesChanged: string[];

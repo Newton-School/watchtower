@@ -33,6 +33,12 @@ export interface AgentContext {
   policyPack?: { packName: string; rules: string[] };
   imagePaths?: string[];
   requestedBy?: string;
+  /**
+   * The coder's actual changes (git diff vs the pre-coder base), captured by the
+   * pipeline after the coder runs. Fed to the reviewer/verifier so they assess
+   * the real diff against the approved plan rather than the coder's self-report (#388).
+   */
+  coderDiff?: { diff: string; truncated: boolean };
 }
 
 export interface PipelineConfig {

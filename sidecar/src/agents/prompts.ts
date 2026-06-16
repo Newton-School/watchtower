@@ -17,6 +17,36 @@ function policyBlock(ctx: AgentContext): string {
   return [`Active policy pack: ${ctx.policyPack.packName}`, ...ctx.policyPack.rules.map(r => `- ${r}`)].join('\n');
 }
 
+/** The approved plan the coder/reviewer/verifier all read off the planner step. */
+function planFromSteps(ctx: AgentContext): { planMarkdown: string; scope: string; affectedFiles: string[] } {
+  const plannerStep = ctx.previousSteps.find(s => s.role === 'planner');
+  const plannerOutput = (plannerStep?.output ?? {}) as Record<string, unknown>;
+  const planMarkdown = typeof plannerOutput.planMarkdown === 'string' ? plannerOutput.planMarkdown : '';
+  const scope = typeof plannerOutput.scope === 'string' ? plannerOutput.scope : 'medium';
+  const affectedFiles = Array.isArray(plannerOutput.affectedFiles)
+    ? (plannerOutput.affectedFiles as unknown[]).filter((f): f is string => typeof f === 'string')
+    : [];
+  return { planMarkdown, scope, affectedFiles };
+}
+
+/**
+ * Renders the coder's ACTUAL diff for the reviewer/verifier (#388). They run in the
+ * coder's worktree, so when the diff isn't pre-captured they can still fall back to
+ * `git diff`. Compares-against-reality beats trusting the coder's self-report.
+ */
+function coderDiffSection(ctx: AgentContext): string {
+  if (!ctx.coderDiff || ctx.coderDiff.diff.trim().length === 0) {
+    return 'Actual code changes (git diff): not captured — run `git diff` in the worktree to inspect the real changes before judging.';
+  }
+  const truncNote = ctx.coderDiff.truncated
+    ? '\n…(diff truncated — run `git diff` in the worktree for the full change)'
+    : '';
+  return `Actual code changes (git diff vs base — review THIS, not the coder's summary):
+\`\`\`diff
+${ctx.coderDiff.diff}
+\`\`\`${truncNote}`;
+}
+
 export function buildPlannerPrompt(ctx: AgentContext): string {
   return `
 You are the PLANNER agent in a multi-agent pipeline.
@@ -83,15 +113,8 @@ Use the read tools (grep, file reads) to ground every claim — do not guess at 
 }
 
 export function buildCoderPrompt(ctx: AgentContext): string {
-  const plannerStep = ctx.previousSteps.find(s => s.role === 'planner');
   const reviewerFeedback = ctx.previousSteps.filter(s => s.role === 'reviewer');
-
-  const plannerOutput = (plannerStep?.output ?? {}) as Record<string, unknown>;
-  const planMarkdown = typeof plannerOutput.planMarkdown === 'string' ? plannerOutput.planMarkdown : '';
-  const scope = typeof plannerOutput.scope === 'string' ? plannerOutput.scope : 'medium';
-  const affectedFiles = Array.isArray(plannerOutput.affectedFiles)
-    ? (plannerOutput.affectedFiles as unknown[]).filter((f): f is string => typeof f === 'string')
-    : [];
+  const { planMarkdown, scope, affectedFiles } = planFromSteps(ctx);
 
   return `
 You are the CODER agent in a multi-agent pipeline.
@@ -144,29 +167,40 @@ Return strict JSON:
 }
 
 export function buildReviewerPrompt(ctx: AgentContext): string {
-  const plannerOutput = ctx.previousSteps.find(s => s.role === 'planner');
+  const { planMarkdown, scope, affectedFiles } = planFromSteps(ctx);
   const coderOutput = ctx.previousSteps.find(s => s.role === 'coder');
 
   return `
 You are the REVIEWER agent in a multi-agent pipeline.
 
-Your role: Review the code changes for correctness, maintainability, and adherence to the plan.
+Your role: Review the code changes for correctness, maintainability, and — above all — conformance to the approved plan.
 
 Workflow: ${ctx.workflowIntent}
 Repository: ${ctx.repoPath}
 Policy: ${policyBlock(ctx)}
 
-Planner output:
-${plannerOutput ? JSON.stringify(plannerOutput.output, null, 2) : 'No planner output.'}
+Approved plan (the admin signed off on THIS — review against it):
+${planMarkdown || 'No plan markdown available.'}
+${affectedFiles.length > 0 ? `Planned files: ${affectedFiles.map(f => `\`${f}\``).join(', ')}` : ''}
+Plan scope: ${scope}
 
-Coder output:
+Coder's self-reported output (do NOT trust this over the diff):
 ${coderOutput ? JSON.stringify(coderOutput.output, null, 2) : 'No coder output.'}
 
-Previous agent results:
-${serializePreviousSteps(ctx)}
+${coderDiffSection(ctx)}
+
+PLAN CONFORMANCE (hard gate — check this FIRST):
+Compare the ACTUAL diff above against the approved plan's intent — not the coder's
+self-description. If the diff does NOT accomplish the approved plan — e.g. it makes a
+different or narrower change, implements the original request instead of the revised
+plan, touches the wrong files, or only partially implements it — you MUST:
+  • set "approved": false, and
+  • add a finding { "severity": "high", "category": "plan-mismatch", "message": "<what the plan asked vs what the diff actually does>" }.
+Do not approve work that diverges from the approved plan, even if the code is clean.
+(Use "high", not "critical", so the coder gets a chance to correct on the same branch.)
 
 Review checklist:
-- Does the implementation match the plan?
+- Does the diff actually implement the approved plan? (see PLAN CONFORMANCE above)
 - Are there logic errors, edge cases, or regressions?
 - Are tests adequate and meaningful?
 - Is the code clean, readable, and maintainable?
@@ -247,20 +281,29 @@ Return strict JSON:
 }
 
 export function buildVerifierPrompt(ctx: AgentContext): string {
+  const { planMarkdown, scope, affectedFiles } = planFromSteps(ctx);
+
   return `
 You are the VERIFIER agent in a multi-agent pipeline.
 
-Your role: Verify that all previous agent outputs are consistent, tests pass, and requirements are met.
+Your role: Verify that all previous agent outputs are consistent, tests pass, and the approved plan's requirements are actually met by the code.
 
 Workflow: ${ctx.workflowIntent}
 Repository: ${ctx.repoPath}
+
+Approved plan (verify the code fulfils THIS):
+${planMarkdown || 'No plan markdown available.'}
+${affectedFiles.length > 0 ? `Planned files: ${affectedFiles.map(f => `\`${f}\``).join(', ')}` : ''}
+Plan scope: ${scope}
+
+${coderDiffSection(ctx)}
 
 Previous agent results:
 ${serializePreviousSteps(ctx)}
 
 Verification checklist:
 1. Run the project's test suite and confirm tests pass
-2. Verify the planner's requirements are addressed in the coder's output
+2. PLAN CONFORMANCE: confirm the ACTUAL diff above fulfils the approved plan's intent — not just that some files changed. If the diff implements a different or narrower change than the approved plan, set "verified": false, "requirementsMet": false, and add a { "severity": "high", "category": "plan-mismatch", "message": "<plan vs diff>" } finding.
 3. Confirm reviewer and security findings were addressed (if any)
 4. Validate the PR is in a mergeable state
 5. Check that no regressions were introduced
