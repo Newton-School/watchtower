@@ -1,6 +1,6 @@
 import path from 'node:path';
 import type { WebClient } from '@slack/web-api';
-import type { AppConfig, NormalizedTask, WorkflowResult, WorkflowStepLogger } from '../types/contracts.js';
+import type { AppConfig, NormalizedTask, PrContext, WorkflowResult, WorkflowStepLogger } from '../types/contracts.js';
 import type { JobStore } from '../state/jobStore.js';
 import { runClaudeAgentic } from './runClaude.js';
 import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
@@ -8,7 +8,8 @@ import { refreshSharedRepoToDefaultBranch } from '../workspaces/workspaceManager
 import { getBackend } from '../backends/registry.js';
 import { extractQaTargetUrl } from '../router/intentParser.js';
 import { parseScreenshotManifest, uploadScreenshots } from '../slack/imageUploader.js';
-import { startPrDevServer } from '../devServer/devServerManager.js';
+import { preparePrWorktree, bootPrDevServer, runPrBuildGate } from '../devServer/devServerManager.js';
+import type { PrDevServer, PreparedPrWorktree, PrBuildGateResult } from '../devServer/devServerManager.js';
 
 export type AgenticMode = 'informational' | 'conversational' | 'qa';
 
@@ -198,6 +199,35 @@ export async function runAgenticEntry(params: RunAgenticEntryParams): Promise<Wo
   };
 }
 
+/** Render the install+build-gate verdict for a deps/runtime-only PR as Slack mrkdwn. */
+function formatBuildGateReport(pr: PrContext, changedPaths: string[], gate: PrBuildGateResult): string {
+  const changed = changedPaths.map(p => `\`${p}\``).join(', ');
+  const nodeLine = gate.usedNvmrc
+    ? `*Node* — ${gate.nodeVersion} (from the PR's \`.nvmrc\`)`
+    : `*Node* — ${gate.nodeVersion} (host default — nvm unavailable, so the PR's \`.nvmrc\` could not be applied)`;
+  const cmd = gate.buildScript ? `\`npm ci\` + \`npm run ${gate.buildScript}\`` : '`npm ci` (no build script found)';
+  if (gate.ok) {
+    return [
+      `*Build gate* — PR #${pr.number} (\`${pr.repo}\`): deps/runtime-only, no app code.`,
+      nodeLine,
+      `*Result* — :white_check_mark: ${cmd} succeeded on the PR's own lockfile + Node version.`,
+      `*Changed* — ${changed}`,
+      `_This is the right check for a runtime/deps PR — a dev-server browser QA would only have exercised the base clone's installed deps, not this PR._`,
+    ].join('\n');
+  }
+  return [
+    `*Build gate* — PR #${pr.number} (\`${pr.repo}\`): deps/runtime-only, no app code.`,
+    nodeLine,
+    `*Result* — :x: FAILED at the *${gate.failedStage}* stage — ${cmd}.`,
+    `*Changed* — ${changed}`,
+    '*Last output*',
+    '```',
+    gate.outputTail || '(no output captured)',
+    '```',
+    `_A real, PR-attributable failure: a clean install + build on the PR's lockfile and Node version — not the stale base-clone artifact a dev server would surface._`,
+  ].join('\n');
+}
+
 /**
  * Webapp-QA flow: drive a real browser against a user-supplied URL via the
  * Claude Code backend (forced — it shells out to Playwright and the deployed
@@ -281,6 +311,38 @@ async function runWebappQa(params: RunAgenticEntryParams): Promise<WorkflowResul
     };
   };
 
+  // Build gate for a deps/runtime-only PR: validate `npm ci` + build on the
+  // PR's OWN lockfile and Node version (what a dev server against base-clone
+  // deps cannot check), and report the verdict.
+  const runQaBuildGate = async (pr: PrContext, prepared: PreparedPrWorktree): Promise<WorkflowResult> => {
+    const changedList = prepared.changedPaths.map(p => `\`${p}\``).join(', ');
+    await postReply(
+      `:test_tube: PR #${pr.number} (\`${pr.repo}\`) changes only build/runtime/deps (${changedList}) — no app code, ` +
+        `so a dev server would only test the base clone's installed deps. Running the real gate instead — ` +
+        `\`npm ci\` + build on the PR's own Node version. This can take a few minutes.`,
+    );
+    const gate = await runPrBuildGate({ worktreePath: prepared.worktreePath, prNumber: pr.number, signal, logStep });
+    const report = formatBuildGateReport(pr, prepared.changedPaths, gate);
+    const slackPosted = await postReply(report);
+    return {
+      workflow: 'WEBAPP_QA',
+      status: 'SUCCESS',
+      message: report,
+      notifyDesktop: !gate.ok,
+      slackPosted,
+      result: {
+        prNumber: pr.number,
+        repo: pr.repo,
+        mode: 'build-gate',
+        buildOk: gate.ok,
+        nodeVersion: gate.nodeVersion,
+        usedNvmrc: gate.usedNvmrc,
+        buildScript: gate.buildScript,
+        failedStage: gate.failedStage ?? null,
+      },
+    };
+  };
+
   // Path 1 — a literal URL in the message: QA it directly.
   const literalUrl = extractQaTargetUrl(task.event.text);
   if (literalUrl) {
@@ -288,18 +350,21 @@ async function runWebappQa(params: RunAgenticEntryParams): Promise<WorkflowResul
     return runQaAgainstUrl(literalUrl, {});
   }
 
-  // Path 2 — a PR link ("test this PR <url>"): check out the PR head, boot a
-  // local dev server, QA the changed pages, then always tear it down.
+  // Path 2 — a PR link ("test this PR <url>"): check out the PR head into an
+  // isolated worktree, then either browser-QA a booted dev server (app-code
+  // PRs) or run an install+build gate (deps/runtime-only PRs — a dev server
+  // can't validate those: it runs against the base clone's symlinked
+  // node_modules under the harness Node). Always tear the worktree down.
   if (task.prContext) {
     const pr = task.prContext;
     await postReply(
-      `:test_tube: Checking out PR #${pr.number} (\`${pr.repo}\`) and booting a dev server to QA it — this can take several minutes.`,
+      `:test_tube: Checking out PR #${pr.number} (\`${pr.repo}\`) to QA it — this can take a few minutes.`,
     );
 
     const githubToken = await resolveGithubTokenForCodex();
-    let devServer: Awaited<ReturnType<typeof startPrDevServer>>;
+    let prepared: PreparedPrWorktree;
     try {
-      devServer = await startPrDevServer({
+      prepared = await preparePrWorktree({
         baseRepoPath: config.repoPaths.newtonWeb,
         prContext: pr,
         threadTs: task.event.threadTs,
@@ -310,21 +375,50 @@ async function runWebappQa(params: RunAgenticEntryParams): Promise<WorkflowResul
     } catch (err) {
       const text =
         err instanceof Error && err.message === 'aborted'
-          ? 'QA cancelled before the dev server was ready.'
+          ? 'QA cancelled before the PR was ready.'
           : `Couldn't set up PR #${pr.number} for QA: ${err instanceof Error ? err.message : String(err)}`;
       const slackPosted = await postReply(text);
       return { workflow: 'WEBAPP_QA', status: 'FAILED', message: text, notifyDesktop: true, slackPosted };
     }
 
     try {
-      await postReply(`Dev server up at \`${devServer.url}\` — testing the pages this PR touches…`);
-      return await runQaAgainstUrl(
-        devServer.url,
-        { prNumber: pr.number, repo: pr.repo, changedPaths: devServer.changedPaths.length },
-        { changedPaths: devServer.changedPaths, depsChanged: devServer.depsChanged },
-      );
+      // Deps/runtime-only PR (e.g. a Node-version bump) → a dev server can't
+      // validate it; run the real install+build gate on the PR's own Node.
+      if (prepared.classification.depsOrInfraOnly) {
+        return await runQaBuildGate(pr, prepared);
+      }
+
+      // App-code / mixed PR → boot a dev server and browser-QA it.
+      let devServer: PrDevServer;
+      try {
+        await postReply(`Booting a dev server for PR #${pr.number} to test the pages it touches…`);
+        devServer = await bootPrDevServer({
+          worktreePath: prepared.worktreePath,
+          prNumber: pr.number,
+          signal,
+          logStep,
+        });
+      } catch (err) {
+        const text =
+          err instanceof Error && err.message === 'aborted'
+            ? 'QA cancelled before the dev server was ready.'
+            : `Couldn't boot a dev server for PR #${pr.number}: ${err instanceof Error ? err.message : String(err)}`;
+        const slackPosted = await postReply(text);
+        return { workflow: 'WEBAPP_QA', status: 'FAILED', message: text, notifyDesktop: true, slackPosted };
+      }
+
+      try {
+        await postReply(`Dev server up at \`${devServer.url}\` — testing the pages this PR touches…`);
+        return await runQaAgainstUrl(
+          devServer.url,
+          { prNumber: pr.number, repo: pr.repo, changedPaths: prepared.changedPaths.length },
+          { changedPaths: prepared.changedPaths, depsChanged: prepared.classification.depsChanged },
+        );
+      } finally {
+        await devServer.stop();
+      }
     } finally {
-      await devServer.stop();
+      await prepared.cleanup();
     }
   }
 
