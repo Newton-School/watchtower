@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { extractQaTargetUrl, isWebappQaRequest, isWebappQaOnPrRequest } from '../src/router/intentParser.js';
 import { parseScreenshotManifest } from '../src/slack/imageUploader.js';
-import { changedPathsFromDiff, findFreePort } from '../src/devServer/devServerManager.js';
+import { changedPathsFromDiff, classifyChangedPaths, findFreePort } from '../src/devServer/devServerManager.js';
 
 const PR_URL = 'https://github.com/Newton-School/newton-web/pull/8399';
 
@@ -101,6 +101,55 @@ describe('changedPathsFromDiff', () => {
 
   it('returns an empty array for an empty diff', () => {
     expect(changedPathsFromDiff('')).toEqual([]);
+  });
+});
+
+describe('classifyChangedPaths', () => {
+  it('flags a Node-version bump PR (.nvmrc + Dockerfile + package.json) as deps/infra-only', () => {
+    const c = classifyChangedPaths(['.nvmrc', 'Dockerfile', 'package.json']);
+    expect(c).toEqual({ depsChanged: true, runtimeChanged: true, appCodeChanged: false, depsOrInfraOnly: true });
+  });
+
+  it('does NOT flag deps/infra-only when app code also changed', () => {
+    const c = classifyChangedPaths(['.nvmrc', 'src/app/page.tsx']);
+    expect(c.appCodeChanged).toBe(true);
+    expect(c.depsOrInfraOnly).toBe(false);
+  });
+
+  it('treats a lockfile-only PR as deps/infra-only', () => {
+    const c = classifyChangedPaths(['package-lock.json']);
+    expect(c.depsChanged).toBe(true);
+    expect(c.depsOrInfraOnly).toBe(true);
+  });
+
+  it('detects runtime files nested in a subdirectory', () => {
+    const c = classifyChangedPaths(['frontend/.nvmrc']);
+    expect(c.runtimeChanged).toBe(true);
+    expect(c.depsOrInfraOnly).toBe(true);
+  });
+
+  it('does NOT trigger the gate for a CI-only PR (no deps/runtime change)', () => {
+    const c = classifyChangedPaths(['.github/workflows/ci.yml']);
+    expect(c.appCodeChanged).toBe(false);
+    expect(c.depsChanged).toBe(false);
+    expect(c.runtimeChanged).toBe(false);
+    expect(c.depsOrInfraOnly).toBe(false);
+  });
+
+  it('treats a mixed deps + app PR as app code (browser QA, not gate)', () => {
+    const c = classifyChangedPaths(['package.json', 'components/Button.tsx']);
+    expect(c.depsChanged).toBe(true);
+    expect(c.appCodeChanged).toBe(true);
+    expect(c.depsOrInfraOnly).toBe(false);
+  });
+
+  it('returns all-false for an empty changed set', () => {
+    expect(classifyChangedPaths([])).toEqual({
+      depsChanged: false,
+      runtimeChanged: false,
+      appCodeChanged: false,
+      depsOrInfraOnly: false,
+    });
   });
 });
 
