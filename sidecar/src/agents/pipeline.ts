@@ -447,10 +447,11 @@ export type RepoChoiceResult = {
   replyTs: string;
 };
 
-type RepoIntent = 'web' | 'api' | 'cancel' | 'unclear';
+type RepoIntent = 'web' | 'api' | 'both' | 'cancel' | 'unclear';
 
 const WEB_SHORTHAND = /^(web|newton-?web|frontend|fe|ui)$/i;
 const API_SHORTHAND = /^(api|newton-?api|backend|be|server)$/i;
+const BOTH_SHORTHAND = /^(both|both repos?|web (?:and|&|\+) api|api (?:and|&|\+) web|dono|donon)$/i;
 const CANCEL_SHORTHAND = /^(cancel|stop|abort|nevermind|never mind|skip)\b/i;
 
 async function classifyRepoChoice(
@@ -463,21 +464,24 @@ async function classifyRepoChoice(
   // Cheap regex short-circuits before calling the model.
   if (WEB_SHORTHAND.test(trimmed)) return 'web';
   if (API_SHORTHAND.test(trimmed)) return 'api';
+  if (BOTH_SHORTHAND.test(trimmed)) return 'both';
   if (CANCEL_SHORTHAND.test(trimmed)) return 'cancel';
 
   const prompt = `You are a classifier for miniOG, a developer bot. miniOG asked an admin which repo to work in for an ambiguous task. The choices are:
 - "newton-web" — the frontend repo (React/JavaScript, pages, components, UI)
 - "newton-api" — the backend repo (Python/Django, endpoints, models, serializers)
 
-Classify the admin's reply into one of four categories:
+Classify the admin's reply into one of five categories:
 
 "web" — the reply identifies newton-web. Examples: "web", "newton-web", "frontend", "the react one", "UI", "it's a frontend change".
 
 "api" — the reply identifies newton-api. Examples: "api", "newton-api", "backend", "the django one", "it's in python".
 
+"both" — the reply says the task spans BOTH repos. Examples: "both", "both repos", "web and api", "api and web", "dono", "it's a cross-repo change", "frontend + backend".
+
 "cancel" — the reply tells miniOG to stop / skip / abort. Examples: "cancel", "nevermind", "don't bother", "stop".
 
-"unclear" — the reply doesn't pick a repo and isn't a cancel. Examples: "not sure", a question, unrelated chat, or anything that doesn't map to web/api/cancel.
+"unclear" — the reply doesn't pick a repo and isn't a cancel or "both". Examples: "not sure", a question, unrelated chat, or anything that doesn't map to web/api/both/cancel.
 
 Recent thread messages (for context):
 ${recentThread.map((m, i) => `[${i + 1}] ${m}`).join('\n')}
@@ -487,7 +491,7 @@ New message to classify:
 
 Return strict JSON:
 {
-  "intent": "web" | "api" | "cancel" | "unclear",
+  "intent": "web" | "api" | "both" | "cancel" | "unclear",
   "reasoning": "one sentence explaining why"
 }`;
 
@@ -511,7 +515,7 @@ Return strict JSON:
     }
 
     const raw = result.parsedJson as { intent?: string; reasoning?: string };
-    const valid: RepoIntent[] = ['web', 'api', 'cancel', 'unclear'];
+    const valid: RepoIntent[] = ['web', 'api', 'both', 'cancel', 'unclear'];
     const intent: RepoIntent = valid.includes(raw.intent as RepoIntent) ? (raw.intent as RepoIntent) : 'unclear';
 
     logStep({
@@ -565,6 +569,10 @@ export async function waitForRepoChoice(params: {
   const notifiedUsers = new Set<string>();
   const startedAt = Date.now();
   let nudged = false;
+  // Posted once if an admin answers "both": the implementation pipeline runs one
+  // repo per run, so we acknowledge the cross-repo nature and ask them to pick a
+  // starting repo instead of silently re-polling the same reply forever (#394).
+  let bothGuidanceSent = false;
 
   while (true) {
     if (signal?.aborted) {
@@ -650,6 +658,29 @@ export async function waitForRepoChoice(params: {
           message: `Admin <@${reply.user}> cancelled the task: "${text}"`,
         });
         return { outcome: 'cancelled', userReply: text, approverId: reply.user, replyTs: reply.ts };
+      }
+
+      if (intent === 'both') {
+        // The task spans both repos, but the implementation pipeline works one
+        // repo at a time. Acknowledge once and ask for a starting repo, then keep
+        // waiting for a definitive web/api/cancel. Without this, "both" classifies
+        // as 'unclear' and the loop silently re-polls until cancel/timeout (#394).
+        if (!bothGuidanceSent) {
+          bothGuidanceSent = true;
+          slack.chat
+            .postMessage({
+              channel: channelId,
+              thread_ts: threadTs,
+              text: `<@${reply.user}> This looks like it touches *both* repos. I implement one repo per run — reply *web* or *api* to pick which I should start with, and tag me again for the other once that PR is up.`,
+            })
+            .catch(() => {});
+          logStep({
+            stage: 'pipeline.repo_choice.both',
+            message: `Admin <@${reply.user}> said the task spans both repos; asked them to pick one to start with: "${text}"`,
+            data: { user: reply.user },
+          });
+        }
+        continue;
       }
 
       // intent === 'unclear' → keep waiting, don't echo into thread noise.

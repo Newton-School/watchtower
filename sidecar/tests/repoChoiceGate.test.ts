@@ -170,4 +170,62 @@ describe('waitForRepoChoice', () => {
     await advancePollCycles(2);
     expect((await promise).outcome).toBe('newton-api');
   });
+
+  it('acknowledges "both" once and resolves when the admin then picks a repo (#394)', async () => {
+    const slack = makeSlack();
+    mockFetchThread.mockResolvedValueOnce([{ ts: 'post.2', user: 'UADMIN', text: 'both' }]).mockResolvedValueOnce([
+      { ts: 'post.2', user: 'UADMIN', text: 'both' },
+      { ts: 'post.3', user: 'UADMIN', text: 'web' },
+    ]);
+
+    const promise = waitForRepoChoice({
+      slack,
+      channelId: 'C01',
+      threadTs: '111.00',
+      approverUserIds: ['UADMIN'],
+      promptTs: 'post.1',
+      logStep: () => {},
+      botUserId: 'UBOT',
+    });
+
+    await advancePollCycles(2);
+    expect((await promise).outcome).toBe('newton-web');
+    // "both" and "web" both hit the cheap regex — the classifier model is never called.
+    expect(mockRunCodex).not.toHaveBeenCalled();
+    // The cross-repo guidance is posted exactly once, even though "both" is re-seen on both polls.
+    const guidanceCalls = slack.chat.postMessage.mock.calls.filter((c: any[]) =>
+      String(c[0]?.text ?? '').includes('one repo per run'),
+    );
+    expect(guidanceCalls).toHaveLength(1);
+  });
+
+  it('classifies a free-text cross-repo reply as "both" via the AI classifier (#394)', async () => {
+    const slack = makeSlack();
+    mockFetchThread
+      .mockResolvedValueOnce([{ ts: 'post.2', user: 'UADMIN', text: 'we need to touch frontend and backend' }])
+      .mockResolvedValueOnce([
+        { ts: 'post.2', user: 'UADMIN', text: 'we need to touch frontend and backend' },
+        { ts: 'post.3', user: 'UADMIN', text: 'api' },
+      ]);
+    // Free text → classifier returns 'both' (re-seen each poll, so use a persistent mock).
+    mockRunCodex.mockResolvedValue({ ok: true, parsedJson: { intent: 'both', reasoning: 'spans both repos' } });
+
+    const promise = waitForRepoChoice({
+      slack,
+      channelId: 'C01',
+      threadTs: '111.00',
+      approverUserIds: ['UADMIN'],
+      promptTs: 'post.1',
+      logStep: () => {},
+      botUserId: 'UBOT',
+    });
+
+    await advancePollCycles(2);
+    // "api" on the second poll short-circuits via regex and resolves.
+    expect((await promise).outcome).toBe('newton-api');
+    const guidanceCalls = slack.chat.postMessage.mock.calls.filter((c: any[]) =>
+      String(c[0]?.text ?? '').includes('one repo per run'),
+    );
+    expect(guidanceCalls).toHaveLength(1);
+  });
 });
