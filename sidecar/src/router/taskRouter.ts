@@ -261,6 +261,9 @@ export async function routeTask(params: {
     channelId: task.event.channelId,
     channelType: task.event.channelType,
     requiredLevel,
+    // An indirect owner-mention (the message tags @theOG, not @miniOG) may run
+    // read-only (viewer-tier) workflows even from a non-allowlisted author.
+    ownerMentioned: task.mentionType === 'owner',
   });
 
   if (!accessDecision.allowed) {
@@ -298,26 +301,41 @@ export async function routeTask(params: {
     if (shouldBlock) {
       const denialText = accessDecision.reason ?? "Sorry, you're not on the access list. Please contact an admin.";
 
-      await slack.chat.postMessage({
-        channel: task.event.channelId,
-        thread_ts: task.event.threadTs,
-        text: denialText,
-      });
+      // Indirect owner-mentions weren't sent to miniOG — they tagged @theOG in a
+      // (likely human-to-human) thread. Don't barge in with an "access denied"
+      // reply; stay silent like the NONE branch. Read-only intents are already
+      // allowed above via the owner-mention grant, so this only covers
+      // owner-mentioned write/elevated asks the author can't run. Direct
+      // @miniOG mentions still get the deny reply.
+      const silentForOwnerMention = task.mentionType === 'owner';
+      if (!silentForOwnerMention) {
+        await slack.chat.postMessage({
+          channel: task.event.channelId,
+          thread_ts: task.event.threadTs,
+          text: denialText,
+        });
+      }
 
       return {
         workflow: resolvedIntent,
         status: 'SKIPPED',
         message: denialText,
         notifyDesktop: false,
-        slackPosted: true,
+        slackPosted: !silentForOwnerMention,
       };
     }
   } else {
     logStep?.({
-      stage: accessDecision.ownerBypass ? 'access.owner_bypass' : 'access.allowed',
+      stage: accessDecision.ownerBypass
+        ? 'access.owner_bypass'
+        : accessDecision.ownerMentionGrant
+          ? 'access.owner_mention_grant'
+          : 'access.allowed',
       message: accessDecision.ownerBypass
         ? 'Owner bypass granted unrestricted access.'
-        : 'Access control allowed this request.',
+        : accessDecision.ownerMentionGrant
+          ? 'Owner was mentioned — granting read-only access for this request.'
+          : 'Access control allowed this request.',
       data: {
         intent: resolvedIntent,
         requiredLevel,

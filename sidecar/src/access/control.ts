@@ -31,6 +31,11 @@ export type AccessDenyReason = 'NOT_ON_ACCESS_LIST' | 'INSUFFICIENT_ROLE' | 'CHA
 export type AccessDecision = {
   allowed: boolean;
   ownerBypass: boolean;
+  /**
+   * Granted because the message MENTIONS the owner (@theOG) and the request is
+   * read-only (viewer-tier). Distinct from `ownerBypass` (author IS the owner).
+   */
+  ownerMentionGrant?: boolean;
   requiredLevel: AccessLevel;
   matchedGroups: AccessGroupKey[];
   userGroups: AccessGroupKey[];
@@ -526,8 +531,15 @@ export function evaluateCapability(params: {
   channelId: string;
   channelType?: string;
   capability: Capability;
+  /**
+   * True when the triggering Slack message MENTIONS the owner (@theOG) rather
+   * than being authored by the owner. Such messages may run READ-ONLY
+   * (viewer-tier) workflows even from someone not on the access list — the
+   * owner was explicitly looped in and these flows only read + report (#394+).
+   */
+  ownerMentioned?: boolean;
 }): AccessDecision {
-  const { config, userId, channelId, channelType, capability } = params;
+  const { config, userId, channelId, channelType, capability, ownerMentioned } = params;
   const requiredLevel = CAPABILITY_TO_LEGACY_TIER[capability];
 
   // 1. Owner bypass — short-circuit before any bundle lookup.
@@ -538,6 +550,22 @@ export function evaluateCapability(params: {
       requiredLevel,
       matchedGroups: ['owner'],
       userGroups: ['owner'],
+    };
+  }
+
+  // 2. Owner-mention grant — a message that tags the owner (@theOG) may run
+  // READ-ONLY (viewer-tier) workflows like INVESTIGATION/INFORMATIONAL even
+  // when the author isn't on the access list. The owner was looped in and
+  // these flows don't write, so completing them is safe and expected. Write /
+  // elevated capabilities still require the author's real access.
+  if (ownerMentioned && requiredLevel === 'viewer') {
+    return {
+      allowed: true,
+      ownerBypass: false,
+      ownerMentionGrant: true,
+      requiredLevel,
+      matchedGroups: ['owner'],
+      userGroups: [],
     };
   }
 
@@ -604,6 +632,7 @@ export function evaluateAccess(params: {
   channelId: string;
   channelType?: string;
   requiredLevel: AccessLevel;
+  ownerMentioned?: boolean;
 }): AccessDecision {
   // If a caller passed an explicit accessControl override, translate it to
   // bundles for the duration of this call so the override still wins. This
@@ -619,6 +648,7 @@ export function evaluateAccess(params: {
     channelId: params.channelId,
     channelType: params.channelType,
     capability,
+    ownerMentioned: params.ownerMentioned,
   });
 
   // Preserve the legacy `requiredLevel` field on the returned decision —
