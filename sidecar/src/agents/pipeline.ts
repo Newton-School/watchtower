@@ -482,20 +482,24 @@ async function classifyRepoChoice(
   if (CANCEL_SHORTHAND.test(trimmed)) return 'cancel';
 
   const prompt = `You are a classifier for miniOG, a developer bot. miniOG asked an admin which repo to work in for an ambiguous task. The choices are:
-- "newton-web" — the frontend repo (React/JavaScript, pages, components, UI)
+- "newton-web" — the PRODUCT frontend (React/JavaScript, the logged-in app at my.newtonschool.co: pages, components, UI)
 - "newton-api" — the backend repo (Python/Django, endpoints, models, serializers)
+- "newton-marketing-web" — the PUBLIC MARKETING site (newtonschool.co landing pages, Webflow migration, Tailwind, Cloudflare)
 
-Classify the admin's reply into one of five categories:
+Classify the admin's reply into one of six categories:
 
-"web" — the reply identifies newton-web. Examples: "web", "newton-web", "frontend", "the react one", "UI", "it's a frontend change".
+"web" — the reply identifies newton-web. Examples: "web", "newton-web", "frontend", "the react one", "UI", "it's a frontend change", "the product app".
 
 "api" — the reply identifies newton-api. Examples: "api", "newton-api", "backend", "the django one", "it's in python".
 
-"both" — the reply says the task spans BOTH repos. Examples: "both", "both repos", "web and api", "api and web", "dono", "it's a cross-repo change", "frontend + backend".
+"marketing" — the reply identifies newton-marketing-web. Examples: "marketing", "mweb", "nmw", "the marketing site", "landing pages", "the webflow one", "the tailwind one", "the public site".
+IMPORTANT: "marketing web", "marketing site", and "landing" mean newton-marketing-web, NOT newton-web. Classify as "web" only when the reply points at the product app.
+
+"both" — the reply says the task spans MULTIPLE repos. Examples: "both", "both repos", "web and api", "api and web", "web and marketing", "dono", "it's a cross-repo change", "frontend + backend".
 
 "cancel" — the reply tells miniOG to stop / skip / abort. Examples: "cancel", "nevermind", "don't bother", "stop".
 
-"unclear" — the reply doesn't pick a repo and isn't a cancel or "both". Examples: "not sure", a question, unrelated chat, or anything that doesn't map to web/api/both/cancel.
+"unclear" — the reply doesn't pick a repo and isn't a cancel or "both". Examples: "not sure", a question, unrelated chat, or anything that doesn't map to a category above.
 
 Recent thread messages (for context):
 ${recentThread.map((m, i) => `[${i + 1}] ${m}`).join('\n')}
@@ -505,7 +509,7 @@ New message to classify:
 
 Return strict JSON:
 {
-  "intent": "web" | "api" | "both" | "cancel" | "unclear",
+  "intent": "web" | "api" | "marketing" | "both" | "cancel" | "unclear",
   "reasoning": "one sentence explaining why"
 }`;
 
@@ -708,7 +712,7 @@ export async function waitForRepoChoice(params: {
             .postMessage({
               channel: channelId,
               thread_ts: threadTs,
-              text: `<@${reply.user}> This looks like it touches *both* repos. I implement one repo per run — reply *web* or *api* to pick which I should start with, and tag me again for the other once that PR is up.`,
+              text: `<@${reply.user}> This looks like it touches *multiple* repos. I implement one repo per run — reply *web*, *api*, or *marketing* to pick which I should start with, and tag me again for the others once that PR is up.`,
             })
             .catch(() => {});
           logStep({
