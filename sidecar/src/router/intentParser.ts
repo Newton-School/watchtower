@@ -26,29 +26,52 @@ export function containsMetabaseUrl(text: string | undefined | null): boolean {
   return METABASE_URL_REGEX.test(text);
 }
 
+const DEPLOY_VERB_RE = /\b(deploy|ship|release|push to prod|push prod)\b/;
+const MARKETING_DEPLOY_REF_RE = /\b(marketing|landing|webflow|wrangler|cloudflare|mweb|nmw|newton[- ]?marketing)\b/;
+
+function normalizeDeployText(text: string): string {
+  return text
+    .replace(/<@[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .toLowerCase()
+    .trim();
+}
+
 /**
  * Deterministic check: does the message ask to deploy newton-web to production?
  * This runs before the AI classifier so deploy requests are never misrouted.
  */
 export function isDeployRequest(text: string): boolean {
-  const normalized = text
-    .replace(/<@[^>]+>/g, ' ')
-    .replace(/\s+/g, ' ')
-    .toLowerCase()
-    .trim();
+  const normalized = normalizeDeployText(text);
 
   // Must contain a deploy verb
-  const hasDeployVerb = /\b(deploy|ship|release|push to prod|push prod)\b/.test(normalized);
-  if (!hasDeployVerb) return false;
+  if (!DEPLOY_VERB_RE.test(normalized)) return false;
+
+  // A deploy ask that names the marketing site must NEVER fire the newton-web
+  // production deploy — it belongs to the marketing (GitHub Actions) flow.
+  if (MARKETING_DEPLOY_REF_RE.test(normalized)) return false;
 
   // Must reference production target
   const hasProdTarget = /\b(prod|production)\b/.test(normalized);
-  // Must reference the app (or be unambiguous enough with just "deploy prod")
-  const hasAppRef = /\b(newton[- ]?web|newton[- ]?school|frontend)\b/.test(normalized);
+  // Must reference the app. NOTE: `newton school` deliberately dropped from
+  // this list — with two frontends, "deploy the newton school site" is
+  // genuinely ambiguous and must not deterministically mean newton-web.
+  const hasAppRef = /\b(newton[- ]?web|frontend)\b/.test(normalized);
 
   // "deploy to prod" / "deploy prod" is unambiguous enough even without app name
   // "deploy newton-web" without "prod" is also valid (prod is the only deploy target)
   return hasProdTarget || hasAppRef;
+}
+
+/**
+ * Deterministic check: does the message ask to deploy the MARKETING site
+ * (newton-marketing-web)? Kept separate from isDeployRequest so the two
+ * deploy mechanisms (newton-web prod skill vs marketing GitHub Actions
+ * dispatch) can never be confused for each other.
+ */
+export function isMarketingDeployRequest(text: string): boolean {
+  const normalized = normalizeDeployText(text);
+  return DEPLOY_VERB_RE.test(normalized) && MARKETING_DEPLOY_REF_RE.test(normalized);
 }
 
 export function detectMention(
@@ -324,8 +347,11 @@ function inferIntent(
     return { intent: 'DEV_ASSIST' };
   }
 
-  // Deterministic deploy detection — routed before the AI classifier.
-  if (mention.detected && isDeployRequest(event.text ?? '')) {
+  // Deterministic deploy detection — routed before the AI classifier. The
+  // marketing check runs first: its tokens are disjoint from isDeployRequest's
+  // (which explicitly excludes them), so a deploy ask resolves to exactly one
+  // of the two deploy flows. deployWorkflow re-derives the target the same way.
+  if (mention.detected && (isMarketingDeployRequest(event.text ?? '') || isDeployRequest(event.text ?? ''))) {
     return { intent: 'DEPLOY' };
   }
 

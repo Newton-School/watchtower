@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import type { WebClient } from '@slack/web-api';
 import { evaluateCapability } from '../access/control.js';
 import type { AppConfig, NormalizedTask, WorkflowResult, WorkflowStepLogger } from '../types/contracts.js';
@@ -9,6 +11,18 @@ import { highReasoningProfile } from '../codex/modelProfiles.js';
 import { buildMentionSystemPrompt } from '../codex/mentionSystemPrompt.js';
 import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
 import { extractReplyFromCodexResult } from './shared/workflowUtils.js';
+import { isMarketingDeployRequest } from '../router/intentParser.js';
+import { getRepo, repoPathOrNull } from '../repos/registry.js';
+
+const execFileAsync = promisify(execFile);
+
+/** Internal seam — overridden by tests to avoid spawning the real `gh` CLI. */
+export const __ghCli = {
+  async exec(args: string[], cwd: string, timeoutMs: number): Promise<string> {
+    const { stdout } = await execFileAsync('gh', args, { cwd, timeout: timeoutMs });
+    return stdout;
+  },
+};
 
 /**
  * Resolves the deploy-prod skill instructions.
@@ -55,6 +69,13 @@ export async function runDeployWorkflow(params: {
   signal?: AbortSignal;
 }): Promise<WorkflowResult> {
   const { task, config, slack, logStep, signal } = params;
+
+  // Same deterministic check the intent gate used: a deploy ask naming the
+  // marketing site routes to the GitHub Actions flow; everything else is the
+  // classic newton-web prod deploy. Never let one mechanism run the other.
+  if (isMarketingDeployRequest(task.event.text ?? '')) {
+    return runMarketingDeploy(params);
+  }
 
   logStep?.({
     stage: 'deploy.start',
@@ -175,6 +196,207 @@ export async function runDeployWorkflow(params: {
     message: reply,
     notifyDesktop: true,
     slackPosted,
+  };
+}
+
+/**
+ * Marketing (newton-marketing-web) production deploy: a GitHub Actions
+ * dispatch, not the newton-web prod skill. Staging needs no trigger at all
+ * (it auto-deploys on every push to main). The workflow's `production`
+ * GitHub Environment approval gate still applies — dispatching starts the
+ * run; GitHub may hold it for a human approval.
+ */
+async function runMarketingDeploy(params: {
+  task: NormalizedTask;
+  config: AppConfig;
+  slack: WebClient;
+  logStep?: WorkflowStepLogger;
+  signal?: AbortSignal;
+}): Promise<WorkflowResult> {
+  const { task, config, slack, logStep, signal } = params;
+
+  logStep?.({
+    stage: 'deploy.marketing.start',
+    message: 'Running marketing deploy workflow (GitHub Actions dispatch).',
+  });
+
+  const skipped = (message: string): WorkflowResult => ({
+    workflow: 'DEPLOY',
+    status: 'SKIPPED',
+    message,
+    notifyDesktop: false,
+    slackPosted: true,
+  });
+
+  // Same capability as the newton-web prod deploy — it goes live on
+  // newtonschool.co.
+  const accessDecision = evaluateCapability({
+    config,
+    userId: task.event.userId,
+    channelId: task.event.channelId,
+    channelType: task.event.channelType,
+    capability: 'deploy_prod',
+  });
+  if (!accessDecision.allowed) {
+    const msg = accessDecision.reason ?? 'Deploy to production is restricted to admins.';
+    await slack.chat.postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: msg });
+    logStep?.({
+      stage: 'deploy.marketing.denied',
+      message: msg,
+      level: 'WARN',
+      data: { userId: task.event.userId, denyReason: accessDecision.denyReason },
+    });
+    return skipped(msg);
+  }
+
+  const repoPath = repoPathOrNull(config, 'newton-marketing-web');
+  if (!repoPath) {
+    const msg =
+      "The newton-marketing-web clone isn't configured on this host, so I can't trigger its deploy. Set newton_marketing_web_path in Watchtower settings.";
+    await slack.chat.postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: msg });
+    return skipped(msg);
+  }
+
+  const normalized = (task.event.text ?? '').toLowerCase();
+  const deployMeta = getRepo('newton-marketing-web').deploy;
+  const stagingNote =
+    deployMeta.method === 'github-actions' ? deployMeta.stagingNote : 'staging auto-deploys on push to main';
+  if (/\bstaging\b/.test(normalized) && !/\b(prod|production)\b/.test(normalized)) {
+    const msg = `Nothing to trigger — ${stagingNote}. Merge to \`main\` and it ships itself.`;
+    await slack.chat.postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: msg });
+    return skipped(msg);
+  }
+
+  await slack.chat
+    .postMessage({
+      channel: task.event.channelId,
+      thread_ts: task.event.threadTs,
+      text: ':rocket: Dispatching the *newton-marketing-web* production deploy (GitHub Actions)…',
+    })
+    .catch(() => {});
+
+  // Dispatch. `gh` resolves the target repo from the clone's origin remote.
+  try {
+    await __ghCli.exec(
+      ['workflow', 'run', 'deploy-prod.yml', '--ref', 'main', '-f', 'confirm=deploy'],
+      repoPath,
+      60_000,
+    );
+  } catch (error) {
+    const msg = `Couldn't dispatch the marketing prod deploy: ${error instanceof Error ? error.message : String(error)}`;
+    logStep?.({ stage: 'deploy.marketing.dispatch_failed', message: msg, level: 'ERROR' });
+    const slackPosted = await postDeployReplyBestEffort({
+      slack,
+      channelId: task.event.channelId,
+      threadTs: task.event.threadTs,
+      text: msg,
+      logStep,
+    });
+    return { workflow: 'DEPLOY', status: 'FAILED', message: msg, notifyDesktop: true, slackPosted };
+  }
+
+  // Resolve the run we just dispatched, then poll it to completion. Like the
+  // newton-web path, the side-effect has already executed — every failure
+  // after this point must degrade to a report, never a retry.
+  const run = await watchMarketingDeployRun({ repoPath, signal, logStep });
+
+  logStep?.({
+    stage: 'deploy.marketing.done',
+    message: `Marketing deploy dispatch finished: ${run.summary}`,
+    data: { conclusion: run.conclusion, url: run.url },
+  });
+
+  const slackPosted = await postDeployReplyBestEffort({
+    slack,
+    channelId: task.event.channelId,
+    threadTs: task.event.threadTs,
+    text: run.summary,
+    logStep,
+  });
+
+  return {
+    workflow: 'DEPLOY',
+    status: run.conclusion === 'failure' ? 'FAILED' : 'SUCCESS',
+    message: run.summary,
+    notifyDesktop: true,
+    slackPosted,
+  };
+}
+
+async function watchMarketingDeployRun(params: {
+  repoPath: string;
+  signal?: AbortSignal;
+  logStep?: WorkflowStepLogger;
+}): Promise<{ conclusion: 'success' | 'failure' | 'pending'; url?: string; summary: string }> {
+  const { repoPath, signal, logStep } = params;
+
+  const readLatestRun = async (): Promise<{ id?: number; url?: string; status?: string; conclusion?: string }> => {
+    const stdout = await __ghCli.exec(
+      ['run', 'list', '--workflow=deploy-prod.yml', '--limit', '1', '--json', 'databaseId,url,status,conclusion'],
+      repoPath,
+      30_000,
+    );
+    const rows = JSON.parse(stdout || '[]') as Array<{
+      databaseId?: number;
+      url?: string;
+      status?: string;
+      conclusion?: string;
+    }>;
+    const row = rows[0] ?? {};
+    return { id: row.databaseId, url: row.url, status: row.status, conclusion: row.conclusion };
+  };
+
+  const startedAt = Date.now();
+  const maxWaitMs = 15 * 60 * 1000;
+  const pollMs = 15_000;
+  let lastUrl: string | undefined;
+
+  while (Date.now() - startedAt < maxWaitMs) {
+    if (signal?.aborted) break;
+    let run: Awaited<ReturnType<typeof readLatestRun>>;
+    try {
+      run = await readLatestRun();
+    } catch (error) {
+      logStep?.({
+        stage: 'deploy.marketing.poll_failed',
+        level: 'WARN',
+        message: `Couldn't read the deploy run status: ${String(error)}`,
+      });
+      await new Promise(resolve => setTimeout(resolve, pollMs));
+      continue;
+    }
+    lastUrl = run.url ?? lastUrl;
+
+    if (run.status === 'completed') {
+      if (run.conclusion === 'success') {
+        return {
+          conclusion: 'success',
+          url: run.url,
+          summary: `:white_check_mark: newton-marketing-web production deploy succeeded — live on www.newtonschool.co.${run.url ? ` Run: ${run.url}` : ''}`,
+        };
+      }
+      return {
+        conclusion: 'failure',
+        url: run.url,
+        summary: `:x: newton-marketing-web production deploy finished with *${run.conclusion ?? 'unknown'}*.${run.url ? ` Run: ${run.url}` : ''}`,
+      };
+    }
+    if (run.status === 'waiting') {
+      // The `production` GitHub Environment is holding the run for approval —
+      // that can take arbitrarily long, so report and hand off to the human.
+      return {
+        conclusion: 'pending',
+        url: run.url,
+        summary: `:hourglass: The marketing prod deploy is dispatched and *waiting for the production-environment approval* in GitHub.${run.url ? ` Approve/watch it here: ${run.url}` : ''}`,
+      };
+    }
+    await new Promise(resolve => setTimeout(resolve, pollMs));
+  }
+
+  return {
+    conclusion: 'pending',
+    url: lastUrl,
+    summary: `:hourglass: The marketing prod deploy is dispatched and still running.${lastUrl ? ` Watch it here: ${lastUrl}` : ''}`,
   };
 }
 

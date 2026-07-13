@@ -9,6 +9,7 @@ import {
   guardrailBlockFor,
   isRepoEnabled,
   qaCaveatBlockFor,
+  repoKeyForWorkspacePath,
   repoKeyFromGithubRepoName,
   repoPathOrNull,
   resolveRepoPath,
@@ -79,6 +80,31 @@ describe('repoKeyFromGithubRepoName', () => {
     expect(repoKeyFromGithubRepoName('newton-mobile')).toBeNull();
     // The marketing slug must never fuzzy-match the newton-web key.
     expect(repoKeyFromGithubRepoName('newton-web-legacy')).toBeNull();
+  });
+});
+
+describe('repoKeyForWorkspacePath', () => {
+  it('matches configured clones and their derived worktrees, segment-bounded', () => {
+    expect(repoKeyForWorkspacePath('/mini-og/newton-web', THREE_REPO_CONFIG)).toBe('newton-web');
+    expect(repoKeyForWorkspacePath('/mini-og/newton-web/src', THREE_REPO_CONFIG)).toBe('newton-web');
+    expect(repoKeyForWorkspacePath('/Users/x/.watchtower/workspaces/newton-web/123.4', THREE_REPO_CONFIG)).toBe(
+      'newton-web',
+    );
+    // The marketing workspace segment must never match the newton-web basename.
+    expect(
+      repoKeyForWorkspacePath('/Users/x/.watchtower/workspaces/newton-marketing-web/123.4', THREE_REPO_CONFIG),
+    ).toBe('newton-marketing-web');
+  });
+
+  it('returns null for spanning roots and unknown paths', () => {
+    expect(repoKeyForWorkspacePath('/mini-og', THREE_REPO_CONFIG)).toBeNull();
+    expect(repoKeyForWorkspacePath('/tmp', THREE_REPO_CONFIG)).toBeNull();
+  });
+
+  it('never resolves a disabled repo', () => {
+    expect(
+      repoKeyForWorkspacePath('/Users/x/.watchtower/workspaces/newton-marketing-web/123.4', TWO_REPO_CONFIG),
+    ).toBeNull();
   });
 });
 

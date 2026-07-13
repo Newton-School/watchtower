@@ -123,6 +123,7 @@ Your role: Implement the plan from the planner agent. Write code, create tests, 
 
 Workflow: ${ctx.workflowIntent}
 Repository: ${ctx.repoPath}
+Policy: ${policyBlock(ctx)}
 Plan scope: ${scope}
 ${affectedFiles.length > 0 ? `Likely files to touch: ${affectedFiles.map(f => `\`${f}\``).join(', ')}` : ''}
 
@@ -290,6 +291,7 @@ Your role: Verify that all previous agent outputs are consistent, tests pass, an
 
 Workflow: ${ctx.workflowIntent}
 Repository: ${ctx.repoPath}
+Policy: ${policyBlock(ctx)}
 
 Approved plan (verify the code fulfils THIS):
 ${planMarkdown || 'No plan markdown available.'}

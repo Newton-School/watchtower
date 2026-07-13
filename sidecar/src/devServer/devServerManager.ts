@@ -270,20 +270,24 @@ export async function preparePrWorktree(params: PreparePrWorktreeParams): Promis
     // 3b. Initialise git submodules. newton-web vendors `content_platform` as a
     //     submodule that form pages (study-buddy, register, …) import at COMPILE
     //     time; it's absent from a fresh worktree, so those pages 500 without it.
+    //     Gated on .gitmodules so submodule-less repos (newton-api,
+    //     newton-marketing-web) skip the network call and its 3-min timeout.
     //     Best-effort: relies on the same ambient git credentials as the PR
     //     checkout; on failure we proceed and the QA agent reports the error.
-    try {
-      await execFileAsync('git', ['-C', worktreePath, 'submodule', 'update', '--init', '--recursive'], {
-        timeout: 180_000,
-        maxBuffer: 10 * 1024 * 1024,
-      });
-      logStep?.({ stage: 'qa.pr.submodules_ready', message: 'Initialised git submodules in the worktree.' });
-    } catch (err) {
-      logStep?.({
-        stage: 'qa.pr.submodules_failed',
-        level: 'WARN',
-        message: `Couldn't init git submodules (pages that import them may 500): ${String(err)}`,
-      });
+    if (fs.existsSync(path.join(worktreePath, '.gitmodules'))) {
+      try {
+        await execFileAsync('git', ['-C', worktreePath, 'submodule', 'update', '--init', '--recursive'], {
+          timeout: 180_000,
+          maxBuffer: 10 * 1024 * 1024,
+        });
+        logStep?.({ stage: 'qa.pr.submodules_ready', message: 'Initialised git submodules in the worktree.' });
+      } catch (err) {
+        logStep?.({
+          stage: 'qa.pr.submodules_failed',
+          level: 'WARN',
+          message: `Couldn't init git submodules (pages that import them may 500): ${String(err)}`,
+        });
+      }
     }
 
     // 4. Diff → changed paths + strategy classification.

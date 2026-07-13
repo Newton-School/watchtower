@@ -1,9 +1,9 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { describe, expect, it, vi } from 'vitest';
-import { isDeployRequest } from '../src/router/intentParser.js';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { isDeployRequest, isMarketingDeployRequest } from '../src/router/intentParser.js';
 import { normalizeTask } from '../src/router/intentParser.js';
 import type { AppConfig, NormalizedTask, SlackEventEnvelope } from '../src/types/contracts.js';
-import { runDeployWorkflow } from '../src/workflows/deployWorkflow.js';
+import { runDeployWorkflow, __ghCli } from '../src/workflows/deployWorkflow.js';
 import { runCodex } from '../src/codex/runCodex.js';
 
 vi.mock('../src/codex/runCodex.js', () => ({
@@ -123,6 +123,161 @@ describe('normalizeTask routes DEPLOY deterministically', () => {
   it('prioritizes DEV_ASSIST prefix over DEPLOY', () => {
     const task = normalizeTask({ ...baseEvent, text: '<@UBOT1> wt deploy prod' }, config, []);
     expect(task.intent).toBe('DEV_ASSIST');
+  });
+});
+
+describe('marketing deploy gating', () => {
+  it('never treats a marketing deploy ask as the newton-web deploy', () => {
+    expect(isDeployRequest('<@UBOT1> deploy the marketing site to prod')).toBe(false);
+    expect(isDeployRequest('<@UBOT1> ship the landing pages to production')).toBe(false);
+    expect(isDeployRequest('<@UBOT1> deploy newton-marketing-web')).toBe(false);
+    expect(isDeployRequest('<@UBOT1> release the webflow migration to prod')).toBe(false);
+  });
+
+  it('no longer treats "newton school" as a deterministic newton-web reference', () => {
+    // With two frontends, "the newton school site" is genuinely ambiguous.
+    expect(isDeployRequest('<@UBOT1> deploy the newton school site')).toBe(false);
+  });
+
+  it('detects marketing deploy asks', () => {
+    expect(isMarketingDeployRequest('<@UBOT1> deploy the marketing site to prod')).toBe(true);
+    expect(isMarketingDeployRequest('<@UBOT1> deploy marketing')).toBe(true);
+    expect(isMarketingDeployRequest('<@UBOT1> ship the landing pages to production')).toBe(true);
+    expect(isMarketingDeployRequest('<@UBOT1> deploy newton-web to prod')).toBe(false);
+    expect(isMarketingDeployRequest('<@UBOT1> the marketing page is broken')).toBe(false);
+  });
+
+  it('routes marketing deploy asks to DEPLOY deterministically', () => {
+    const task = normalizeTask({ ...baseEvent, text: '<@UBOT1> deploy the marketing site to prod' }, config, []);
+    expect(task.intent).toBe('DEPLOY');
+  });
+});
+
+describe('runDeployWorkflow marketing branch', () => {
+  function marketingTask(text = '<@UBOT1> deploy the marketing site to prod'): NormalizedTask {
+    return {
+      event: {
+        eventId: 'Ev-mkt-deploy',
+        channelId: 'C-DEPLOY',
+        threadTs: '888.77',
+        eventTs: '888.77',
+        userId: 'UOWNER1',
+        text,
+        rawEvent: {},
+      },
+      mentionDetected: true,
+      mentionType: 'bot',
+      isOwnerAuthor: true,
+      isCoreDevAuthor: true,
+      intent: 'DEPLOY',
+    };
+  }
+
+  const marketingConfig: AppConfig = {
+    ...config,
+    repoPaths: { ...config.repoPaths, newtonMarketingWeb: '/Users/dipesh/code/mini-og/newton-marketing-web' },
+  };
+
+  beforeEach(() => {
+    vi.mocked(runCodex).mockReset();
+    __ghCli.exec = vi.fn().mockResolvedValue('');
+  });
+
+  it('skips with guidance when the marketing clone is not configured — and never runs gh or the newton-web skill', async () => {
+    const ghExec = vi.fn();
+    __ghCli.exec = ghExec;
+    const postMessage = vi.fn().mockResolvedValue({ ok: true, ts: '1.0' });
+    const slack = { chat: { postMessage } } as any;
+
+    const result = await runDeployWorkflow({ task: marketingTask(), config, slack });
+
+    expect(result.status).toBe('SKIPPED');
+    expect(result.message).toContain('newton_marketing_web_path');
+    expect(ghExec).not.toHaveBeenCalled();
+    expect(runCodex).not.toHaveBeenCalled();
+  });
+
+  it('explains that staging needs no trigger', async () => {
+    const ghExec = vi.fn();
+    __ghCli.exec = ghExec;
+    const postMessage = vi.fn().mockResolvedValue({ ok: true, ts: '1.0' });
+    const slack = { chat: { postMessage } } as any;
+
+    const result = await runDeployWorkflow({
+      task: marketingTask('<@UBOT1> deploy marketing to staging'),
+      config: marketingConfig,
+      slack,
+    });
+
+    expect(result.status).toBe('SKIPPED');
+    expect(result.message).toContain('Nothing to trigger');
+    expect(ghExec).not.toHaveBeenCalled();
+  });
+
+  it('dispatches the GitHub Actions prod deploy and reports the completed run', async () => {
+    const ghExec = vi
+      .fn()
+      .mockResolvedValueOnce('') // workflow run dispatch
+      .mockResolvedValueOnce(
+        JSON.stringify([
+          {
+            databaseId: 42,
+            url: 'https://github.com/Newton-School/newton-marketing-web/actions/runs/42',
+            status: 'completed',
+            conclusion: 'success',
+          },
+        ]),
+      );
+    __ghCli.exec = ghExec;
+    const postMessage = vi.fn().mockResolvedValue({ ok: true, ts: '1.0' });
+    const slack = { chat: { postMessage } } as any;
+
+    const result = await runDeployWorkflow({ task: marketingTask(), config: marketingConfig, slack });
+
+    expect(result.status).toBe('SUCCESS');
+    expect(result.message).toContain('actions/runs/42');
+    expect(ghExec).toHaveBeenNthCalledWith(
+      1,
+      ['workflow', 'run', 'deploy-prod.yml', '--ref', 'main', '-f', 'confirm=deploy'],
+      '/Users/dipesh/code/mini-og/newton-marketing-web',
+      60_000,
+    );
+    // The newton-web prod skill must never run for a marketing deploy.
+    expect(runCodex).not.toHaveBeenCalled();
+  });
+
+  it('reports the approval hold when the run is waiting on the production environment', async () => {
+    __ghCli.exec = vi
+      .fn()
+      .mockResolvedValueOnce('')
+      .mockResolvedValueOnce(
+        JSON.stringify([
+          {
+            databaseId: 43,
+            url: 'https://github.com/Newton-School/newton-marketing-web/actions/runs/43',
+            status: 'waiting',
+          },
+        ]),
+      );
+    const postMessage = vi.fn().mockResolvedValue({ ok: true, ts: '1.0' });
+    const slack = { chat: { postMessage } } as any;
+
+    const result = await runDeployWorkflow({ task: marketingTask(), config: marketingConfig, slack });
+
+    expect(result.status).toBe('SUCCESS');
+    expect(result.message).toContain('waiting for the production-environment approval');
+  });
+
+  it('fails cleanly when the dispatch itself errors', async () => {
+    __ghCli.exec = vi.fn().mockRejectedValueOnce(new Error('gh: workflow not found'));
+    const postMessage = vi.fn().mockResolvedValue({ ok: true, ts: '1.0' });
+    const slack = { chat: { postMessage } } as any;
+
+    const result = await runDeployWorkflow({ task: marketingTask(), config: marketingConfig, slack });
+
+    expect(result.status).toBe('FAILED');
+    expect(result.message).toContain("Couldn't dispatch");
+    expect(runCodex).not.toHaveBeenCalled();
   });
 });
 
