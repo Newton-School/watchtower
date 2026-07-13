@@ -199,6 +199,76 @@ describe('waitForRepoChoice', () => {
     expect(guidanceCalls).toHaveLength(1);
   });
 
+  it.each(['marketing', 'mweb', 'nmw', 'landing', 'marketing web', 'newton-marketing-web'])(
+    'resolves to newton-marketing-web on shorthand %j without calling the classifier',
+    async shorthand => {
+      const slack = makeSlack();
+      mockFetchThread.mockResolvedValueOnce([{ ts: 'post.2', user: 'UADMIN', text: shorthand }]);
+
+      const promise = waitForRepoChoice({
+        slack,
+        channelId: 'C01',
+        threadTs: '111.00',
+        approverUserIds: ['UADMIN'],
+        promptTs: 'post.1',
+        logStep: () => {},
+        botUserId: 'UBOT',
+      });
+
+      await advancePollCycles(1);
+      expect((await promise).outcome).toBe('newton-marketing-web');
+      expect(mockRunCodex).not.toHaveBeenCalled();
+    },
+  );
+
+  it('resolves marketing via the AI classifier for free-text replies', async () => {
+    const slack = makeSlack();
+    mockFetchThread.mockResolvedValueOnce([{ ts: 'post.2', user: 'UADMIN', text: 'the webflow one' }]);
+    mockRunCodex.mockResolvedValueOnce({
+      ok: true,
+      parsedJson: { intent: 'marketing', reasoning: 'webflow = marketing site' },
+    });
+
+    const promise = waitForRepoChoice({
+      slack,
+      channelId: 'C01',
+      threadTs: '111.00',
+      approverUserIds: ['UADMIN'],
+      promptTs: 'post.1',
+      logStep: () => {},
+      botUserId: 'UBOT',
+    });
+
+    await advancePollCycles(1);
+    expect((await promise).outcome).toBe('newton-marketing-web');
+  });
+
+  it('rejects a repo outside allowedRepos with a one-time notice and keeps waiting', async () => {
+    const slack = makeSlack();
+    mockFetchThread.mockResolvedValueOnce([{ ts: 'post.2', user: 'UADMIN', text: 'marketing' }]).mockResolvedValueOnce([
+      { ts: 'post.2', user: 'UADMIN', text: 'marketing' },
+      { ts: 'post.3', user: 'UADMIN', text: 'web' },
+    ]);
+
+    const promise = waitForRepoChoice({
+      slack,
+      channelId: 'C01',
+      threadTs: '111.00',
+      approverUserIds: ['UADMIN'],
+      promptTs: 'post.1',
+      logStep: () => {},
+      botUserId: 'UBOT',
+      allowedRepos: ['newton-web', 'newton-api'],
+    });
+
+    await advancePollCycles(2);
+    expect((await promise).outcome).toBe('newton-web');
+    const notices = slack.chat.postMessage.mock.calls.filter((c: any[]) =>
+      String(c[0]?.text ?? '').includes("isn't configured on this host"),
+    );
+    expect(notices).toHaveLength(1);
+  });
+
   it('classifies a free-text cross-repo reply as "both" via the AI classifier (#394)', async () => {
     const slack = makeSlack();
     mockFetchThread

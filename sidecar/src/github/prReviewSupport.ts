@@ -1,12 +1,13 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { AppConfig, CodexRunResult, PrContext, WorkflowStepLogger } from '../types/contracts.js';
+import { REPO_KEYS, repoKeyFromGithubRepoName, repoPathOrNull } from '../repos/registry.js';
 import type { AgentFinding } from '../agents/types.js';
 import type { ReviewEvent, SubmitPrReviewResult } from './submitPrReview.js';
 
 const execFileAsync = promisify(execFile);
 
-export const SUPPORTED_PR_REPOS = ['newton-web', 'newton-api'] as const;
+export const SUPPORTED_PR_REPOS = REPO_KEYS;
 const FINDING_SEVERITIES = new Set<AgentFinding['severity']>(['critical', 'high', 'medium', 'low', 'info']);
 
 export type PrReviewRole = 'reviewer' | 'security' | 'performance';
@@ -23,13 +24,8 @@ export interface NormalizedPrReviewAgentOutput {
 }
 
 export function mapRepoPath(config: AppConfig, pr: PrContext): string | null {
-  if (pr.repo === 'newton-web') {
-    return config.repoPaths.newtonWeb;
-  }
-  if (pr.repo === 'newton-api') {
-    return config.repoPaths.newtonApi;
-  }
-  return null;
+  const key = repoKeyFromGithubRepoName(pr.repo);
+  return key ? repoPathOrNull(config, key) : null;
 }
 
 export async function fetchPrHeadSha(params: {

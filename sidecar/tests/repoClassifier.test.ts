@@ -102,12 +102,34 @@ describe('classifyRepo (agent-based)', () => {
     await classifyRepo({
       task: 'fix the thing',
       threshold: 0.75,
-      affinity: { newtonWebHits: 1, newtonApiHits: 20 },
+      affinity: { 'newton-web': 1, 'newton-api': 20, 'newton-marketing-web': 3 },
       planAffectedFiles: ['handlers/create.py'],
     });
     const args = vi.mocked(runCodex).mock.calls[0][0];
     expect(args.prompt).toContain('newton-api=20 hits');
+    expect(args.prompt).toContain('newton-marketing-web=3 hits');
     expect(args.prompt).toContain('handlers/create.py');
+  });
+
+  it('accepts newton-marketing-web from the agent', async () => {
+    vi.mocked(runCodex).mockResolvedValueOnce(
+      aiReply({ selectedRepo: 'newton-marketing-web', confidence: 0.9, reasoning: 'landing page CTA' }),
+    );
+    const out = await classifyRepo({
+      task: 'the CTA on the NSAT landing page is broken',
+      threshold: 0.75,
+    });
+    expect(out.selectedRepo).toBe('newton-marketing-web');
+    expect(out.uncertain).toBe(false);
+  });
+
+  it('nulls out unknown repo names from the agent', async () => {
+    vi.mocked(runCodex).mockResolvedValueOnce(
+      aiReply({ selectedRepo: 'newton-mobile', confidence: 0.9, reasoning: 'hallucinated repo' }),
+    );
+    const out = await classifyRepo({ task: 'fix the thing', threshold: 0.75 });
+    expect(out.selectedRepo).toBeNull();
+    expect(out.uncertain).toBe(true);
   });
 });
 
@@ -160,14 +182,20 @@ describe('gatherRepoSignals', () => {
     __gitGrepHasHit.fn = () => false;
   });
 
+  const WEB_API_PATHS: Array<{ key: 'newton-web' | 'newton-api'; path: string }> = [
+    { key: 'newton-web', path: '/web' },
+    { key: 'newton-api', path: '/api' },
+  ];
+
   it('returns empty signals when no entities or paths', () => {
-    const out = gatherRepoSignals({ entities: [], webPath: '/x', apiPath: '/y' });
-    expect(out.webHittingEntities).toEqual([]);
-    expect(out.apiHittingEntities).toEqual([]);
+    const out = gatherRepoSignals({ entities: [], repoGrepPaths: WEB_API_PATHS });
+    expect(out.hitsByRepo['newton-web']).toEqual([]);
+    expect(out.hitsByRepo['newton-api']).toEqual([]);
+    expect(out.hitsByRepo['newton-marketing-web']).toEqual([]);
     expect(out.hasDistinctiveHit).toBe(false);
   });
 
-  it('records which side matched each entity and flags distinctive (≥12-char) hits', () => {
+  it('records which repo matched each entity and flags distinctive (≥12-char) hits', () => {
     __gitGrepHasHit.fn = (repoPath: string, entity: string) => {
       if (repoPath === '/web' && entity === 'share-payment-link-experiment') return true;
       if (repoPath === '/api' && entity === 'ViewSet') return true;
@@ -175,11 +203,12 @@ describe('gatherRepoSignals', () => {
     };
     const out = gatherRepoSignals({
       entities: ['share-payment-link-experiment', 'ViewSet'],
-      webPath: '/web',
-      apiPath: '/api',
+      repoGrepPaths: WEB_API_PATHS,
     });
-    expect(out.webHittingEntities).toEqual(['share-payment-link-experiment']);
-    expect(out.apiHittingEntities).toEqual(['ViewSet']);
+    expect(out.hitsByRepo['newton-web']).toEqual(['share-payment-link-experiment']);
+    expect(out.hitsByRepo['newton-api']).toEqual(['ViewSet']);
+    // Marketing path not configured → never grepped, always empty.
+    expect(out.hitsByRepo['newton-marketing-web']).toEqual([]);
     // share-payment-link-experiment is 29 chars → distinctive.
     expect(out.hasDistinctiveHit).toBe(true);
   });
@@ -188,8 +217,7 @@ describe('gatherRepoSignals', () => {
     __gitGrepHasHit.fn = (_: string, entity: string) => entity === 'short1';
     const out = gatherRepoSignals({
       entities: ['short1'],
-      webPath: '/web',
-      apiPath: '/api',
+      repoGrepPaths: WEB_API_PATHS,
     });
     expect(out.hasDistinctiveHit).toBe(false);
   });
@@ -201,6 +229,12 @@ describe('classifyRepo grep short-circuit', () => {
     __gitGrepHasHit.fn = () => false;
   });
 
+  const THREE_REPO_PATHS: Array<{ key: 'newton-web' | 'newton-api' | 'newton-marketing-web'; path: string }> = [
+    { key: 'newton-web', path: '/web' },
+    { key: 'newton-api', path: '/api' },
+    { key: 'newton-marketing-web', path: '/marketing' },
+  ];
+
   it('short-circuits to newton-web when a distinctive entity hits only in newton-web', async () => {
     __gitGrepHasHit.fn = (repoPath: string, entity: string) =>
       repoPath === '/web' && entity === 'share-payment-link-nsat-timeline-v2-experiment';
@@ -208,8 +242,7 @@ describe('classifyRepo grep short-circuit', () => {
     const out = await classifyRepo({
       task: 'stop the experiment share-payment-link-nsat-timeline-v2-experiment, set distribution to 0:100',
       threshold: 0.75,
-      webPath: '/web',
-      apiPath: '/api',
+      repoGrepPaths: THREE_REPO_PATHS,
     });
 
     expect(out.selectedRepo).toBe('newton-web');
@@ -227,8 +260,7 @@ describe('classifyRepo grep short-circuit', () => {
     const out = await classifyRepo({
       task: 'describe the table content_management_contentcreationcoursestructuretask please',
       threshold: 0.75,
-      webPath: '/web',
-      apiPath: '/api',
+      repoGrepPaths: THREE_REPO_PATHS,
     });
 
     expect(out.selectedRepo).toBe('newton-api');
@@ -236,15 +268,31 @@ describe('classifyRepo grep short-circuit', () => {
     expect(runCodex).not.toHaveBeenCalled();
   });
 
-  it('does NOT short-circuit when both repos have hits — falls through to the LLM with the hint injected', async () => {
-    __gitGrepHasHit.fn = (_: string, entity: string) => entity === 'shared-identifier-foo';
+  it('short-circuits to newton-marketing-web when a distinctive entity hits only there', async () => {
+    __gitGrepHasHit.fn = (repoPath: string, entity: string) =>
+      repoPath === '/marketing' && entity === 'data-science-ai-temp';
+
+    const out = await classifyRepo({
+      task: 'migrate the data-science-ai-temp page from Webflow',
+      threshold: 0.75,
+      repoGrepPaths: THREE_REPO_PATHS,
+    });
+
+    expect(out.selectedRepo).toBe('newton-marketing-web');
+    expect(out.uncertain).toBe(false);
+    expect(out.confidence).toBe(0.95);
+    expect(runCodex).not.toHaveBeenCalled();
+  });
+
+  it('does NOT short-circuit when both frontends have hits — falls through to the LLM with the hint injected', async () => {
+    __gitGrepHasHit.fn = (repoPath: string, entity: string) =>
+      (repoPath === '/web' || repoPath === '/marketing') && entity === 'shared-identifier-foo';
     vi.mocked(runCodex).mockResolvedValueOnce(aiReply({ selectedRepo: 'newton-web', confidence: 0.8, reasoning: 'x' }));
 
     await classifyRepo({
       task: 'investigate shared-identifier-foo it appears in both repos',
       threshold: 0.75,
-      webPath: '/web',
-      apiPath: '/api',
+      repoGrepPaths: THREE_REPO_PATHS,
     });
 
     expect(runCodex).toHaveBeenCalledTimes(1);
@@ -260,8 +308,7 @@ describe('classifyRepo grep short-circuit', () => {
     await classifyRepo({
       task: 'do short1 thing',
       threshold: 0.75,
-      webPath: '/web',
-      apiPath: '/api',
+      repoGrepPaths: THREE_REPO_PATHS,
     });
 
     // Falls through to LLM — non-distinctive short identifier shouldn't be enough to skip the agent.

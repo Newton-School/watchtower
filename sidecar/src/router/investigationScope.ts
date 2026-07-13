@@ -71,12 +71,15 @@ export async function classifyInvestigationScope(params: {
   //    the LLM (mirrors repoClassifier's grep short-circuit).
   if (webPath || apiPath) {
     const entities = extractEntities(`${bugReport}\n${threadMessages.join('\n')}`);
-    const signals = gatherRepoSignals({ entities, webPath, apiPath });
-    const webOnly = signals.webHittingEntities.length > 0 && signals.apiHittingEntities.length === 0;
-    const apiOnly = signals.apiHittingEntities.length > 0 && signals.webHittingEntities.length === 0;
+    const repoGrepPaths: Array<{ key: 'newton-web' | 'newton-api'; path: string }> = [];
+    if (webPath) repoGrepPaths.push({ key: 'newton-web', path: webPath });
+    if (apiPath) repoGrepPaths.push({ key: 'newton-api', path: apiPath });
+    const signals = gatherRepoSignals({ entities, repoGrepPaths });
+    const webOnly = signals.hitsByRepo['newton-web'].length > 0 && signals.hitsByRepo['newton-api'].length === 0;
+    const apiOnly = signals.hitsByRepo['newton-api'].length > 0 && signals.hitsByRepo['newton-web'].length === 0;
     if ((webOnly || apiOnly) && signals.hasDistinctiveHit) {
       const scope: InvestigationScope = webOnly ? 'newton-web' : 'newton-api';
-      const hits = webOnly ? signals.webHittingEntities : signals.apiHittingEntities;
+      const hits = webOnly ? signals.hitsByRepo['newton-web'] : signals.hitsByRepo['newton-api'];
       const result: InvestigationScopeResult = {
         scope,
         confidence: 0.9,

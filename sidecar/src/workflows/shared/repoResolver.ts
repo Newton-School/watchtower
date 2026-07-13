@@ -1,10 +1,19 @@
 import type { WebClient } from '@slack/web-api';
 import type { AppConfig, NormalizedTask, WorkflowStepLogger } from '../../types/contracts.js';
 import { classifyRepo, type RepoAffinity } from '../../router/repoClassifier.js';
+import {
+  REPO_KEYS,
+  enabledRepoKeys,
+  enabledRepoPaths,
+  isRepoEnabled,
+  resolveRepoPath,
+  type RepoKey,
+} from '../../repos/registry.js';
 import { formatAdminMention, getAdminUserIds } from '../../access/control.js';
 import { waitForRepoChoice } from '../../agents/pipeline.js';
 
-export type RepoName = 'newton-web' | 'newton-api';
+/** Canonical repo union — re-exported so the ~6 importers keep compiling. */
+export type RepoName = RepoKey;
 export type RepoResolution =
   | { outcome: 'resolved'; name: RepoName; path: string; source: ResolutionSource }
   | { outcome: 'desktop_only'; reason: string }
@@ -34,15 +43,38 @@ export type ResolutionSource = 'plan-affected-files' | 'classifier' | 'admin-cho
  */
 export function inferRepoFromAffectedFiles(files: string[]): RepoName | null {
   if (files.length === 0) return null;
-  const webHits = files.filter(f => f.includes('newton-web')).length;
-  const apiHits = files.filter(f => f.includes('newton-api')).length;
-  if (webHits >= 2 && apiHits === 0) return 'newton-web';
-  if (apiHits >= 2 && webHits === 0) return 'newton-api';
+  // NOTE: 'newton-marketing-web' does not contain the substring 'newton-web',
+  // so these per-key counters cannot cross-contaminate.
+  const hits = REPO_KEYS.map(key => ({ key, count: files.filter(f => f.includes(key)).length }));
+  const winners = hits.filter(h => h.count >= 2);
+  if (winners.length === 1 && hits.every(h => h.key === winners[0].key || h.count === 0)) {
+    return winners[0].key;
+  }
   return null;
 }
 
 export function repoPathFor(name: RepoName, config: AppConfig): string {
-  return name === 'newton-web' ? config.repoPaths.newtonWeb : config.repoPaths.newtonApi;
+  return resolveRepoPath(config, name);
+}
+
+/**
+ * Read the user's per-repo affinity out of a dossier, covering every known
+ * repo. Shared by the two call sites that previously hardcoded the
+ * newton-web/newton-api lookups (and silently dropped anything else).
+ */
+export function readRepoAffinity(dossier: {
+  affinity: Array<{ repo: string; hits: number }>;
+}): RepoAffinity | undefined {
+  const result: RepoAffinity = {};
+  let any = false;
+  for (const key of REPO_KEYS) {
+    const row = dossier.affinity.find(a => a.repo === key);
+    if (row && row.hits > 0) {
+      result[key] = row.hits;
+      any = true;
+    }
+  }
+  return any ? result : undefined;
 }
 
 export async function resolveRepoOrAsk(params: {
@@ -86,7 +118,9 @@ export async function resolveRepoOrAsk(params: {
   // Deterministic substring check on file paths, not classification — calling
   // the agent here would just burn a round-trip.
   const fromFiles = inferRepoFromAffectedFiles(planAffectedFiles);
-  if (fromFiles) return resolved(fromFiles, config, 'plan-affected-files');
+  if (fromFiles && isRepoEnabled(config, fromFiles)) {
+    return resolved(fromFiles, config, 'plan-affected-files');
+  }
 
   const classification = await classifyRepo({
     task: task.event.text,
@@ -95,11 +129,10 @@ export async function resolveRepoOrAsk(params: {
     affinity: repoAffinity,
     planAffectedFiles,
     planMarkdown,
-    webPath: config.repoPaths.newtonWeb,
-    apiPath: config.repoPaths.newtonApi,
+    repoGrepPaths: enabledRepoPaths(config),
     logStep,
   });
-  if (!classification.uncertain && classification.selectedRepo) {
+  if (!classification.uncertain && classification.selectedRepo && isRepoEnabled(config, classification.selectedRepo)) {
     return resolved(classification.selectedRepo, config, 'classifier');
   }
 
@@ -159,6 +192,7 @@ export async function resolveRepoOrAsk(params: {
     logStep: logStep ?? (() => {}),
     botUserId: config.botUserId,
     signal,
+    allowedRepos: enabledRepoKeys(config),
     nudgeText:
       "Still waiting on an admin to pick *newton-web* or *newton-api* for this task. Reply here or say 'cancel' to stop.",
   });
