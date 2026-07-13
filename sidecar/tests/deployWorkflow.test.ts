@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { isDeployRequest, isMarketingDeployRequest } from '../src/router/intentParser.js';
+import { classifyDeployTarget, isDeployRequest, isMarketingDeployRequest } from '../src/router/intentParser.js';
 import { normalizeTask } from '../src/router/intentParser.js';
 import type { AppConfig, NormalizedTask, SlackEventEnvelope } from '../src/types/contracts.js';
 import { runDeployWorkflow, __ghCli, __deployTiming } from '../src/workflows/deployWorkflow.js';
@@ -133,25 +133,36 @@ describe('marketing deploy gating', () => {
     expect(isDeployRequest('<@UBOT1> release the webflow migration to prod')).toBe(false);
   });
 
-  it('an explicit newton-web reference wins over an incidental marketing mention', () => {
-    // Review finding: an incidental token must not hijack (or veto) an
-    // explicitly named newton-web deploy.
-    const text = '<@UBOT1> deploy newton-web to prod — marketing needs the new banner live';
-    expect(isDeployRequest(text)).toBe(true);
-    expect(isMarketingDeployRequest(text)).toBe(false);
+  it('signals for BOTH repos in one message classify as ambiguous — neither prod deploy is guessed', () => {
+    // Review findings (both directions): an incidental mention of the other
+    // repo must not pick a winner. "deploy newton-web … marketing …" must not
+    // silently deploy either repo, and vice versa.
+    for (const text of [
+      '<@UBOT1> deploy newton-web to prod — marketing needs the new banner live',
+      '<@UBOT1> deploy the marketing site to prod — the newton-web banner is already live',
+    ]) {
+      expect(classifyDeployTarget(text)).toBe('ambiguous');
+      expect(isDeployRequest(text)).toBe(false);
+      expect(isMarketingDeployRequest(text)).toBe(false);
+    }
   });
 
-  it('ambiguous frontend targets fire NEITHER deterministic deploy', () => {
+  it('ambiguous frontend targets stay in the DEPLOY flow but pin no repo', () => {
     // "landing page" / "homepage" / "newton school" describe screens in both
-    // frontends — a prod deploy must not be guessed from them.
+    // frontends — a prod deploy must not be guessed from them, but the ask is
+    // still deploy-shaped: only the deterministic gate can produce DEPLOY, so
+    // these must not leak into the implementation pipeline.
     for (const text of [
       '<@UBOT1> ship the landing pages to production',
       '<@UBOT1> deploy the landing page changes to prod',
       '<@UBOT1> ship the homepage to production',
       '<@UBOT1> deploy the newton school site',
     ]) {
+      expect(classifyDeployTarget(text)).toBe('ambiguous');
       expect(isDeployRequest(text)).toBe(false);
       expect(isMarketingDeployRequest(text)).toBe(false);
+      const task = normalizeTask({ ...baseEvent, text }, config, []);
+      expect(task.intent).toBe('DEPLOY');
     }
   });
 
@@ -352,6 +363,70 @@ describe('runDeployWorkflow marketing branch', () => {
 
     expect(result.status).toBe('SUCCESS');
     expect(result.message).toContain('waiting for the production-environment approval');
+  });
+
+  it('an ambiguous deploy ask on a marketing-enabled host asks for the target instead of deploying', async () => {
+    const ghExec = vi.fn();
+    __ghCli.exec = ghExec;
+    const postMessage = vi.fn().mockResolvedValue({ ok: true, ts: '1.0' });
+    const slack = { chat: { postMessage } } as any;
+
+    const result = await runDeployWorkflow({
+      task: marketingTask('<@UBOT1> ship the landing pages to production'),
+      config: marketingConfig,
+      slack,
+    });
+
+    expect(result.status).toBe('SKIPPED');
+    expect(result.message).toContain('could mean');
+    expect(ghExec).not.toHaveBeenCalled();
+    expect(runCodex).not.toHaveBeenCalled();
+  });
+
+  it('an ambiguous deploy ask without the marketing clone falls through to the newton-web deploy (pre-stack behavior)', async () => {
+    vi.mocked(runCodex).mockResolvedValueOnce({
+      ok: true,
+      exitCode: 0,
+      timedOut: false,
+      stdout: '',
+      stderr: '',
+      lastMessage: 'Deploy succeeded.',
+      parsedJson: undefined,
+    } as any);
+    const ghExec = vi.fn();
+    __ghCli.exec = ghExec;
+    const postMessage = vi.fn().mockResolvedValue({ ok: true, ts: '1.0' });
+    const slack = { chat: { postMessage } } as any;
+
+    const result = await runDeployWorkflow({
+      task: marketingTask('<@UBOT1> ship the landing pages to production'),
+      config, // no marketing path — only one deployable frontend on this host
+      slack,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    expect(runCodex).toHaveBeenCalledTimes(1);
+    expect(ghExec).not.toHaveBeenCalled();
+  });
+
+  it('skips run-watching (no stale-run report) when the pre-dispatch anchor read fails', async () => {
+    // Review finding: a failed anchor read must not collapse into "no prior
+    // runs" — with an unknown anchor the watcher could pick up the PREVIOUS
+    // deploy's run and report its outcome as this one's.
+    const ghExec = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('gh timeout')) // anchor read fails
+      .mockResolvedValueOnce(''); // dispatch succeeds
+    __ghCli.exec = ghExec;
+    const postMessage = vi.fn().mockResolvedValue({ ok: true, ts: '1.0' });
+    const slack = { chat: { postMessage } } as any;
+
+    const result = await runDeployWorkflow({ task: marketingTask(), config: marketingConfig, slack });
+
+    expect(result.status).toBe('SUCCESS');
+    expect(result.message).toContain("couldn't establish a pre-dispatch baseline");
+    // Exactly two gh calls: anchor attempt + dispatch. No run list/view polling.
+    expect(ghExec).toHaveBeenCalledTimes(2);
   });
 
   it('fails cleanly when the dispatch itself errors', async () => {

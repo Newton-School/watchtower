@@ -47,48 +47,60 @@ function normalizeDeployText(text: string): string {
     .trim();
 }
 
+export type DeployTarget = 'newton-web' | 'newton-marketing-web' | 'ambiguous';
+
 /**
- * Deterministic check: does the message ask to deploy newton-web to production?
- * This runs before the AI classifier so deploy requests are never misrouted.
+ * Deterministic deploy-target classification. This is the ONLY producer of
+ * the DEPLOY intent (the AI intent classifier cannot emit DEPLOY), so every
+ * deploy-shaped ask must resolve here — including the ambiguous ones.
+ *
+ * Precedence:
+ * - Explicit signals for BOTH repos in one message ⇒ 'ambiguous'. Picking a
+ *   winner is unsafe in both directions (either repo could be hijacked into
+ *   a wrong production deploy by an incidental mention of the other).
+ * - Exactly one explicit repo signal ⇒ that repo.
+ * - Only frontend-ambiguous nouns (landing/homepage/newton school) ⇒
+ *   'ambiguous' — never guess a prod deploy from those.
+ * - Bare "deploy to prod" / "deploy the frontend" ⇒ newton-web (historical
+ *   behavior; prod was the only deploy target before marketing existed).
+ *
+ * The deploy workflow resolves 'ambiguous' with config: hosts without the
+ * marketing clone have exactly one deployable frontend and behave as before;
+ * hosts with it get a clarify reply instead of a guessed production deploy.
  */
-export function isDeployRequest(text: string): boolean {
+export function classifyDeployTarget(text: string): DeployTarget | null {
   const normalized = normalizeDeployText(text);
+  if (!DEPLOY_VERB_RE.test(normalized)) return null;
 
-  // Must contain a deploy verb
-  if (!DEPLOY_VERB_RE.test(normalized)) return false;
+  const namesNewtonWeb = NEWTON_WEB_REF_RE.test(normalized);
+  const namesMarketing = MARKETING_DEPLOY_REF_RE.test(normalized);
+  if (namesNewtonWeb && namesMarketing) return 'ambiguous';
+  if (namesNewtonWeb) return 'newton-web';
+  if (namesMarketing) return 'newton-marketing-web';
+  if (AMBIGUOUS_DEPLOY_TARGET_RE.test(normalized)) return 'ambiguous';
 
-  // Explicit newton-web reference wins over everything else.
-  if (NEWTON_WEB_REF_RE.test(normalized)) return true;
-
-  // A deploy ask that names the marketing stack must NEVER fire the newton-web
-  // production deploy — it belongs to the marketing (GitHub Actions) flow.
-  if (MARKETING_DEPLOY_REF_RE.test(normalized)) return false;
-
-  // "deploy the landing page / the newton school site to prod" — could be
-  // either frontend. Don't guess a production deploy from a regex; let the
-  // classifier/admin flow sort it out.
-  if (AMBIGUOUS_DEPLOY_TARGET_RE.test(normalized)) return false;
-
-  // Must reference production target
   const hasProdTarget = /\b(prod|production)\b/.test(normalized);
   const hasAppRef = /\bfrontend\b/.test(normalized);
-
-  // "deploy to prod" / "deploy prod" is unambiguous enough even without app name
-  return hasProdTarget || hasAppRef;
+  return hasProdTarget || hasAppRef ? 'newton-web' : null;
 }
 
 /**
- * Deterministic check: does the message ask to deploy the MARKETING site
- * (newton-marketing-web)? Kept separate from isDeployRequest so the two
- * deploy mechanisms (newton-web prod skill vs marketing GitHub Actions
- * dispatch) can never be confused for each other. An explicit newton-web
- * reference always disqualifies the marketing flow.
+ * Deterministic check: does the message unambiguously ask to deploy
+ * newton-web to production? Runs before the AI classifier so deploy requests
+ * are never misrouted.
+ */
+export function isDeployRequest(text: string): boolean {
+  return classifyDeployTarget(text) === 'newton-web';
+}
+
+/**
+ * Deterministic check: does the message unambiguously ask to deploy the
+ * MARKETING site (newton-marketing-web)? Kept separate from isDeployRequest
+ * so the two deploy mechanisms (newton-web prod skill vs marketing GitHub
+ * Actions dispatch) can never be confused for each other.
  */
 export function isMarketingDeployRequest(text: string): boolean {
-  const normalized = normalizeDeployText(text);
-  return (
-    DEPLOY_VERB_RE.test(normalized) && MARKETING_DEPLOY_REF_RE.test(normalized) && !NEWTON_WEB_REF_RE.test(normalized)
-  );
+  return classifyDeployTarget(text) === 'newton-marketing-web';
 }
 
 export function detectMention(
@@ -364,11 +376,12 @@ function inferIntent(
     return { intent: 'DEV_ASSIST' };
   }
 
-  // Deterministic deploy detection — routed before the AI classifier. The
-  // marketing check runs first: its tokens are disjoint from isDeployRequest's
-  // (which explicitly excludes them), so a deploy ask resolves to exactly one
-  // of the two deploy flows. deployWorkflow re-derives the target the same way.
-  if (mention.detected && (isMarketingDeployRequest(event.text ?? '') || isDeployRequest(event.text ?? ''))) {
+  // Deterministic deploy detection — routed before the AI classifier, which
+  // cannot emit DEPLOY. Every deploy-shaped ask (newton-web, marketing, or
+  // ambiguous between the frontends) lands on the DEPLOY intent here;
+  // deployWorkflow re-derives the target the same way and resolves
+  // 'ambiguous' with config.
+  if (mention.detected && classifyDeployTarget(event.text ?? '') !== null) {
     return { intent: 'DEPLOY' };
   }
 

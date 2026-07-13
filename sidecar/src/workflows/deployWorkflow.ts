@@ -11,8 +11,8 @@ import { highReasoningProfile } from '../codex/modelProfiles.js';
 import { buildMentionSystemPrompt } from '../codex/mentionSystemPrompt.js';
 import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
 import { extractReplyFromCodexResult } from './shared/workflowUtils.js';
-import { isMarketingDeployRequest } from '../router/intentParser.js';
-import { getRepo, repoPathOrNull } from '../repos/registry.js';
+import { classifyDeployTarget } from '../router/intentParser.js';
+import { getRepo, isRepoEnabled, repoPathOrNull } from '../repos/registry.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -70,11 +70,26 @@ export async function runDeployWorkflow(params: {
 }): Promise<WorkflowResult> {
   const { task, config, slack, logStep, signal } = params;
 
-  // Same deterministic check the intent gate used: a deploy ask naming the
-  // marketing site routes to the GitHub Actions flow; everything else is the
-  // classic newton-web prod deploy. Never let one mechanism run the other.
-  if (isMarketingDeployRequest(task.event.text ?? '')) {
+  // Same deterministic classification the intent gate used: a deploy ask
+  // naming the marketing site routes to the GitHub Actions flow; everything
+  // else is the classic newton-web prod deploy. Never let one mechanism run
+  // the other, and never GUESS between them on conflicting signals.
+  const target = classifyDeployTarget(task.event.text ?? '') ?? 'newton-web';
+  if (target === 'newton-marketing-web') {
     return runMarketingDeploy(params);
+  }
+  if (target === 'ambiguous' && isRepoEnabled(config, 'newton-marketing-web')) {
+    // Two deployable frontends and the ask doesn't pin one — ask instead of
+    // firing a production deploy on a guess. (Without the marketing clone
+    // there is only one deployable frontend, so we fall through to the
+    // newton-web deploy exactly as before the marketing repo existed.)
+    const msg =
+      'That deploy ask could mean the *newton-web* app or the *newton-marketing-web* site. Re-ask with the target in the message — e.g. "deploy newton-web to prod" or "deploy marketing to prod".';
+    await slack.chat
+      .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: msg })
+      .catch(() => {});
+    logStep?.({ stage: 'deploy.ambiguous_target', message: msg, level: 'WARN' });
+    return { workflow: 'DEPLOY', status: 'SKIPPED', message: msg, notifyDesktop: false, slackPosted: true };
   }
 
   logStep?.({
@@ -278,12 +293,15 @@ async function runMarketingDeploy(params: {
   // Anchor on the newest existing run BEFORE dispatching: `gh workflow run`
   // returns before GitHub materializes the new run, so without an anchor the
   // watcher's first poll would read the PREVIOUS deploy's outcome and report
-  // it as this one's. Best-effort — a failed read just means no anchor.
+  // it as this one's. A FAILED anchor read is not the same as "no prior
+  // runs": with an unknown anchor we cannot tell the new run from the last
+  // one, so we dispatch but skip run-watching entirely.
   let anchorRunId: number | undefined;
+  let anchorKnown = true;
   try {
     anchorRunId = (await readLatestDeployRun(repoPath)).id;
   } catch {
-    anchorRunId = undefined;
+    anchorKnown = false;
   }
 
   // Dispatch. `gh` resolves the target repo from the clone's origin remote.
@@ -309,7 +327,14 @@ async function runMarketingDeploy(params: {
   // Resolve the run we just dispatched, then poll it to completion. Like the
   // newton-web path, the side-effect has already executed — every failure
   // after this point must degrade to a report, never a retry.
-  const run = await watchMarketingDeployRun({ repoPath, anchorRunId, signal, logStep });
+  const run = anchorKnown
+    ? await watchMarketingDeployRun({ repoPath, anchorRunId, signal, logStep })
+    : {
+        conclusion: 'pending' as const,
+        url: undefined,
+        summary:
+          ":hourglass: The marketing prod deploy was dispatched, but I couldn't establish a pre-dispatch baseline to identify its run — check the repo's Actions tab for the latest deploy-prod run.",
+      };
 
   logStep?.({
     stage: 'deploy.marketing.done',

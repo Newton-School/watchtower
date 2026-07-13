@@ -458,9 +458,10 @@ const REPO_FOR_INTENT: Record<'web' | 'api' | 'marketing', RepoKey> = {
 
 // MARKETING_SHORTHAND is tested before WEB_SHORTHAND: the anchors already keep
 // "marketing web" out of WEB_SHORTHAND today, but the ordering makes that safe
-// against any future de-anchoring of these regexes.
-const MARKETING_SHORTHAND =
-  /^(marketing|mweb|nmw|mkt|marketing[- ]?(web|site)|newton[- ]?marketing([- ]?web)?|landing([- ]?pages?)?)$/i;
+// against any future de-anchoring of these regexes. Bare "landing (page)" is
+// deliberately NOT shorthand — newton-web has landing screens too, so that
+// reply goes to the LLM, which weighs the thread context.
+const MARKETING_SHORTHAND = /^(marketing|mweb|nmw|mkt|marketing[- ]?(web|site)|newton[- ]?marketing([- ]?web)?)$/i;
 const WEB_SHORTHAND = /^(web|newton-?web|frontend|fe|ui)$/i;
 const API_SHORTHAND = /^(api|newton-?api|backend|be|server)$/i;
 const BOTH_SHORTHAND =
@@ -486,36 +487,24 @@ async function classifyRepoChoice(
   if (BOTH_SHORTHAND.test(trimmed)) return 'both';
   if (CANCEL_SHORTHAND.test(trimmed)) return 'cancel';
 
-  // The LLM prompt only describes the repos this host can actually resolve —
-  // on a two-repo host it stays byte-compatible with the pre-marketing copy.
-  const marketingChoiceLine = marketingAllowed
-    ? `\n- "newton-marketing-web" — the PUBLIC MARKETING site (newtonschool.co landing pages, Webflow migration, Tailwind, Cloudflare)`
-    : '';
-  const marketingCategory = marketingAllowed
-    ? `
-
-"marketing" — the reply identifies newton-marketing-web. Examples: "marketing", "mweb", "nmw", "the marketing site", "landing pages", "the webflow one", "the tailwind one", "the public site".
-IMPORTANT: "marketing web", "marketing site", and "landing" mean newton-marketing-web, NOT newton-web. Classify as "web" only when the reply points at the product app.`
-    : '';
-  const categoryCount = marketingAllowed ? 'six' : 'five';
-  const bothExamples = marketingAllowed
-    ? `"both", "both repos", "web and api", "api and web", "web and marketing", "dono", "it's a cross-repo change", "frontend + backend"`
-    : `"both", "both repos", "web and api", "api and web", "dono", "it's a cross-repo change", "frontend + backend"`;
-  const intentUnion = marketingAllowed
-    ? `"web" | "api" | "marketing" | "both" | "cancel" | "unclear"`
-    : `"web" | "api" | "both" | "cancel" | "unclear"`;
-
-  const prompt = `You are a classifier for miniOG, a developer bot. miniOG asked an admin which repo to work in for an ambiguous task. The choices are:
+  // On a two-repo host the LLM prompt is BYTE-IDENTICAL to the pre-marketing
+  // copy (invariant: an unconfigured marketing repo changes nothing).
+  const prompt = marketingAllowed
+    ? `You are a classifier for miniOG, a developer bot. miniOG asked an admin which repo to work in for an ambiguous task. The choices are:
 - "newton-web" — the PRODUCT frontend (React/JavaScript, the logged-in app at my.newtonschool.co: pages, components, UI)
-- "newton-api" — the backend repo (Python/Django, endpoints, models, serializers)${marketingChoiceLine}
+- "newton-api" — the backend repo (Python/Django, endpoints, models, serializers)
+- "newton-marketing-web" — the PUBLIC MARKETING site (newtonschool.co landing pages, Webflow migration, Tailwind, Cloudflare)
 
-Classify the admin's reply into one of ${categoryCount} categories:
+Classify the admin's reply into one of six categories:
 
 "web" — the reply identifies newton-web. Examples: "web", "newton-web", "frontend", "the react one", "UI", "it's a frontend change", "the product app".
 
-"api" — the reply identifies newton-api. Examples: "api", "newton-api", "backend", "the django one", "it's in python".${marketingCategory}
+"api" — the reply identifies newton-api. Examples: "api", "newton-api", "backend", "the django one", "it's in python".
 
-"both" — the reply says the task spans MULTIPLE repos. Examples: ${bothExamples}.
+"marketing" — the reply identifies newton-marketing-web. Examples: "marketing", "mweb", "nmw", "the marketing site", "landing pages", "the webflow one", "the tailwind one", "the public site".
+IMPORTANT: "marketing web", "marketing site", and "landing" mean newton-marketing-web, NOT newton-web. Classify as "web" only when the reply points at the product app.
+
+"both" — the reply says the task spans MULTIPLE repos. Examples: "both", "both repos", "web and api", "api and web", "web and marketing", "dono", "it's a cross-repo change", "frontend + backend".
 
 "cancel" — the reply tells miniOG to stop / skip / abort. Examples: "cancel", "nevermind", "don't bother", "stop".
 
@@ -529,7 +518,34 @@ New message to classify:
 
 Return strict JSON:
 {
-  "intent": ${intentUnion},
+  "intent": "web" | "api" | "marketing" | "both" | "cancel" | "unclear",
+  "reasoning": "one sentence explaining why"
+}`
+    : `You are a classifier for miniOG, a developer bot. miniOG asked an admin which repo to work in for an ambiguous task. The choices are:
+- "newton-web" — the frontend repo (React/JavaScript, pages, components, UI)
+- "newton-api" — the backend repo (Python/Django, endpoints, models, serializers)
+
+Classify the admin's reply into one of five categories:
+
+"web" — the reply identifies newton-web. Examples: "web", "newton-web", "frontend", "the react one", "UI", "it's a frontend change".
+
+"api" — the reply identifies newton-api. Examples: "api", "newton-api", "backend", "the django one", "it's in python".
+
+"both" — the reply says the task spans BOTH repos. Examples: "both", "both repos", "web and api", "api and web", "dono", "it's a cross-repo change", "frontend + backend".
+
+"cancel" — the reply tells miniOG to stop / skip / abort. Examples: "cancel", "nevermind", "don't bother", "stop".
+
+"unclear" — the reply doesn't pick a repo and isn't a cancel or "both". Examples: "not sure", a question, unrelated chat, or anything that doesn't map to web/api/both/cancel.
+
+Recent thread messages (for context):
+${recentThread.map((m, i) => `[${i + 1}] ${m}`).join('\n')}
+
+New message to classify:
+"${message}"
+
+Return strict JSON:
+{
+  "intent": "web" | "api" | "both" | "cancel" | "unclear",
   "reasoning": "one sentence explaining why"
 }`;
 

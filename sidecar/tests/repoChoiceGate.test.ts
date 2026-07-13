@@ -199,7 +199,7 @@ describe('waitForRepoChoice', () => {
     expect(guidanceCalls).toHaveLength(1);
   });
 
-  it.each(['marketing', 'mweb', 'nmw', 'landing', 'marketing web', 'newton-marketing-web'])(
+  it.each(['marketing', 'mweb', 'nmw', 'marketing web', 'newton-marketing-web'])(
     'resolves to newton-marketing-web on shorthand %j without calling the classifier',
     async shorthand => {
       const slack = makeSlack();
