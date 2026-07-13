@@ -27,7 +27,17 @@ export function containsMetabaseUrl(text: string | undefined | null): boolean {
 }
 
 const DEPLOY_VERB_RE = /\b(deploy|ship|release|push to prod|push prod)\b/;
-const MARKETING_DEPLOY_REF_RE = /\b(marketing|landing|webflow|wrangler|cloudflare|mweb|nmw|newton[- ]?marketing)\b/;
+// Tokens that pick the MARKETING deploy flow. Deliberately narrow: generic
+// words like "landing" or "homepage" also describe newton-web product screens
+// and would let an incidental mention hijack (or veto) a production deploy.
+const MARKETING_DEPLOY_REF_RE = /\b(marketing|mweb|nmw|newton[- ]?marketing([- ]?web)?|webflow|wrangler|cloudflare)\b/;
+// An explicitly named newton-web target always wins, even when marketing is
+// mentioned incidentally ("deploy newton-web to prod — marketing needs the
+// banner live").
+const NEWTON_WEB_REF_RE = /\bnewton[- ]?web\b/;
+// Targets that are genuinely ambiguous between the two frontends. A deploy
+// ask naming only these must not deterministically fire EITHER prod deploy.
+const AMBIGUOUS_DEPLOY_TARGET_RE = /\b(landing([- ]?pages?)?|homepage|newton[- ]?school)\b/;
 
 function normalizeDeployText(text: string): string {
   return text
@@ -47,19 +57,23 @@ export function isDeployRequest(text: string): boolean {
   // Must contain a deploy verb
   if (!DEPLOY_VERB_RE.test(normalized)) return false;
 
-  // A deploy ask that names the marketing site must NEVER fire the newton-web
+  // Explicit newton-web reference wins over everything else.
+  if (NEWTON_WEB_REF_RE.test(normalized)) return true;
+
+  // A deploy ask that names the marketing stack must NEVER fire the newton-web
   // production deploy — it belongs to the marketing (GitHub Actions) flow.
   if (MARKETING_DEPLOY_REF_RE.test(normalized)) return false;
 
+  // "deploy the landing page / the newton school site to prod" — could be
+  // either frontend. Don't guess a production deploy from a regex; let the
+  // classifier/admin flow sort it out.
+  if (AMBIGUOUS_DEPLOY_TARGET_RE.test(normalized)) return false;
+
   // Must reference production target
   const hasProdTarget = /\b(prod|production)\b/.test(normalized);
-  // Must reference the app. NOTE: `newton school` deliberately dropped from
-  // this list — with two frontends, "deploy the newton school site" is
-  // genuinely ambiguous and must not deterministically mean newton-web.
-  const hasAppRef = /\b(newton[- ]?web|frontend)\b/.test(normalized);
+  const hasAppRef = /\bfrontend\b/.test(normalized);
 
   // "deploy to prod" / "deploy prod" is unambiguous enough even without app name
-  // "deploy newton-web" without "prod" is also valid (prod is the only deploy target)
   return hasProdTarget || hasAppRef;
 }
 
@@ -67,11 +81,14 @@ export function isDeployRequest(text: string): boolean {
  * Deterministic check: does the message ask to deploy the MARKETING site
  * (newton-marketing-web)? Kept separate from isDeployRequest so the two
  * deploy mechanisms (newton-web prod skill vs marketing GitHub Actions
- * dispatch) can never be confused for each other.
+ * dispatch) can never be confused for each other. An explicit newton-web
+ * reference always disqualifies the marketing flow.
  */
 export function isMarketingDeployRequest(text: string): boolean {
   const normalized = normalizeDeployText(text);
-  return DEPLOY_VERB_RE.test(normalized) && MARKETING_DEPLOY_REF_RE.test(normalized);
+  return (
+    DEPLOY_VERB_RE.test(normalized) && MARKETING_DEPLOY_REF_RE.test(normalized) && !NEWTON_WEB_REF_RE.test(normalized)
+  );
 }
 
 export function detectMention(

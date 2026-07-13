@@ -471,31 +471,51 @@ async function classifyRepoChoice(
   message: string,
   recentThread: string[],
   logStep: WorkflowStepLogger,
+  allowedRepos: readonly RepoKey[] = REPO_KEYS,
 ): Promise<RepoIntent> {
   const trimmed = message.trim();
+  const marketingAllowed = allowedRepos.includes('newton-marketing-web');
 
-  // Cheap regex short-circuits before calling the model.
+  // Cheap regex short-circuits before calling the model. The marketing
+  // shorthand runs even when marketing is disabled — the caller's
+  // allowedRepos gate then posts the "not configured on this host" notice,
+  // which beats silently classifying "marketing" as unclear.
   if (MARKETING_SHORTHAND.test(trimmed)) return 'marketing';
   if (WEB_SHORTHAND.test(trimmed)) return 'web';
   if (API_SHORTHAND.test(trimmed)) return 'api';
   if (BOTH_SHORTHAND.test(trimmed)) return 'both';
   if (CANCEL_SHORTHAND.test(trimmed)) return 'cancel';
 
+  // The LLM prompt only describes the repos this host can actually resolve —
+  // on a two-repo host it stays byte-compatible with the pre-marketing copy.
+  const marketingChoiceLine = marketingAllowed
+    ? `\n- "newton-marketing-web" — the PUBLIC MARKETING site (newtonschool.co landing pages, Webflow migration, Tailwind, Cloudflare)`
+    : '';
+  const marketingCategory = marketingAllowed
+    ? `
+
+"marketing" — the reply identifies newton-marketing-web. Examples: "marketing", "mweb", "nmw", "the marketing site", "landing pages", "the webflow one", "the tailwind one", "the public site".
+IMPORTANT: "marketing web", "marketing site", and "landing" mean newton-marketing-web, NOT newton-web. Classify as "web" only when the reply points at the product app.`
+    : '';
+  const categoryCount = marketingAllowed ? 'six' : 'five';
+  const bothExamples = marketingAllowed
+    ? `"both", "both repos", "web and api", "api and web", "web and marketing", "dono", "it's a cross-repo change", "frontend + backend"`
+    : `"both", "both repos", "web and api", "api and web", "dono", "it's a cross-repo change", "frontend + backend"`;
+  const intentUnion = marketingAllowed
+    ? `"web" | "api" | "marketing" | "both" | "cancel" | "unclear"`
+    : `"web" | "api" | "both" | "cancel" | "unclear"`;
+
   const prompt = `You are a classifier for miniOG, a developer bot. miniOG asked an admin which repo to work in for an ambiguous task. The choices are:
 - "newton-web" — the PRODUCT frontend (React/JavaScript, the logged-in app at my.newtonschool.co: pages, components, UI)
-- "newton-api" — the backend repo (Python/Django, endpoints, models, serializers)
-- "newton-marketing-web" — the PUBLIC MARKETING site (newtonschool.co landing pages, Webflow migration, Tailwind, Cloudflare)
+- "newton-api" — the backend repo (Python/Django, endpoints, models, serializers)${marketingChoiceLine}
 
-Classify the admin's reply into one of six categories:
+Classify the admin's reply into one of ${categoryCount} categories:
 
 "web" — the reply identifies newton-web. Examples: "web", "newton-web", "frontend", "the react one", "UI", "it's a frontend change", "the product app".
 
-"api" — the reply identifies newton-api. Examples: "api", "newton-api", "backend", "the django one", "it's in python".
+"api" — the reply identifies newton-api. Examples: "api", "newton-api", "backend", "the django one", "it's in python".${marketingCategory}
 
-"marketing" — the reply identifies newton-marketing-web. Examples: "marketing", "mweb", "nmw", "the marketing site", "landing pages", "the webflow one", "the tailwind one", "the public site".
-IMPORTANT: "marketing web", "marketing site", and "landing" mean newton-marketing-web, NOT newton-web. Classify as "web" only when the reply points at the product app.
-
-"both" — the reply says the task spans MULTIPLE repos. Examples: "both", "both repos", "web and api", "api and web", "web and marketing", "dono", "it's a cross-repo change", "frontend + backend".
+"both" — the reply says the task spans MULTIPLE repos. Examples: ${bothExamples}.
 
 "cancel" — the reply tells miniOG to stop / skip / abort. Examples: "cancel", "nevermind", "don't bother", "stop".
 
@@ -509,7 +529,7 @@ New message to classify:
 
 Return strict JSON:
 {
-  "intent": "web" | "api" | "marketing" | "both" | "cancel" | "unclear",
+  "intent": ${intentUnion},
   "reasoning": "one sentence explaining why"
 }`;
 
@@ -664,7 +684,7 @@ export async function waitForRepoChoice(params: {
       }
 
       const recentThread = messages.slice(-6).map(m => m.text.trim());
-      const intent = await classifyRepoChoice(text, recentThread, logStep);
+      const intent = await classifyRepoChoice(text, recentThread, logStep, allowedRepos);
 
       if (intent === 'web' || intent === 'api' || intent === 'marketing') {
         const repo = REPO_FOR_INTENT[intent];
@@ -712,7 +732,7 @@ export async function waitForRepoChoice(params: {
             .postMessage({
               channel: channelId,
               thread_ts: threadTs,
-              text: `<@${reply.user}> This looks like it touches *multiple* repos. I implement one repo per run — reply *web*, *api*, or *marketing* to pick which I should start with, and tag me again for the others once that PR is up.`,
+              text: `<@${reply.user}> This looks like it touches *multiple* repos. I implement one repo per run — reply ${allowedRepos.includes('newton-marketing-web') ? '*web*, *api*, or *marketing*' : '*web* or *api*'} to pick which I should start with, and tag me again for the others once that PR is up.`,
             })
             .catch(() => {});
           logStep({

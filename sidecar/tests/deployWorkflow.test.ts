@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { isDeployRequest, isMarketingDeployRequest } from '../src/router/intentParser.js';
 import { normalizeTask } from '../src/router/intentParser.js';
 import type { AppConfig, NormalizedTask, SlackEventEnvelope } from '../src/types/contracts.js';
-import { runDeployWorkflow, __ghCli } from '../src/workflows/deployWorkflow.js';
+import { runDeployWorkflow, __ghCli, __deployTiming } from '../src/workflows/deployWorkflow.js';
 import { runCodex } from '../src/codex/runCodex.js';
 
 vi.mock('../src/codex/runCodex.js', () => ({
@@ -129,20 +129,36 @@ describe('normalizeTask routes DEPLOY deterministically', () => {
 describe('marketing deploy gating', () => {
   it('never treats a marketing deploy ask as the newton-web deploy', () => {
     expect(isDeployRequest('<@UBOT1> deploy the marketing site to prod')).toBe(false);
-    expect(isDeployRequest('<@UBOT1> ship the landing pages to production')).toBe(false);
     expect(isDeployRequest('<@UBOT1> deploy newton-marketing-web')).toBe(false);
     expect(isDeployRequest('<@UBOT1> release the webflow migration to prod')).toBe(false);
   });
 
-  it('no longer treats "newton school" as a deterministic newton-web reference', () => {
-    // With two frontends, "the newton school site" is genuinely ambiguous.
-    expect(isDeployRequest('<@UBOT1> deploy the newton school site')).toBe(false);
+  it('an explicit newton-web reference wins over an incidental marketing mention', () => {
+    // Review finding: an incidental token must not hijack (or veto) an
+    // explicitly named newton-web deploy.
+    const text = '<@UBOT1> deploy newton-web to prod — marketing needs the new banner live';
+    expect(isDeployRequest(text)).toBe(true);
+    expect(isMarketingDeployRequest(text)).toBe(false);
+  });
+
+  it('ambiguous frontend targets fire NEITHER deterministic deploy', () => {
+    // "landing page" / "homepage" / "newton school" describe screens in both
+    // frontends — a prod deploy must not be guessed from them.
+    for (const text of [
+      '<@UBOT1> ship the landing pages to production',
+      '<@UBOT1> deploy the landing page changes to prod',
+      '<@UBOT1> ship the homepage to production',
+      '<@UBOT1> deploy the newton school site',
+    ]) {
+      expect(isDeployRequest(text)).toBe(false);
+      expect(isMarketingDeployRequest(text)).toBe(false);
+    }
   });
 
   it('detects marketing deploy asks', () => {
     expect(isMarketingDeployRequest('<@UBOT1> deploy the marketing site to prod')).toBe(true);
     expect(isMarketingDeployRequest('<@UBOT1> deploy marketing')).toBe(true);
-    expect(isMarketingDeployRequest('<@UBOT1> ship the landing pages to production')).toBe(true);
+    expect(isMarketingDeployRequest('<@UBOT1> release the webflow migration to prod')).toBe(true);
     expect(isMarketingDeployRequest('<@UBOT1> deploy newton-web to prod')).toBe(false);
     expect(isMarketingDeployRequest('<@UBOT1> the marketing page is broken')).toBe(false);
   });
@@ -181,6 +197,11 @@ describe('runDeployWorkflow marketing branch', () => {
   beforeEach(() => {
     vi.mocked(runCodex).mockReset();
     __ghCli.exec = vi.fn().mockResolvedValue('');
+    // Never sleep for real in tests.
+    __deployTiming.resolvePollMs = 1;
+    __deployTiming.resolveTimeoutMs = 200;
+    __deployTiming.watchPollMs = 1;
+    __deployTiming.watchTimeoutMs = 200;
   });
 
   it('skips with guidance when the marketing clone is not configured — and never runs gh or the newton-web skill', async () => {
@@ -217,16 +238,25 @@ describe('runDeployWorkflow marketing branch', () => {
   it('dispatches the GitHub Actions prod deploy and reports the completed run', async () => {
     const ghExec = vi
       .fn()
+      .mockResolvedValueOnce('[]') // pre-dispatch anchor read (no prior runs)
       .mockResolvedValueOnce('') // workflow run dispatch
       .mockResolvedValueOnce(
+        // resolve the new run
         JSON.stringify([
           {
             databaseId: 42,
             url: 'https://github.com/Newton-School/newton-marketing-web/actions/runs/42',
-            status: 'completed',
-            conclusion: 'success',
+            status: 'in_progress',
           },
         ]),
+      )
+      .mockResolvedValueOnce(
+        // watch that run by id
+        JSON.stringify({
+          status: 'completed',
+          conclusion: 'success',
+          url: 'https://github.com/Newton-School/newton-marketing-web/actions/runs/42',
+        }),
       );
     __ghCli.exec = ghExec;
     const postMessage = vi.fn().mockResolvedValue({ ok: true, ts: '1.0' });
@@ -237,19 +267,69 @@ describe('runDeployWorkflow marketing branch', () => {
     expect(result.status).toBe('SUCCESS');
     expect(result.message).toContain('actions/runs/42');
     expect(ghExec).toHaveBeenNthCalledWith(
-      1,
+      2,
       ['workflow', 'run', 'deploy-prod.yml', '--ref', 'main', '-f', 'confirm=deploy'],
       '/Users/dipesh/code/mini-og/newton-marketing-web',
       60_000,
+    );
+    expect(ghExec).toHaveBeenNthCalledWith(
+      4,
+      ['run', 'view', '42', '--json', 'status,conclusion,url'],
+      expect.any(String),
+      30_000,
     );
     // The newton-web prod skill must never run for a marketing deploy.
     expect(runCodex).not.toHaveBeenCalled();
   });
 
+  it("never reports the PREVIOUS run's outcome as this deploy's result (anchor race)", async () => {
+    // Review finding: gh workflow run returns before GitHub materializes the
+    // new run; the first post-dispatch poll can still see the previous
+    // (completed) run. The watcher must anchor on the pre-dispatch run id and
+    // wait for a DIFFERENT id.
+    const oldRun = {
+      databaseId: 41,
+      url: 'https://github.com/Newton-School/newton-marketing-web/actions/runs/41',
+      status: 'completed',
+      conclusion: 'success',
+    };
+    __ghCli.exec = vi
+      .fn()
+      .mockResolvedValueOnce(JSON.stringify([oldRun])) // anchor read → run 41
+      .mockResolvedValueOnce('') // dispatch
+      .mockResolvedValueOnce(JSON.stringify([oldRun])) // new run not materialized yet — must NOT be reported
+      .mockResolvedValueOnce(
+        JSON.stringify([
+          {
+            databaseId: 42,
+            url: 'https://github.com/Newton-School/newton-marketing-web/actions/runs/42',
+            status: 'queued',
+          },
+        ]),
+      )
+      .mockResolvedValueOnce(
+        JSON.stringify({
+          status: 'completed',
+          conclusion: 'failure',
+          url: 'https://github.com/Newton-School/newton-marketing-web/actions/runs/42',
+        }),
+      );
+    const postMessage = vi.fn().mockResolvedValue({ ok: true, ts: '1.0' });
+    const slack = { chat: { postMessage } } as any;
+
+    const result = await runDeployWorkflow({ task: marketingTask(), config: marketingConfig, slack });
+
+    // It reports run 42's real outcome (failure) — never run 41's stale success.
+    expect(result.status).toBe('FAILED');
+    expect(result.message).toContain('actions/runs/42');
+    expect(result.message).not.toContain('actions/runs/41');
+  });
+
   it('reports the approval hold when the run is waiting on the production environment', async () => {
     __ghCli.exec = vi
       .fn()
-      .mockResolvedValueOnce('')
+      .mockResolvedValueOnce('[]') // anchor
+      .mockResolvedValueOnce('') // dispatch
       .mockResolvedValueOnce(
         JSON.stringify([
           {
@@ -258,6 +338,12 @@ describe('runDeployWorkflow marketing branch', () => {
             status: 'waiting',
           },
         ]),
+      )
+      .mockResolvedValueOnce(
+        JSON.stringify({
+          status: 'waiting',
+          url: 'https://github.com/Newton-School/newton-marketing-web/actions/runs/43',
+        }),
       );
     const postMessage = vi.fn().mockResolvedValue({ ok: true, ts: '1.0' });
     const slack = { chat: { postMessage } } as any;
@@ -269,7 +355,10 @@ describe('runDeployWorkflow marketing branch', () => {
   });
 
   it('fails cleanly when the dispatch itself errors', async () => {
-    __ghCli.exec = vi.fn().mockRejectedValueOnce(new Error('gh: workflow not found'));
+    __ghCli.exec = vi
+      .fn()
+      .mockResolvedValueOnce('[]') // anchor read succeeds
+      .mockRejectedValueOnce(new Error('gh: workflow not found')); // dispatch fails
     const postMessage = vi.fn().mockResolvedValue({ ok: true, ts: '1.0' });
     const slack = { chat: { postMessage } } as any;
 

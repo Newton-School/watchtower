@@ -275,6 +275,17 @@ async function runMarketingDeploy(params: {
     })
     .catch(() => {});
 
+  // Anchor on the newest existing run BEFORE dispatching: `gh workflow run`
+  // returns before GitHub materializes the new run, so without an anchor the
+  // watcher's first poll would read the PREVIOUS deploy's outcome and report
+  // it as this one's. Best-effort — a failed read just means no anchor.
+  let anchorRunId: number | undefined;
+  try {
+    anchorRunId = (await readLatestDeployRun(repoPath)).id;
+  } catch {
+    anchorRunId = undefined;
+  }
+
   // Dispatch. `gh` resolves the target repo from the clone's origin remote.
   try {
     await __ghCli.exec(
@@ -298,7 +309,7 @@ async function runMarketingDeploy(params: {
   // Resolve the run we just dispatched, then poll it to completion. Like the
   // newton-web path, the side-effect has already executed — every failure
   // after this point must degrade to a report, never a retry.
-  const run = await watchMarketingDeployRun({ repoPath, signal, logStep });
+  const run = await watchMarketingDeployRun({ repoPath, anchorRunId, signal, logStep });
 
   logStep?.({
     stage: 'deploy.marketing.done',
@@ -323,62 +334,106 @@ async function runMarketingDeploy(params: {
   };
 }
 
+/** Poll/timeout knobs — a test seam so the suite never sleeps for real. */
+export const __deployTiming = {
+  resolvePollMs: 5_000,
+  resolveTimeoutMs: 120_000,
+  watchPollMs: 15_000,
+  watchTimeoutMs: 15 * 60 * 1000,
+};
+
+async function readLatestDeployRun(
+  repoPath: string,
+): Promise<{ id?: number; url?: string; status?: string; conclusion?: string }> {
+  const stdout = await __ghCli.exec(
+    ['run', 'list', '--workflow=deploy-prod.yml', '--limit', '1', '--json', 'databaseId,url,status,conclusion'],
+    repoPath,
+    30_000,
+  );
+  const rows = JSON.parse(stdout || '[]') as Array<{
+    databaseId?: number;
+    url?: string;
+    status?: string;
+    conclusion?: string;
+  }>;
+  const row = rows[0] ?? {};
+  return { id: row.databaseId, url: row.url, status: row.status, conclusion: row.conclusion };
+}
+
 async function watchMarketingDeployRun(params: {
   repoPath: string;
+  /** Newest run id observed BEFORE dispatch; the new run must differ from it. */
+  anchorRunId?: number;
   signal?: AbortSignal;
   logStep?: WorkflowStepLogger;
 }): Promise<{ conclusion: 'success' | 'failure' | 'pending'; url?: string; summary: string }> {
-  const { repoPath, signal, logStep } = params;
+  const { repoPath, anchorRunId, signal, logStep } = params;
+  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-  const readLatestRun = async (): Promise<{ id?: number; url?: string; status?: string; conclusion?: string }> => {
-    const stdout = await __ghCli.exec(
-      ['run', 'list', '--workflow=deploy-prod.yml', '--limit', '1', '--json', 'databaseId,url,status,conclusion'],
-      repoPath,
-      30_000,
-    );
-    const rows = JSON.parse(stdout || '[]') as Array<{
-      databaseId?: number;
-      url?: string;
-      status?: string;
-      conclusion?: string;
-    }>;
-    const row = rows[0] ?? {};
-    return { id: row.databaseId, url: row.url, status: row.status, conclusion: row.conclusion };
-  };
-
-  const startedAt = Date.now();
-  const maxWaitMs = 15 * 60 * 1000;
-  const pollMs = 15_000;
-  let lastUrl: string | undefined;
-
-  while (Date.now() - startedAt < maxWaitMs) {
-    if (signal?.aborted) break;
-    let run: Awaited<ReturnType<typeof readLatestRun>>;
+  // Phase 1 — identify the run this dispatch created: the newest run whose id
+  // differs from the pre-dispatch anchor. Never report on the anchor run.
+  const resolveDeadline = Date.now() + __deployTiming.resolveTimeoutMs;
+  let runId: number | undefined;
+  let runUrl: string | undefined;
+  while (Date.now() < resolveDeadline && !signal?.aborted) {
     try {
-      run = await readLatestRun();
+      const latest = await readLatestDeployRun(repoPath);
+      if (latest.id !== undefined && latest.id !== anchorRunId) {
+        runId = latest.id;
+        runUrl = latest.url;
+        break;
+      }
+    } catch (error) {
+      logStep?.({
+        stage: 'deploy.marketing.poll_failed',
+        level: 'WARN',
+        message: `Couldn't list deploy runs while resolving the dispatched run: ${String(error)}`,
+      });
+    }
+    await sleep(__deployTiming.resolvePollMs);
+  }
+  if (runId === undefined) {
+    return {
+      conclusion: 'pending',
+      summary:
+        ":hourglass: The marketing prod deploy was dispatched, but I couldn't identify its run yet — check the repo's Actions tab for the latest deploy-prod run.",
+    };
+  }
+
+  // Phase 2 — poll THAT run (by id) to completion.
+  const watchDeadline = Date.now() + __deployTiming.watchTimeoutMs;
+  while (Date.now() < watchDeadline && !signal?.aborted) {
+    let run: { status?: string; conclusion?: string; url?: string };
+    try {
+      const stdout = await __ghCli.exec(
+        ['run', 'view', String(runId), '--json', 'status,conclusion,url'],
+        repoPath,
+        30_000,
+      );
+      run = JSON.parse(stdout || '{}') as { status?: string; conclusion?: string; url?: string };
     } catch (error) {
       logStep?.({
         stage: 'deploy.marketing.poll_failed',
         level: 'WARN',
         message: `Couldn't read the deploy run status: ${String(error)}`,
       });
-      await new Promise(resolve => setTimeout(resolve, pollMs));
+      await sleep(__deployTiming.watchPollMs);
       continue;
     }
-    lastUrl = run.url ?? lastUrl;
+    runUrl = run.url ?? runUrl;
 
     if (run.status === 'completed') {
       if (run.conclusion === 'success') {
         return {
           conclusion: 'success',
-          url: run.url,
-          summary: `:white_check_mark: newton-marketing-web production deploy succeeded — live on www.newtonschool.co.${run.url ? ` Run: ${run.url}` : ''}`,
+          url: runUrl,
+          summary: `:white_check_mark: newton-marketing-web production deploy succeeded — live on www.newtonschool.co.${runUrl ? ` Run: ${runUrl}` : ''}`,
         };
       }
       return {
         conclusion: 'failure',
-        url: run.url,
-        summary: `:x: newton-marketing-web production deploy finished with *${run.conclusion ?? 'unknown'}*.${run.url ? ` Run: ${run.url}` : ''}`,
+        url: runUrl,
+        summary: `:x: newton-marketing-web production deploy finished with *${run.conclusion ?? 'unknown'}*.${runUrl ? ` Run: ${runUrl}` : ''}`,
       };
     }
     if (run.status === 'waiting') {
@@ -386,17 +441,17 @@ async function watchMarketingDeployRun(params: {
       // that can take arbitrarily long, so report and hand off to the human.
       return {
         conclusion: 'pending',
-        url: run.url,
-        summary: `:hourglass: The marketing prod deploy is dispatched and *waiting for the production-environment approval* in GitHub.${run.url ? ` Approve/watch it here: ${run.url}` : ''}`,
+        url: runUrl,
+        summary: `:hourglass: The marketing prod deploy is dispatched and *waiting for the production-environment approval* in GitHub.${runUrl ? ` Approve/watch it here: ${runUrl}` : ''}`,
       };
     }
-    await new Promise(resolve => setTimeout(resolve, pollMs));
+    await sleep(__deployTiming.watchPollMs);
   }
 
   return {
     conclusion: 'pending',
-    url: lastUrl,
-    summary: `:hourglass: The marketing prod deploy is dispatched and still running.${lastUrl ? ` Watch it here: ${lastUrl}` : ''}`,
+    url: runUrl,
+    summary: `:hourglass: The marketing prod deploy is dispatched and still running.${runUrl ? ` Watch it here: ${runUrl}` : ''}`,
   };
 }
 

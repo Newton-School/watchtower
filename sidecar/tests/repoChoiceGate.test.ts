@@ -243,6 +243,42 @@ describe('waitForRepoChoice', () => {
     expect((await promise).outcome).toBe('newton-marketing-web');
   });
 
+  it('on a two-repo host: the LLM prompt and both-guidance never mention marketing', async () => {
+    const slack = makeSlack();
+    mockFetchThread
+      .mockResolvedValueOnce([{ ts: 'post.2', user: 'UADMIN', text: 'we need to touch several parts' }])
+      .mockResolvedValueOnce([
+        { ts: 'post.2', user: 'UADMIN', text: 'we need to touch several parts' },
+        { ts: 'post.3', user: 'UADMIN', text: 'both' },
+        { ts: 'post.4', user: 'UADMIN', text: 'web' },
+      ]);
+    mockRunCodex.mockResolvedValue({ ok: true, parsedJson: { intent: 'unclear' } });
+
+    const promise = waitForRepoChoice({
+      slack,
+      channelId: 'C01',
+      threadTs: '111.00',
+      approverUserIds: ['UADMIN'],
+      promptTs: 'post.1',
+      logStep: () => {},
+      botUserId: 'UBOT',
+      allowedRepos: ['newton-web', 'newton-api'],
+    });
+
+    await advancePollCycles(2);
+    expect((await promise).outcome).toBe('newton-web');
+    // The free-text reply went to the LLM — with a two-repo prompt.
+    const llmPrompt = String(mockRunCodex.mock.calls[0][0]?.prompt ?? '');
+    expect(llmPrompt).not.toContain('newton-marketing-web');
+    expect(llmPrompt).toContain('one of five categories');
+    // The both-guidance copy matches the host's repos.
+    const guidance = slack.chat.postMessage.mock.calls
+      .map((c: any[]) => String(c[0]?.text ?? ''))
+      .find((t: string) => t.includes('one repo per run'));
+    expect(guidance).toContain('*web* or *api*');
+    expect(guidance).not.toContain('marketing');
+  });
+
   it('rejects a repo outside allowedRepos with a one-time notice and keeps waiting', async () => {
     const slack = makeSlack();
     mockFetchThread.mockResolvedValueOnce([{ ts: 'post.2', user: 'UADMIN', text: 'marketing' }]).mockResolvedValueOnce([
