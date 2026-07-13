@@ -309,6 +309,7 @@ export type AppSettings = {
   bugsAndUpdatesChannelId: string;
   newtonWebPath: string;
   newtonApiPath: string;
+  newtonMarketingWebPath: string;
   maxConcurrentJobs: number;
   repoClassifierThreshold: number;
   themePreset: ThemePresetId;

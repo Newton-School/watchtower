@@ -166,6 +166,13 @@ export interface AppConfig {
     newtonWeb: string;
     newtonApi: string;
     /**
+     * Optional absolute path to the newton-marketing-web clone (the public
+     * newtonschool.co marketing site). Unset means the repo is not onboarded
+     * on this host: routing never offers it and marketing-aware features
+     * degrade gracefully instead of erroring.
+     */
+    newtonMarketingWeb?: string;
+    /**
      * Optional absolute path to the watchtower repo itself. Powers the
      * self-inquiry target in the informational workflow so miniOG can answer
      * questions about its own configuration. If unset, the workflow attempts

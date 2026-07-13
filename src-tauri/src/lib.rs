@@ -367,6 +367,10 @@ struct AppSettings {
     bugs_and_updates_channel_id: String,
     newton_web_path: String,
     newton_api_path: String,
+    // Optional third repo (newton-marketing-web); blank disables it. #[serde(default)]
+    // keeps payloads from older frontends deserializable.
+    #[serde(default)]
+    newton_marketing_web_path: String,
     max_concurrent_jobs: i64,
     pr_review_timeout_ms: i64,
     bug_fix_timeout_ms: i64,
@@ -467,6 +471,7 @@ impl Default for AppSettings {
             bugs_and_updates_channel_id: "C01H25RNLJH".to_string(),
             newton_web_path: String::new(),
             newton_api_path: String::new(),
+            newton_marketing_web_path: String::new(),
             max_concurrent_jobs: 2,
             pr_review_timeout_ms: 720_000,
             bug_fix_timeout_ms: 2_700_000,
@@ -3176,6 +3181,12 @@ fn initialize_db(path: &PathBuf) -> Result<(), String> {
         "ALTER TABLE app_settings ADD COLUMN mini_og_repo_root TEXT NOT NULL DEFAULT '/Users/dipesh/code/mini-og'",
         [],
     );
+    // newton_marketing_web_path: same fresh-install hazard as mini_og_repo_root — the Rust
+    // read path selects it unconditionally, so the column must exist before first read.
+    let _ = connection.execute(
+        "ALTER TABLE app_settings ADD COLUMN newton_marketing_web_path TEXT NOT NULL DEFAULT ''",
+        [],
+    );
     // executed_workflow tracks the workflow that actually ran after router AI
     // reclassification. The sidecar's listDevRuns query reads it via COALESCE so
     // dashboard surfaces show the right label without disturbing jobs.workflow
@@ -3481,7 +3492,8 @@ fn read_app_settings(connection: &Connection) -> Result<AppSettings, String> {
               COALESCE(core_dev_slack_user_group, '') as core_dev_slack_user_group,
               COALESCE(vault_path, '') as vault_path,
               COALESCE(vault_enabled, 0) as vault_enabled,
-              COALESCE(mini_og_repo_root, '/Users/dipesh/code/mini-og') as mini_og_repo_root
+              COALESCE(mini_og_repo_root, '/Users/dipesh/code/mini-og') as mini_og_repo_root,
+              COALESCE(newton_marketing_web_path, '') as newton_marketing_web_path
              FROM app_settings
              WHERE id = 1
              LIMIT 1",
@@ -3521,6 +3533,7 @@ fn read_app_settings(connection: &Connection) -> Result<AppSettings, String> {
                 vault_path: row.get(27)?,
                 vault_enabled: row.get::<_, i64>(28)? != 0,
                 mini_og_repo_root: row.get(29)?,
+                newton_marketing_web_path: row.get(30)?,
                 access_control: AccessControlSettings::default(),
             })
         })
@@ -3545,6 +3558,7 @@ fn persist_app_settings(connection: &Connection, settings: &AppSettings) -> Resu
               bugs_and_updates_channel_id,
               newton_web_path,
               newton_api_path,
+              newton_marketing_web_path,
               max_concurrent_jobs,
               pr_review_timeout_ms,
               bug_fix_timeout_ms,
@@ -3568,7 +3582,7 @@ fn persist_app_settings(connection: &Connection, settings: &AppSettings) -> Resu
               vault_path,
               vault_enabled,
               updated_at
-             ) VALUES(1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ) VALUES(1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
               slack_bot_token=excluded.slack_bot_token,
               slack_app_token=excluded.slack_app_token,
@@ -3577,6 +3591,7 @@ fn persist_app_settings(connection: &Connection, settings: &AppSettings) -> Resu
               bugs_and_updates_channel_id=excluded.bugs_and_updates_channel_id,
               newton_web_path=excluded.newton_web_path,
               newton_api_path=excluded.newton_api_path,
+              newton_marketing_web_path=excluded.newton_marketing_web_path,
               max_concurrent_jobs=excluded.max_concurrent_jobs,
               pr_review_timeout_ms=excluded.pr_review_timeout_ms,
               bug_fix_timeout_ms=excluded.bug_fix_timeout_ms,
@@ -3608,6 +3623,7 @@ fn persist_app_settings(connection: &Connection, settings: &AppSettings) -> Resu
                 settings.bugs_and_updates_channel_id.trim(),
                 settings.newton_web_path.trim(),
                 settings.newton_api_path.trim(),
+                settings.newton_marketing_web_path.trim(),
                 settings.max_concurrent_jobs,
                 settings.pr_review_timeout_ms,
                 settings.bug_fix_timeout_ms,
@@ -3714,6 +3730,10 @@ fn validate_settings_for_save(settings: &AppSettings) -> Result<(), String> {
 
     validate_optional_path(&settings.newton_web_path, "newtonWebPath")?;
     validate_optional_path(&settings.newton_api_path, "newtonApiPath")?;
+    validate_optional_path(
+        &settings.newton_marketing_web_path,
+        "newtonMarketingWebPath",
+    )?;
     validate_theme_setting(&settings.theme_preset, "themePreset")?;
     validate_theme_setting(&settings.theme_font_family, "themeFontFamily")?;
     validate_hex_color(&settings.theme_background_color, "themeBackgroundColor")?;
@@ -3955,7 +3975,12 @@ fn repo_paths_under_miniog_root(settings: &AppSettings) -> bool {
             Err(_) => false,
         }
     };
-    canon_under(&settings.newton_web_path) && canon_under(&settings.newton_api_path)
+    canon_under(&settings.newton_web_path)
+        && canon_under(&settings.newton_api_path)
+        // Marketing repo is optional: blank disables it, so only enforce the
+        // root invariant when a path is actually configured.
+        && (settings.newton_marketing_web_path.trim().is_empty()
+            || canon_under(&settings.newton_marketing_web_path))
 }
 
 fn is_settings_complete(settings: &AppSettings) -> bool {
@@ -4628,6 +4653,33 @@ mod tests {
 
         let settings = read_app_settings(&connection).expect("read settings");
         assert_eq!(settings.mini_og_repo_root, "/Users/dipesh/code/mini-og");
+
+        drop(connection);
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn newton_marketing_web_path_fresh_install_and_persist_roundtrip() {
+        // Same fresh-install hazard as mini_og_repo_root: read_app_settings selects the
+        // column unconditionally, so it must exist before the first read. Also proves the
+        // persist path carries the field (unlike watchtower_path, which Rust never saves).
+        let db_path = test_db_path();
+        initialize_db(&db_path).expect("initialize db");
+        let connection = Connection::open(&db_path).expect("open db");
+
+        let settings = read_app_settings(&connection).expect("read settings");
+        assert_eq!(settings.newton_marketing_web_path, "");
+
+        let mut updated = complete_settings();
+        updated.newton_marketing_web_path =
+            "/Users/dipesh/code/mini-og/newton-marketing-web".to_string();
+        persist_app_settings(&connection, &updated).expect("persist settings");
+
+        let reread = read_app_settings(&connection).expect("re-read settings");
+        assert_eq!(
+            reread.newton_marketing_web_path,
+            "/Users/dipesh/code/mini-og/newton-marketing-web"
+        );
 
         drop(connection);
         let _ = fs::remove_file(db_path);

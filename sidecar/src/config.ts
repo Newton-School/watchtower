@@ -20,6 +20,7 @@ const settingsSchema = z.object({
   bugs_and_updates_channel_id: z.string().default('C01H25RNLJH'),
   newton_web_path: z.string(),
   newton_api_path: z.string(),
+  newton_marketing_web_path: z.string().default(''),
   max_concurrent_jobs: z.number().int().positive().default(2),
   pr_review_timeout_ms: z.number().int().positive().default(720000),
   bug_fix_timeout_ms: z.number().int().positive().default(2700000),
@@ -184,6 +185,11 @@ export function loadConfigFromDb(dbPath: string): AppConfig {
       /* column already exists */
     }
     try {
+      db.exec(`ALTER TABLE app_settings ADD COLUMN newton_marketing_web_path TEXT NOT NULL DEFAULT ''`);
+    } catch {
+      /* column already exists */
+    }
+    try {
       db.exec(
         `ALTER TABLE app_settings ADD COLUMN metabase_mcp_url TEXT NOT NULL DEFAULT '${METABASE_MCP_URL_DEFAULT}'`,
       );
@@ -201,6 +207,7 @@ export function loadConfigFromDb(dbPath: string): AppConfig {
           bugs_and_updates_channel_id,
           newton_web_path,
           newton_api_path,
+          COALESCE(newton_marketing_web_path, '') AS newton_marketing_web_path,
           max_concurrent_jobs,
           pr_review_timeout_ms,
           bug_fix_timeout_ms,
@@ -324,6 +331,11 @@ function mapSettingsToConfig(settings: SettingsRow, accessControlSettings?: Acce
 
   const newtonWeb = mustBeAbsoluteExistingDir(settings.newton_web_path, 'newton_web_path');
   const newtonApi = mustBeAbsoluteExistingDir(settings.newton_api_path, 'newton_api_path');
+  // Optional third repo: blank means "not onboarded on this host" and every
+  // marketing-aware feature must degrade gracefully rather than error.
+  const newtonMarketingWeb = settings.newton_marketing_web_path.trim()
+    ? mustBeAbsoluteExistingDir(settings.newton_marketing_web_path, 'newton_marketing_web_path')
+    : undefined;
   const miniOgRepoRoot = mustBeAbsoluteExistingDir(settings.mini_og_repo_root, 'mini_og_repo_root');
 
   const offending: Array<{ label: string; path: string }> = [];
@@ -332,6 +344,9 @@ function mapSettingsToConfig(settings: SettingsRow, accessControlSettings?: Acce
   }
   if (!isPathUnder(miniOgRepoRoot, newtonApi)) {
     offending.push({ label: 'newton_api_path', path: newtonApi });
+  }
+  if (newtonMarketingWeb && !isPathUnder(miniOgRepoRoot, newtonMarketingWeb)) {
+    offending.push({ label: 'newton_marketing_web_path', path: newtonMarketingWeb });
   }
   if (offending.length > 0) {
     throw new MiniOgRepoRootViolationError(miniOgRepoRoot, offending);
@@ -364,6 +379,7 @@ function mapSettingsToConfig(settings: SettingsRow, accessControlSettings?: Acce
     repoPaths: {
       newtonWeb,
       newtonApi,
+      newtonMarketingWeb,
       watchtower: watchtowerPath,
     },
     miniOgRepoRoot,
