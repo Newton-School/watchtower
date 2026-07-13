@@ -221,7 +221,7 @@ export function diagnoseFailure(input: {
       actions: [
         'Check that the repo classifier resolved a valid repository (look for workflow.repo.classified in logs).',
         'Ensure the target repo path exists and is accessible.',
-        'Retry and mention the repo name explicitly (e.g., "in newton-web").',
+        'Retry and mention the repo name explicitly (e.g., "in newton-web" or "in newton-marketing-web").',
       ],
     };
   }

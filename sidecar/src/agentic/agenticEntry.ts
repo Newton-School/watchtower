@@ -11,7 +11,34 @@ import { parseScreenshotManifest, uploadScreenshots } from '../slack/imageUpload
 import { preparePrWorktree, bootPrDevServer, runPrBuildGate } from '../devServer/devServerManager.js';
 import type { PrDevServer, PreparedPrWorktree, PrBuildGateResult } from '../devServer/devServerManager.js';
 import { mapRepoPath, SUPPORTED_PR_REPOS } from '../github/prReviewSupport.js';
-import { repoKeyFromGithubRepoName } from '../repos/registry.js';
+import {
+  describeEnabledRepos,
+  enabledRepoPaths,
+  qaCaveatBlockFor,
+  repoKeyFromGithubRepoName,
+  repoPathOrNull,
+  type RepoKey,
+} from '../repos/registry.js';
+
+/**
+ * Which repo's clone should host a QA run against a literal URL? The
+ * marketing site owns the bare/www newtonschool.co hosts (and its staging
+ * host); the logged-in product app and everything else default to newton-web.
+ * Exported for tests.
+ */
+export function qaRepoForUrl(url: string, config: AppConfig): { key: RepoKey; path: string } {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    const marketingPath = repoPathOrNull(config, 'newton-marketing-web');
+    const marketingHosts = ['newtonschool.co', 'www.newtonschool.co', 'staging-marketing-web.newtonschool.co'];
+    if (marketingPath && marketingHosts.includes(host)) {
+      return { key: 'newton-marketing-web', path: marketingPath };
+    }
+  } catch {
+    // Unparseable URL — fall through to the default.
+  }
+  return { key: 'newton-web', path: config.repoPaths.newtonWeb };
+}
 
 export type AgenticMode = 'informational' | 'conversational' | 'qa';
 
@@ -29,10 +56,13 @@ export interface RunAgenticEntryParams {
   signal?: AbortSignal;
 }
 
-const INFORMATIONAL_SYSTEM_PROMPT = `You are miniOG, a Slack assistant. The user has asked an informational question — code lookup, "where is X", "how does Y work", documentation, table schemas, data sources.
+function informationalSystemPrompt(config: AppConfig): string {
+  return `You are miniOG, a Slack assistant. The user has asked an informational question — code lookup, "where is X", "how does Y work", documentation, table schemas, data sources.
 
 Your job:
-1. Use your native tools (Read, Grep, Bash, Glob) to find the answer in the repos under the current working directory. The repos you have access to typically include newton-web (frontend), newton-api (backend), and watchtower (the bot itself).
+1. Use your native tools (Read, Grep, Bash, Glob) to find the answer in the repos under the current working directory. The repos you have access to:
+${describeEnabledRepos(config)}
+- watchtower: the bot itself (this assistant's own codebase), when configured.
 2. Be efficient — don't grep for tangential things. Find the answer and stop.
 3. Compose a concise Slack reply citing file:line refs. Use Slack markdown: \`code\`, *bold*, _italic_, bullets.
 4. Output ONLY the final Slack reply text as your last message — no JSON, no code fences around the reply, no preamble like "Here's what I found:" or "Based on my search:".
@@ -41,6 +71,7 @@ Constraints:
 - If you can't find what they asked about, say so directly — don't speculate.
 - Stay terse. The user reads on Slack; long answers get skipped.
 - Never fabricate file paths or line numbers — only cite things you actually opened.`;
+}
 
 const CONVERSATIONAL_SYSTEM_PROMPT = `You are miniOG, a Slack assistant. The user is making a conversational request — greeting, status check, casual chat, or a question about miniOG itself.
 
@@ -59,8 +90,13 @@ Keep replies short — one or two sentences usually. Slack markdown is fine but 
  * Code backend, which shells out to Playwright directly instead of relying on
  * the Codex-only `js_repl` + `playwright-interactive` runtime.
  */
-function qaSystemPrompt(targetUrl: string, opts?: { changedPaths?: string[]; depsChanged?: boolean }): string {
+export function qaSystemPrompt(
+  targetUrl: string,
+  opts?: { changedPaths?: string[]; depsChanged?: boolean; repoKey?: RepoKey },
+): string {
   const changed = opts?.changedPaths ?? [];
+  const repoCaveats = opts?.repoKey ? qaCaveatBlockFor(opts.repoKey) : '';
+  const repoCaveatSection = repoCaveats ? `\n\n${repoCaveats}` : '';
   const prFocus =
     changed.length > 0
       ? `
@@ -79,10 +115,10 @@ ${changed
   return `You are miniOG's web-QA agent. You drive a REAL browser to test a running web app and return an evidence-backed QA report to Slack.
 
 TARGET URL: ${targetUrl}
-The user's message (below) describes the feature/flow to test and the expected behavior. If the scope is vague, pick the most important happy path plus its obvious failure modes.${prFocus}
+The user's message (below) describes the feature/flow to test and the expected behavior. If the scope is vague, pick the most important happy path plus its obvious failure modes.${prFocus}${repoCaveatSection}
 
 EXECUTION (use your Bash tool):
-1. Ensure Playwright is available in the current working directory. Try \`node -e "require('playwright')"\`; if it fails, run \`npm i -D playwright\` then \`npx playwright install chromium\`. Do this quietly — do not put install logs in the report.
+1. Ensure Playwright is available in the current working directory. Try \`node -e "require('playwright')"\`; if it fails, run \`npm i --no-save playwright\` (never save it to package.json — this is a shared clone) then \`npx playwright install chromium\`. Do this quietly — do not put install logs in the report.
 2. Write a short Node script that launches Chromium with Playwright (headless is fine), navigates to the TARGET URL, and exercises the flow with real user interactions (click, fill, press). Capture a screenshot to an absolute path under a fresh temp dir (e.g. /tmp/miniog-qa-<timestamp>/<scenario>.png) for each key state. Collect console errors and failed network requests.
 3. Build a small coverage matrix relevant to the feature: happy path, input/validation, empty/error states, auth/permission if relevant, and one responsive/mobile check if relevant. Only mark a scenario *Passed* if you actually executed and observed it — otherwise *Failed*, *Blocked*, or *Not Run*.
 4. If the app never loads or auth/data is missing, produce a *Blocked* report describing the blocker and the lost coverage. Do not claim execution that did not happen.
@@ -118,7 +154,7 @@ export async function runAgenticEntry(params: RunAgenticEntryParams): Promise<Wo
     return runWebappQa(params);
   }
 
-  const systemPromptBase = mode === 'informational' ? INFORMATIONAL_SYSTEM_PROMPT : CONVERSATIONAL_SYSTEM_PROMPT;
+  const systemPromptBase = mode === 'informational' ? informationalSystemPrompt(config) : CONVERSATIONAL_SYSTEM_PROMPT;
 
   // Conversational guardrail: when investigation findings are pending for
   // this thread, prepend a steer so the agent does NOT claim work is done.
@@ -147,7 +183,7 @@ export async function runAgenticEntry(params: RunAgenticEntryParams): Promise<Wo
   // (e.g. "feature X isn't implemented" the day after the PR adding it merged).
   // Conversational replies don't read code, so we skip the fetch cost there.
   if (mode === 'informational') {
-    for (const repoPath of [config.repoPaths.newtonWeb, config.repoPaths.newtonApi]) {
+    for (const { path: repoPath } of enabledRepoPaths(config)) {
       const state = await refreshSharedRepoToDefaultBranch(repoPath);
       logStep?.({
         stage: 'agentic.repo_refresh',
@@ -262,16 +298,19 @@ async function runWebappQa(params: RunAgenticEntryParams): Promise<WorkflowResul
   }
 
   // Drive the QA agent against a reachable URL, then post the report + upload
-  // screenshots. Shared by the literal-URL and PR paths.
+  // screenshots. Shared by the literal-URL and PR paths. `cwd` is the target
+  // repo's shared clone so the agent's code lookups (and its playwright
+  // install) land in the repo actually under test.
   const runQaAgainstUrl = async (
     targetUrl: string,
     resultMeta: Record<string, unknown>,
-    promptOpts?: { changedPaths?: string[]; depsChanged?: boolean },
+    promptOpts?: { changedPaths?: string[]; depsChanged?: boolean; repoKey?: RepoKey },
+    cwd?: string,
   ): Promise<WorkflowResult> => {
     const result = await runClaudeAgentic({
       systemPrompt: qaSystemPrompt(targetUrl, promptOpts),
       userMessage: task.event.text || `QA the web app at ${targetUrl}`,
-      cwd: config.repoPaths.newtonWeb,
+      cwd: cwd ?? config.repoPaths.newtonWeb,
       forceBackend: 'claude-code',
       timeoutMs: QA_TIMEOUT_MS,
       logStep,
@@ -345,11 +384,14 @@ async function runWebappQa(params: RunAgenticEntryParams): Promise<WorkflowResul
     };
   };
 
-  // Path 1 — a literal URL in the message: QA it directly.
+  // Path 1 — a literal URL in the message: QA it directly, from the clone of
+  // the repo that owns the URL's host (marketing owns www./bare
+  // newtonschool.co; everything else defaults to newton-web).
   const literalUrl = extractQaTargetUrl(task.event.text);
   if (literalUrl) {
+    const target = qaRepoForUrl(literalUrl, config);
     await postReply(`:test_tube: Running browser QA on \`${literalUrl}\` — this can take a few minutes.`);
-    return runQaAgainstUrl(literalUrl, {});
+    return runQaAgainstUrl(literalUrl, { repo: target.key }, { repoKey: target.key }, target.path);
   }
 
   // Path 2 — a PR link ("test this PR <url>"): check out the PR head into an
@@ -429,7 +471,12 @@ async function runWebappQa(params: RunAgenticEntryParams): Promise<WorkflowResul
         return await runQaAgainstUrl(
           devServer.url,
           { prNumber: pr.number, repo: pr.repo, changedPaths: prepared.changedPaths.length },
-          { changedPaths: prepared.changedPaths, depsChanged: prepared.classification.depsChanged },
+          {
+            changedPaths: prepared.changedPaths,
+            depsChanged: prepared.classification.depsChanged,
+            repoKey: repoKeyFromGithubRepoName(pr.repo) ?? undefined,
+          },
+          baseRepoPath,
         );
       } finally {
         await devServer.stop();

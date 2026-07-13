@@ -2,8 +2,72 @@ import { describe, expect, it } from 'vitest';
 import { extractQaTargetUrl, isWebappQaRequest, isWebappQaOnPrRequest } from '../src/router/intentParser.js';
 import { parseScreenshotManifest } from '../src/slack/imageUploader.js';
 import { changedPathsFromDiff, classifyChangedPaths, findFreePort } from '../src/devServer/devServerManager.js';
+import { qaRepoForUrl, qaSystemPrompt } from '../src/agentic/agenticEntry.js';
+import type { AppConfig } from '../src/types/contracts.js';
 
 const PR_URL = 'https://github.com/Newton-School/newton-web/pull/8399';
+
+const QA_CONFIG = {
+  repoPaths: {
+    newtonWeb: '/repos/newton-web',
+    newtonApi: '/repos/newton-api',
+    newtonMarketingWeb: '/repos/newton-marketing-web',
+  },
+} as AppConfig;
+
+describe('qaRepoForUrl', () => {
+  it('routes bare/www/staging newtonschool.co hosts to the marketing clone', () => {
+    for (const url of [
+      'https://www.newtonschool.co/newton-school-of-technology-nst',
+      'https://newtonschool.co/about-us',
+      'https://staging-marketing-web.newtonschool.co/ai',
+    ]) {
+      expect(qaRepoForUrl(url, QA_CONFIG)).toEqual({
+        key: 'newton-marketing-web',
+        path: '/repos/newton-marketing-web',
+      });
+    }
+  });
+
+  it('routes the product app and unknown hosts to newton-web', () => {
+    for (const url of [
+      'https://my.newtonschool.co/course/xyz',
+      'http://localhost:3123/login',
+      'https://staging.example.com/x',
+      'not a url',
+    ]) {
+      expect(qaRepoForUrl(url, QA_CONFIG)).toEqual({ key: 'newton-web', path: '/repos/newton-web' });
+    }
+  });
+
+  it('falls back to newton-web when the marketing clone is not configured', () => {
+    const twoRepoConfig = {
+      repoPaths: { newtonWeb: '/repos/newton-web', newtonApi: '/repos/newton-api' },
+    } as AppConfig;
+    expect(qaRepoForUrl('https://www.newtonschool.co/about-us', twoRepoConfig)).toEqual({
+      key: 'newton-web',
+      path: '/repos/newton-web',
+    });
+  });
+});
+
+describe('qaSystemPrompt repo caveats', () => {
+  it('injects the marketing QA caveats for the marketing repo', () => {
+    const prompt = qaSystemPrompt('http://localhost:3123', { repoKey: 'newton-marketing-web' });
+    expect(prompt).toContain('401');
+    expect(prompt).toContain('-temp');
+    expect(prompt).toContain('worker/paths.js');
+  });
+
+  it('renders no caveat block for newton-web (empty caveats) or when no repo is given', () => {
+    expect(qaSystemPrompt('http://localhost:3123', { repoKey: 'newton-web' })).not.toContain('Repo-specific QA');
+    expect(qaSystemPrompt('http://localhost:3123')).not.toContain('Repo-specific QA');
+  });
+
+  it('never saves playwright into the shared clone', () => {
+    expect(qaSystemPrompt('http://localhost:3123')).toContain('npm i --no-save playwright');
+  });
+});
 
 describe('extractQaTargetUrl', () => {
   it('returns a generic http(s) target URL', () => {
