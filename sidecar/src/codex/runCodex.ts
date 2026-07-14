@@ -400,7 +400,7 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
       }
     }
 
-    const parsedOutput = backend.parseOutput(lastMessage);
+    const parsedOutput = backend.parseOutput(lastMessage, { planMode: request.planMode });
     const parsedJson = parsedOutput.parsedJson;
     if (parsedJson) {
       request.onLog?.({

@@ -221,7 +221,7 @@ describe('claudeCodeBackend.parseOutput', () => {
       return planPath;
     }
 
-    it('recovers the plan from the plan file named in the final text', () => {
+    it('recovers the plan from the plan file named in the final text (plan mode)', () => {
       const planPath = writeTempPlanFile();
       const wrapper = JSON.stringify({
         type: 'result',
@@ -233,7 +233,7 @@ describe('claudeCodeBackend.parseOutput', () => {
         permission_denials: [],
       });
 
-      const parsed = claudeCodeBackend.parseOutput(wrapper);
+      const parsed = claudeCodeBackend.parseOutput(wrapper, { planMode: true });
       expect(parsed.strategy).toBe('claude_unwrap+plan_file');
       expect(parsed.parsedJson?.planMarkdown).toBe(planMarkdown.trim());
       expect(parsed.parsedJson?.summary).toBe(planMarkdown.trim());
@@ -249,7 +249,7 @@ describe('claudeCodeBackend.parseOutput', () => {
         permission_denials: [],
       });
 
-      const parsed = claudeCodeBackend.parseOutput(wrapper);
+      const parsed = claudeCodeBackend.parseOutput(wrapper, { planMode: true });
       expect(parsed.strategy).toBe('claude_unwrap+plain_text');
       const summary = String(parsed.parsedJson?.summary ?? '');
       expect(summary).not.toContain('ExitPlanMode');
@@ -259,6 +259,13 @@ describe('claudeCodeBackend.parseOutput', () => {
 
     it('keeps the original text when stripping would leave nothing (fail-open)', () => {
       expect(stripPlanHarnessMeta('`ExitPlanMode` is not available.')).toBe('`ExitPlanMode` is not available.');
+    });
+
+    it('does not mutilate text that merely DISCUSSES plan-mode internals', () => {
+      const answer =
+        'The backend passes `--permission-mode plan` so the planner is read-only.\n' +
+        'ExitPlanMode used to be the harvest channel; see claudeCodeBackend.ts.';
+      expect(stripPlanHarnessMeta(answer)).toBe(answer);
     });
 
     it('recovers from tool_input.planFilePath when the denial carries no inline plan', () => {
@@ -284,10 +291,77 @@ describe('claudeCodeBackend.parseOutput', () => {
         permission_denials: [],
       });
 
-      const parsed = claudeCodeBackend.parseOutput(wrapper);
+      const parsed = claudeCodeBackend.parseOutput(wrapper, { planMode: true });
       expect(parsed.strategy).toBe('claude_unwrap+plain_text');
       expect(parsed.parsedJson?.status).toBe('error');
       expect(parsed.parsedJson?.summary).toBe('You have hit your usage limit.');
+    });
+
+    it('NEVER hijacks non-plan runs that mention a plans path (review defect)', () => {
+      const planPath = writeTempPlanFile();
+      // (a) a valid JSON result naming the plans file keeps its JSON.
+      const jsonWrapper = JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result: JSON.stringify({
+          status: 'success',
+          summary: `the stale plan at ${planPath} was the culprit`,
+          actions: [],
+          prUrl: '',
+        }),
+        permission_denials: [],
+      });
+      const parsedJsonRun = claudeCodeBackend.parseOutput(jsonWrapper);
+      expect(parsedJsonRun.strategy).not.toBe('claude_unwrap+plan_file');
+      expect(String(parsedJsonRun.parsedJson?.summary)).toContain('was the culprit');
+
+      // (b) a plain-text non-plan answer naming the plans file is untouched.
+      const textWrapper = JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result: `RCA: the planner wrote ${planPath} but the harvest failed. ExitPlanMode was not available on this CLI.`,
+        permission_denials: [],
+      });
+      const parsedTextRun = claudeCodeBackend.parseOutput(textWrapper);
+      expect(parsedTextRun.strategy).toBe('claude_unwrap+plain_text');
+      expect(String(parsedTextRun.parsedJson?.summary)).toContain('the harvest failed');
+    });
+
+    it('a long final-message plan that cites an old plan file is NOT displaced by the file (review defect)', () => {
+      const planPath = writeTempPlanFile();
+      const realPlan =
+        '# Plan: rework harvest\n\n' +
+        `## Context\nThe prior incident artifact lives at ${planPath} and shows the failure shape.\n\n` +
+        '## Steps\n' +
+        Array.from({ length: 12 }, (_, i) => `${i + 1}. Step ${i + 1} does a concrete thing to a concrete file.`).join(
+          '\n',
+        ) +
+        '\n\nScope: medium\nRequires code changes: yes';
+      const wrapper = JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result: realPlan,
+        permission_denials: [],
+      });
+
+      const parsed = claudeCodeBackend.parseOutput(wrapper, { planMode: true });
+      expect(parsed.strategy).toBe('claude_unwrap+plain_text');
+      expect(String(parsed.parsedJson?.summary)).toContain('rework harvest');
+      expect(String(parsed.parsedJson?.summary)).not.toBe(planMarkdown.trim());
+    });
+
+    it('plan-file regex returns quickly on slash-dense tokens (ReDoS regression)', () => {
+      const slashBomb = `https://bucket.s3.amazonaws.com/${'a/'.repeat(200)}object?sig=${'b/'.repeat(120)}end`;
+      const wrapper = JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result: `Uploaded to ${slashBomb} — done.`,
+        permission_denials: [],
+      });
+      const startedAt = Date.now();
+      const parsed = claudeCodeBackend.parseOutput(wrapper, { planMode: true });
+      expect(Date.now() - startedAt).toBeLessThan(1000);
+      expect(parsed.strategy).toBe('claude_unwrap+plain_text');
     });
   });
 });

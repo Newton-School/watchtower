@@ -132,6 +132,14 @@ describe('normalizePlannerOutput', () => {
       expect(result.affectedFiles).toEqual(['src/features/nst-entrance/sections/hero.tsx']);
     });
 
+    it('keeps repo-relative .claude files (skills/settings) as affected files', () => {
+      const result = normalizePlannerOutput(
+        { summary: 'Add `.claude/skills/new-skill/SKILL.md` and update `.claude/settings.json`.' },
+        'claude-code',
+      );
+      expect(result.affectedFiles).toEqual(['.claude/skills/new-skill/SKILL.md', '.claude/settings.json']);
+    });
+
     it('recognises known extensionless filenames and dotfiles', () => {
       const result = normalizePlannerOutput(
         {

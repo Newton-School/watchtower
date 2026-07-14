@@ -1,7 +1,7 @@
 import fsSync from 'node:fs';
 import os from 'node:os';
 import path, { delimiter as pathDelimiter } from 'node:path';
-import type { AgentBackend, AgentRunRequest, ParsedBackendOutput } from './types.js';
+import type { AgentBackend, AgentRunRequest, ParseOutputOptions, ParsedBackendOutput } from './types.js';
 import type { TokenUsage } from '../types/contracts.js';
 import { parseStructuredOutput } from './codexBackend.js';
 
@@ -32,8 +32,12 @@ function readPlanFile(filePath: string): string | undefined {
  * Newer Claude Code CLIs (observed on 2.1.209) run headless plan mode through
  * a plan FILE instead of the ExitPlanMode tool — the file the agent names is
  * the authoritative plan. Never glob "newest file"; only trust the named path.
+ * NOTE: the segment class excludes `/` so segmentation is unambiguous — with
+ * `/` included, `(?:[^…]+\/)*?` backtracks exponentially on slash-dense
+ * tokens (S3 URLs, base64 blobs) and a single result text can hang the
+ * event loop for seconds (#408 review).
  */
-const PLAN_FILE_REF_RE = /(?:~\/|\/(?:[^\s`'"]+\/)*?)\.claude\/plans\/[^\s`'"]+\.md/;
+const PLAN_FILE_REF_RE = /(?:~\/|\/(?:[^\s`'"/]+\/)*?)\.claude\/plans\/[^\s`'"]+\.md/;
 
 /**
  * Harvest the plan from a plan-mode result envelope.
@@ -83,16 +87,32 @@ function extractPlanFromReferencedFile(finalText: string): string | undefined {
 
 /**
  * Strip harness meta-commentary (tool availability, plan-file bookkeeping)
- * from an agent's final text before it becomes a user-facing summary.
+ * from a PLAN-MODE agent's final text before it becomes a user-facing
+ * summary. Deliberately narrow — only bookkeeping-sentence shapes, so a plan
+ * or answer that legitimately DISCUSSES ExitPlanMode / permission modes
+ * (e.g. about this repo's own backend code) is never mutilated.
  * Fail-open: if stripping would leave nothing, return the original text.
  */
-export function stripPlanHarnessMeta(text: string): string {
-  const META_LINE_RE = /ExitPlanMode|written the plan to|callable tool|deferred tool|permission[- ]mode/i;
-  const stripped = text
+const META_LINE_RE = new RegExp(
+  [
+    /written the plan to\s+\S*\.claude\/plans\//.source,
+    /\bExitPlanMode\b[^\n]*\b(?:isn'?t|is not|not)\s+(?:available|registered|callable)/.source,
+    /\bisn'?t registered as a deferred tool\b/.source,
+  ].join('|'),
+  'i',
+);
+
+/** Strict variant: may return '' when the whole text is bookkeeping. */
+function stripMetaLines(text: string): string {
+  return text
     .split('\n')
     .filter(line => !META_LINE_RE.test(line))
     .join('\n')
     .trim();
+}
+
+export function stripPlanHarnessMeta(text: string): string {
+  const stripped = stripMetaLines(text);
   return stripped.length > 0 ? stripped : text;
 }
 
@@ -246,7 +266,7 @@ export const claudeCodeBackend: AgentBackend = {
     return env;
   },
 
-  parseOutput(raw: string): ParsedBackendOutput {
+  parseOutput(raw: string, opts?: ParseOutputOptions): ParsedBackendOutput {
     // Claude Code with --output-format json wraps the response in:
     // {"type":"result","subtype":"success","result":"<actual AI text>","session_id":"...","cost_usd":...,"usage":{...}}
     // We need to unwrap the "result" field first, then parse the inner content.
@@ -291,21 +311,34 @@ export const claudeCodeBackend: AgentBackend = {
       }
 
       const innerText = (envelope.result as string).trim();
-      const planFromReferencedFile = extractPlanFromReferencedFile(innerText);
-      if (planFromReferencedFile) {
-        return {
-          parsedJson: {
-            status: 'success',
-            planMarkdown: planFromReferencedFile,
-            summary: planFromReferencedFile,
-            actions: [],
-            prUrl: '',
-          },
-          strategy: 'claude_unwrap+plan_file',
-          usage,
-          costUsd,
-          sessionId,
-        };
+      // Plan-file recovery is PLAN-MODE ONLY, and only when the final text is
+      // meta-shaped (short after stripping bookkeeping). Two failure modes it
+      // must never cause (#408 review): (a) an ordinary run whose result
+      // merely mentions a plans path getting its output replaced by a stale
+      // file; (b) a real final-message plan that cites an older plan file
+      // being displaced by that file's content.
+      if (opts?.planMode) {
+        // Strict strip (may be empty): the gate must see how much REAL
+        // content remains, so the fail-open wrapper is wrong here.
+        const looksMetaOnly = stripMetaLines(innerText).length < 200;
+        if (looksMetaOnly) {
+          const planFromReferencedFile = extractPlanFromReferencedFile(innerText);
+          if (planFromReferencedFile) {
+            return {
+              parsedJson: {
+                status: 'success',
+                planMarkdown: planFromReferencedFile,
+                summary: planFromReferencedFile,
+                actions: [],
+                prUrl: '',
+              },
+              strategy: 'claude_unwrap+plan_file',
+              usage,
+              costUsd,
+              sessionId,
+            };
+          }
+        }
       }
       // Try to parse the inner text as the structured JSON we asked the model to produce
       const innerParsed = parseStructuredOutput(innerText);
@@ -319,16 +352,16 @@ export const claudeCodeBackend: AgentBackend = {
         };
       }
       // Inner text is plain text (not JSON) — surface it as a summary so
-      // workflows can use it, minus any harness meta-commentary (#408).
-      // Honor the envelope's own error signals: a failed run (e.g. a
-      // usage-limit hit) must not persist as status:"success" with the error
-      // text as its summary (issue #342).
+      // workflows can use it; in plan mode, minus any harness bookkeeping
+      // lines (#408). Honor the envelope's own error signals: a failed run
+      // (e.g. a usage-limit hit) must not persist as status:"success" with
+      // the error text as its summary (issue #342).
       const envelopeIsError =
         envelope.is_error === true || (typeof envelope.subtype === 'string' && envelope.subtype !== 'success');
       return {
         parsedJson: {
           status: envelopeIsError ? 'error' : 'success',
-          summary: stripPlanHarnessMeta(innerText),
+          summary: opts?.planMode ? stripPlanHarnessMeta(innerText) : innerText,
           actions: [],
           prUrl: '',
         },
