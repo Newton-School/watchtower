@@ -35,9 +35,11 @@ const MARKETING_DEPLOY_REF_RE = /\b(marketing|mweb|nmw|newton[- ]?marketing([- ]
 // mentioned incidentally ("deploy newton-web to prod — marketing needs the
 // banner live").
 const NEWTON_WEB_REF_RE = /\bnewton[- ]?web\b/;
-// Targets that are genuinely ambiguous between the two frontends. A deploy
-// ask naming only these must not deterministically fire EITHER prod deploy.
-const AMBIGUOUS_DEPLOY_TARGET_RE = /\b(landing([- ]?pages?)?|homepage|newton[- ]?school)\b/;
+// Targets that are genuinely ambiguous between the two frontends (NSAT/NST
+// pages exist in both: public admission landing pages in marketing, the
+// logged-in timeline/test flows in newton-web). A deploy ask naming only
+// these must not deterministically fire EITHER prod deploy.
+const AMBIGUOUS_DEPLOY_TARGET_RE = /\b(landing([- ]?pages?)?|homepage|newton[- ]?school|nsat|nst)\b/;
 
 function normalizeDeployText(text: string): string {
   return text

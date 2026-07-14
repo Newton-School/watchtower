@@ -157,6 +157,8 @@ describe('marketing deploy gating', () => {
       '<@UBOT1> deploy the landing page changes to prod',
       '<@UBOT1> ship the homepage to production',
       '<@UBOT1> deploy the newton school site',
+      '<@UBOT1> deploy the NSAT landing page to prod',
+      '<@UBOT1> ship the NST pages to production',
     ]) {
       expect(classifyDeployTarget(text)).toBe('ambiguous');
       expect(isDeployRequest(text)).toBe(false);

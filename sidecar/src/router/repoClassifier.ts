@@ -136,9 +136,9 @@ export function gatherRepoSignals(params: {
 }
 
 const REPO_PROMPT_BLOCKS: Record<RepoKey, string> = {
-  'newton-web': `- "newton-web" — the PRODUCT frontend (Next.js Pages Router, React, Redux/redux-saga, styled-components/Sass). Owns the logged-in app at my.newtonschool.co: courses, lessons, assignments, assessments/tests, code editors, proctoring, TMS (track management), dashboards, payments UI, profile, notifications — the product features users interact with after logging in.`,
+  'newton-web': `- "newton-web" — the PRODUCT frontend (Next.js Pages Router, React, Redux/redux-saga, styled-components/Sass). Owns the logged-in app at my.newtonschool.co: courses, lessons, assignments, assessments/tests, code editors, proctoring, TMS (track management), dashboards, payments UI, profile, notifications, and the NSAT timeline / NSAT test-taking flows — the product features users interact with after logging in.`,
   'newton-api': `- "newton-api" — the backend repo (Python + Django). Owns HTTP endpoints, request handlers, serializers, models, migrations, Celery tasks, Postgres queries, server-side business logic, integrations with third-party APIs, background jobs, and HTTP 5xx errors.`,
-  'newton-marketing-web': `- "newton-marketing-web" — the PUBLIC MARKETING site (Next.js App Router, React 19, Tailwind, static export served behind a Cloudflare Worker). Owns newtonschool.co landing pages migrated page-by-page from Webflow: the homepage, program/course LANDING pages, NST / NSAT admission pages, SEO/meta/sitemap, Lighthouse/CLS/page-speed work, image rehosting to CloudFront, Webflow cutovers, \`-temp\` preview pages, Cloudflare worker path routing, staging-marketing-web.newtonschool.co.`,
+  'newton-marketing-web': `- "newton-marketing-web" — the PUBLIC MARKETING site (Next.js App Router, React 19, Tailwind, static export served behind a Cloudflare Worker). Owns newtonschool.co landing pages migrated page-by-page from Webflow: the homepage, program/course LANDING pages, the PUBLIC NST/NSAT admission pages (the logged-in NSAT timeline/test flows live in newton-web), SEO/meta/sitemap, Lighthouse/CLS/page-speed work, image rehosting to CloudFront, Webflow cutovers, \`-temp\` preview pages, Cloudflare worker path routing, staging-marketing-web.newtonschool.co.`,
 };
 
 const REPO_SIGNAL_BLOCKS: Record<RepoKey, string> = {
@@ -157,18 +157,19 @@ const REPO_SIGNAL_BLOCKS: Record<RepoKey, string> = {
 };
 
 const FRONTEND_DISAMBIGUATION = `TELLING THE TWO FRONTENDS APART — both are React apps "visible on a URL"; a URL or a visual change is NOT enough by itself:
-- URL host is the strongest signal: my.newtonschool.co/… ⇒ newton-web. A bare newtonschool.co/<slug> or www.newtonschool.co public content page (homepage, program landing page, admissions) ⇒ newton-marketing-web.
-- Marketing vocabulary (any of these ⇒ newton-marketing-web): "landing page", "marketing site/page", "Webflow", page "migration"/"cutover", "batch<N>", "-temp" page, SEO / meta tags / sitemap, Lighthouse / CLS / page speed, image rehost / CloudFront, wrangler / Cloudflare / worker, NST or NSAT ADMISSION landing pages.
-- Product vocabulary (⇒ newton-web): course/lesson/assignment as an in-app feature, assessment or test-taking, code editor, proctoring, TMS, dashboards, logged-in flows, Redux/useSelector/saga, styled-components, jest tests.
-- NOT disambiguators (both frontends have them): Next.js, React, @newtonschool/grauity components, port 3000, the words "page"/"component", responsive or mobile styling.`;
+- URL host is the strongest signal: my.newtonschool.co/… ⇒ newton-web. A bare newtonschool.co/<slug> or www.newtonschool.co public content page ⇒ newton-marketing-web.
+- STRONG marketing signals (decisive ⇒ newton-marketing-web): "marketing site/page", "Webflow", page "migration"/"cutover", "batch<N>", "-temp" page, Lighthouse / CLS / page-speed work, image rehost / CloudFront, wrangler / Cloudflare / worker, staging-marketing-web.newtonschool.co.
+- STRONG product signals (decisive ⇒ newton-web): logged-in flows, course/lesson/assignment as an in-app feature, assessment or test-taking, the NSAT TIMELINE, code editor, proctoring, TMS, dashboards, Redux/useSelector/saga, styled-components, jest tests.
+- SHARED PAGE NOUNS — NEVER decisive alone, they exist in BOTH frontends: "landing page", the homepage, NSAT/NST pages, course pages, SEO / meta tags, banners / CTAs / hero sections, responsive or mobile styling, Next.js, React, @newtonschool/grauity components, port 3000, the words "page"/"component". In particular: marketing owns the PUBLIC NST/NSAT admission landing pages, while newton-web owns the logged-in NSAT timeline and test flows — the noun alone cannot tell them apart.
+- Resolution: a shared noun combined with ONE strong signal (or a URL host, or grep evidence) ⇒ follow that signal. Shared nouns ALONE ⇒ genuinely conflicting ⇒ return null with low confidence so the admin gate asks.`;
 
 export function buildClassifyPrompt(allowedRepos: readonly RepoKey[]): string {
   const marketingAllowed = allowedRepos.includes('newton-marketing-web');
 
   const frontendRules = marketingAllowed
-    ? `- A frontend task with NO marketing signal is "newton-web" — it is by far the more common target. "newton-marketing-web" is opt-in: choose it only on explicit marketing signals (the vocabulary above, a bare newtonschool.co landing URL, or grep evidence).
-- A task about public landing pages, Webflow migration/cutover, SEO, page speed on newtonschool.co, or the Cloudflare worker is "newton-marketing-web".
-- If the task is clearly frontend but carries genuinely CONFLICTING product-vs-marketing signals, return null with low confidence — the admin gate will ask. Never guess between the two frontends when signals conflict.`
+    ? `- A frontend task with NO STRONG marketing signal is "newton-web" — it is by far the more common target. "newton-marketing-web" is opt-in: choose it only on a STRONG marketing signal, a bare/www newtonschool.co URL, or grep evidence.
+- A task about Webflow migration/cutover, the Cloudflare worker, or page speed on newtonschool.co is "newton-marketing-web".
+- If the task is clearly frontend but carries only SHARED PAGE NOUNS (or conflicting product-vs-marketing signals), return null with low confidence — the admin gate will ask. Never guess between the two frontends.`
     : `- A task that asks to add, remove, hide, or restyle something visible on a URL is almost always "newton-web".`;
 
   return `You are a repo classifier for miniOG, a developer productivity bot.
