@@ -106,6 +106,65 @@ describe('runInvestigationWorkflow scope wiring', () => {
     expect(prompt).toMatch(/mcp__metabase__/);
   });
 
+  it('marketing scope pins the marketing worktree and warns about Webflow path routing', async () => {
+    classifyInvestigationScope.mockResolvedValue({
+      scope: 'newton-marketing-web',
+      confidence: 0.9,
+      reasoning: 'landing page symptom',
+      method: 'llm',
+    });
+    const slack = slackStub();
+    const marketingConfig = {
+      ...config,
+      repoPaths: { ...config.repoPaths, newtonMarketingWeb: '/repos/newton-marketing-web' },
+    };
+
+    await runInvestigationWorkflow({
+      task: makeTask('images 404 on the AI course landing page'),
+      config: marketingConfig,
+      slack: slack as any,
+    });
+
+    expect(prepareWorkflowContext).toHaveBeenCalledWith(
+      expect.objectContaining({ repoOverride: 'newton-marketing-web' }),
+    );
+    // The scope classifier greps all enabled clones, marketing included.
+    expect(classifyInvestigationScope).toHaveBeenCalledWith(
+      expect.objectContaining({
+        repoGrepPaths: [
+          { key: 'newton-web', path: '/repos/newton-web' },
+          { key: 'newton-api', path: '/repos/newton-api' },
+          { key: 'newton-marketing-web', path: '/repos/newton-marketing-web' },
+        ],
+      }),
+    );
+    const acks = slack.chat.postMessage.mock.calls.map(c => c[0].text as string);
+    expect(acks.some(t => t.includes('newton-marketing-web'))).toBe(true);
+    // The investigator is told to check worker/paths.js before blaming code.
+    const prompt = runCodex.mock.calls[0][0].prompt as string;
+    expect(prompt).toContain('worker/paths.js');
+  });
+
+  it('broad scope excludes the marketing clone when it is configured', async () => {
+    classifyInvestigationScope.mockResolvedValue({
+      scope: 'broad',
+      confidence: 0.3,
+      reasoning: 'vague',
+      method: 'llm',
+    });
+    const marketingConfig = {
+      ...config,
+      repoPaths: { ...config.repoPaths, newtonMarketingWeb: '/repos/newton-marketing-web' },
+    };
+
+    await runInvestigationWorkflow({ task: makeTask('broken'), config: marketingConfig, slack: slackStub() as any });
+    expect(runCodex.mock.calls[0][0].prompt as string).toContain('OUT OF SCOPE');
+
+    runCodex.mockClear();
+    await runInvestigationWorkflow({ task: makeTask('broken'), config, slack: slackStub() as any });
+    expect(runCodex.mock.calls[0][0].prompt as string).not.toContain('OUT OF SCOPE');
+  });
+
   it('broad scope degrades to repos-only on the codex backend', async () => {
     getActiveBackendId.mockReturnValue('codex');
     classifyInvestigationScope.mockResolvedValue({
