@@ -89,7 +89,9 @@ Return strict JSON:
 
 export function buildPlannerPlanModePrompt(ctx: AgentContext): string {
   return `
-You are the PLANNER for a multi-agent coding pipeline. You are running in plan mode: explore the repo with read-only tools, then produce a concrete implementation plan via ExitPlanMode.
+You are the PLANNER for a multi-agent coding pipeline. You are running in plan mode: explore the repo with read-only tools, then produce a concrete implementation plan.
+
+DELIVERY CONTRACT: your FINAL message must be exactly the full plan markdown and nothing else — no preamble, no closing remarks, and no notes about tools, plan files you wrote, or session mechanics. If your environment also asks you to record the plan elsewhere (a plan file or a plan tool), do that too — but ALWAYS end by outputting the complete plan markdown as your final message. The downstream coder agent reads it verbatim.
 
 Workflow: ${ctx.workflowIntent}
 Repository: ${ctx.repoPath}
@@ -100,7 +102,7 @@ ${ctx.threadContext}
 
 ${ctx.prContext ? `PR context: ${ctx.prContext.url} (${ctx.prContext.owner}/${ctx.prContext.repo}#${ctx.prContext.number})` : ''}
 
-What to produce in your ExitPlanMode plan (markdown is fine; the downstream coder agent reads it verbatim):
+What the plan must contain (markdown):
 - A short summary of the user's intent.
 - The concrete files you expect to touch, with brief rationale per file.
 - An ordered list of implementation steps.

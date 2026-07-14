@@ -400,7 +400,7 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
       }
     }
 
-    const parsedOutput = backend.parseOutput(lastMessage);
+    const parsedOutput = backend.parseOutput(lastMessage, { planMode: request.planMode });
     const parsedJson = parsedOutput.parsedJson;
     if (parsedJson) {
       request.onLog?.({
@@ -410,6 +410,18 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
           strategy: parsedOutput.strategy,
         },
       });
+      // CLI-drift telemetry (#408): a plan-mode run that did NOT yield an
+      // ExitPlanMode harvest means the installed CLI no longer exposes the
+      // tool in headless plan sessions — the layered fallbacks cover it, but
+      // surface the drift instead of degrading silently for weeks.
+      if (request.planMode && parsedOutput.strategy !== 'claude_unwrap+exit_plan_mode') {
+        request.onLog?.({
+          stage: 'agent.plan.harvest_fallback',
+          level: 'WARN',
+          message: `Plan-mode run harvested via "${parsedOutput.strategy}" (no ExitPlanMode denial) — installed CLI likely runs plan mode through plan files.`,
+          data: { strategy: parsedOutput.strategy },
+        });
+      }
     } else {
       // Capture a bounded preview of the raw final message for post-mortem.
       // Pre-fix this log carried no payload, making it impossible to tell
