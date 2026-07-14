@@ -501,8 +501,8 @@ Classify the admin's reply into one of six categories:
 
 "api" — the reply identifies newton-api. Examples: "api", "newton-api", "backend", "the django one", "it's in python".
 
-"marketing" — the reply identifies newton-marketing-web. Examples: "marketing", "mweb", "nmw", "the marketing site", "landing pages", "the webflow one", "the tailwind one", "the public site".
-IMPORTANT: "marketing web", "marketing site", and "landing" mean newton-marketing-web, NOT newton-web. Classify as "web" only when the reply points at the product app.
+"marketing" — the reply identifies newton-marketing-web. Examples: "marketing", "mweb", "nmw", "the marketing site", "the webflow one", "the tailwind one", "the public site".
+IMPORTANT: "marketing web" and "marketing site" mean newton-marketing-web, NOT newton-web. But a bare "landing page" / "homepage" / "NSAT page" reply is AMBIGUOUS — both frontends have such pages (marketing owns the public admission landing pages; newton-web owns the logged-in NSAT timeline) — weigh the thread context, and return "unclear" if it doesn't settle it.
 
 "both" — the reply says the task spans MULTIPLE repos. Examples: "both", "both repos", "web and api", "api and web", "web and marketing", "dono", "it's a cross-repo change", "frontend + backend".
 

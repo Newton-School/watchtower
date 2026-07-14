@@ -61,8 +61,11 @@ export type DeployTarget = 'newton-web' | 'newton-marketing-web' | 'ambiguous';
  *   winner is unsafe in both directions (either repo could be hijacked into
  *   a wrong production deploy by an incidental mention of the other).
  * - Exactly one explicit repo signal ⇒ that repo.
- * - Only frontend-ambiguous nouns (landing/homepage/newton school) ⇒
- *   'ambiguous' — never guess a prod deploy from those.
+ * - Frontend-ambiguous nouns (landing/homepage/newton school/NSAT/NST) WITH a
+ *   prod token ⇒ 'ambiguous' — never guess a prod deploy from those. Without
+ *   a prod token they are not a deploy ask at all: deploy verbs double as
+ *   ordinary chatter ("release the NSAT results page fix", "ship the
+ *   homepage banner"), which must keep flowing to the normal classifier.
  * - Bare "deploy to prod" / "deploy the frontend" ⇒ newton-web (historical
  *   behavior; prod was the only deploy target before marketing existed).
  *
@@ -79,9 +82,12 @@ export function classifyDeployTarget(text: string): DeployTarget | null {
   if (namesNewtonWeb && namesMarketing) return 'ambiguous';
   if (namesNewtonWeb) return 'newton-web';
   if (namesMarketing) return 'newton-marketing-web';
-  if (AMBIGUOUS_DEPLOY_TARGET_RE.test(normalized)) return 'ambiguous';
 
   const hasProdTarget = /\b(prod|production)\b/.test(normalized);
+  if (AMBIGUOUS_DEPLOY_TARGET_RE.test(normalized)) {
+    return hasProdTarget ? 'ambiguous' : null;
+  }
+
   const hasAppRef = /\bfrontend\b/.test(normalized);
   return hasProdTarget || hasAppRef ? 'newton-web' : null;
 }
