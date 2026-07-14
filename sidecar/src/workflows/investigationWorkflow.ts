@@ -7,6 +7,7 @@ import { buildMentionSystemPrompt } from '../codex/mentionSystemPrompt.js';
 import { prepareWorkflowContext } from './shared/workflowUtils.js';
 import { assertThreadParentExists, fetchThreadContext } from '../slack/threadContext.js';
 import { classifyInvestigationScope, type InvestigationScope } from '../router/investigationScope.js';
+import { enabledRepoPaths } from '../repos/registry.js';
 import type { McpServerConfig } from '../types/contracts.js';
 import type { PipelineStore } from '../agents/pipeline.js';
 import type { InvestigationStore } from '../state/investigationStore.js';
@@ -35,8 +36,7 @@ export async function runInvestigationWorkflow(params: {
   const scope = await classifyInvestigationScope({
     bugReport: task.event.text ?? '',
     threadMessages: scopeThread.map(m => m.text),
-    webPath: config.repoPaths.newtonWeb,
-    apiPath: config.repoPaths.newtonApi,
+    repoGrepPaths: enabledRepoPaths(config),
     logStep,
   });
 
@@ -302,6 +302,9 @@ function scopeAckText(scope: InvestigationScope, useMetabase: boolean): string {
   }
   if (scope === 'newton-api') {
     return 'Looks data/backend-related — digging into *newton-api*. I’ll share what I find.';
+  }
+  if (scope === 'newton-marketing-web') {
+    return 'Looks like a marketing-site issue — digging into *newton-marketing-web*. I’ll share what I find.';
   }
   return useMetabase
     ? 'Couldn’t localize this to one layer — sweeping *newton-web* + *newton-api* + Metabase (read-only) to trace it end-to-end.'

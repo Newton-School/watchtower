@@ -20,6 +20,7 @@ import { getBackend } from '../backends/registry.js';
 import { runAgentPipeline, formatPlanMessage, waitForApproval, buildApprovalMessage } from '../agents/pipeline.js';
 import { normalizePlannerOutput } from '../agents/normalizePlannerOutput.js';
 import { inferRepoFromAffectedFiles, readRepoAffinity, repoPathFor, resolveRepoOrAsk } from './shared/repoResolver.js';
+import { enabledRepoKeys } from '../repos/registry.js';
 import type { RepoAffinity } from '../router/repoClassifier.js';
 import { waitForClarificationWithIdle, detectClarificationLoop } from './shared/clarificationGuards.js';
 import type { ClarificationRound } from './shared/clarificationGuards.js';
@@ -44,7 +45,7 @@ function buildOwnerPrimaryPrompt(params: {
   threadContext: string;
   imageContext: string;
 }): string {
-  const { task, workspaceRoot, githubToken, threadContext, imageContext } = params;
+  const { task, config, workspaceRoot, githubToken, threadContext, imageContext } = params;
   return `
 ${buildMentionSystemPrompt({ task, workflow: 'IMPLEMENTATION', toneMode: task.toneMode })}
 
@@ -54,7 +55,7 @@ The request below was sent by a configured owner Slack user.
 
 Environment:
 - Working directory: ${workspaceRoot}
-- Known repositories: newton-web, newton-api
+- Known repositories: ${enabledRepoKeys(config).join(', ')}
 - GitHub auth mode: ${githubAuthModeHint(Boolean(githubToken))}
 
 Guardrails:
@@ -87,7 +88,7 @@ function buildOwnerRelaxedPrompt(params: {
   threadContext: string;
   imageContext: string;
 }): string {
-  const { task, workspaceRoot, githubToken, threadContext, imageContext } = params;
+  const { task, config, workspaceRoot, githubToken, threadContext, imageContext } = params;
   return `
 ${buildMentionSystemPrompt({ task, workflow: 'IMPLEMENTATION', toneMode: task.toneMode })}
 
@@ -95,7 +96,7 @@ You are running Watchtower implementation mode in relaxed output mode.
 
 Environment:
 - Working directory: ${workspaceRoot}
-- Known repositories: newton-web, newton-api
+- Known repositories: ${enabledRepoKeys(config).join(', ')}
 - GitHub auth mode: ${githubAuthModeHint(Boolean(githubToken))}
 
 Guardrails:

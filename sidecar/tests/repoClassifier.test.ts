@@ -10,7 +10,7 @@ vi.mock('../src/codex/modelProfiles.js', () => ({
 }));
 
 const { runCodex } = await import('../src/codex/runCodex.js');
-const { classifyRepo, extractEntities, gatherRepoSignals, __gitGrepHasHit } =
+const { classifyRepo, extractEntities, gatherRepoSignals, buildClassifyPrompt, __gitGrepHasHit } =
   await import('../src/router/repoClassifier.js');
 
 function aiReply(parsedJson: Record<string, unknown>): any {
@@ -130,6 +130,30 @@ describe('classifyRepo (agent-based)', () => {
     const out = await classifyRepo({ task: 'fix the thing', threshold: 0.75 });
     expect(out.selectedRepo).toBeNull();
     expect(out.uncertain).toBe(true);
+  });
+});
+
+describe('buildClassifyPrompt', () => {
+  it('with marketing enabled: three repo blocks, host rule, opt-in default, and no URL⇒newton-web shortcut', () => {
+    const prompt = buildClassifyPrompt(['newton-web', 'newton-api', 'newton-marketing-web']);
+    expect(prompt).toContain('"newton-web"');
+    expect(prompt).toContain('"newton-api"');
+    expect(prompt).toContain('"newton-marketing-web"');
+    // URL host is a first-class disambiguator between the two frontends.
+    expect(prompt).toContain('my.newtonschool.co');
+    expect(prompt).toContain('TELLING THE TWO FRONTENDS APART');
+    // Marketing is opt-in; a frontend task with no marketing signal defaults to newton-web.
+    expect(prompt).toContain('NO marketing signal is "newton-web"');
+    expect(prompt).toContain('Never guess between the two frontends');
+    // The old binary rule must be gone — it is the #1 misroute source vs a second frontend.
+    expect(prompt).not.toContain('almost always "newton-web"');
+  });
+
+  it('without marketing: keeps the classic two-repo rule and omits marketing copy', () => {
+    const prompt = buildClassifyPrompt(['newton-web', 'newton-api']);
+    expect(prompt).not.toContain('newton-marketing-web');
+    expect(prompt).not.toContain('TELLING THE TWO FRONTENDS APART');
+    expect(prompt).toContain('almost always "newton-web"');
   });
 });
 

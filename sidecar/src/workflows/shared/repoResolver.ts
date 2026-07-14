@@ -21,6 +21,13 @@ export type RepoResolution =
 
 export type ResolutionSource = 'plan-affected-files' | 'classifier' | 'admin-choice';
 
+/** The one-word reply we suggest for each repo in the admin clarify prompt. */
+const REPO_SHORT_REPLY: Record<RepoKey, string> = {
+  'newton-web': 'web',
+  'newton-api': 'api',
+  'newton-marketing-web': 'marketing',
+};
+
 /**
  * Deterministic fast-path: returns a repo name only when the planner's
  * affected-files list is overwhelmingly unambiguous. This is the cheap
@@ -160,7 +167,10 @@ export async function resolveRepoOrAsk(params: {
   // Use the core-dev subteam handle when available so we ping the group once
   // instead of unrolling every admin into a wall of individual `<@U…>` tags.
   const mentionStr = formatAdminMention(config);
-  const promptText = `I can't tell whether this task is for *newton-web* or *newton-api*.${mentionStr ? ` ${mentionStr}` : ''} Reply with "web" or "api" (or "cancel" to abandon).`;
+  const enabled = enabledRepoKeys(config);
+  const repoListInline = enabled.map(key => `*${key}*`).join(' / ');
+  const replyOptions = enabled.map(key => `"${REPO_SHORT_REPLY[key]}"`).join(' or ');
+  const promptText = `I can't tell which repo this task targets — ${repoListInline}.${mentionStr ? ` ${mentionStr}` : ''} Reply with ${replyOptions} (or "cancel" to abandon).`;
 
   let promptTs: string | undefined;
   try {
@@ -192,9 +202,8 @@ export async function resolveRepoOrAsk(params: {
     logStep: logStep ?? (() => {}),
     botUserId: config.botUserId,
     signal,
-    allowedRepos: enabledRepoKeys(config),
-    nudgeText:
-      "Still waiting on an admin to pick *newton-web* or *newton-api* for this task. Reply here or say 'cancel' to stop.",
+    allowedRepos: enabled,
+    nudgeText: `Still waiting on an admin to pick ${repoListInline} for this task. Reply here or say 'cancel' to stop.`,
   });
 
   if (choice.outcome === 'cancelled') {

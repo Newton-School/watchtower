@@ -135,39 +135,67 @@ export function gatherRepoSignals(params: {
   return { entities, hitsByRepo, hasDistinctiveHit };
 }
 
-const CLASSIFY_PROMPT = `You are a repo classifier for miniOG, a developer productivity bot.
+const REPO_PROMPT_BLOCKS: Record<RepoKey, string> = {
+  'newton-web': `- "newton-web" — the PRODUCT frontend (Next.js Pages Router, React, Redux/redux-saga, styled-components/Sass). Owns the logged-in app at my.newtonschool.co: courses, lessons, assignments, assessments/tests, code editors, proctoring, TMS (track management), dashboards, payments UI, profile, notifications — the product features users interact with after logging in.`,
+  'newton-api': `- "newton-api" — the backend repo (Python + Django). Owns HTTP endpoints, request handlers, serializers, models, migrations, Celery tasks, Postgres queries, server-side business logic, integrations with third-party APIs, background jobs, and HTTP 5xx errors.`,
+  'newton-marketing-web': `- "newton-marketing-web" — the PUBLIC MARKETING site (Next.js App Router, React 19, Tailwind, static export served behind a Cloudflare Worker). Owns newtonschool.co landing pages migrated page-by-page from Webflow: the homepage, program/course LANDING pages, NST / NSAT admission pages, SEO/meta/sitemap, Lighthouse/CLS/page-speed work, image rehosting to CloudFront, Webflow cutovers, \`-temp\` preview pages, Cloudflare worker path routing, staging-marketing-web.newtonschool.co.`,
+};
 
-The user has sent a task. Route it to one of two repositories:
-
-- "newton-web" — the frontend repo (React, JavaScript). Owns the customer-facing web app at my.newtonschool.co and other newtonschool.co properties. Owns everything visible in the browser: pages, components, nav bars, sidebars, banners, sections, modals, dialogs, buttons, filters, layouts, navigation, CSS, mobile/desktop styling, Next.js / Vite hydration issues, anything tied to a URL the user can open.
-
-- "newton-api" — the backend repo (Python + Django). Owns HTTP endpoints, request handlers, serializers, models, migrations, Celery tasks, Postgres queries, server-side business logic, integrations with third-party APIs, background jobs, and HTTP 5xx errors.
-
-Repo signals you can use beyond intent:
-
-- newton-web (React) file patterns:
+const REPO_SIGNAL_BLOCKS: Record<RepoKey, string> = {
+  'newton-web': `- newton-web (React product app) file patterns:
   • directories: \`src/containers/\`, \`src/components/\`, \`src/hooks/\`, \`src/utils/\`, \`src/tracking/\`, \`src/pages/\`
   • extensions: \`.tsx\`, \`.jsx\`, \`.ts\`, \`.js\`, \`.styles.js\`, \`.styles.ts\`
-  • keywords inside the plan: \`useState\`, \`useEffect\`, \`useSelector\`, \`useDispatch\`, \`styled-components\`, \`NSTypography\`, \`NSButton\`, \`NSIcon\`, \`@newtonschool/grauity\`, \`useNsatTimelineData\`, \`useSendAnalyticsEvent\`
-- newton-api (Django) file patterns:
+  • keywords inside the plan: \`useState\`, \`useEffect\`, \`useSelector\`, \`useDispatch\`, \`styled-components\`, \`NSTypography\`, \`NSButton\`, \`NSIcon\`, \`@newtonschool/grauity\`, \`useNsatTimelineData\`, \`useSendAnalyticsEvent\``,
+  'newton-api': `- newton-api (Django) file patterns:
   • directories: \`courses/\`, \`users/\`, \`payments/\`, \`migrations/\`, \`management/commands/\`
   • files: \`models.py\`, \`views.py\`, \`serializers.py\`, \`enums.py\`, \`urls.py\`, \`tasks.py\`, \`signals.py\`, \`apps.py\`
-  • keywords: \`Model\`, \`Serializer\`, \`ViewSet\`, \`APIView\`, \`Celery\`, \`@receiver\`, \`migrations.RunPython\`, \`PreferredCampus enum\`
+  • keywords: \`Model\`, \`Serializer\`, \`ViewSet\`, \`APIView\`, \`Celery\`, \`@receiver\`, \`migrations.RunPython\`, \`PreferredCampus enum\``,
+  'newton-marketing-web': `- newton-marketing-web (marketing site) file patterns:
+  • directories: \`src/app/(home)/\`, \`src/app/(landing)/\`, \`src/features/<page>/\`, \`worker/\`, \`out/\`
+  • files: \`worker/paths.js\`, \`wrangler.toml\`, App Router \`page.tsx\`/\`layout.tsx\`, per-page \`content.ts\`/\`images.ts\` feature slices
+  • keywords: Tailwind utility classes, \`export const metadata\`, \`generateStaticParams\`, \`output: 'export'\` — and notably NO styled-components, NO Redux`,
+};
+
+const FRONTEND_DISAMBIGUATION = `TELLING THE TWO FRONTENDS APART — both are React apps "visible on a URL"; a URL or a visual change is NOT enough by itself:
+- URL host is the strongest signal: my.newtonschool.co/… ⇒ newton-web. A bare newtonschool.co/<slug> or www.newtonschool.co public content page (homepage, program landing page, admissions) ⇒ newton-marketing-web.
+- Marketing vocabulary (any of these ⇒ newton-marketing-web): "landing page", "marketing site/page", "Webflow", page "migration"/"cutover", "batch<N>", "-temp" page, SEO / meta tags / sitemap, Lighthouse / CLS / page speed, image rehost / CloudFront, wrangler / Cloudflare / worker, NST or NSAT ADMISSION landing pages.
+- Product vocabulary (⇒ newton-web): course/lesson/assignment as an in-app feature, assessment or test-taking, code editor, proctoring, TMS, dashboards, logged-in flows, Redux/useSelector/saga, styled-components, jest tests.
+- NOT disambiguators (both frontends have them): Next.js, React, @newtonschool/grauity components, port 3000, the words "page"/"component", responsive or mobile styling.`;
+
+export function buildClassifyPrompt(allowedRepos: readonly RepoKey[]): string {
+  const marketingAllowed = allowedRepos.includes('newton-marketing-web');
+
+  const frontendRules = marketingAllowed
+    ? `- A frontend task with NO marketing signal is "newton-web" — it is by far the more common target. "newton-marketing-web" is opt-in: choose it only on explicit marketing signals (the vocabulary above, a bare newtonschool.co landing URL, or grep evidence).
+- A task about public landing pages, Webflow migration/cutover, SEO, page speed on newtonschool.co, or the Cloudflare worker is "newton-marketing-web".
+- If the task is clearly frontend but carries genuinely CONFLICTING product-vs-marketing signals, return null with low confidence — the admin gate will ask. Never guess between the two frontends when signals conflict.`
+    : `- A task that asks to add, remove, hide, or restyle something visible on a URL is almost always "newton-web".`;
+
+  return `You are a repo classifier for miniOG, a developer productivity bot.
+
+The user has sent a task. Route it to one of ${allowedRepos.length} repositories:
+
+${allowedRepos.map(key => REPO_PROMPT_BLOCKS[key]).join('\n\n')}
+
+${marketingAllowed ? `${FRONTEND_DISAMBIGUATION}\n\n` : ''}Repo signals you can use beyond intent:
+
+${allowedRepos.map(key => REPO_SIGNAL_BLOCKS[key]).join('\n')}
 
 Rules:
-- A task that asks to add, remove, hide, or restyle something visible on a URL is almost always "newton-web".
+${frontendRules}
 - A task about an endpoint, request/response shape, server error, database/model change, or background job is "newton-api".
-- A task that needs both: pick the repo where the BULK of the change lives. Cross-repo references (e.g. a frontend plan citing a backend enum for context) DO NOT flip the verdict — the repo with the actual code changes wins.
+- A task that needs more than one repo: pick the repo where the BULK of the change lives. Cross-repo references (e.g. a frontend plan citing a backend enum for context) DO NOT flip the verdict — the repo with the actual code changes wins.
 - If a plan markdown is provided, trust the plan's own per-file rationale over a raw filename. The planner already explored the repos.
 - The current task always wins over thread context. Thread messages are quoted for background only.
-- Only return null if you genuinely cannot tell after considering all signals. Aim for a decisive verdict — ambiguous output makes the bot stall for an admin gate.
+- Otherwise, only return null if you genuinely cannot tell after considering all signals. Aim for a decisive verdict — ambiguous output makes the bot stall for an admin gate.
 
 Return strict JSON:
 {
-  "selectedRepo": "newton-web" | "newton-api" | null,
+  "selectedRepo": ${allowedRepos.map(key => `"${key}"`).join(' | ')} | null,
   "confidence": number between 0 and 1,
   "reasoning": "one short sentence"
 }`;
+}
 
 const FALLBACK: RepoClassificationResult = {
   selectedRepo: null,
@@ -265,7 +293,10 @@ export async function classifyRepo(params: ClassifyRepoParams): Promise<RepoClas
     );
   }
 
-  const prompt = `${CLASSIFY_PROMPT}\n\n${sections.join('\n\n')}\n\nClassify the current task.`;
+  // Only offer the repos that are actually configured on this host — the
+  // resolver guards the result the same way, so prompt and acceptance agree.
+  const allowedRepos = repoGrepPaths && repoGrepPaths.length > 0 ? repoGrepPaths.map(p => p.key) : [...REPO_KEYS];
+  const prompt = `${buildClassifyPrompt(allowedRepos)}\n\n${sections.join('\n\n')}\n\nClassify the current task.`;
 
   logStep?.({
     stage: 'router.repo_classify.start',
