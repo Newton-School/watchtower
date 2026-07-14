@@ -93,6 +93,9 @@ function looksLikeFilePath(candidate: string): boolean {
   if (candidate.length === 0 || candidate.length > 200) return false;
   if (/\s/.test(candidate)) return false;
   if (/^https?:\/\//i.test(candidate)) return false;
+  // Harness bookkeeping paths (agent-written plan files, session artifacts
+  // under ~/.claude or /Users/x/.claude) are never repo files (#408).
+  if (/(^|\/)\.claude\//.test(candidate) || candidate.startsWith('~/')) return false;
   // Reject function-call-shaped tokens (`foo()`, `foo(arg)`) but allow path
   // segments with parens like Next.js route groups (`src/app/(marketing)/page.tsx`).
   if ((candidate.includes('(') || candidate.includes(')')) && !candidate.includes('/')) return false;

@@ -1,5 +1,8 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { claudeCodeBackend } from '../src/backends/claudeCodeBackend.js';
+import { claudeCodeBackend, stripPlanHarnessMeta } from '../src/backends/claudeCodeBackend.js';
 
 describe('claudeCodeBackend.parseOutput', () => {
   it('unwraps Claude Code wrapper and extracts inner structured JSON', () => {
@@ -199,6 +202,92 @@ describe('claudeCodeBackend.parseOutput', () => {
       // plain-text path that surfaces `result` as `summary`.
       expect(parsed.strategy).toBe('claude_unwrap+plain_text');
       expect(parsed.parsedJson?.summary).toBe('fell back to result text');
+    });
+  });
+
+  describe('plan-file CLIs (no headless ExitPlanMode — issue #408)', () => {
+    // On Claude Code ≥~2.1.2xx (observed 2.1.209), `-p --permission-mode plan`
+    // does NOT register ExitPlanMode: permission_denials stays empty, the
+    // model writes the plan to ~/.claude/plans/<slug>.md and mentions that
+    // path in its final text. These fixtures mirror the live 2026-07-14
+    // incident (job a1079d24).
+    const planMarkdown = '# Plan: add floating WhatsApp pill\n\n## Files to touch\n- `src/features/x.tsx`\n';
+
+    function writeTempPlanFile(): string {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wt-plan-'));
+      const planPath = path.join(dir, '.claude', 'plans', 'user-context-auto-generated-test.md');
+      fs.mkdirSync(path.dirname(planPath), { recursive: true });
+      fs.writeFileSync(planPath, planMarkdown);
+      return planPath;
+    }
+
+    it('recovers the plan from the plan file named in the final text', () => {
+      const planPath = writeTempPlanFile();
+      const wrapper = JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result:
+          `I've written the plan to \`${planPath}\`. \`ExitPlanMode\` isn't available as a callable tool in this session ` +
+          `(it isn't registered as a deferred tool either), so I'll stop here and hand off — the coder agent reads the plan file verbatim.`,
+        session_id: 'plan-session-3',
+        permission_denials: [],
+      });
+
+      const parsed = claudeCodeBackend.parseOutput(wrapper);
+      expect(parsed.strategy).toBe('claude_unwrap+plan_file');
+      expect(parsed.parsedJson?.planMarkdown).toBe(planMarkdown.trim());
+      expect(parsed.parsedJson?.summary).toBe(planMarkdown.trim());
+    });
+
+    it('sanitizes harness meta-text from the summary when the plan file is unreadable', () => {
+      const wrapper = JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result:
+          "I've written the plan to `/nonexistent/.claude/plans/gone.md`. `ExitPlanMode` isn't available as a callable tool in this session, so I'll stop here.\n\n" +
+          '**Summary:** Add the floating WhatsApp pill to the NSAT route.',
+        permission_denials: [],
+      });
+
+      const parsed = claudeCodeBackend.parseOutput(wrapper);
+      expect(parsed.strategy).toBe('claude_unwrap+plain_text');
+      const summary = String(parsed.parsedJson?.summary ?? '');
+      expect(summary).not.toContain('ExitPlanMode');
+      expect(summary).not.toContain('written the plan to');
+      expect(summary).toContain('floating WhatsApp pill');
+    });
+
+    it('keeps the original text when stripping would leave nothing (fail-open)', () => {
+      expect(stripPlanHarnessMeta('`ExitPlanMode` is not available.')).toBe('`ExitPlanMode` is not available.');
+    });
+
+    it('recovers from tool_input.planFilePath when the denial carries no inline plan', () => {
+      const planPath = writeTempPlanFile();
+      const wrapper = JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result: '',
+        permission_denials: [{ tool_name: 'ExitPlanMode', tool_input: { plan: '', planFilePath: planPath } }],
+      });
+
+      const parsed = claudeCodeBackend.parseOutput(wrapper);
+      expect(parsed.strategy).toBe('claude_unwrap+exit_plan_mode');
+      expect(parsed.parsedJson?.planMarkdown).toBe(planMarkdown.trim());
+    });
+
+    it('does not misreport errors: envelope error status survives the sanitizer', () => {
+      const wrapper = JSON.stringify({
+        type: 'result',
+        subtype: 'error_during_execution',
+        is_error: true,
+        result: 'You have hit your usage limit.',
+        permission_denials: [],
+      });
+
+      const parsed = claudeCodeBackend.parseOutput(wrapper);
+      expect(parsed.strategy).toBe('claude_unwrap+plain_text');
+      expect(parsed.parsedJson?.status).toBe('error');
+      expect(parsed.parsedJson?.summary).toBe('You have hit your usage limit.');
     });
   });
 });

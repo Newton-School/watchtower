@@ -120,6 +120,18 @@ describe('normalizePlannerOutput', () => {
       expect(result.affectedFiles).toEqual(['src/foo.ts', './util/bar.ts']);
     });
 
+    it('never harvests harness bookkeeping paths under .claude/ (issue #408)', () => {
+      const result = normalizePlannerOutput(
+        {
+          summary:
+            "I've written the plan to `/Users/dipesh/.claude/plans/user-context-auto-generated-melodic-fox.md` and " +
+            'also referenced `~/.claude/plans/other.md`. Edit `src/features/nst-entrance/sections/hero.tsx`.',
+        },
+        'claude-code',
+      );
+      expect(result.affectedFiles).toEqual(['src/features/nst-entrance/sections/hero.tsx']);
+    });
+
     it('recognises known extensionless filenames and dotfiles', () => {
       const result = normalizePlannerOutput(
         {
