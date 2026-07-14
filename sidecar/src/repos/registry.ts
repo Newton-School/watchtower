@@ -174,3 +174,20 @@ export function describeEnabledRepos(config: AppConfig): string {
     .map(key => `- ${key}: ${REPO_REGISTRY[key].description}`)
     .join('\n');
 }
+
+/**
+ * Best-effort: which repo does a working directory belong to? Matches either
+ * the configured clone itself or a workspace worktree derived from it
+ * (worktrees live under `…/workspaces/<basename(clonePath)>/<threadTs>`).
+ * Segment-bounded comparison, so `newton-marketing-web` never matches a
+ * `newton-web` segment. Returns null for spanning roots (broad/combined cwd).
+ */
+export function repoKeyForWorkspacePath(cwd: string, config: AppConfig): RepoKey | null {
+  for (const { key, path } of enabledRepoPaths(config)) {
+    const basename = path.split('/').filter(Boolean).pop();
+    if (!basename) continue;
+    if (cwd === path || cwd.startsWith(`${path}/`)) return key;
+    if (cwd.endsWith(`/${basename}`) || cwd.includes(`/${basename}/`)) return key;
+  }
+  return null;
+}

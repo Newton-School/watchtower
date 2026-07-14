@@ -15,6 +15,7 @@ import { resolvePrReviewTargets } from '../router/prTargetResolver.js';
 import { assembleRecall } from '../codex/recallAssembler.js';
 import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
 import { buildOutOfScopePrReply, mapRepoPath, fetchPrHeadSha } from '../github/prReviewSupport.js';
+import { isRepoEnabled } from '../repos/registry.js';
 import { reviewSinglePr, type PrReviewDeps, type PrReviewOutcome } from './prReviewAgent.js';
 
 export type AgenticPrReviewStore = Pick<JobStore, 'findLatestReviewedPrHeadSha' | 'getChannelPolicyPack'> &
@@ -148,7 +149,7 @@ export async function runAgenticPrReview(params: {
     await slack.chat.postMessage({
       channel: task.event.channelId,
       thread_ts: task.event.threadTs,
-      text: `${selectorNote}I found ${resolution.candidates?.length ?? 0} PRs in this thread:\n${candidateList}\nReply with the link (or "web"/"api"/"#number") to review, or "both" for all of them.`,
+      text: `${selectorNote}I found ${resolution.candidates?.length ?? 0} PRs in this thread:\n${candidateList}\nReply with the link (or ${isRepoEnabled(config, 'newton-marketing-web') ? '"web"/"api"/"marketing"/"#number"' : '"web"/"api"/"#number"'}) to review, or "both" for all of them.`,
     });
 
     return {

@@ -10,6 +10,8 @@ import { extractQaTargetUrl } from '../router/intentParser.js';
 import { parseScreenshotManifest, uploadScreenshots } from '../slack/imageUploader.js';
 import { preparePrWorktree, bootPrDevServer, runPrBuildGate } from '../devServer/devServerManager.js';
 import type { PrDevServer, PreparedPrWorktree, PrBuildGateResult } from '../devServer/devServerManager.js';
+import { mapRepoPath, SUPPORTED_PR_REPOS } from '../github/prReviewSupport.js';
+import { repoKeyFromGithubRepoName } from '../repos/registry.js';
 
 export type AgenticMode = 'informational' | 'conversational' | 'qa';
 
@@ -357,6 +359,21 @@ async function runWebappQa(params: RunAgenticEntryParams): Promise<WorkflowResul
   // node_modules under the harness Node). Always tear the worktree down.
   if (task.prContext) {
     const pr = task.prContext;
+
+    // Resolve the PR's OWN base clone. Fetching pull/<N>/head against the
+    // wrong clone's origin silently checks out that repo's PR #<N> — a
+    // plausible-looking QA report about entirely unrelated code. Never fall
+    // back to newton-web.
+    const baseRepoPath = mapRepoPath(config, pr);
+    if (!baseRepoPath) {
+      const key = repoKeyFromGithubRepoName(pr.repo);
+      const text = key
+        ? `I can't QA \`${pr.repo}\` PRs on this host — the ${pr.repo} clone isn't configured in Watchtower settings.`
+        : `I can only QA PRs on ${SUPPORTED_PR_REPOS.join(', ')} — \`${pr.repo}\` isn't one of them.`;
+      const slackPosted = await postReply(text);
+      return { workflow: 'WEBAPP_QA', status: 'SKIPPED', message: text, notifyDesktop: false, slackPosted };
+    }
+
     await postReply(
       `:test_tube: Checking out PR #${pr.number} (\`${pr.repo}\`) to QA it — this can take a few minutes.`,
     );
@@ -365,7 +382,7 @@ async function runWebappQa(params: RunAgenticEntryParams): Promise<WorkflowResul
     let prepared: PreparedPrWorktree;
     try {
       prepared = await preparePrWorktree({
-        baseRepoPath: config.repoPaths.newtonWeb,
+        baseRepoPath,
         prContext: pr,
         threadTs: task.event.threadTs,
         githubToken,

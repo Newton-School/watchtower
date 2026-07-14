@@ -20,7 +20,7 @@ import { getBackend } from '../backends/registry.js';
 import { runAgentPipeline, formatPlanMessage, waitForApproval, buildApprovalMessage } from '../agents/pipeline.js';
 import { normalizePlannerOutput } from '../agents/normalizePlannerOutput.js';
 import { inferRepoFromAffectedFiles, readRepoAffinity, repoPathFor, resolveRepoOrAsk } from './shared/repoResolver.js';
-import { enabledRepoKeys } from '../repos/registry.js';
+import { enabledRepoKeys, getRepo, repoKeyForWorkspacePath } from '../repos/registry.js';
 import type { RepoAffinity } from '../router/repoClassifier.js';
 import { waitForClarificationWithIdle, detectClarificationLoop } from './shared/clarificationGuards.js';
 import type { ClarificationRound } from './shared/clarificationGuards.js';
@@ -115,15 +115,36 @@ Your response will be posted DIRECTLY to a Slack thread as-is. Write a ready-to-
 `.trim();
 }
 
+/**
+ * Repo-scoped policy pack for the agent pipeline. Rendered into planner,
+ * coder, reviewer, and verifier prompts via `policyBlock`. Placed as an
+ * explicit override so recalled per-user habits from OTHER repos (jest
+ * tests, /public assets, styled-components) can't leak into repos whose
+ * conventions differ.
+ */
+function repoPolicyPackForCwd(cwd: string, config: AppConfig): { packName: string; rules: string[] } | undefined {
+  const key = repoKeyForWorkspacePath(cwd, config);
+  if (!key) return undefined;
+  const rules = getRepo(key).guardrails;
+  if (rules.length === 0) return undefined;
+  return {
+    packName: `repo:${key}`,
+    rules: ['These repo rules OVERRIDE any prior habits or recalled conventions from other repos.', ...rules],
+  };
+}
+
 function buildGuardrailedPrompt(params: {
   task: NormalizedTask;
+  config: AppConfig;
   repoPath: string;
   repoName: string;
   githubToken?: string;
   threadContext: string;
   imageContext: string;
 }): string {
-  const { task, repoPath, repoName, githubToken, threadContext, imageContext } = params;
+  const { task, config, repoPath, repoName, githubToken, threadContext, imageContext } = params;
+  const repoPack = repoPolicyPackForCwd(repoPath, config);
+  const repoRules = repoPack ? `\n${repoPack.rules.map(rule => `- ${rule}`).join('\n')}` : '';
   return `
 ${buildMentionSystemPrompt({ task, workflow: 'IMPLEMENTATION', toneMode: task.toneMode })}
 
@@ -136,7 +157,7 @@ Environment:
 
 GUARDRAILS:
 - Work only within this repository directory. Do not access or modify files outside of it.
-- Do not run destructive git commands (force push, reset --hard, etc.).
+- Do not run destructive git commands (force push, reset --hard, etc.).${repoRules}
 
 Task:
 Implement the requested changes within the repository. Create a branch, commit your changes, and open a PR to the default branch.
@@ -1369,6 +1390,10 @@ Write your response as a ready-to-post Slack message describing what you did.
       pipelineConfig: fullPipelineConfig,
       imagePaths: ctx.imagePaths.length > 0 ? ctx.imagePaths : undefined,
       requestedBy: ctx.requestedBy,
+      // Repo-scoped hard rules (belt-and-braces over the repo's own CLAUDE.md,
+      // which the backend also reads in the worktree). Derived from the final
+      // pipelineCwd because plan revisions may have swapped repos mid-flight.
+      policyPack: repoPolicyPackForCwd(pipelineCwd, config),
     });
 
     let currentThreadContext = ctx.threadContext;
@@ -1633,6 +1658,7 @@ Write your response as a ready-to-post Slack message describing what you did.
       })
     : buildGuardrailedPrompt({
         task,
+        config,
         repoPath: cwd,
         repoName: ctx.repoName ?? 'unknown',
         githubToken: ctx.githubToken,
