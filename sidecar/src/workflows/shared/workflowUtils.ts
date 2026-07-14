@@ -9,7 +9,8 @@ import { getBackend } from '../../backends/registry.js';
 import { getActiveBackendId } from '../../codex/runCodex.js';
 import { resolveGithubTokenForCodex } from '../../github/githubAuth.js';
 import { resolveWorkspace } from '../../workspaces/workspaceManager.js';
-import { resolveRepoOrAsk } from './repoResolver.js';
+import { readRepoAffinity, repoPathFor, resolveRepoOrAsk, type RepoName } from './repoResolver.js';
+import type { RepoAffinity } from '../../router/repoClassifier.js';
 import type { DossierStore } from '../../state/dossierStore.js';
 
 /** Minimal slice of JobStore needed for first-seen capture; keeps PipelineStore callers compatible. */
@@ -214,6 +215,11 @@ export function buildSlackThreadLink(channelId: string, threadTs: string): strin
  * absolute paths in the prompt). Generalizes the former owner-only helper.
  */
 export function resolveCombinedWorkspaceRoot(config: AppConfig): string {
+  // miniOgRepoRoot is validated at config load to contain every configured
+  // repo path, so it is the correct N-repo spanning directory when set.
+  if (config.miniOgRepoRoot) {
+    return config.miniOgRepoRoot;
+  }
   const webParent = path.dirname(config.repoPaths.newtonWeb);
   const apiParent = path.dirname(config.repoPaths.newtonApi);
   if (webParent === apiParent) {
@@ -241,11 +247,11 @@ export async function prepareWorkflowContext(params: {
   store?: DossierAware;
   /**
    * Bypass repo classification and pin the workspace directly (issue: scoped
-   * investigation). 'newton-web' / 'newton-api' → that repo's worktree;
-   * 'broad' → the combined parent dir so the agent spans both repos. When set,
-   * resolveRepoOrAsk is skipped entirely (no admin "web or api?" round-trip).
+   * investigation). A repo key → that repo's worktree; 'broad' → the combined
+   * parent dir so the agent spans the configured repos. When set,
+   * resolveRepoOrAsk is skipped entirely (no admin "which repo?" round-trip).
    */
-  repoOverride?: 'newton-web' | 'newton-api' | 'broad';
+  repoOverride?: RepoName | 'broad';
 }): Promise<WorkflowContext> {
   const { task, config, slack, logStep, resolveRepo = true, store, repoOverride } = params;
   const isOwnerAuthor = config.ownerSlackUserIds.includes(task.event.userId);
@@ -318,22 +324,24 @@ export async function prepareWorkflowContext(params: {
     if (repoOverride === 'broad') {
       cwd = resolveCombinedWorkspaceRoot(config);
     } else {
-      repoName = repoOverride;
-      const repoPath = repoOverride === 'newton-web' ? config.repoPaths.newtonWeb : config.repoPaths.newtonApi;
-      cwd = await resolveWorkspace(repoPath, task.event.threadTs);
+      try {
+        const repoPath = repoPathFor(repoOverride, config);
+        repoName = repoOverride;
+        cwd = await resolveWorkspace(repoPath, task.event.threadTs);
+      } catch {
+        // The override names a repo that isn't configured on this host —
+        // don't crash the workflow; surface it like an unresolvable repo.
+        cwd = os.tmpdir();
+        desktopOnly = { reason: `${repoOverride} is not configured on this host`, cancelled: false };
+      }
     }
   } else if (isOwnerAuthor) {
     cwd = resolveOwnerWorkspaceRoot(config);
   } else {
-    let repoAffinity: { newtonWebHits?: number; newtonApiHits?: number } | undefined;
+    let repoAffinity: RepoAffinity | undefined;
     if (store?.dossierStore && task.event.userId) {
       try {
-        const dossier = store.dossierStore().getDossier(task.event.userId);
-        const web = dossier.affinity.find(a => a.repo === 'newton-web');
-        const api = dossier.affinity.find(a => a.repo === 'newton-api');
-        if (web || api) {
-          repoAffinity = { newtonWebHits: web?.hits, newtonApiHits: api?.hits };
-        }
+        repoAffinity = readRepoAffinity(store.dossierStore().getDossier(task.event.userId));
       } catch {
         // dossier read shouldn't block repo resolution
       }

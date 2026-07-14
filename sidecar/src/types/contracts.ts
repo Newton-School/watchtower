@@ -1,3 +1,5 @@
+import type { RepoKey } from '../repos/registry.js';
+
 export type AgentBackendId = 'codex' | 'claude-code';
 export type AccessMode = 'audit' | 'enforce';
 /**
@@ -342,7 +344,7 @@ export interface NormalizedTask {
 }
 
 export interface RepoClassificationResult {
-  selectedRepo: 'newton-web' | 'newton-api' | null;
+  selectedRepo: RepoKey | null;
   confidence: number;
   reasoning: string;
   uncertain: boolean;

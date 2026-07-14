@@ -23,7 +23,8 @@ const USAGE_LIMIT_RESUME_RE = /\b(resume|retry|continue|go|try again)\b/i;
  * qualifiers resolvePrReviewTargets understands ("both"/"all", repo names,
  * "#123"), so whatever resumes the job will also resolve to targets.
  */
-const TARGET_CHOICE_RE = /\b(both|all|frontend|front-end|web|newton-web|backend|back-end|api|newton-api)\b|#\d{2,}\b/i;
+const TARGET_CHOICE_RE =
+  /\b(both|all|frontend|front-end|web|newton-web|backend|back-end|api|newton-api|marketing|mweb|nmw|mkt|landing|newton-marketing-web)\b|#\d{2,}\b/i;
 
 export interface PausedResumeDecision {
   resume: boolean;

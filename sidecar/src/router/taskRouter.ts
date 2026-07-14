@@ -41,7 +41,7 @@ import { looksLikeFixAffirmation } from './resumeIntentParser.js';
 // conversational workflow then hallucinated a "fix done" reply. Typical
 // successful classifications run 0.85+, so 0.75 is a conservative floor.
 export const CLASSIFIER_CONFIDENCE_FLOOR = 0.75;
-import { isPresencePing } from '../workflows/shared/workflowUtils.js';
+import { isPresencePing, resolveCombinedWorkspaceRoot } from '../workflows/shared/workflowUtils.js';
 import { formatDossierForPrompt } from '../state/dossierStore.js';
 
 export async function routeTask(params: {
@@ -415,7 +415,9 @@ async function runTemplateWorkflow(params: {
   const { task, config, slack, template, logStep, signal } = params;
 
   const prompt = renderPromptTemplate(template.promptTemplate, task, config);
-  const cwd = config.repoPaths.newtonWeb;
+  // Templates can reference any configured repo via {{repo_*}} vars — run from
+  // the spanning root rather than pinning the process to newton-web.
+  const cwd = resolveCombinedWorkspaceRoot(config);
 
   await slack.chat
     .postMessage({

@@ -9,6 +9,7 @@ import { buildPromptForRole } from './prompts.js';
 import { lightweightProfile, profileForAgentRole } from '../codex/modelProfiles.js';
 import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
 import { normalizePlannerOutput, type NormalizedPlannerOutput } from './normalizePlannerOutput.js';
+import { REPO_KEYS, type RepoKey } from '../repos/registry.js';
 import { withAgentCallContext } from '../state/runContext.js';
 import { fetchThreadContext } from '../slack/threadContext.js';
 import { currentHead, checkCoderProducedChanges, getDiffVsBase } from '../workspaces/gitState.js';
@@ -438,7 +439,7 @@ export async function waitForApproval(params: {
  * admins in-thread "which repo?" and wait for an answer.
  * ---------------------------------------------------------------------- */
 
-export type RepoChoiceOutcome = 'newton-web' | 'newton-api' | 'cancelled' | 'timeout' | 'paused';
+export type RepoChoiceOutcome = RepoKey | 'cancelled' | 'timeout' | 'paused';
 export type RepoChoiceResult = {
   outcome: RepoChoiceOutcome;
   userReply: string;
@@ -447,11 +448,23 @@ export type RepoChoiceResult = {
   replyTs: string;
 };
 
-type RepoIntent = 'web' | 'api' | 'both' | 'cancel' | 'unclear';
+type RepoIntent = 'web' | 'api' | 'marketing' | 'both' | 'cancel' | 'unclear';
 
+const REPO_FOR_INTENT: Record<'web' | 'api' | 'marketing', RepoKey> = {
+  web: 'newton-web',
+  api: 'newton-api',
+  marketing: 'newton-marketing-web',
+};
+
+// MARKETING_SHORTHAND is tested before WEB_SHORTHAND: the anchors already keep
+// "marketing web" out of WEB_SHORTHAND today, but the ordering makes that safe
+// against any future de-anchoring of these regexes.
+const MARKETING_SHORTHAND =
+  /^(marketing|mweb|nmw|mkt|marketing[- ]?(web|site)|newton[- ]?marketing([- ]?web)?|landing([- ]?pages?)?)$/i;
 const WEB_SHORTHAND = /^(web|newton-?web|frontend|fe|ui)$/i;
 const API_SHORTHAND = /^(api|newton-?api|backend|be|server)$/i;
-const BOTH_SHORTHAND = /^(both|both repos?|web (?:and|&|\+) api|api (?:and|&|\+) web|dono|donon)$/i;
+const BOTH_SHORTHAND =
+  /^(both|all|both repos?|(?:web|api|marketing)\s*(?:and|&|\+)\s*(?:web|api|marketing)|dono|donon)$/i;
 const CANCEL_SHORTHAND = /^(cancel|stop|abort|nevermind|never mind|skip)\b/i;
 
 async function classifyRepoChoice(
@@ -462,6 +475,7 @@ async function classifyRepoChoice(
   const trimmed = message.trim();
 
   // Cheap regex short-circuits before calling the model.
+  if (MARKETING_SHORTHAND.test(trimmed)) return 'marketing';
   if (WEB_SHORTHAND.test(trimmed)) return 'web';
   if (API_SHORTHAND.test(trimmed)) return 'api';
   if (BOTH_SHORTHAND.test(trimmed)) return 'both';
@@ -515,7 +529,7 @@ Return strict JSON:
     }
 
     const raw = result.parsedJson as { intent?: string; reasoning?: string };
-    const valid: RepoIntent[] = ['web', 'api', 'both', 'cancel', 'unclear'];
+    const valid: RepoIntent[] = ['web', 'api', 'marketing', 'both', 'cancel', 'unclear'];
     const intent: RepoIntent = valid.includes(raw.intent as RepoIntent) ? (raw.intent as RepoIntent) : 'unclear';
 
     logStep({
@@ -551,6 +565,13 @@ export async function waitForRepoChoice(params: {
   nudgeAfterMs?: number;
   nudgeText?: string;
   signal?: AbortSignal;
+  /**
+   * Repos this host may resolve to (from enabledRepoKeys). A reply that picks
+   * a repo outside this list gets a one-time "not configured here" note and
+   * the gate keeps waiting. Defaults to all known repos so existing callers
+   * and tests keep working.
+   */
+  allowedRepos?: readonly RepoKey[];
 }): Promise<RepoChoiceResult> {
   const {
     slack,
@@ -564,6 +585,7 @@ export async function waitForRepoChoice(params: {
     nudgeAfterMs = 30 * 60 * 1000,
     nudgeText,
     signal,
+    allowedRepos = REPO_KEYS,
   } = params;
   const pollIntervalMs = 5_000;
   const notifiedUsers = new Set<string>();
@@ -573,6 +595,8 @@ export async function waitForRepoChoice(params: {
   // repo per run, so we acknowledge the cross-repo nature and ask them to pick a
   // starting repo instead of silently re-polling the same reply forever (#394).
   let bothGuidanceSent = false;
+  // Posted once if an admin picks a repo that isn't configured on this host.
+  let disallowedNoticeSent = false;
 
   while (true) {
     if (signal?.aborted) {
@@ -638,19 +662,32 @@ export async function waitForRepoChoice(params: {
       const recentThread = messages.slice(-6).map(m => m.text.trim());
       const intent = await classifyRepoChoice(text, recentThread, logStep);
 
-      if (intent === 'web') {
+      if (intent === 'web' || intent === 'api' || intent === 'marketing') {
+        const repo = REPO_FOR_INTENT[intent];
+        if (!allowedRepos.includes(repo)) {
+          if (!disallowedNoticeSent) {
+            disallowedNoticeSent = true;
+            slack.chat
+              .postMessage({
+                channel: channelId,
+                thread_ts: threadTs,
+                text: `<@${reply.user}> *${repo}* isn't configured on this host, so I can't work in it. Pick one of the configured repos or say *cancel*.`,
+              })
+              .catch(() => {});
+          }
+          logStep({
+            stage: 'pipeline.repo_choice.disallowed',
+            message: `Admin <@${reply.user}> picked ${repo}, which is not configured on this host — still waiting: "${text}"`,
+            level: 'WARN',
+            data: { repo, allowedRepos: [...allowedRepos] },
+          });
+          continue;
+        }
         logStep({
           stage: 'pipeline.repo_choice.resolved',
-          message: `Admin <@${reply.user}> chose newton-web: "${text}"`,
+          message: `Admin <@${reply.user}> chose ${repo}: "${text}"`,
         });
-        return { outcome: 'newton-web', userReply: text, approverId: reply.user, replyTs: reply.ts };
-      }
-      if (intent === 'api') {
-        logStep({
-          stage: 'pipeline.repo_choice.resolved',
-          message: `Admin <@${reply.user}> chose newton-api: "${text}"`,
-        });
-        return { outcome: 'newton-api', userReply: text, approverId: reply.user, replyTs: reply.ts };
+        return { outcome: repo, userReply: text, approverId: reply.user, replyTs: reply.ts };
       }
       if (intent === 'cancel') {
         logStep({

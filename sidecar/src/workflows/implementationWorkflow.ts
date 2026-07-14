@@ -19,7 +19,8 @@ import { notifyDesktop } from '../notify/desktopNotifier.js';
 import { getBackend } from '../backends/registry.js';
 import { runAgentPipeline, formatPlanMessage, waitForApproval, buildApprovalMessage } from '../agents/pipeline.js';
 import { normalizePlannerOutput } from '../agents/normalizePlannerOutput.js';
-import { inferRepoFromAffectedFiles, repoPathFor, resolveRepoOrAsk } from './shared/repoResolver.js';
+import { inferRepoFromAffectedFiles, readRepoAffinity, repoPathFor, resolveRepoOrAsk } from './shared/repoResolver.js';
+import type { RepoAffinity } from '../router/repoClassifier.js';
 import { waitForClarificationWithIdle, detectClarificationLoop } from './shared/clarificationGuards.js';
 import type { ClarificationRound } from './shared/clarificationGuards.js';
 import { profileForAgentRole } from '../codex/modelProfiles.js';
@@ -1127,15 +1128,10 @@ Write your response as a ready-to-post Slack message describing what you did.
     // we abandon cleanly.
     let pipelineCwd = ctx.cwd;
     if (ctx.isOwnerAuthor) {
-      let repoAffinity: { newtonWebHits?: number; newtonApiHits?: number } | undefined;
+      let repoAffinity: RepoAffinity | undefined;
       if (store?.dossierStore && task.event.userId) {
         try {
-          const dossier = store.dossierStore().getDossier(task.event.userId);
-          const web = dossier.affinity.find(a => a.repo === 'newton-web');
-          const api = dossier.affinity.find(a => a.repo === 'newton-api');
-          if (web || api) {
-            repoAffinity = { newtonWebHits: web?.hits, newtonApiHits: api?.hits };
-          }
+          repoAffinity = readRepoAffinity(store.dossierStore().getDossier(task.event.userId));
         } catch {
           // dossier read shouldn't block repo resolution
         }
