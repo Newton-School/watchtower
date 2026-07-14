@@ -26,7 +26,7 @@ export interface InvestigationScopeResult {
 
 const MARKETING_SCOPE_BLOCKS = {
   codebase: `- newton-marketing-web: the PUBLIC MARKETING site (Next.js static export behind a Cloudflare Worker). Owns newtonschool.co landing/marketing pages migrated from Webflow, their SEO/meta, and their images. It never reads from newton-api.`,
-  scope: `- "newton-marketing-web": a public marketing/landing-page symptom on newtonschool.co — a broken landing page, wrong SEO/meta tags, an image 404 on a marketing page, layout/CLS issues on a program landing page, a page that should have cut over from Webflow. The marketing site is a static export and never reads from newton-api — a marketing-page bug does NOT need the backend or "broad". (Logged-in my.newtonschool.co symptoms are newton-web, not marketing.)`,
+  scope: `- "newton-marketing-web": a symptom with an explicit PUBLIC-SITE signal — a bare/www newtonschool.co URL, or strong marketing vocabulary (Webflow/cutover, "-temp" page, wrangler/Cloudflare worker, image rehost/CloudFront, marketing site). The marketing site is a static export and never reads from newton-api — a marketing-page bug does NOT need the backend or "broad". CAUTION: "landing page", the homepage, and NSAT/NST pages exist in BOTH frontends (marketing owns the public admission landing pages; newton-web owns the logged-in NSAT timeline/test flows) — those nouns alone are NOT a public-site signal. Logged-in my.newtonschool.co symptoms are newton-web; when torn between the two frontends with no public-site signal, prefer "newton-web".`,
 } as const;
 
 function buildScopePrompt(marketingEnabled: boolean): string {

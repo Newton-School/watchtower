@@ -113,10 +113,12 @@ describe('classifyRepo (agent-based)', () => {
 
   it('accepts newton-marketing-web from the agent', async () => {
     vi.mocked(runCodex).mockResolvedValueOnce(
-      aiReply({ selectedRepo: 'newton-marketing-web', confidence: 0.9, reasoning: 'landing page CTA' }),
+      aiReply({ selectedRepo: 'newton-marketing-web', confidence: 0.9, reasoning: 'webflow page = marketing' }),
     );
     const out = await classifyRepo({
-      task: 'the CTA on the NSAT landing page is broken',
+      // Strong marketing signal ("webflow") — a bare shared noun like "the
+      // NSAT landing page" must NOT be presented as a decisive marketing ask.
+      task: 'the CTA on the webflow about-us page is broken',
       threshold: 0.75,
     });
     expect(out.selectedRepo).toBe('newton-marketing-web');
@@ -142,11 +144,25 @@ describe('buildClassifyPrompt', () => {
     // URL host is a first-class disambiguator between the two frontends.
     expect(prompt).toContain('my.newtonschool.co');
     expect(prompt).toContain('TELLING THE TWO FRONTENDS APART');
-    // Marketing is opt-in; a frontend task with no marketing signal defaults to newton-web.
-    expect(prompt).toContain('NO marketing signal is "newton-web"');
+    // Marketing is opt-in; only STRONG signals are decisive.
+    expect(prompt).toContain('NO STRONG marketing signal is "newton-web"');
     expect(prompt).toContain('Never guess between the two frontends');
     // The old binary rule must be gone — it is the #1 misroute source vs a second frontend.
     expect(prompt).not.toContain('almost always "newton-web"');
+  });
+
+  it('treats shared page nouns (NSAT/NST, landing page, homepage) as non-decisive between the frontends', () => {
+    const prompt = buildClassifyPrompt(['newton-web', 'newton-api', 'newton-marketing-web']);
+    // The shared-nouns tier exists and names the NSAT overlap explicitly.
+    expect(prompt).toContain('SHARED PAGE NOUNS');
+    expect(prompt).toContain('NSAT/NST pages');
+    expect(prompt).toContain('newton-web owns the logged-in NSAT timeline');
+    // NSAT must NOT appear as a decisive marketing signal — the strong list
+    // carries no NSAT/NST or bare "landing page" tokens.
+    const strongMarketingLine = prompt.split('\n').find(l => l.includes('STRONG marketing signals')) ?? '';
+    expect(strongMarketingLine).not.toMatch(/NSAT|NST\b|landing page/i);
+    // Shared nouns alone must route to the admin gate, not a guess.
+    expect(prompt).toContain('Shared nouns ALONE');
   });
 
   it('without marketing: keeps the classic two-repo rule and omits marketing copy', () => {

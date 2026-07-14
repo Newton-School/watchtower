@@ -147,8 +147,8 @@ describe('marketing deploy gating', () => {
     }
   });
 
-  it('ambiguous frontend targets stay in the DEPLOY flow but pin no repo', () => {
-    // "landing page" / "homepage" / "newton school" describe screens in both
+  it('ambiguous frontend targets WITH a prod token stay in the DEPLOY flow but pin no repo', () => {
+    // "landing page" / "homepage" / "NSAT|NST pages" describe screens in both
     // frontends — a prod deploy must not be guessed from them, but the ask is
     // still deploy-shaped: only the deterministic gate can produce DEPLOY, so
     // these must not leak into the implementation pipeline.
@@ -156,13 +156,31 @@ describe('marketing deploy gating', () => {
       '<@UBOT1> ship the landing pages to production',
       '<@UBOT1> deploy the landing page changes to prod',
       '<@UBOT1> ship the homepage to production',
-      '<@UBOT1> deploy the newton school site',
+      '<@UBOT1> deploy the newton school site to prod',
+      '<@UBOT1> deploy the NSAT page to prod',
+      '<@UBOT1> ship the NST pages to production',
     ]) {
       expect(classifyDeployTarget(text)).toBe('ambiguous');
       expect(isDeployRequest(text)).toBe(false);
       expect(isMarketingDeployRequest(text)).toBe(false);
       const task = normalizeTask({ ...baseEvent, text }, config, []);
       expect(task.intent).toBe('DEPLOY');
+    }
+  });
+
+  it('deploy verbs used as ordinary chatter about shared pages never enter the DEPLOY flow', () => {
+    // Review-caught hijack: "release"/"ship" + a product noun with NO prod
+    // token is implementation chatter, not a deploy ask. Pre-fix this entered
+    // DEPLOY and, on a marketing-less host, ran a real newton-web prod deploy.
+    for (const text of [
+      '<@UBOT1> release the NSAT results page fix',
+      '<@UBOT1> ship the NST samurai leaderboard',
+      '<@UBOT1> ship the homepage banner fix',
+      '<@UBOT1> deploy the newton school site',
+    ]) {
+      expect(classifyDeployTarget(text)).toBeNull();
+      const task = normalizeTask({ ...baseEvent, text }, config, []);
+      expect(task.intent).not.toBe('DEPLOY');
     }
   });
 
