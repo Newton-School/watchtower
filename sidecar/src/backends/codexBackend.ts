@@ -139,7 +139,10 @@ export const codexBackend: AgentBackend = {
   },
 
   buildArgs(request: AgentRunRequest, outputPath: string): string[] {
-    const args = ['exec', '--cd', request.cwd, '--full-auto', '--skip-git-repo-check'];
+    // `--json` streams JSONL events to stdout so runCodex can narrate progress
+    // live. It coexists with --output-last-message (verified): the final
+    // message file is still written, so parseOutput is unaffected.
+    const args = ['exec', '--json', '--cd', request.cwd, '--full-auto', '--skip-git-repo-check'];
     if (request.model) {
       args.push('-m', request.model);
     }

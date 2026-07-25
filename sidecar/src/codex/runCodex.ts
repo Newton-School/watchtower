@@ -2,12 +2,26 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import type { CodexRunRequest, CodexRunResult, CostSource, WorkflowIntent } from '../types/contracts.js';
+import type {
+  CodexRunRequest,
+  CodexRunResult,
+  CostSource,
+  WorkflowIntent,
+  WorkflowStepLog,
+} from '../types/contracts.js';
 import type { AgentBackend, AgentBackendId } from '../backends/types.js';
 import { getBackend } from '../backends/registry.js';
 import { computeCostUsd } from '../pricing/modelPrices.js';
 import { agentCallContext } from '../state/runContext.js';
+import { createStreamDecoder } from './streamEvents.js';
 import type { DossierStore } from '../state/dossierStore.js';
+
+/**
+ * Upper bound on retained raw stdout. With stream-json the child emits an event
+ * per tool call, so an unbounded buffer would hold tens of MB per running job.
+ * The decoder owns the authoritative final message; this tail is diagnostic.
+ */
+const MAX_RETAINED_STDOUT = 256 * 1024;
 
 let activeBackendId: AgentBackendId = 'codex';
 
@@ -309,9 +323,30 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
   let stdoutStarted = false;
   let stderrStarted = false;
 
+  // Decodes the backend's JSONL event stream into step logs as the run
+  // progresses. This is what turns an opaque multi-minute agent run into a live
+  // trail of tool / skill / MCP / subagent activity in job_logs and the Slack
+  // status line.
+  const decoder = createStreamDecoder(backend.id);
+
+  /** Emit decoded steps without ever letting a decode bug kill the run. */
+  const emitSteps = (steps: WorkflowStepLog[]): void => {
+    for (const step of steps) {
+      try {
+        request.onLog?.(step);
+      } catch {
+        // Non-fatal: progress reporting must not abort agent execution.
+      }
+    }
+  };
+
   child.stdout.on('data', chunk => {
     const text = chunk.toString();
-    stdout += text;
+    // Bounded: `--output-format stream-json --verbose` produces far more stdout
+    // than the old single-blob JSON, and this string used to grow without
+    // limit. The tail is what matters for post-mortem; the authoritative final
+    // message comes from the decoder, not from this buffer.
+    stdout = stdout.length > MAX_RETAINED_STDOUT ? stdout.slice(-MAX_RETAINED_STDOUT) + text : stdout + text;
     stdoutBytes += Buffer.byteLength(text);
     if (!stdoutStarted) {
       stdoutStarted = true;
@@ -319,6 +354,11 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
         stage: 'agent.stdout.start',
         message: `${backend.displayName} started streaming stdout.`,
       });
+    }
+    try {
+      emitSteps(decoder.push(text));
+    } catch {
+      // Non-fatal: a malformed stream must not abort the run.
     }
   });
   child.stderr.on('data', chunk => {
@@ -367,11 +407,21 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
       },
     });
 
+    // Decode anything left in the buffer without a trailing newline.
+    try {
+      emitSteps(decoder.flush());
+    } catch {
+      // Non-fatal.
+    }
+
     let lastMessage = '';
-    // Claude Code writes JSON to stdout (--output-format json), not to a file.
-    // Skip the file read entirely for backends that use stdout.
+    // Claude Code streams JSONL to stdout, not a file. The authoritative final
+    // output is the `{"type":"result",…}` line the decoder retained — handing
+    // parseOutput the whole JSONL buffer would break the envelope unwrap and
+    // the plan-mode permission_denials harvest with it. Fall back to the
+    // concatenated assistant prose (still better than raw JSONL), then stdout.
     if (backend.id === 'claude-code') {
-      lastMessage = stdout;
+      lastMessage = decoder.finalMessage() ?? decoder.assistantText() ?? stdout;
     } else {
       try {
         lastMessage = await fs.readFile(outputPath, 'utf8');
@@ -384,8 +434,10 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
           },
         });
       } catch {
-        // Output file not written — fall back to captured stdout.
-        lastMessage = stdout;
+        // Output file not written — recover the last agent message from the
+        // JSONL stream. Raw stdout is now events, not prose, so it is only the
+        // last resort.
+        lastMessage = decoder.finalMessage() ?? decoder.assistantText() ?? stdout;
         request.onLog?.({
           stage: 'agent.output.missing',
           message: lastMessage

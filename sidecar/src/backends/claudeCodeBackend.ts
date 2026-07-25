@@ -203,7 +203,12 @@ export const claudeCodeBackend: AgentBackend = {
     } else {
       args.push('-p', request.prompt);
     }
-    args.push('--output-format', 'json');
+    // `stream-json` (which requires `--verbose` under `--print`) emits one JSON
+    // event per line as the run progresses instead of a single blob at exit.
+    // That is what makes live tool/skill/MCP narration possible; runCodex's
+    // stream decoder recovers the final `{"type":"result",…}` envelope from the
+    // stream, so parseOutput below still sees exactly what it saw before.
+    args.push('--output-format', 'stream-json', '--verbose');
     // `--dangerously-skip-permissions` is equivalent to `--permission-mode bypassPermissions`
     // and silently wins over `--permission-mode plan`, so passing both leaves the model
     // without the ExitPlanMode tool. Choose one or the other.
@@ -278,7 +283,10 @@ export const claudeCodeBackend: AgentBackend = {
       typeof outerParsed.parsedJson.result === 'string'
     ) {
       const envelope = outerParsed.parsedJson;
-      const costUsd = asFiniteNumber(envelope.cost_usd);
+      // The installed CLI reports `total_cost_usd`; older builds (and the test
+      // fixtures written against them) used `cost_usd`. Reading only the legacy
+      // key meant real claude-code runs recorded no cost at all in agent_calls.
+      const costUsd = asFiniteNumber(envelope.total_cost_usd) ?? asFiniteNumber(envelope.cost_usd);
       const usage = extractClaudeUsage(envelope);
       const sessionId = typeof envelope.session_id === 'string' ? envelope.session_id : undefined;
 
