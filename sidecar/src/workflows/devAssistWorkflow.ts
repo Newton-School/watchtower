@@ -1,8 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { WebClient } from '@slack/web-api';
-import type { AppConfig, NormalizedTask, WorkflowResult, WorkflowStepLogger } from '../types/contracts.js';
+import type {
+  AppConfig,
+  JobCostSummary,
+  NormalizedTask,
+  WorkflowResult,
+  WorkflowStepLogger,
+} from '../types/contracts.js';
 import { diagnoseFailure } from '../learning/failureDoctor.js';
+import { formatJobTrace } from './shared/traceFormatter.js';
 import { parseDevAssistCommand } from '../router/devAssistParser.js';
 import { cancelJob, getActiveJobIds } from '../state/activeJobs.js';
 import { loadPolicies, getPolicySnapshot } from '../policies/evaluator.js';
@@ -264,13 +271,15 @@ export async function runDevAssistWorkflow(params: {
     }
 
     const logs = store.listJobLogsTail(resolvedJobId, command.limit);
-    const lines = logs.map(log => {
-      return `[${log.level}] ${log.stage} - ${log.message}`;
-    });
-
-    const text = logs.length
-      ? [`Trace for job ${resolvedJobId}:`, ...lines].join('\n')
-      : `No trace logs found for job ${resolvedJobId}.`;
+    // The Slack status line vanishes when miniOG replies, so this timeline is
+    // the durable record of the tools, skills, and MCP calls a run used.
+    let cost: JobCostSummary | undefined;
+    try {
+      cost = store.getJobCallSummary(resolvedJobId);
+    } catch {
+      // Non-fatal: the trail is still worth showing without a cost footer.
+    }
+    const text = formatJobTrace({ jobId: resolvedJobId, logs, cost });
 
     await slack.chat.postMessage({
       channel: task.event.channelId,

@@ -95,6 +95,33 @@ describe('claudeCodeBackend.parseOutput', () => {
     });
   });
 
+  // The installed CLI emits `total_cost_usd`; reading only the legacy
+  // `cost_usd` key meant real runs recorded no cost in agent_calls at all,
+  // while these fixtures kept passing.
+  it('extracts cost from total_cost_usd as emitted by the current CLI', () => {
+    const wrapper = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      result: 'Plain reply.',
+      session_id: 'sess-cost',
+      total_cost_usd: 0.142377,
+    });
+
+    expect(claudeCodeBackend.parseOutput(wrapper).costUsd).toBe(0.142377);
+  });
+
+  it('prefers total_cost_usd when both keys are present', () => {
+    const wrapper = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      result: 'Plain reply.',
+      total_cost_usd: 0.5,
+      cost_usd: 0.1,
+    });
+
+    expect(claudeCodeBackend.parseOutput(wrapper).costUsd).toBe(0.5);
+  });
+
   it('returns undefined usage when envelope has no usage block', () => {
     const wrapper = JSON.stringify({
       type: 'result',
@@ -376,6 +403,22 @@ describe('claudeCodeBackend.buildArgs', () => {
     const args = claudeCodeBackend.buildArgs(baseRequest, '/tmp/out.json');
     expect(args).toContain('--dangerously-skip-permissions');
     expect(args).not.toContain('--permission-mode');
+  });
+
+  it('requests stream-json so tool activity can be narrated live', () => {
+    const args = claudeCodeBackend.buildArgs(baseRequest, '/tmp/out.json');
+    const idx = args.indexOf('--output-format');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('stream-json');
+    // The CLI rejects stream-json under --print without --verbose.
+    expect(args).toContain('--verbose');
+  });
+
+  it('still streams in plan mode', () => {
+    const args = claudeCodeBackend.buildArgs({ ...baseRequest, planMode: true }, '/tmp/out.json');
+    expect(args[args.indexOf('--output-format') + 1]).toBe('stream-json');
+    expect(args).toContain('--verbose');
+    expect(args[args.indexOf('--permission-mode') + 1]).toBe('plan');
   });
 
   it('uses --permission-mode plan and omits skip-permissions when planMode is true', () => {

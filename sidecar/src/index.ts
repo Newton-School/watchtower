@@ -34,7 +34,9 @@ import { configureVaultWriter, shutdownVaultWriter } from './vault/vaultWriter.j
 import { configureVaultWatcher, shutdownVaultWatcher } from './vault/vaultWatcher.js';
 import { startProfileSynthesizerScheduler, stopProfileSynthesizerScheduler } from './learning/profileSynthesizer.js';
 import { loadWorkflowTemplates } from './workflows/registry.js';
+import { narrateStep } from './slack/statusNarrator.js';
 import { fetchThreadContext } from './slack/threadContext.js';
+import { createThreadStatus, type ThreadStatus } from './slack/threadStatus.js';
 import { resolveUserGroup } from './slack/userGroupResolver.js';
 import { registerActiveJob, unregisterActiveJob, cancelJob } from './state/activeJobs.js';
 import { JobStore } from './state/jobStore.js';
@@ -938,6 +940,11 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
 
   const stepLogs: WorkflowStepLog[] = [];
 
+  // `status` is declared below but referenced inside logStep: the two are
+  // mutually dependent (logStep drives the status line; the status module
+  // reports its own failures back through logStep). Safe because
+  // createThreadStatus never invokes logStep synchronously, so `status` is
+  // always initialized before any logStep call can read it.
   const logStep = (step: WorkflowStepLog): void => {
     stepLogs.push({
       level: step.level ?? 'INFO',
@@ -982,7 +989,32 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
         'failed to persist workflow step log',
       );
     }
+
+    // Drive the Slack status line. Wrapped because status is decoration: a
+    // narration bug must never break logging or abort a job.
+    try {
+      const narrated = narrateStep(step);
+      if (narrated && status) {
+        status.set(narrated.text);
+        // Human-wait gates idle for hours; stop refreshing so the status
+        // expires on its own instead of being pinned.
+        if (narrated.suspend) status.suspend();
+      }
+    } catch (error) {
+      logger.warn({ jobId, stage: step.stage, error: String(error) }, 'status narration failed');
+    }
   };
+
+  // Live "miniOG is …" thread status. Every workflow lights up for free:
+  // logStep is the one choke point all ~200 stages — and the CLI tool events
+  // from the stream decoder — flow through.
+  const status: ThreadStatus = createThreadStatus({
+    slack: client,
+    channelId: event.channelId,
+    threadTs: event.threadTs,
+    logStep,
+  });
+  status.set('is getting started…');
 
   logStep({
     stage: 'job.created',
@@ -1397,6 +1429,14 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     } catch {
       // ignore persistence failures in terminal error path
     }
+  } finally {
+    // Slack clears the status automatically whenever miniOG posts a message,
+    // but SKIPPED jobs can end without ever posting — clear explicitly so the
+    // thread does not keep showing "miniOG is …" after the job is done.
+    // dispose() then releases the keepalive timer, which would otherwise hold a
+    // reference to the client and the job for the life of the sidecar.
+    await status.clear();
+    status.dispose();
   }
 }
 

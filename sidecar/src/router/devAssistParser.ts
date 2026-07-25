@@ -128,8 +128,11 @@ function parsePrefixedDevAssistCommand(body: string): DevAssistCommand | undefin
 
   const traceMatch = body.match(/^trace\s+([a-z0-9-]{6,})(?:\s+(\d+))?\b/i);
   if (traceMatch) {
-    const rawLimit = Number(traceMatch[2] ?? '20');
-    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 100) : 20;
+    // Raised from 20/100: job_logs now carries a row per tool call, so a
+    // 20-line tail would only show the last few seconds of a run instead of
+    // the timeline the trace is for.
+    const rawLimit = Number(traceMatch[2] ?? '60');
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 300) : 60;
     return {
       type: 'TRACE',
       jobId: traceMatch[1],
