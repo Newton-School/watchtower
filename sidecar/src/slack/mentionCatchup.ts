@@ -10,12 +10,15 @@ const CATCHUP_INTERVAL_MS = 2 * 60 * 1000;
 const CATCHUP_LOOKBACK_SECONDS = 60 * 60 * 24;
 const CATCHUP_PAGE_SIZE = 200;
 // Hard ceiling on how many messages we accumulate in memory per channel per
-// scan. Steady-state ticks cover ~2-minute windows (far below this), so the cap
-// only ever engages on the first run or after a long downtime in a very busy
-// channel — exactly the case where unbounded `do/while(cursor)` pagination
-// would balloon the array. conversations.history returns newest-first, so the
-// most recent (most likely still-actionable) mentions are the ones we keep.
+// scan. Every tick fetches the full lookback window (we need old parents'
+// reply metadata to spot fresh thread activity), so the cap bounds a very busy
+// channel's backlog. conversations.history returns newest-first, so the most
+// recent (most likely still-actionable) mentions are the ones we keep.
 const CATCHUP_MAX_MESSAGES_PER_CHANNEL = 1000;
+// Same bound for one thread's replies. conversations.replies pages
+// oldest-first, so a pathological >cap thread keeps its oldest replies and can
+// miss the newest — the warn line in fetchThreadReplies makes that visible.
+const CATCHUP_MAX_REPLIES_PER_THREAD = 1000;
 // Catchup is a recovery scanner — it walks `conversations.history` and replays
 // mentions whose live socket delivery we may have missed. Deletions only flow
 // through the live socket path (where processMessageDeleted reacts); a
@@ -38,12 +41,14 @@ export function startMentionCatchup(deps: CatchupDeps): void {
   }, CATCHUP_INTERVAL_MS);
 }
 
-async function runMentionCatchup(deps: CatchupDeps): Promise<void> {
+// Exported for unit testing of the scan passes; production entry is
+// startMentionCatchup.
+export async function runMentionCatchup(deps: CatchupDeps): Promise<void> {
   const { webClient, config, store, enqueue } = deps;
   const nowTs = Math.floor(Date.now() / 1000);
   const storedCursorRaw = store.getState(CATCHUP_STATE_KEY);
   const storedCursor = storedCursorRaw ? Number(storedCursorRaw) : 0;
-  const oldestTs =
+  const cursorBoundary =
     Number.isFinite(storedCursor) && storedCursor > 0
       ? Math.max(0, storedCursor - 5)
       : nowTs - CATCHUP_LOOKBACK_SECONDS;
@@ -51,7 +56,7 @@ async function runMentionCatchup(deps: CatchupDeps): Promise<void> {
   logger.info(
     {
       component: 'slack-catchup',
-      oldestTs,
+      cursorBoundary,
       cursorTs: storedCursor || null,
     },
     'starting missed mention catch-up scan',
@@ -68,10 +73,16 @@ async function runMentionCatchup(deps: CatchupDeps): Promise<void> {
 
   let recovered = 0;
   let scannedMessages = 0;
-  let maxSeenTs = oldestTs;
+  let maxSeenTs = cursorBoundary;
+  const enqueuedThisScan = new Set<string>();
 
   for (const channelId of channelIds) {
-    const historyMessages = await fetchChannelHistory(webClient, channelId, oldestTs);
+    // Fetch the full lookback window rather than just the cursor delta: plain
+    // thread replies never appear in conversations.history, so fresh thread
+    // activity is only visible through the *parent* row's reply metadata —
+    // and that parent can be much older than the last scan. Idempotency comes
+    // from the event/job dedup gates below, not from a narrow fetch window.
+    const historyMessages = await fetchChannelHistory(webClient, channelId, nowTs - CATCHUP_LOOKBACK_SECONDS);
     if (historyMessages.length === 0) {
       continue;
     }
@@ -89,24 +100,17 @@ async function runMentionCatchup(deps: CatchupDeps): Promise<void> {
       scannedMessages += 1;
       maxSeenTs = Math.max(maxSeenTs, toEpochSeconds(eventTs));
 
-      const subtype = message.subtype ? String(message.subtype) : '';
-      if (subtype && NON_ACTIONABLE_SUBTYPES.has(subtype)) {
-        continue;
-      }
-
-      const text = String(message.text ?? '');
-      const userId = String(message.user ?? '');
-      if (!text || !userId || userId === config.botUserId) {
-        continue;
-      }
-
-      const mention = detectMention(text, config);
-      if (!mention.detected) {
+      const candidate = extractActionableMention(message, config);
+      if (!candidate) {
         continue;
       }
 
       const replayEventId = `replay:${channelId}:${eventTs}`;
-      if (store.hasEvent(replayEventId) || store.hasJobForEventTs(channelId, eventTs)) {
+      if (
+        enqueuedThisScan.has(replayEventId) ||
+        store.hasEvent(replayEventId) ||
+        store.hasJobForEventTs(channelId, eventTs)
+      ) {
         continue;
       }
 
@@ -128,14 +132,79 @@ async function runMentionCatchup(deps: CatchupDeps): Promise<void> {
         channelId,
         threadTs,
         eventTs,
-        userId,
-        text,
-        messageSubtype: subtype || undefined,
+        userId: candidate.userId,
+        text: candidate.text,
+        messageSubtype: candidate.subtype || undefined,
         rawEvent: message as Record<string, unknown>,
       };
 
       await enqueue(envelope, webClient, 'catchup');
+      enqueuedThisScan.add(replayEventId);
       recovered += 1;
+    }
+
+    // Second pass: thread replies. conversations.history never returns plain
+    // thread replies, so before this pass an @mention posted inside a thread
+    // was invisible to catch-up and silently dropped whenever live socket
+    // delivery was down (RCA 2026-07-29). Parents carry reply metadata, so we
+    // fetch replies only for threads with activity since the last scan.
+    for (const message of ordered) {
+      const parentTs = String(message.ts ?? '');
+      const replyCount = Number(message.reply_count ?? 0);
+      const latestReplyEpoch = toEpochSeconds(String(message.latest_reply ?? ''));
+      if (!parentTs || replyCount <= 0 || latestReplyEpoch <= cursorBoundary) {
+        continue;
+      }
+
+      const replies = await fetchThreadReplies(webClient, channelId, parentTs);
+      for (const reply of replies) {
+        const replyTs = String(reply.ts ?? '');
+        if (!replyTs || replyTs === parentTs) {
+          continue;
+        }
+
+        scannedMessages += 1;
+
+        const candidate = extractActionableMention(reply, config);
+        if (!candidate) {
+          continue;
+        }
+
+        const replayEventId = `replay:${channelId}:${replyTs}`;
+        if (
+          enqueuedThisScan.has(replayEventId) ||
+          store.hasEvent(replayEventId) ||
+          store.hasJobForEventTs(channelId, replyTs)
+        ) {
+          continue;
+        }
+
+        // We already hold the full reply list — check for a bot response
+        // in-place instead of a second conversations.replies round-trip.
+        const replyEpoch = toEpochSeconds(replyTs);
+        const botRespondedLater = replies.some(
+          other => String(other.user ?? '') === config.botUserId && toEpochSeconds(String(other.ts ?? '')) > replyEpoch,
+        );
+        if (botRespondedLater) {
+          store.recordEvent(replayEventId, channelId, parentTs);
+          continue;
+        }
+
+        const envelope: SlackEventEnvelope = {
+          eventId: replayEventId,
+          channelId,
+          threadTs: parentTs,
+          eventTs: replyTs,
+          userId: candidate.userId,
+          text: candidate.text,
+          messageSubtype: candidate.subtype || undefined,
+          rawEvent: reply,
+        };
+
+        await enqueue(envelope, webClient, 'catchup');
+        enqueuedThisScan.add(replayEventId);
+        recovered += 1;
+      }
     }
   }
 
@@ -151,6 +220,33 @@ async function runMentionCatchup(deps: CatchupDeps): Promise<void> {
     },
     'completed missed mention catch-up scan',
   );
+}
+
+type ActionableMention = { text: string; userId: string; subtype: string };
+
+/**
+ * Shared actionability gate for both scan passes: skip non-actionable
+ * subtypes, bot-authored and empty messages, and anything without a detected
+ * mention. Dedup against prior processing stays with the callers because the
+ * two passes record events with different thread anchors.
+ */
+function extractActionableMention(message: Record<string, unknown>, config: AppConfig): ActionableMention | null {
+  const subtype = message.subtype ? String(message.subtype) : '';
+  if (subtype && NON_ACTIONABLE_SUBTYPES.has(subtype)) {
+    return null;
+  }
+
+  const text = String(message.text ?? '');
+  const userId = String(message.user ?? '');
+  if (!text || !userId || userId === config.botUserId) {
+    return null;
+  }
+
+  if (!detectMention(text, config).detected) {
+    return null;
+  }
+
+  return { text, userId, subtype };
 }
 
 async function discoverChannels(client: WebClient, store: JobStore, config: AppConfig): Promise<string[]> {
@@ -247,6 +343,60 @@ export async function fetchChannelHistory(
         error: String(error),
       },
       'failed to fetch channel history during missed mention catch-up',
+    );
+  }
+
+  return messages;
+}
+
+// Exported for unit testing of the per-thread accumulation cap.
+export async function fetchThreadReplies(
+  client: WebClient,
+  channelId: string,
+  threadTs: string,
+): Promise<Array<Record<string, unknown>>> {
+  const messages: Array<Record<string, unknown>> = [];
+  let cursor: string | undefined;
+
+  try {
+    do {
+      const response = await client.conversations.replies({
+        channel: channelId,
+        ts: threadTs,
+        inclusive: true,
+        limit: CATCHUP_PAGE_SIZE,
+        cursor,
+      });
+
+      for (const message of response.messages ?? []) {
+        messages.push(message as unknown as Record<string, unknown>);
+      }
+
+      cursor = response.response_metadata?.next_cursor || undefined;
+
+      if (cursor && messages.length >= CATCHUP_MAX_REPLIES_PER_THREAD) {
+        logger.warn(
+          {
+            component: 'slack-catchup',
+            channelId,
+            threadTs,
+            accumulated: messages.length,
+            cap: CATCHUP_MAX_REPLIES_PER_THREAD,
+          },
+          'thread replies hit per-thread cap during catch-up; stopping pagination',
+        );
+        break;
+      }
+    } while (cursor);
+  } catch (error) {
+    logger.warn(
+      {
+        component: 'slack-catchup',
+        channelId,
+        threadTs,
+        error: String(error),
+      },
+      'failed to fetch thread replies during missed mention catch-up',
     );
   }
 

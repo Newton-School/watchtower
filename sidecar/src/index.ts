@@ -29,6 +29,7 @@ import { classifyProduct } from './router/productClassifier.js';
 import { routeTask } from './router/taskRouter.js';
 import { startMentionCatchup } from './slack/mentionCatchup.js';
 import { SocketSlackClient } from './slack/socketClient.js';
+import { SocketWatchdog } from './slack/socketWatchdog.js';
 import { cleanupStaleWorkspaces, cleanupThreadWorkspaces } from './workspaces/workspaceManager.js';
 import { configureVaultWriter, shutdownVaultWriter } from './vault/vaultWriter.js';
 import { configureVaultWatcher, shutdownVaultWatcher } from './vault/vaultWatcher.js';
@@ -1509,6 +1510,27 @@ async function main(): Promise<void> {
     },
   );
 
+  const socketWatchdog = new SocketWatchdog({
+    reconnect: () => client.restart(),
+    alert: async ({ channelId }) => {
+      notifyDesktop(
+        'Slack socket zombie detected',
+        `Catch-up recovered a mention live delivery missed in <#${channelId}>. Reconnecting.`,
+      );
+      const ownerId = config.ownerSlackUserIds[0];
+      if (ownerId) {
+        try {
+          await client.webClient.chat.postMessage({
+            channel: ownerId,
+            text: `:rotating_light: Socket Mode went zombie — catch-up recovered a mention in <#${channelId}> that live delivery missed. Reconnecting now; recent in-thread mentions may have gone unanswered.`,
+          });
+        } catch (error) {
+          logger.warn({ error: String(error) }, 'failed to DM owner about zombie socket');
+        }
+      }
+    },
+  });
+
   process.on('SIGINT', () => {
     logger.info('received SIGINT');
     shutdownVaultWriter();
@@ -1528,6 +1550,7 @@ async function main(): Promise<void> {
   });
 
   await client.start();
+  socketWatchdog.markConnected();
   logger.info('autonomous feed/digest/incident posting disabled; mention-triggered replies only');
 
   const refreshAccessGroups = async () => {
@@ -1684,7 +1707,12 @@ async function main(): Promise<void> {
     webClient: client.webClient,
     config,
     store,
-    enqueue: enqueueSlackEvent,
+    enqueue: async (event, webClient, source) => {
+      // Every genuine catch-up recovery is evidence the live socket missed an
+      // event — feed it to the watchdog so a zombie connection gets restarted.
+      socketWatchdog.noteCatchupRecovery(event.channelId, event.eventTs);
+      await enqueueSlackEvent(event, webClient, source);
+    },
   });
 
   startLaunchpadRequestPoller({
