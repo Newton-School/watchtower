@@ -318,8 +318,8 @@ function scopeAckText(scope: InvestigationScope, useMetabase: boolean): string {
     return 'Looks like a marketing-site issue — digging into *newton-marketing-web*. I’ll share what I find.';
   }
   return useMetabase
-    ? 'Couldn’t localize this to one layer — sweeping *newton-web* + *newton-api* + Metabase (read-only) to trace it end-to-end.'
-    : 'Couldn’t localize this to one layer — sweeping *newton-web* + *newton-api* to trace it end-to-end.';
+    ? 'Tracing this end-to-end through *newton-web*, *newton-api*, and database. I’ll share what I find.'
+    : 'Tracing this end-to-end through *newton-web* and *newton-api*. I’ll share what I find.';
 }
 
 function formatInvestigationMessage(findings: {
