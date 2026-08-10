@@ -1,7 +1,7 @@
 import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
-import { highReasoningProfile } from '../codex/modelProfiles.js';
+import { highReasoningProfile, lightweightProfile } from '../codex/modelProfiles.js';
 import { extractReplyFromCodexResult } from '../workflows/shared/workflowUtils.js';
-import type { WorkflowStepLogger } from '../types/contracts.js';
+import type { WorkflowStepLogger, CodexReasoningEffort } from '../types/contracts.js';
 import type { AgentBackendId } from '../backends/types.js';
 
 export interface RunClaudeAgenticRequest {
@@ -19,6 +19,17 @@ export interface RunClaudeAgenticRequest {
   forceBackend?: AgentBackendId;
   /** Hard timeout for the spawned agent. Defaults to none (outer signal only). */
   timeoutMs?: number;
+  /**
+   * Model tier for the run, resolved against whichever backend is active —
+   * callers pick a tier, never a model id, so the choice stays correct when
+   * the backend flips. Defaults to 'high' (the pre-existing behavior).
+   */
+  tier?: 'light' | 'high';
+  /**
+   * Reasoning-effort override on top of the tier's default. Effort values are
+   * backend-portable, unlike model ids. See docs/model-effort-audit.md.
+   */
+  effort?: CodexReasoningEffort;
 }
 
 export interface RunClaudeAgenticResult {
@@ -41,17 +52,20 @@ export interface RunClaudeAgenticResult {
  * wrapping.
  */
 export async function runClaudeAgentic(request: RunClaudeAgenticRequest): Promise<RunClaudeAgenticResult> {
-  const { systemPrompt, userMessage, cwd, githubToken, logStep, signal, forceBackend, timeoutMs } = request;
+  const { systemPrompt, userMessage, cwd, githubToken, logStep, signal, forceBackend, timeoutMs, tier, effort } =
+    request;
 
   const prompt = `${systemPrompt}\n\n---\n\nUser message:\n${userMessage}`;
   const backendId = forceBackend ?? getActiveBackendId();
+  const profile = tier === 'light' ? lightweightProfile(backendId) : highReasoningProfile(backendId);
 
   try {
     const result = await runCodex({
       cwd,
       prompt,
       githubToken,
-      ...highReasoningProfile(backendId),
+      ...profile,
+      reasoningEffort: effort ?? profile.reasoningEffort,
       backendOverride: forceBackend,
       timeoutMs,
       onLog: logStep,
