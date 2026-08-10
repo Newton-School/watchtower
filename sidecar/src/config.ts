@@ -22,7 +22,7 @@ const settingsSchema = z.object({
   newton_api_path: z.string(),
   newton_marketing_web_path: z.string().default(''),
   max_concurrent_jobs: z.number().int().positive().default(2),
-  pr_review_timeout_ms: z.number().int().positive().default(720000),
+  pr_review_timeout_ms: z.number().int().positive().default(1200000),
   bug_fix_timeout_ms: z.number().int().positive().default(2700000),
   repo_classifier_threshold: z.number().min(0).max(1).default(0.75),
   multi_agent_enabled: z.number().int().min(0).max(1).default(0),

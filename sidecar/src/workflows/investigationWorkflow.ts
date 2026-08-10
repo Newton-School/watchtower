@@ -194,9 +194,9 @@ Return strict JSON:
     model: profile.model,
     reasoningEffort: profile.reasoningEffort,
     mcpServers,
-    // No per-agent timeoutMs. Substantive investigations on Claude Opus at
-    // max reasoning routinely exceed a fractional sub-budget (e.g. 40% of
-    // bugFixTimeoutMs = 18 min) on real feature scoping, and a forced
+    // No per-agent timeoutMs. Substantive investigations on the high-reasoning
+    // tier (Opus at xhigh) routinely exceed a fractional sub-budget (e.g. 40%
+    // of bugFixTimeoutMs = 18 min) on real feature scoping, and a forced
     // SIGKILL produces no plan content and no actionable error. The outer
     // workflow's abort signal (passed below) is the safety net.
     onLog: logStep,

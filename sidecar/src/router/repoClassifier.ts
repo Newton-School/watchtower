@@ -315,7 +315,7 @@ export async function classifyRepo(params: ClassifyRepoParams): Promise<RepoClas
       prompt,
       model: profile.model,
       reasoningEffort: profile.reasoningEffort,
-      timeoutMs: 30_000,
+      timeoutMs: 45_000,
     });
 
     if (!result.ok || !result.parsedJson) {

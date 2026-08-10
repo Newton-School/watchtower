@@ -122,7 +122,7 @@ export async function classifyWorkflowIntent(params: {
       prompt: fullPrompt,
       model: profile.model,
       reasoningEffort: profile.reasoningEffort,
-      timeoutMs: 30_000,
+      timeoutMs: 45_000,
     });
 
     if (!result.ok || !result.parsedJson) {

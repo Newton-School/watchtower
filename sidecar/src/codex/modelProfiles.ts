@@ -31,12 +31,12 @@ const BACKEND_PROFILES: Record<AgentBackendId, BackendProfileTable> = {
   },
   'claude-code': {
     lightweight: {
-      model: 'claude-sonnet-4-6',
+      model: 'claude-sonnet-5',
       reasoningEffort: 'low',
     },
     highReasoning: {
-      model: 'claude-opus-4-7',
-      reasoningEffort: 'high',
+      model: 'claude-opus-5',
+      reasoningEffort: 'xhigh',
     },
   },
 };
@@ -53,9 +53,12 @@ const ROLE_TIER: Record<AgentRole, 'lightweight' | 'highReasoning'> = {
 export function profileForAgentRole(role: AgentRole, backendId?: AgentBackendId): CodexExecutionProfile {
   const backend = backendId ?? 'codex';
   if (role === 'planner' && backend === 'claude-code') {
+    // xhigh, not max: max is prone to overthinking with diminishing returns on
+    // Opus 5, and this is the least-bounded call in the system (no timeout,
+    // up to 3 runs per job). See docs/model-effort-audit.md.
     return {
-      model: 'claude-opus-4-7',
-      reasoningEffort: 'max',
+      model: 'claude-opus-5',
+      reasoningEffort: 'xhigh',
     };
   }
   const tier = ROLE_TIER[role];
