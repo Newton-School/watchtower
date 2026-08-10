@@ -66,4 +66,21 @@ describe('modelProfiles — every producible model has a price entry', () => {
       expect(getModelPricing(model), `missing price entry for ${model}`).toBeDefined();
     }
   });
+
+  // Pin the actual rates for the live tier so a fat-fingered decimal fails the
+  // build — cost telemetry is computed from these on 99.6% of rows.
+  it('live-tier prices match Anthropic list pricing', () => {
+    expect(getModelPricing('claude-opus-5')).toEqual({
+      inputPer1k: 0.005,
+      outputPer1k: 0.025,
+      cacheReadPer1k: 0.0005,
+      cacheCreatePer1k: 0.00625,
+    });
+    expect(getModelPricing('claude-sonnet-5')).toEqual({
+      inputPer1k: 0.003,
+      outputPer1k: 0.015,
+      cacheReadPer1k: 0.0003,
+      cacheCreatePer1k: 0.00375,
+    });
+  });
 });
