@@ -22,6 +22,14 @@ export const HIGH_REASONING_CODEX_PROFILE: CodexExecutionProfile = {
   reasoningEffort: 'xhigh',
 };
 
+// Escape hatches for the live backend, mirroring the codex pair above: model
+// id only (never effort), read once at module load — a change requires a
+// sidecar restart. An override id missing from pricing/modelPrices.ts records
+// NULL cost silently; the price guard in modelProfiles.test.ts only covers
+// the table defaults.
+const CLAUDE_LIGHTWEIGHT_MODEL = readOverride('WATCHTOWER_CLAUDE_LIGHTWEIGHT_MODEL') ?? 'claude-sonnet-5';
+const CLAUDE_HIGH_REASONING_MODEL = readOverride('WATCHTOWER_CLAUDE_HIGH_REASONING_MODEL') ?? 'claude-opus-5';
+
 type BackendProfileTable = Record<'lightweight' | 'highReasoning', CodexExecutionProfile>;
 
 const BACKEND_PROFILES: Record<AgentBackendId, BackendProfileTable> = {
@@ -31,11 +39,11 @@ const BACKEND_PROFILES: Record<AgentBackendId, BackendProfileTable> = {
   },
   'claude-code': {
     lightweight: {
-      model: 'claude-sonnet-5',
+      model: CLAUDE_LIGHTWEIGHT_MODEL,
       reasoningEffort: 'low',
     },
     highReasoning: {
-      model: 'claude-opus-5',
+      model: CLAUDE_HIGH_REASONING_MODEL,
       reasoningEffort: 'xhigh',
     },
   },
@@ -50,14 +58,14 @@ const ROLE_TIER: Record<AgentRole, 'lightweight' | 'highReasoning'> = {
   verifier: 'lightweight',
 };
 
-export function profileForAgentRole(role: AgentRole, backendId?: AgentBackendId): CodexExecutionProfile {
-  const backend = backendId ?? 'codex';
+export function profileForAgentRole(role: AgentRole, backendId: AgentBackendId): CodexExecutionProfile {
+  const backend = backendId;
   if (role === 'planner' && backend === 'claude-code') {
     // xhigh, not max: max is prone to overthinking with diminishing returns on
     // Opus 5, and this is the least-bounded call in the system (no timeout,
     // up to 3 runs per job). See docs/model-effort-audit.md.
     return {
-      model: 'claude-opus-5',
+      model: CLAUDE_HIGH_REASONING_MODEL,
       reasoningEffort: 'xhigh',
     };
   }

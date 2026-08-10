@@ -74,6 +74,7 @@ export async function classifyInvestigationScope(params: {
   /** Configured repo checkouts to grep — from enabledRepoPaths(config). */
   repoGrepPaths?: Array<{ key: RepoKey; path: string }>;
   logStep?: WorkflowStepLogger;
+  signal?: AbortSignal;
 }): Promise<InvestigationScopeResult> {
   const { bugReport, threadMessages = [], repoGrepPaths = [], logStep } = params;
   // Without grep paths (callers that only want the LLM verdict) assume the
@@ -117,6 +118,8 @@ export async function classifyInvestigationScope(params: {
       model: profile.model,
       reasoningEffort: profile.reasoningEffort,
       timeoutMs: 45_000,
+      onLog: params.logStep,
+      signal: params.signal,
     });
 
     if (!result.ok || !result.parsedJson) {

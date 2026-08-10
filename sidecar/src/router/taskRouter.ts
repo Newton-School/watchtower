@@ -155,6 +155,7 @@ export async function routeTask(params: {
         mentionType: task.mentionType,
         userDossierSummary,
         logStep,
+        signal,
       });
       classificationReasoning = classification.reasoning;
 

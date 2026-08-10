@@ -93,8 +93,9 @@ export async function classifyWorkflowIntent(params: {
    */
   userDossierSummary?: string;
   logStep?: WorkflowStepLogger;
+  signal?: AbortSignal;
 }): Promise<IntentClassification> {
-  const { userMessage, threadContext, hasPrUrl, mentionType = 'bot', userDossierSummary, logStep } = params;
+  const { userMessage, threadContext, hasPrUrl, mentionType = 'bot', userDossierSummary, logStep, signal } = params;
   const isIndirectMention = mentionType === 'owner';
 
   logStep?.({
@@ -123,6 +124,8 @@ export async function classifyWorkflowIntent(params: {
       model: profile.model,
       reasoningEffort: profile.reasoningEffort,
       timeoutMs: 45_000,
+      onLog: logStep,
+      signal,
     });
 
     if (!result.ok || !result.parsedJson) {
