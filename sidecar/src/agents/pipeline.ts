@@ -233,7 +233,7 @@ Return strict JSON:
       prompt,
       model: profile.model,
       reasoningEffort: profile.reasoningEffort,
-      timeoutMs: 15_000,
+      timeoutMs: 30_000,
     });
 
     if (!result.ok || !result.parsedJson) {
@@ -556,7 +556,7 @@ Return strict JSON:
       prompt,
       model: profile.model,
       reasoningEffort: profile.reasoningEffort,
-      timeoutMs: 15_000,
+      timeoutMs: 30_000,
     });
 
     if (!result.ok || !result.parsedJson) {

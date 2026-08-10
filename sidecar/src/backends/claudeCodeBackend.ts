@@ -384,10 +384,10 @@ export const claudeCodeBackend: AgentBackend = {
   },
 
   availableModels(): string[] {
-    return ['claude-sonnet-4-6', 'claude-opus-4-7'];
+    return ['claude-sonnet-5', 'claude-opus-5'];
   },
 
   defaultModel(): string {
-    return 'claude-sonnet-4-6';
+    return 'claude-sonnet-5';
   },
 };

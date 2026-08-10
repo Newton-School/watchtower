@@ -174,7 +174,7 @@ export async function synthesizeUserProfile(opts: {
     prompt,
     model: profile.model,
     reasoningEffort: profile.reasoningEffort,
-    timeoutMs: 60_000,
+    timeoutMs: 90_000,
   }).catch(err => {
     logger.warn({ err: String(err), userId }, 'profile synthesizer: runCodex threw');
     return null;

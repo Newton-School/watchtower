@@ -116,7 +116,7 @@ export async function classifyInvestigationScope(params: {
       prompt: `${buildScopePrompt(marketingEnabled)}\n\nBug report:\n"${bugReport}"${threadBlock}\n\nClassify this bug.`,
       model: profile.model,
       reasoningEffort: profile.reasoningEffort,
-      timeoutMs: 30_000,
+      timeoutMs: 45_000,
     });
 
     if (!result.ok || !result.parsedJson) {

@@ -14,11 +14,25 @@ export interface ModelPricing {
 
 const PRICES: Record<string, ModelPricing> = {
   // Anthropic Claude
+  'claude-opus-5': {
+    inputPer1k: 0.005,
+    outputPer1k: 0.025,
+    cacheReadPer1k: 0.0005,
+    cacheCreatePer1k: 0.00625,
+  },
+  'claude-sonnet-5': {
+    inputPer1k: 0.003,
+    outputPer1k: 0.015,
+    cacheReadPer1k: 0.0003,
+    cacheCreatePer1k: 0.00375,
+  },
+  // Opus 4.7 lists at $5/$25 per MTok — this previously carried legacy
+  // Opus 4.0/4.1 rates ($15/$75), inflating every recorded cost ~3x.
   'claude-opus-4-7': {
-    inputPer1k: 0.015,
-    outputPer1k: 0.075,
-    cacheReadPer1k: 0.0015,
-    cacheCreatePer1k: 0.01875,
+    inputPer1k: 0.005,
+    outputPer1k: 0.025,
+    cacheReadPer1k: 0.0005,
+    cacheCreatePer1k: 0.00625,
   },
   'claude-sonnet-4-6': {
     inputPer1k: 0.003,
