@@ -2,6 +2,7 @@ import os from 'node:os';
 import { lightweightProfile } from '../codex/modelProfiles.js';
 import { getActiveBackendId, runCodex } from '../codex/runCodex.js';
 import { logger } from '../logging/logger.js';
+import { extractReplyFromCodexResult } from '../workflows/shared/workflowUtils.js';
 import { productDisplayName } from '../router/productClassifier.js';
 import type { JobStore } from '../state/jobStore.js';
 import type { PinnedFactRow, UserDossier, UserMemoryRow } from '../state/dossierStore.js';
@@ -183,7 +184,14 @@ export async function synthesizeUserProfile(opts: {
   if (!result || !result.ok) {
     return { ok: false, reason: 'llm-failed' };
   }
-  const text = (result.lastMessage ?? '').trim().slice(0, SYNTHESIS_MAX_CHARS);
+  // On claude-code, result.lastMessage is the raw {"type":"result",...} JSONL
+  // envelope (retained for parseOutput) — persisting it verbatim injected
+  // truncated JSON into every dossier-carrying prompt's About line. Unwrap via
+  // the shared helper (parsedJson.summary -> parsedJson.result -> envelope).
+  if (result.parsedJson?.status === 'error') {
+    return { ok: false, reason: 'llm-failed' };
+  }
+  const text = extractReplyFromCodexResult(result).trim().slice(0, SYNTHESIS_MAX_CHARS);
   if (!text) return { ok: false, reason: 'empty-output' };
 
   const generatedAt = now.toISOString();
