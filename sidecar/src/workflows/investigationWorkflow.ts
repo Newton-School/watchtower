@@ -38,6 +38,7 @@ export async function runInvestigationWorkflow(params: {
     threadMessages: scopeThread.map(m => m.text),
     repoGrepPaths: enabledRepoPaths(config),
     logStep,
+    signal,
   });
 
   const ctx = await prepareWorkflowContext({ task, config, slack, logStep, repoOverride: scope.scope });

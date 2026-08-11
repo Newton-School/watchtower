@@ -35,6 +35,7 @@ export interface ClassifyRepoParams {
    */
   repoGrepPaths?: Array<{ key: RepoKey; path: string }>;
   logStep?: WorkflowStepLogger;
+  signal?: AbortSignal;
 }
 
 const ENTITY_MAX_PER_REQUEST = 8;
@@ -316,6 +317,8 @@ export async function classifyRepo(params: ClassifyRepoParams): Promise<RepoClas
       model: profile.model,
       reasoningEffort: profile.reasoningEffort,
       timeoutMs: 45_000,
+      onLog: params.logStep,
+      signal: params.signal,
     });
 
     if (!result.ok || !result.parsedJson) {

@@ -138,6 +138,7 @@ export async function resolveRepoOrAsk(params: {
     planMarkdown,
     repoGrepPaths: enabledRepoPaths(config),
     logStep,
+    signal,
   });
   if (!classification.uncertain && classification.selectedRepo && isRepoEnabled(config, classification.selectedRepo)) {
     return resolved(classification.selectedRepo, config, 'classifier');
