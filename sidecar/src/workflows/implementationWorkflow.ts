@@ -17,6 +17,7 @@ import { buildMentionSystemPrompt } from '../codex/mentionSystemPrompt.js';
 import { githubAuthModeHint } from '../github/githubAuth.js';
 import { notifyDesktop } from '../notify/desktopNotifier.js';
 import { getBackend } from '../backends/registry.js';
+import type { AgentBackendId } from '../backends/types.js';
 import { runAgentPipeline, formatPlanMessage, waitForApproval, buildApprovalMessage } from '../agents/pipeline.js';
 import { normalizePlannerOutput } from '../agents/normalizePlannerOutput.js';
 import { inferRepoFromAffectedFiles, readRepoAffinity, repoPathFor, resolveRepoOrAsk } from './shared/repoResolver.js';
@@ -236,6 +237,8 @@ async function runApprovalLoop(input: {
   pauseCountStart: number;
   plannerSchemaPath: string;
   plannerProfile: ReturnType<typeof profileForAgentRole>;
+  /** Backend the planner ran on — decides how revision output is normalized. */
+  plannerBackend: AgentBackendId;
   workflowTimeoutMs: number;
   githubToken?: string;
   /** When set, the first loop iteration uses this ts as the wait-cutoff instead of posting a fresh prompt. */
@@ -253,6 +256,7 @@ async function runApprovalLoop(input: {
     pauseCountStart,
     plannerSchemaPath,
     plannerProfile,
+    plannerBackend,
     githubToken,
     resumeApprovalPromptTs,
     workflowIntent,
@@ -538,9 +542,11 @@ Return the JSON now.`;
       }
 
       plannerOutput = revisedResult.parsedJson;
-      // Revision prompts always demand structured JSON (regardless of original
-      // backend), so normalize as the codex JSON path here.
-      const revisedNormalized = normalizePlannerOutput(plannerOutput, 'codex');
+      // Normalize per the backend the planner actually ran on. On claude-code the
+      // revision schema is unenforced (buildArgs ignores outputSchemaPath), so a
+      // prose/markdown revision must go through the claude-code branch — the codex
+      // branch would yield an empty planMarkdown and silently keep the stale plan.
+      const revisedNormalized = normalizePlannerOutput(plannerOutput, plannerBackend);
       planMarkdown = revisedNormalized.planMarkdown || planMarkdown;
       planAffectedFiles =
         revisedNormalized.affectedFiles.length > 0 ? revisedNormalized.affectedFiles : planAffectedFiles;
@@ -1286,6 +1292,7 @@ Write your response as a ready-to-post Slack message describing what you did.
       pauseCountStart: 0,
       plannerSchemaPath,
       plannerProfile,
+      plannerBackend,
       workflowTimeoutMs,
       githubToken: ctx.githubToken,
       workflowIntent: task.intent === 'OWNER_AUTOPILOT' ? 'OWNER_AUTOPILOT' : 'IMPLEMENTATION',
