@@ -1,6 +1,13 @@
 import path from 'node:path';
 import type { WebClient } from '@slack/web-api';
-import type { AppConfig, NormalizedTask, PrContext, WorkflowResult, WorkflowStepLogger } from '../types/contracts.js';
+import type {
+  AppConfig,
+  NormalizedTask,
+  PrContext,
+  WorkflowResult,
+  WorkflowStepLogger,
+  CodexReasoningEffort,
+} from '../types/contracts.js';
 import type { JobStore } from '../state/jobStore.js';
 import { runClaudeAgentic } from './runClaude.js';
 import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
@@ -44,6 +51,21 @@ export type AgenticMode = 'informational' | 'conversational' | 'qa';
 
 /** Hard ceiling for a browser-QA run — driving a real browser is slow. */
 const QA_TIMEOUT_MS = 20 * 60 * 1000;
+
+/**
+ * Per-mode model policy. Tier picks the backend-resolved profile (on the live
+ * claude-code backend: light = Sonnet, high = Opus); effort overrides the
+ * tier's default. Informational keeps Opus quality at medium effort (a code
+ * lookup doesn't need xhigh's long-horizon planning); conversational is
+ * chitchat + guardrail, so the light tier suffices; QA is bound by
+ * QA_TIMEOUT_MS, where xhigh would spend the budget thinking instead of
+ * driving Playwright. See docs/model-effort-audit.md.
+ */
+const MODE_POLICY: Record<AgenticMode, { tier: 'light' | 'high'; effort?: CodexReasoningEffort }> = {
+  informational: { tier: 'high', effort: 'medium' },
+  conversational: { tier: 'light' },
+  qa: { tier: 'high', effort: 'high' },
+};
 
 export interface RunAgenticEntryParams {
   mode: AgenticMode;
@@ -200,6 +222,8 @@ export async function runAgenticEntry(params: RunAgenticEntryParams): Promise<Wo
     userMessage: task.event.text || '(empty message)',
     cwd,
     githubToken,
+    tier: MODE_POLICY[mode].tier,
+    effort: MODE_POLICY[mode].effort,
     logStep,
     signal,
   });
@@ -312,6 +336,8 @@ async function runWebappQa(params: RunAgenticEntryParams): Promise<WorkflowResul
       userMessage: task.event.text || `QA the web app at ${targetUrl}`,
       cwd: cwd ?? config.repoPaths.newtonWeb,
       forceBackend: 'claude-code',
+      tier: MODE_POLICY.qa.tier,
+      effort: MODE_POLICY.qa.effort,
       timeoutMs: QA_TIMEOUT_MS,
       logStep,
       signal,
