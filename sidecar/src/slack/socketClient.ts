@@ -321,6 +321,25 @@ export class SocketSlackClient {
     logger.info({ component: 'slack' }, 'socket mode started');
   }
 
+  /**
+   * Tear down and re-establish the Socket Mode connection. Used by the
+   * zombie-socket watchdog: a stop() on an already-dead websocket can throw,
+   * which must not prevent the fresh start().
+   */
+  async restart(): Promise<void> {
+    logger.warn({ component: 'slack' }, 'restarting socket mode connection');
+    try {
+      await this.app.stop();
+    } catch (error) {
+      logger.warn(
+        { component: 'slack', error: String(error) },
+        'stopping stale socket mode app failed; starting anyway',
+      );
+    }
+    await this.app.start();
+    logger.info({ component: 'slack' }, 'socket mode restarted');
+  }
+
   get webClient() {
     return this.app.client;
   }
