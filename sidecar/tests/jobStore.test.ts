@@ -871,3 +871,62 @@ describe('time-window snapshots (julianday → sargable ISO-threshold rewrite)',
     store.close();
   });
 });
+
+describe('pr_review_findings (durable review memory)', () => {
+  it('records and reads back a review job findings, filtered by job id', () => {
+    const dbPath = tempDbPath();
+    const store = new JobStore(dbPath);
+
+    store.recordPrReviewFindings({
+      jobId: 'job-review-1',
+      prUrl: 'https://github.com/Newton-School/newton-api/pull/42',
+      repo: 'newton-api',
+      prNumber: 42,
+      prHeadSha: 'aaaa1111',
+      author: 'octo-dev',
+      appliedSkills: ['newton-api-pr-review'],
+      findings: [
+        { role: 'security', severity: 'high', category: 'authz', message: 'missing check', file: 'src/a.py', line: 12 },
+        { role: 'reviewer', severity: 'low', category: 'style', message: 'nit', suggestion: 'rename' },
+      ],
+    });
+    store.recordPrReviewFindings({
+      jobId: 'job-review-2',
+      prUrl: 'https://github.com/Newton-School/newton-api/pull/42',
+      repo: 'newton-api',
+      prNumber: 42,
+      prHeadSha: 'bbbb2222',
+      findings: [{ role: 'performance', severity: 'medium', category: 'n+1', message: 'query in loop' }],
+    });
+
+    const byJob = store.getPrReviewFindings({
+      prUrl: 'https://github.com/Newton-School/newton-api/pull/42',
+      jobId: 'job-review-1',
+    });
+    expect(byJob).toHaveLength(2);
+    expect(byJob[0]).toMatchObject({
+      jobId: 'job-review-1',
+      prHeadSha: 'aaaa1111',
+      role: 'security',
+      severity: 'high',
+      file: 'src/a.py',
+      line: 12,
+    });
+    expect(byJob[1]).toMatchObject({ role: 'reviewer', suggestion: 'rename', file: undefined, line: undefined });
+
+    const all = store.getPrReviewFindings({ prUrl: 'https://github.com/Newton-School/newton-api/pull/42' });
+    expect(all).toHaveLength(3);
+
+    // Zero-finding reviews record nothing (the head-SHA dedup covers "reviewed clean").
+    store.recordPrReviewFindings({
+      jobId: 'job-review-3',
+      prUrl: 'https://github.com/Newton-School/newton-api/pull/43',
+      repo: 'newton-api',
+      prNumber: 43,
+      findings: [],
+    });
+    expect(store.getPrReviewFindings({ prUrl: 'https://github.com/Newton-School/newton-api/pull/43' })).toHaveLength(0);
+
+    store.close();
+  });
+});

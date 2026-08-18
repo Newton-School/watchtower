@@ -437,6 +437,27 @@ export class JobStore {
       );
       CREATE INDEX IF NOT EXISTS idx_investigation_findings_channel ON investigation_findings(channel_id, thread_ts);
 
+      CREATE TABLE IF NOT EXISTS pr_review_findings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pr_url TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        pr_number INTEGER NOT NULL,
+        pr_head_sha TEXT,
+        job_id TEXT NOT NULL,
+        author TEXT,
+        role TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        category TEXT NOT NULL,
+        message TEXT NOT NULL,
+        file TEXT,
+        line INTEGER,
+        suggestion TEXT,
+        applied_skills TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_pr_review_findings_pr ON pr_review_findings(pr_url, created_at);
+      CREATE INDEX IF NOT EXISTS idx_pr_review_findings_repo ON pr_review_findings(repo, created_at);
+
       CREATE TABLE IF NOT EXISTS user_dossiers (
         user_id TEXT PRIMARY KEY,
         display_name TEXT,
@@ -2831,6 +2852,118 @@ export class JobStore {
     }
 
     return undefined;
+  }
+
+  /**
+   * Persist a completed PR review's findings — the durable memory an
+   * interactive session structurally lacks. Feeds the PRIOR REVIEW context on
+   * re-reviews and, later, cross-PR recall ("this bug class shipped in PR #X").
+   * Deliberately NOT pruned by pruneOldRows (long-term value, like the dossier
+   * tables). Failures must never fail a review — callers wrap in try/catch.
+   */
+  recordPrReviewFindings(input: {
+    jobId: string;
+    prUrl: string;
+    repo: string;
+    prNumber: number;
+    prHeadSha?: string;
+    author?: string;
+    appliedSkills?: string[];
+    findings: Array<{
+      role: string;
+      severity: string;
+      category: string;
+      message: string;
+      file?: string;
+      line?: number;
+      suggestion?: string;
+    }>;
+  }): void {
+    if (input.findings.length === 0) return;
+    const now = new Date().toISOString();
+    const appliedSkills =
+      input.appliedSkills && input.appliedSkills.length > 0 ? JSON.stringify(input.appliedSkills) : null;
+    const insert = this.db.prepare(
+      `INSERT INTO pr_review_findings
+        (pr_url, repo, pr_number, pr_head_sha, job_id, author, role, severity, category, message, file, line, suggestion, applied_skills, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const tx = this.db.transaction(() => {
+      for (const finding of input.findings) {
+        insert.run(
+          input.prUrl,
+          input.repo,
+          input.prNumber,
+          input.prHeadSha ?? null,
+          input.jobId,
+          input.author ?? null,
+          finding.role,
+          finding.severity,
+          finding.category,
+          finding.message,
+          finding.file ?? null,
+          finding.line ?? null,
+          finding.suggestion ?? null,
+          appliedSkills,
+          now,
+        );
+      }
+    });
+    tx();
+  }
+
+  /** Findings persisted by a prior review of this PR (optionally one job's). */
+  getPrReviewFindings(input: { prUrl: string; jobId?: string; limit?: number }): Array<{
+    jobId: string;
+    prHeadSha?: string;
+    role: string;
+    severity: string;
+    category: string;
+    message: string;
+    file?: string;
+    line?: number;
+    suggestion?: string;
+    createdAt: string;
+  }> {
+    const limit = Math.max(1, Math.min(input.limit ?? 50, 200));
+    const rows = (
+      input.jobId
+        ? this.db
+            .prepare(
+              `SELECT job_id, pr_head_sha, role, severity, category, message, file, line, suggestion, created_at
+               FROM pr_review_findings WHERE pr_url = ? AND job_id = ? ORDER BY id ASC LIMIT ?`,
+            )
+            .all(input.prUrl, input.jobId, limit)
+        : this.db
+            .prepare(
+              `SELECT job_id, pr_head_sha, role, severity, category, message, file, line, suggestion, created_at
+               FROM pr_review_findings WHERE pr_url = ? ORDER BY id DESC LIMIT ?`,
+            )
+            .all(input.prUrl, limit)
+    ) as Array<{
+      job_id: string;
+      pr_head_sha: string | null;
+      role: string;
+      severity: string;
+      category: string;
+      message: string;
+      file: string | null;
+      line: number | null;
+      suggestion: string | null;
+      created_at: string;
+    }>;
+    return rows.map(row => ({
+      jobId: row.job_id,
+      prHeadSha: row.pr_head_sha ?? undefined,
+      role: row.role,
+      severity: row.severity,
+      category: row.category,
+      message: row.message,
+      file: row.file ?? undefined,
+      line: row.line ?? undefined,
+      suggestion: row.suggestion ?? undefined,
+      createdAt: row.created_at,
+    }));
   }
 
   getDevStatusSnapshot(): {

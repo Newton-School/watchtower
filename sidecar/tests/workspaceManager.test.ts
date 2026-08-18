@@ -135,6 +135,44 @@ describe('resolveWorkspace refresh-on-reuse', () => {
     expect(await git(ws, ['rev-parse', 'HEAD'])).toBe(commitA); // fresh worktree at origin/main
   });
 
+  it('keeps a symlinked node_modules invisible to git even when .gitignore says "node_modules/" (#413)', async () => {
+    // The repo ships the trailing-slash pattern, which matches directories only.
+    await writeFile(path.join(repo, '.gitignore'), 'node_modules/\n');
+    await git(repo, ['add', '.gitignore']);
+    await git(repo, ['commit', '-qm', 'add gitignore']);
+    await git(repo, ['push', '-q', 'origin', 'main']);
+    // Parent clone needs a node_modules for the worktree symlink to be created.
+    fs.mkdirSync(path.join(repo, 'node_modules'), { recursive: true });
+
+    const ws = await resolveWorkspace(repo, thread);
+
+    expect(fs.lstatSync(path.join(ws, 'node_modules')).isSymbolicLink()).toBe(true);
+    // The whole point: git must not see it. Untracked here meant `git add -A`
+    // committed a mode-120000 blob holding a local absolute path into a PR.
+    expect(await git(ws, ['status', '--porcelain'])).toBe('');
+  });
+
+  it('survives the clean -fd on reuse, so tooling keeps its node_modules (#413)', async () => {
+    await writeFile(path.join(repo, '.gitignore'), 'node_modules/\n');
+    await git(repo, ['add', '.gitignore']);
+    await git(repo, ['commit', '-qm', 'add gitignore']);
+    await git(repo, ['push', '-q', 'origin', 'main']);
+    fs.mkdirSync(path.join(repo, 'node_modules'), { recursive: true });
+
+    const ws1 = await resolveWorkspace(repo, thread);
+    expect(fs.existsSync(path.join(ws1, 'node_modules'))).toBe(true);
+
+    // Reuse runs `git clean -fd`, which deletes UNTRACKED paths. Before the fix
+    // the symlink was untracked in a trailing-slash repo, so the second task in
+    // a thread lost node_modules entirely and every npm command in the worktree
+    // broke. Excluded paths are left alone.
+    const ws2 = await resolveWorkspace(repo, thread);
+
+    expect(ws2).toBe(ws1);
+    expect(fs.lstatSync(path.join(ws2, 'node_modules')).isSymbolicLink()).toBe(true);
+    expect(await git(ws2, ['status', '--porcelain'])).toBe('');
+  });
+
   it('reuse discards stale tracked + untracked leftovers from a prior run', async () => {
     const ws1 = await resolveWorkspace(repo, thread);
     // Simulate a prior coder run that dirtied the worktree.

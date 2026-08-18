@@ -157,9 +157,18 @@ Requirements:
    **Thread:** ${ctx.task.event.threadTs}
 5. When creating the PR with \`gh pr create\`, include the flag \`--label miniog\` to tag it
 6. Do not run destructive git commands
+7. If you cannot map the request to a concrete change — the plan above is missing, the terminology
+   doesn't resolve to anything in this repo, or you'd be guessing at which code the requester means —
+   do NOT guess and do NOT commit anything. Return \`"status": "blocked"\` with \`blockedReason\` set to
+   the question you need answered, addressed to the requester. Blocked runs are asked back in Slack;
+   they never open a PR, so a block costs the requester one reply and a wrong guess costs them a bad
+   change on a live page. Only use this when you are genuinely stuck — a plan you can follow is not a
+   reason to block.
 
 Return strict JSON:
 {
+  "status": string,        // "done" once you've implemented the change, or "blocked" per requirement 7
+  "blockedReason": string, // required when status is "blocked": what you need, phrased as a question. "" otherwise
   "filesChanged": string[],
   "summary": string,
   "testsAdded": string[],

@@ -1,11 +1,33 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
+import type { WebClient } from '@slack/web-api';
 import { extractQaTargetUrl, isWebappQaRequest, isWebappQaOnPrRequest } from '../src/router/intentParser.js';
-import { parseScreenshotManifest } from '../src/slack/imageUploader.js';
+import { parseScreenshotManifest, uploadScreenshots } from '../src/slack/imageUploader.js';
 import { changedPathsFromDiff, classifyChangedPaths, findFreePort } from '../src/devServer/devServerManager.js';
 import { qaRepoForUrl, qaSystemPrompt } from '../src/agentic/agenticEntry.js';
-import type { AppConfig } from '../src/types/contracts.js';
+import type { AppConfig, WorkflowStepLog } from '../src/types/contracts.js';
 
 const PR_URL = 'https://github.com/Newton-School/newton-web/pull/8399';
+
+function makeTempPng(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qa-shot-'));
+  const p = path.join(dir, 'shot.png');
+  fs.writeFileSync(p, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]));
+  return p;
+}
+
+/** Minimal WebClient stub exposing only filesUploadV2. */
+function fakeSlack(filesUploadV2: () => Promise<unknown>): WebClient {
+  return { filesUploadV2 } as unknown as WebClient;
+}
+
+function missingScopeError(): Error {
+  const err = new Error('An API error occurred: missing_scope') as Error & { data?: Record<string, unknown> };
+  err.data = { ok: false, error: 'missing_scope', needed: 'files:write', provided: 'chat:write,channels:read' };
+  return err;
+}
 
 const QA_CONFIG = {
   repoPaths: {
@@ -222,6 +244,81 @@ describe('findFreePort', () => {
     const port = await findFreePort();
     expect(port).toBeGreaterThan(0);
     expect(port).toBeLessThan(65536);
+  });
+});
+
+describe('uploadScreenshots logging', () => {
+  it('classifies a missing files:write scope explicitly (needed/provided surfaced)', async () => {
+    const logs: WorkflowStepLog[] = [];
+    const slack = fakeSlack(() => Promise.reject(missingScopeError()));
+    const n = await uploadScreenshots({
+      slack,
+      channelId: 'C1',
+      threadTs: '1.1',
+      screenshots: [{ path: makeTempPng(), caption: 'login' }],
+      logStep: e => logs.push(e),
+    });
+    expect(n).toBe(0);
+    expect(logs.some(l => l.stage === 'qa.evidence.upload_attempt')).toBe(true);
+    const scopeLog = logs.find(l => l.stage === 'qa.evidence.missing_scope');
+    expect(scopeLog).toBeDefined();
+    expect(scopeLog?.level).toBe('ERROR');
+    expect(scopeLog?.data?.needed).toBe('files:write');
+    expect(String(scopeLog?.data?.provided)).toContain('chat:write');
+    // a missing-scope failure must NOT be logged as a generic upload_failed
+    expect(logs.some(l => l.stage === 'qa.evidence.upload_failed')).toBe(false);
+  });
+
+  it('logs an upload on success and returns the count', async () => {
+    const logs: WorkflowStepLog[] = [];
+    let called = false;
+    const slack = fakeSlack(() => {
+      called = true;
+      return Promise.resolve({ ok: true });
+    });
+    const n = await uploadScreenshots({
+      slack,
+      channelId: 'C1',
+      threadTs: '1.1',
+      screenshots: [{ path: makeTempPng() }],
+      logStep: e => logs.push(e),
+    });
+    expect(called).toBe(true);
+    expect(n).toBe(1);
+    expect(logs.some(l => l.stage === 'qa.evidence.uploaded')).toBe(true);
+  });
+
+  it('skips the API call (and logs) when the manifest is empty', async () => {
+    const logs: WorkflowStepLog[] = [];
+    let called = false;
+    const slack = fakeSlack(() => {
+      called = true;
+      return Promise.resolve({ ok: true });
+    });
+    const n = await uploadScreenshots({ slack, channelId: 'C1', screenshots: [], logStep: e => logs.push(e) });
+    expect(called).toBe(false);
+    expect(n).toBe(0);
+    expect(logs.some(l => l.stage === 'qa.evidence.skip')).toBe(true);
+  });
+
+  it('records skipped files with reasons and makes no API call when none are valid', async () => {
+    const logs: WorkflowStepLog[] = [];
+    let called = false;
+    const slack = fakeSlack(() => {
+      called = true;
+      return Promise.resolve({ ok: true });
+    });
+    const n = await uploadScreenshots({
+      slack,
+      channelId: 'C1',
+      screenshots: [{ path: '/nonexistent/nope.png' }],
+      logStep: e => logs.push(e),
+    });
+    expect(called).toBe(false);
+    expect(n).toBe(0);
+    const none = logs.find(l => l.stage === 'qa.evidence.none');
+    expect(none).toBeDefined();
+    expect(Array.isArray(none?.data?.skipped)).toBe(true);
   });
 });
 

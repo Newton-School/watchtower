@@ -82,6 +82,46 @@ export interface PrMetadata {
   headRef?: string;
   title?: string;
   body?: string;
+  /** PR base branch name (e.g. `master`) — used for full-diff-via-git guidance. */
+  baseRef?: string;
+  baseSha?: string;
+  /** PR author login — future per-author review memory keys on this. */
+  author?: string;
+  /** GitHub's mergeable_state (clean/dirty/behind/blocked/unknown…). */
+  mergeableState?: string;
+  /** Live check-runs verdict on the PR head, so the review can open with
+   * deterministic CI context an interactive session on a stale clone lacks. */
+  ciStatus?: 'passing' | 'failing' | 'pending' | 'unknown';
+  /** Names of failing check runs, when any. */
+  ciFailing?: string[];
+}
+
+async function fetchCiStatus(params: {
+  prContext: PrContext;
+  headSha: string;
+  headers: Record<string, string>;
+}): Promise<{ ciStatus: PrMetadata['ciStatus']; ciFailing: string[] }> {
+  const { prContext, headSha, headers } = params;
+  try {
+    const url = `https://api.github.com/repos/${prContext.owner}/${prContext.repo}/commits/${headSha}/check-runs?per_page=100`;
+    const response = await fetch(url, { headers: { ...headers, Accept: 'application/vnd.github+json' } });
+    if (!response.ok) return { ciStatus: 'unknown', ciFailing: [] };
+    const payload = (await response.json()) as {
+      check_runs?: Array<{ name?: string; status?: string; conclusion?: string | null }>;
+    };
+    const runs = Array.isArray(payload.check_runs) ? payload.check_runs : [];
+    if (runs.length === 0) return { ciStatus: 'unknown', ciFailing: [] };
+    const ciFailing = runs
+      .filter(run => run.conclusion === 'failure' || run.conclusion === 'timed_out')
+      .map(run => run.name ?? 'unnamed check');
+    if (ciFailing.length > 0) return { ciStatus: 'failing', ciFailing };
+    if (runs.some(run => run.status === 'queued' || run.status === 'in_progress')) {
+      return { ciStatus: 'pending', ciFailing: [] };
+    }
+    return { ciStatus: 'passing', ciFailing: [] };
+  } catch {
+    return { ciStatus: 'unknown', ciFailing: [] };
+  }
 }
 
 export async function fetchPrMetadata(params: {
@@ -99,11 +139,23 @@ export async function fetchPrMetadata(params: {
     if (!response.ok) return {};
     const payload = (await response.json()) as Record<string, unknown>;
     const head = payload.head as Record<string, unknown> | undefined;
+    const base = payload.base as Record<string, unknown> | undefined;
+    const user = payload.user as Record<string, unknown> | undefined;
+    const headSha = typeof head?.sha === 'string' ? head.sha : undefined;
+    const ci = headSha
+      ? await fetchCiStatus({ prContext, headSha, headers })
+      : { ciStatus: 'unknown' as const, ciFailing: [] };
     return {
-      headSha: typeof head?.sha === 'string' ? head.sha : undefined,
+      headSha,
       headRef: typeof head?.ref === 'string' ? head.ref : undefined,
       title: typeof payload.title === 'string' ? payload.title : undefined,
       body: typeof payload.body === 'string' ? payload.body : undefined,
+      baseRef: typeof base?.ref === 'string' ? base.ref : undefined,
+      baseSha: typeof base?.sha === 'string' ? base.sha : undefined,
+      author: typeof user?.login === 'string' ? user.login : undefined,
+      mergeableState: typeof payload.mergeable_state === 'string' ? payload.mergeable_state : undefined,
+      ciStatus: ci.ciStatus,
+      ciFailing: ci.ciFailing,
     };
   } catch (error) {
     logStep?.({
@@ -135,12 +187,22 @@ export interface PrDiffResult {
   viaFilesFallback?: boolean;
 }
 
+/** Prompt budget for the embedded diff. Raised from the original 100k for the
+ * orchestrated review (which can also read the FULL diff via git in the
+ * worktree when this truncates); env-overridable for tuning without a release,
+ * read once at load (restart to apply — the modelProfiles override contract). */
+export const DIFF_PROMPT_MAX_CHARS = (() => {
+  const raw = process.env.WATCHTOWER_PR_DIFF_MAX_CHARS?.trim();
+  const parsed = raw ? Number(raw) : Number.NaN;
+  return Number.isFinite(parsed) && parsed >= 10_000 ? parsed : 150_000;
+})();
+
 export async function fetchPrDiff(params: {
   prContext: PrContext;
   githubToken?: string;
   maxChars?: number;
 }): Promise<PrDiffResult> {
-  const { prContext, githubToken, maxChars = 100_000 } = params;
+  const { prContext, githubToken, maxChars = DIFF_PROMPT_MAX_CHARS } = params;
   const url = `https://api.github.com/repos/${prContext.owner}/${prContext.repo}/pulls/${prContext.number}`;
   const headers: Record<string, string> = { Accept: 'application/vnd.github.diff' };
   if (githubToken) headers.Authorization = `Bearer ${githubToken}`;
@@ -465,19 +527,24 @@ function buildSummaryOnlyFinding(role: string, finding: AgentFinding): string {
   return `- [${role.toUpperCase()} - ${finding.severity.toUpperCase()}] ${finding.message}${suggestion}`;
 }
 
-export function buildGithubReviewSummary(outputs: NormalizedPrReviewAgentOutput[]): string {
+export function buildGithubReviewSummary(outputs: NormalizedPrReviewAgentOutput[], appliedSkills?: string[]): string {
   const allFindings = outputs.flatMap(output => output.findings);
   const attachableFindings = outputs.flatMap(output => output.attachableFindings);
   const unattachableFindings = outputs.flatMap(output =>
     output.unattachableFindings.map(finding => ({ role: output.role, finding })),
   );
   const summaryNotes = outputs.flatMap(output => output.summaryNotes.map(note => ({ role: output.role, note })));
+  const skillsLine =
+    appliedSkills && appliedSkills.length > 0
+      ? `Reviewed with repo skill(s): ${appliedSkills.join(', ')} — plus the standard reviewer/security/performance lenses.\n`
+      : '';
 
   if (allFindings.length === 0 && summaryNotes.length === 0) {
-    return 'Watchtower review complete - no actionable findings. Good to go.';
+    return `${skillsLine}Watchtower review complete - no actionable findings. Good to go.`;
   }
 
   const lines: string[] = [];
+  if (skillsLine) lines.push(skillsLine.trimEnd());
 
   if (allFindings.length > 0) {
     lines.push(`Watchtower found ${allFindings.length} issue(s) in this PR.`);
@@ -512,7 +579,12 @@ export function formatSlackReviewSummary(
   outputs: NormalizedPrReviewAgentOutput[],
   prUrl: string,
   reviewResult?: SubmitPrReviewResult,
+  appliedSkills?: string[],
 ): string {
+  const skillsSuffix =
+    appliedSkills && appliedSkills.length > 0
+      ? `\n_Reviewed with ${appliedSkills.join(' + ')} + standard security/perf lenses_`
+      : '';
   const allFindings = outputs.flatMap(output => output.findings);
   const totalFindings = allFindings.length;
   const totalSummaryNotes = outputs.reduce((sum, output) => sum + output.summaryNotes.length, 0);
@@ -526,22 +598,22 @@ export function formatSlackReviewSummary(
 
   if (totalFindings === 0 && totalSummaryNotes === 0) {
     if (reviewResult?.submissionMode === 'skipped') {
-      return `*PR Review Complete* - No actionable findings. GitHub review submission was skipped${skippedReason}. ${verdict}\n${prUrl}`;
+      return `*PR Review Complete* - No actionable findings. GitHub review submission was skipped${skippedReason}. ${verdict}\n${prUrl}${skillsSuffix}`;
     }
-    return `*PR Review Complete* - No actionable findings. Good to go. ${verdict}\n${prUrl}`;
+    return `*PR Review Complete* - No actionable findings. Good to go. ${verdict}\n${prUrl}${skillsSuffix}`;
   }
 
   const breakdown = totalFindings > 0 ? ` (${buildSeverityBreakdown(allFindings)})` : '';
 
   if (totalFindings === 0) {
     if (reviewResult?.submissionMode === 'skipped') {
-      return `*PR Review Complete* - ${totalSummaryNotes} review note(s) identified, but GitHub review submission was skipped${skippedReason}. ${verdict}\n${prUrl}`;
+      return `*PR Review Complete* - ${totalSummaryNotes} review note(s) identified, but GitHub review submission was skipped${skippedReason}. ${verdict}\n${prUrl}${skillsSuffix}`;
     }
-    return `*PR Review Complete* - ${totalSummaryNotes} review note(s) were posted in the review summary. No inline comments were attached. ${verdict}\n${prUrl}`;
+    return `*PR Review Complete* - ${totalSummaryNotes} review note(s) were posted in the review summary. No inline comments were attached. ${verdict}\n${prUrl}${skillsSuffix}`;
   }
 
   if (!reviewResult || reviewResult.submissionMode === 'skipped') {
-    return `*PR Review Complete* - ${totalFindings} findings identified, but GitHub review submission was skipped${skippedReason}${breakdown} ${verdict}\n${prUrl}`;
+    return `*PR Review Complete* - ${totalFindings} findings identified, but GitHub review submission was skipped${skippedReason}${breakdown} ${verdict}\n${prUrl}${skillsSuffix}`;
   }
 
   const placedParts: string[] = [];
@@ -563,15 +635,15 @@ export function formatSlackReviewSummary(
     // review summary posts but ZERO findings reach the PR inline. Make that loud.
     const allOutsideDiff = reviewResult.droppedOutsideDiff > 0 && reviewResult.droppedOutsideDiff === totalFindings;
     if (allOutsideDiff) {
-      return `*PR Review Complete* - ⚠️ all ${totalFindings} finding(s) fell outside the PR diff and could NOT be posted inline; only the review summary was posted${breakdown} ${verdict}\n${prUrl}`;
+      return `*PR Review Complete* - ⚠️ all ${totalFindings} finding(s) fell outside the PR diff and could NOT be posted inline; only the review summary was posted${breakdown} ${verdict}\n${prUrl}${skillsSuffix}`;
     }
     const reason = dropReasons.length > 0 ? ` — ${dropReasons.join(', ')}` : '';
-    return `*PR Review Complete* - ${totalFindings} findings identified; review summary posted, no inline comments attached${reason}${breakdown} ${verdict}\n${prUrl}`;
+    return `*PR Review Complete* - ${totalFindings} findings identified; review summary posted, no inline comments attached${reason}${breakdown} ${verdict}\n${prUrl}${skillsSuffix}`;
   }
 
   const placed = placedParts.join(' + ') + ' posted';
   const droppedClause = dropReasons.length > 0 ? `; ${dropReasons.join(', ')} dropped` : '';
-  return `*PR Review Complete* - ${totalFindings} findings identified; ${placed}${droppedClause}${breakdown} ${verdict}\n${prUrl}`;
+  return `*PR Review Complete* - ${totalFindings} findings identified; ${placed}${droppedClause}${breakdown} ${verdict}\n${prUrl}${skillsSuffix}`;
 }
 
 export const NO_NEW_CHANGES_TEXT =

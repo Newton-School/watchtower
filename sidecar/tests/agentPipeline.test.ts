@@ -841,6 +841,200 @@ describe('agentPipeline', () => {
     expect(result.needsInputQuestion).toBeDefined();
   });
 
+  describe('approved plan reaches the agents (#413)', () => {
+    const APPROVED_PLAN = '# Scale control to 100%\n\nEdit `src/lib/experiments/registry.ts`: control 70 -> 100.';
+
+    function seededPlannerStep() {
+      return {
+        role: 'planner' as const,
+        status: 'passed' as const,
+        output: {
+          planMarkdown: APPROVED_PLAN,
+          scope: 'small',
+          affectedFiles: ['src/lib/experiments/registry.ts'],
+          requiresCodeChanges: true,
+          clarificationNeeded: null,
+        },
+        findings: [],
+        durationMs: 1000,
+      };
+    }
+
+    function promptFor(role: 'coder' | 'reviewer'): string {
+      const marker = role === 'coder' ? 'You are the CODER agent' : 'You are the REVIEWER agent';
+      const call = vi.mocked(runCodex).mock.calls.find(c => String(c[0].prompt).includes(marker));
+      return String(call?.[0].prompt ?? '');
+    }
+
+    it('hands a pre-approved planner step to the coder and reviewer prompts', async () => {
+      const ctx = makeContext({
+        previousSteps: [seededPlannerStep()],
+        pipelineConfig: makePipelineConfig({ agents: ['coder', 'reviewer'], maxRetryLoops: 0 }),
+      });
+
+      vi.mocked(runCodex)
+        .mockResolvedValueOnce({
+          ok: true,
+          exitCode: 0,
+          timedOut: false,
+          stdout: '',
+          stderr: '',
+          lastMessage: '',
+          parsedJson: { status: 'done', filesChanged: ['a.ts'], summary: 'Done', testsAdded: [], branch: 'x' },
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          exitCode: 0,
+          timedOut: false,
+          stdout: '',
+          stderr: '',
+          lastMessage: '',
+          parsedJson: { approved: true, findings: [], blockers: [] },
+        });
+
+      const result = await runAgentPipeline({ ctx, slack: slack as any, logStep });
+
+      expect(result.finalStatus).toBe('passed');
+
+      const coderPrompt = promptFor('coder');
+      expect(coderPrompt).toContain(APPROVED_PLAN);
+      expect(coderPrompt).not.toContain('No plan markdown available.');
+      expect(coderPrompt).toContain('Plan scope: small');
+      expect(coderPrompt).toContain('src/lib/experiments/registry.ts');
+
+      // The reviewer's plan-conformance gate is only real if it has the plan.
+      const reviewerPrompt = promptFor('reviewer');
+      expect(reviewerPrompt).toContain(APPROVED_PLAN);
+      expect(reviewerPrompt).not.toContain('No plan markdown available.');
+
+      // The seeded step stays out of this run's results — it wasn't run here.
+      expect(result.steps.map(s => s.role)).toEqual(['coder', 'reviewer']);
+    });
+
+    it('quotes the approved plan when asking for more info after an empty coder run', async () => {
+      vi.mocked(checkCoderProducedChanges).mockResolvedValueOnce({
+        producedChanges: false,
+        filesChanged: [],
+        newCommits: 0,
+        hasUncommitted: false,
+        headMoved: false,
+      });
+
+      const ctx = makeContext({
+        previousSteps: [seededPlannerStep()],
+        pipelineConfig: makePipelineConfig({ agents: ['coder', 'reviewer'], maxRetryLoops: 0 }),
+      });
+
+      vi.mocked(runCodex).mockResolvedValueOnce({
+        ok: true,
+        exitCode: 0,
+        timedOut: false,
+        stdout: '',
+        stderr: '',
+        lastMessage: '',
+        parsedJson: { status: 'done', filesChanged: ['ghost.ts'], summary: 'Did it', testsAdded: [], branch: 'x' },
+      });
+
+      const result = await runAgentPipeline({ ctx, slack: slack as any, logStep });
+
+      expect(result.finalStatus).toBe('needs-input');
+      // Without the seeded planner this question was generic — no plan, no files.
+      expect(result.needsInputQuestion).toContain('Scale control to 100%');
+      expect(result.needsInputQuestion).toContain('src/lib/experiments/registry.ts');
+    });
+
+    it('keeps the plan in context when the reviewer rejects and the coder re-runs', async () => {
+      const ctx = makeContext({
+        previousSteps: [seededPlannerStep()],
+        pipelineConfig: makePipelineConfig({ agents: ['coder', 'reviewer'], maxRetryLoops: 1 }),
+      });
+
+      vi.mocked(runCodex)
+        .mockResolvedValueOnce({
+          ok: true,
+          exitCode: 0,
+          timedOut: false,
+          stdout: '',
+          stderr: '',
+          lastMessage: '',
+          parsedJson: { status: 'done', filesChanged: ['a.ts'], summary: 'First try', testsAdded: [], branch: 'x' },
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          exitCode: 0,
+          timedOut: false,
+          stdout: '',
+          stderr: '',
+          lastMessage: '',
+          parsedJson: {
+            approved: false,
+            findings: [{ severity: 'high', category: 'plan-mismatch', message: 'Wrong file' }],
+            blockers: ['Wrong file'],
+          },
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          exitCode: 0,
+          timedOut: false,
+          stdout: '',
+          stderr: '',
+          lastMessage: '',
+          parsedJson: { status: 'done', filesChanged: ['a.ts'], summary: 'Corrected', testsAdded: [], branch: 'x' },
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          exitCode: 0,
+          timedOut: false,
+          stdout: '',
+          stderr: '',
+          lastMessage: '',
+          parsedJson: { approved: true, findings: [], blockers: [] },
+        });
+
+      await runAgentPipeline({ ctx, slack: slack as any, logStep });
+
+      const retryPrompt = String(vi.mocked(runCodex).mock.calls[2][0].prompt);
+      expect(retryPrompt).toContain('You are the CODER agent');
+      expect(retryPrompt).toContain(APPROVED_PLAN);
+      expect(retryPrompt).toContain('Wrong file'); // reviewer feedback still there
+    });
+  });
+
+  it('routes a self-declared coder block to needs-input instead of a PR (#413)', async () => {
+    const ctx = makeContext({
+      pipelineConfig: makePipelineConfig({ agents: ['coder', 'reviewer'], maxRetryLoops: 2 }),
+    });
+
+    vi.mocked(runCodex).mockResolvedValueOnce({
+      ok: true,
+      exitCode: 0,
+      timedOut: false,
+      stdout: '',
+      stderr: '',
+      lastMessage: '',
+      parsedJson: {
+        status: 'blocked',
+        blockedReason: 'Which element should scale to 100% — can you share a Figma link?',
+        summary: 'Blocked: ambiguous request.',
+        filesChanged: [],
+        testsAdded: [],
+        branch: '',
+        prUrl: '',
+      },
+    });
+
+    const result = await runAgentPipeline({ ctx, slack: slack as any, logStep });
+
+    expect(result.finalStatus).toBe('needs-input');
+    expect(result.needsInputQuestion).toContain('can you share a Figma link?');
+    const coderStep = result.steps.find(s => s.role === 'coder');
+    expect(coderStep?.status).toBe('failed');
+    expect(coderStep?.findings.some(f => f.category === 'coder-blocked')).toBe(true);
+    // Reviewer must not run, and there is nothing for a PR to be built from.
+    expect(runCodex).toHaveBeenCalledTimes(1);
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'pipeline.agent.coder.blocked' }));
+  });
+
   it('aborts immediately on a usage-limit hit — no feedback loops, no further spawns (issue #342)', async () => {
     // Incident shape (job 264ea287): every CLI spawn exits 1 in ~3s with the
     // limit message and zero API tokens. The old behavior treated each exit
