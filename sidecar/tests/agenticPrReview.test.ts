@@ -1,6 +1,9 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { runAgenticPrReview } from '../src/agentic/agenticPrReview.js';
+import { VERIFIER_PROMPT_MARKER } from '../src/agentic/prReviewAgent.js';
+import { ORCHESTRATOR_PROMPT_MARKER } from '../src/agentic/prReviewOrchestrator.js';
+import { EMPTY_DISCOVERY } from '../src/agentic/reviewSkills.js';
 import { resolveGithubTokenForCodex } from '../src/github/githubAuth.js';
 import type { AppConfig, NormalizedTask } from '../src/types/contracts.js';
 
@@ -113,13 +116,16 @@ function agentVerify(verdict: 'confirmed' | 'refuted', severity?: string) {
 }
 
 /**
- * Fan-out makes 3 lens calls (reviewer/security/performance) then N verifier
- * calls, all through the same injected `runAgent`. Route the mock by prompt
- * substring so tests are robust to the (non-deterministic) interleave of the
- * parallel lenses. `oneShot` matches the collapse fallback (the combined
- * buildAgenticPrReviewPrompt, which has no "specialist" marker).
+ * Orchestrated fan-out makes an orchestrator call + 2 safety-net lens calls
+ * (security/performance), a reviewer-lens call only on tier-2 fallback, then N
+ * verifier calls, all through the same injected `runAgent`. Route the mock by
+ * prompt marker so tests are robust to the (non-deterministic) interleave of
+ * the parallel agents. `oneShot` matches the collapse fallback (the combined
+ * buildAgenticPrReviewPrompt, which has no "specialist" marker). Orchestrator
+ * defaults to dead so legacy-shaped tests exercise the classic tier-2 lenses.
  */
 function routedRunAgent(routes: {
+  orchestrator?: unknown;
   reviewer?: unknown;
   security?: unknown;
   performance?: unknown;
@@ -128,9 +134,10 @@ function routedRunAgent(routes: {
 }) {
   return vi.fn().mockImplementation((req: any) => {
     const p = req.prompt as string;
-    if (p.includes('skeptical PR-review verifier')) {
+    if (p.includes(VERIFIER_PROMPT_MARKER)) {
       return Promise.resolve(routes.verifier ? routes.verifier(req) : agentVerify('confirmed'));
     }
+    if (p.includes(ORCHESTRATOR_PROMPT_MARKER)) return Promise.resolve(routes.orchestrator ?? agentDead());
     if (p.includes('reviewer specialist')) return Promise.resolve(routes.reviewer ?? agentOk([]));
     if (p.includes('security specialist')) return Promise.resolve(routes.security ?? agentOk([]));
     if (p.includes('performance specialist')) return Promise.resolve(routes.performance ?? agentOk([]));
@@ -139,7 +146,7 @@ function routedRunAgent(routes: {
 }
 
 const verifierCalls = (runAgent: any) =>
-  runAgent.mock.calls.filter((c: any[]) => (c[0].prompt as string).includes('skeptical PR-review verifier')).length;
+  runAgent.mock.calls.filter((c: any[]) => (c[0].prompt as string).includes(VERIFIER_PROMPT_MARKER)).length;
 
 const SUBMIT_OK = {
   submitted: true,
@@ -169,6 +176,10 @@ function makeDeps(overrides: Record<string, unknown> = {}) {
       .mockResolvedValue(
         agentOk([{ role: 'reviewer', severity: 'low', category: 'style', message: 'nit', file: 'src/a.ts', line: 2 }]),
       ),
+    discoverSkills: vi.fn().mockResolvedValue(EMPTY_DISCOVERY),
+    runBuildGate: vi
+      .fn()
+      .mockResolvedValue({ ok: true, nodeVersion: 'v20.0.0', usedNvmrc: false, buildScript: 'build', outputTail: '' }),
     ...overrides,
   };
 }
@@ -180,6 +191,10 @@ const emptyStore = {
 
 beforeEach(() => {
   vi.mocked(resolveGithubTokenForCodex).mockResolvedValue(undefined);
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
 });
 
 describe('agenticPrReview', () => {
@@ -504,9 +519,9 @@ describe('agenticPrReview', () => {
     expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'agentic.pr_review.fallback.one_shot' }));
   });
 
-  it('fan-out: runs three focused lens specialists, each forbidden from posting', async () => {
+  it('fan-out: runs the orchestrator plus the security/performance safety net, each forbidden from posting', async () => {
     const slack = makeSlack([`review ${WEB_PR}`]);
-    const runAgent = routedRunAgent({});
+    const runAgent = routedRunAgent({ orchestrator: agentOk([]) });
     const deps = makeDeps({ runAgent });
 
     const result = await runAgenticPrReview({
@@ -520,16 +535,285 @@ describe('agenticPrReview', () => {
     expect(result.status).toBe('SUCCESS');
     const callFor = (marker: string) =>
       runAgent.mock.calls.find((c: any[]) => (c[0].prompt as string).includes(marker))?.[0];
-    expect(callFor('reviewer specialist')).toBeDefined();
+    expect(callFor(ORCHESTRATOR_PROMPT_MARKER)).toBeDefined();
     expect(callFor('security specialist')).toBeDefined();
     expect(callFor('performance specialist')).toBeDefined();
-    // Per-role tiering: reviewer/security get high-reasoning, performance is lightweight.
+    // The orchestrator subsumes the reviewer lens slot in tier 1.
+    expect(callFor('reviewer specialist')).toBeUndefined();
+    // Per-role tiering: orchestrator/security high-reasoning; performance is
+    // upgraded to the high tier in orchestrated mode (quality-first decision).
+    expect(callFor(ORCHESTRATOR_PROMPT_MARKER)).toMatchObject({ model: 'gpt-5.4', reasoningEffort: 'xhigh' });
     expect(callFor('security specialist')).toMatchObject({ model: 'gpt-5.4', reasoningEffort: 'xhigh' });
-    expect(callFor('reviewer specialist')).toMatchObject({ model: 'gpt-5.4', reasoningEffort: 'xhigh' });
-    expect(callFor('performance specialist')).toMatchObject({ model: 'gpt-5.2-codex', reasoningEffort: 'low' });
-    // Pinned invariant: every lens prompt forbids posting.
+    expect(callFor('performance specialist')).toMatchObject({ model: 'gpt-5.4', reasoningEffort: 'high' });
+    // Pinned invariant: every prompt forbids posting.
     const prompts = runAgent.mock.calls.map((c: any[]) => c[0].prompt as string);
     for (const p of prompts) expect(p).toContain('You must NOT post anything to GitHub or Slack');
+  });
+
+  it('tier-2 fallback: orchestrator failure runs the classic reviewer lens without re-running the safety net', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const runAgent = routedRunAgent({
+      // orchestrator defaults to dead (both tiers)
+      reviewer: agentOk([
+        { role: 'reviewer', severity: 'low', category: 'style', message: 'nit', file: 'src/a.ts', line: 2 },
+      ]),
+    });
+    const deps = makeDeps({ runAgent });
+    const logStep = vi.fn();
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+      logStep,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    const callsFor = (marker: string) =>
+      runAgent.mock.calls.filter((c: any[]) => (c[0].prompt as string).includes(marker));
+    // Orchestrator tried tier-1 + high retry, then the reviewer lens filled its slot.
+    expect(callsFor(ORCHESTRATOR_PROMPT_MARKER)).toHaveLength(2);
+    expect(callsFor('reviewer specialist')).toHaveLength(1);
+    // Security/performance results from tier 1 are reused, never re-run.
+    expect(callsFor('security specialist')).toHaveLength(1);
+    expect(callsFor('performance specialist')).toHaveLength(1);
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'agentic.pr_review.fallback.fanout' }));
+    // The degradation is visible to the user, never silent.
+    const texts = slack.chat.postMessage.mock.calls.map((c: any) => c[0].text as string);
+    expect(texts.some(t => t.includes('orchestrated review unavailable'))).toBe(true);
+    const outcomes = (result.result as any).outcomes;
+    expect(outcomes[0].totalFindings).toBe(1);
+  });
+
+  it('injects classified repo skills into the orchestrator prompt and reports the applied ones', async () => {
+    const slack = makeSlack([`review ${API_PR}`]);
+    const skill = {
+      name: 'newton-api-pr-review',
+      description: 'Checklist review for newton-api.',
+      source: 'claude',
+      dir: '/wt/.claude/skills/newton-api-pr-review',
+      relDir: '.claude/skills/newton-api-pr-review',
+      skillFilePath: '/wt/.claude/skills/newton-api-pr-review/SKILL.md',
+      body: 'Read references/review-patterns.md and review in order.',
+      bodyTruncated: false,
+      frontmatter: {},
+    };
+    const orchestratorResult = {
+      ...agentOk([
+        {
+          role: 'reviewer',
+          severity: 'medium',
+          category: 'repo-fit',
+          message: 'misses convention',
+          file: 'src/a.ts',
+          line: 2,
+        },
+      ]),
+      parsedJson: {
+        findings: [
+          {
+            role: 'reviewer',
+            severity: 'medium',
+            category: 'repo-fit',
+            message: 'misses convention',
+            file: 'src/a.ts',
+            line: 2,
+          },
+        ],
+        summaryNotes: [],
+        summary: 'done',
+        skillsApplied: ['newton-api-pr-review', 'not-a-real-skill'],
+      },
+    };
+    const runAgent = routedRunAgent({ orchestrator: orchestratorResult });
+    const deps = makeDeps({
+      runAgent,
+      discoverSkills: vi.fn().mockResolvedValue({ all: [skill], applicable: [skill], classifierUsed: true }),
+    });
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${API_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    expect(deps.discoverSkills).toHaveBeenCalledTimes(1);
+    const orchPrompt = runAgent.mock.calls
+      .map((c: any[]) => c[0].prompt as string)
+      .find(p => p.includes(ORCHESTRATOR_PROMPT_MARKER)) as string;
+    expect(orchPrompt).toContain('REPO REVIEW SKILLS');
+    expect(orchPrompt).toContain('newton-api-pr-review');
+    expect(orchPrompt).toContain('CRITICAL OVERRIDES');
+    // Unknown names claimed by the orchestrator are filtered out.
+    const outcomes = (result.result as any).outcomes;
+    expect(outcomes[0].appliedSkills).toEqual(['newton-api-pr-review']);
+    const texts = slack.chat.postMessage.mock.calls.map((c: any) => c[0].text as string);
+    expect(texts.some(t => t.includes('Reviewed with newton-api-pr-review'))).toBe(true);
+  });
+
+  it('runs the deterministic build gate for deps-changed PRs and surfaces a failure', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const runAgent = routedRunAgent({ orchestrator: agentOk([]) });
+    const deps = makeDeps({
+      runAgent,
+      fetchDiff: vi.fn().mockResolvedValue({
+        diff: 'diff --git a/package.json b/package.json\n--- a/package.json\n+++ b/package.json\n@@ -1,1 +1,2 @@\n line\n+added',
+        truncated: false,
+        reason: 'ok',
+      }),
+      runBuildGate: vi.fn().mockResolvedValue({
+        ok: false,
+        nodeVersion: 'v24.0.0',
+        usedNvmrc: true,
+        failedStage: 'install',
+        buildScript: 'build',
+        outputTail: 'npm ERR! peer dep conflict',
+      }),
+    });
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    expect(deps.runBuildGate).toHaveBeenCalledTimes(1);
+    const orchPrompt = runAgent.mock.calls
+      .map((c: any[]) => c[0].prompt as string)
+      .find(p => p.includes(ORCHESTRATOR_PROMPT_MARKER)) as string;
+    expect(orchPrompt).toContain('BUILD STATUS');
+    expect(orchPrompt).toContain('FAILED at the install stage');
+    const texts = slack.chat.postMessage.mock.calls.map((c: any) => c[0].text as string);
+    expect(texts.some(t => t.includes('npm ci/build FAILED'))).toBe(true);
+  });
+
+  it('skips the build gate for app-code-only PRs', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const deps = makeDeps();
+
+    await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+    });
+
+    expect(deps.runBuildGate).not.toHaveBeenCalled();
+  });
+
+  it('surfaces a failed PR-head checkout in the prompts and the Slack summary (no more silent degradation)', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const deps = makeDeps({ checkoutPr: vi.fn().mockResolvedValue(false) });
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    const prompts = (deps.runAgent as any).mock.calls.map((c: any[]) => c[0].prompt as string);
+    expect(prompts.some((p: string) => p.includes('the PR-head checkout FAILED'))).toBe(true);
+    const texts = slack.chat.postMessage.mock.calls.map((c: any) => c[0].text as string);
+    expect(texts.some(t => t.includes('Could not check out the PR head'))).toBe(true);
+  });
+
+  it('re-review: prior findings feed the orchestrator prompt and new findings are persisted', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const runAgent = routedRunAgent({
+      orchestrator: agentOk([
+        { role: 'reviewer', severity: 'medium', category: 'bug', message: 'still broken', file: 'src/a.ts', line: 2 },
+      ]),
+    });
+    const deps = makeDeps({ runAgent, resolveHeadSha: vi.fn().mockResolvedValue('newsha9999') });
+    const recordPrReviewFindings = vi.fn();
+    const getPrReviewFindings = vi.fn().mockReturnValue([
+      {
+        jobId: 'previous-job',
+        prHeadSha: 'oldsha1234',
+        role: 'security',
+        severity: 'high',
+        category: 'authz',
+        message: 'missing permission check',
+        file: 'src/a.ts',
+        line: 2,
+        createdAt: '2026-08-01T00:00:00.000Z',
+      },
+    ]);
+    const store = {
+      findLatestReviewedPrHeadSha: () => ({
+        jobId: 'previous-job',
+        prHeadSha: 'oldsha1234',
+        updatedAt: '2026-08-01T00:00:00.000Z',
+      }),
+      getChannelPolicyPack: () => undefined,
+      recordPrReviewFindings,
+      getPrReviewFindings,
+    };
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: store as any,
+      jobId: 'job-new',
+      deps: deps as any,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    expect(getPrReviewFindings).toHaveBeenCalledWith({ prUrl: WEB_PR, jobId: 'previous-job' });
+    const orchPrompt = runAgent.mock.calls
+      .map((c: any[]) => c[0].prompt as string)
+      .find(p => p.includes(ORCHESTRATOR_PROMPT_MARKER)) as string;
+    expect(orchPrompt).toContain('PRIOR REVIEW');
+    expect(orchPrompt).toContain('missing permission check');
+    expect(orchPrompt).toContain('git diff oldsha1234');
+    expect(recordPrReviewFindings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jobId: 'job-new',
+        prUrl: WEB_PR,
+        repo: 'newton-web',
+        prNumber: 8652,
+        findings: [expect.objectContaining({ role: 'reviewer', message: 'still broken', line: 2 })],
+      }),
+    );
+  });
+
+  it('kill switch WATCHTOWER_PR_REVIEW_ORCHESTRATED=0 restores the classic 3-lens fan-out', async () => {
+    vi.stubEnv('WATCHTOWER_PR_REVIEW_ORCHESTRATED', '0');
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const runAgent = routedRunAgent({});
+    const deps = makeDeps({ runAgent });
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    const callsFor = (marker: string) =>
+      runAgent.mock.calls.filter((c: any[]) => (c[0].prompt as string).includes(marker));
+    expect(callsFor(ORCHESTRATOR_PROMPT_MARKER)).toHaveLength(0);
+    expect(callsFor('reviewer specialist')).toHaveLength(1);
+    expect(callsFor('security specialist')).toHaveLength(1);
+    expect(callsFor('performance specialist')).toHaveLength(1);
+    // Classic mode: skill discovery never runs, performance stays lightweight.
+    expect(deps.discoverSkills).not.toHaveBeenCalled();
+    expect(callsFor('performance specialist')[0][0]).toMatchObject({ model: 'gpt-5.2-codex', reasoningEffort: 'low' });
   });
 
   it('graceful degradation: one dead lens still posts the others (partial fan-out)', async () => {
@@ -578,7 +862,7 @@ describe('agenticPrReview', () => {
     expect(outcomes[0].hasBlockingFindings).toBe(true);
   });
 
-  it('adversarial verify drops a refuted high finding (no blocking finding reaches the PR)', async () => {
+  it('adversarial verify drops a high finding only when the adjudicator upholds the refute', async () => {
     const slack = makeSlack([`review ${WEB_PR}`]);
     const runAgent = routedRunAgent({
       security: agentOk([
@@ -599,16 +883,47 @@ describe('agenticPrReview', () => {
     });
 
     expect(result.status).toBe('SUCCESS');
-    expect(verifierCalls(runAgent)).toBe(1);
+    // Primary refute + adjudicator upholding it — a solo light-tier vote no longer drops.
+    expect(verifierCalls(runAgent)).toBe(2);
     const outcomes = (result.result as any).outcomes;
     expect(outcomes[0].hasBlockingFindings).toBe(false);
     expect(outcomes[0].totalFindings).toBe(0);
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'agentic.pr_review.verify.adjudicated' }));
     expect(logStep).toHaveBeenCalledWith(
       expect.objectContaining({
         stage: 'agentic.pr_review.verify.done',
         data: expect.objectContaining({ refuted: 1 }),
       }),
     );
+  });
+
+  it('adjudicator restores a primary-refuted high finding (no solo veto by the light tier)', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const runAgent = routedRunAgent({
+      security: agentOk([
+        { role: 'security', severity: 'high', category: 'authz', message: 'real issue', file: 'src/a.ts', line: 2 },
+      ]),
+      verifier: (req: any) =>
+        (req.prompt as string).includes('senior adjudicator') ? agentVerify('confirmed') : agentVerify('refuted'),
+    });
+    const deps = makeDeps({ runAgent });
+    const logStep = vi.fn();
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+      logStep,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    expect(verifierCalls(runAgent)).toBe(2);
+    const outcomes = (result.result as any).outcomes;
+    expect(outcomes[0].hasBlockingFindings).toBe(true);
+    expect(outcomes[0].totalFindings).toBe(1);
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'agentic.pr_review.verify.adjudicated' }));
   });
 
   it('adversarial verify keeps a confirmed high finding', async () => {
@@ -766,7 +1081,7 @@ describe('agenticPrReview', () => {
     expect(outcomes[0].hasBlockingFindings).toBe(false);
   });
 
-  it('caps verification at 20 blocking findings; the overflow passes through unverified', async () => {
+  it('caps verifier runs by worst-case budget; the overflow passes through unverified', async () => {
     const slack = makeSlack([`review ${WEB_PR}`]);
     const many = Array.from({ length: 21 }, (_v, i) => ({
       role: 'security',
@@ -790,9 +1105,11 @@ describe('agenticPrReview', () => {
     });
 
     expect(result.status).toBe('SUCCESS');
-    expect(verifierCalls(runAgent)).toBe(20);
+    // Budget 30 at worst-case cost 2/high → 15 findings verified; all confirm on
+    // the primary vote so each spends 1 actual run.
+    expect(verifierCalls(runAgent)).toBe(15);
     expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'agentic.pr_review.verify.capped' }));
-    // The 21st (overflow) finding is KEPT unverified, not dropped.
+    // The 6 overflow findings are KEPT unverified, not dropped.
     const outcomes = (result.result as any).outcomes;
     expect(outcomes[0].totalFindings).toBe(21);
   });

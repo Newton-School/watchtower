@@ -16,9 +16,11 @@ import { assembleRecall } from '../codex/recallAssembler.js';
 import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
 import { buildOutOfScopePrReply, mapRepoPath, fetchPrHeadSha } from '../github/prReviewSupport.js';
 import { isRepoEnabled } from '../repos/registry.js';
+import { extractUserFocus } from './reviewFocus.js';
 import { reviewSinglePr, type PrReviewDeps, type PrReviewOutcome } from './prReviewAgent.js';
 
 export type AgenticPrReviewStore = Pick<JobStore, 'findLatestReviewedPrHeadSha' | 'getChannelPolicyPack'> &
+  Partial<Pick<JobStore, 'recordPrReviewFindings' | 'getPrReviewFindings'>> &
   Partial<PipelineStore> &
   RecallCapableStore;
 
@@ -46,7 +48,7 @@ export async function runAgenticPrReview(params: {
   signal?: AbortSignal;
   deps?: Partial<PrReviewDeps>;
 }): Promise<WorkflowResult> {
-  const { task, config, slack, store, resolvePrHeadSha, jobId: _jobId, logStep, signal } = params;
+  const { task, config, slack, store, resolvePrHeadSha, jobId, logStep, signal } = params;
   const deps: Partial<PrReviewDeps> = {
     ...(resolvePrHeadSha ? { resolveHeadSha: resolvePrHeadSha } : {}),
     ...params.deps,
@@ -240,6 +242,16 @@ export async function runAgenticPrReview(params: {
     ? [`Active policy pack: ${policyPack.packName}`, ...policyPack.rules.map(rule => `- ${rule}`)].join('\n')
     : 'No explicit policy pack assigned for this channel.';
 
+  // User focus extracted once per job: the requester's instruction becomes a
+  // first-class prompt section instead of ambient thread text (fails open).
+  const { focusBlock: userFocusBlock } = await extractUserFocus({
+    triggerText: task.event.text ?? '',
+    threadTexts,
+    runAgent: deps.runAgent,
+    logStep,
+    signal,
+  });
+
   // Single ack. Single-PR keeps the message users know; multi-PR lists the
   // batch (and names anything dropped by the target cap — never silent).
   const truncationNote =
@@ -248,10 +260,11 @@ export async function runAgenticPrReview(params: {
           .map(t => `${t.repo}#${t.number}`)
           .join(', ')}; reply with a PR link or "#number" to review those next)`
       : '';
+  const focusNote = userFocusBlock ? ' Noted your focus instructions.' : '';
   await postToThread(
     reviewable.length === 1
-      ? 'PR review in progress. I will drop findings here shortly.'
-      : `Reviewing ${reviewable.length} PRs: ${reviewable.map(r => `${r.target.repo}#${r.target.number}`).join(', ')}${truncationNote} — posting each verdict here as it finishes.`,
+      ? `PR review in progress. I will drop findings here shortly.${focusNote}`
+      : `Reviewing ${reviewable.length} PRs: ${reviewable.map(r => `${r.target.repo}#${r.target.number}`).join(', ')}${truncationNote} — posting each verdict here as it finishes.${focusNote}`,
   );
   logStep?.({
     stage: 'agentic.pr_review.ack_posted',
@@ -276,6 +289,61 @@ export async function runAgenticPrReview(params: {
       prUrl: target.url,
     });
 
+    // Prior findings feed the orchestrator's PRIOR REVIEW section on
+    // re-reviews (addressed / unaddressed / regressed). Best-effort.
+    let priorFindings: ReturnType<NonNullable<AgenticPrReviewStore['getPrReviewFindings']>> | undefined;
+    if (previousReview && store?.getPrReviewFindings) {
+      try {
+        priorFindings = store.getPrReviewFindings({ prUrl: target.url, jobId: previousReview.jobId });
+      } catch (error) {
+        logStep?.({
+          stage: 'agentic.pr_review.prior_findings.failed',
+          level: 'WARN',
+          message: `Could not load prior findings (non-fatal): ${String(error)}`,
+          data: { prUrl: target.url, previousJobId: previousReview.jobId },
+        });
+      }
+    }
+
+    // Findings persistence — the durable memory layer. Never fails a review.
+    const persistFindings =
+      jobId && store?.recordPrReviewFindings
+        ? (input: {
+            findings: Array<{
+              role: string;
+              severity: string;
+              category: string;
+              message: string;
+              file?: string;
+              line?: number;
+              suggestion?: string;
+            }>;
+            appliedSkills: string[];
+            prHeadSha?: string;
+            author?: string;
+          }) => {
+            try {
+              store.recordPrReviewFindings?.({
+                jobId,
+                prUrl: target.url,
+                repo: target.repo,
+                prNumber: target.number,
+                prHeadSha: input.prHeadSha,
+                author: input.author,
+                appliedSkills: input.appliedSkills,
+                findings: input.findings,
+              });
+            } catch (error) {
+              logStep?.({
+                stage: 'agentic.pr_review.persist_findings.failed',
+                level: 'WARN',
+                message: `Could not persist findings (non-fatal): ${String(error)}`,
+                data: { prUrl: target.url },
+              });
+            }
+          }
+        : undefined;
+
     const outcome = await reviewSinglePr({
       task,
       config,
@@ -285,8 +353,11 @@ export async function runAgenticPrReview(params: {
       recallBlock,
       policyBlock,
       threadContext,
+      userFocusBlock,
       githubToken,
       previousReview,
+      priorFindings,
+      persistFindings,
       deps,
       logStep,
       signal,
