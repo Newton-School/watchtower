@@ -80,31 +80,73 @@ export async function uploadScreenshots(params: {
   logStep?: WorkflowStepLogger;
 }): Promise<number> {
   const { slack, channelId, threadTs, screenshots, logStep } = params;
-  if (screenshots.length === 0) return 0;
+  if (screenshots.length === 0) {
+    logStep?.({
+      stage: 'qa.evidence.skip',
+      message: 'No screenshots in the QA report manifest — nothing to upload.',
+      data: { listed: 0 },
+    });
+    return 0;
+  }
 
   const candidates = screenshots.slice(0, MAX_SCREENSHOTS);
+  logStep?.({
+    stage: 'qa.evidence.start',
+    message: `Preparing screenshot upload: ${screenshots.length} listed${
+      screenshots.length > MAX_SCREENSHOTS ? `, capped to ${MAX_SCREENSHOTS}` : ''
+    }.`,
+    data: { listed: screenshots.length, capped: candidates.length, channelId, threadTs },
+  });
+
   const uploads: Array<{ file: Buffer; filename: string; title: string }> = [];
+  const skipped: Array<{ path: string; reason: string }> = [];
 
   for (const shot of candidates) {
     try {
       const stat = await fs.stat(shot.path);
-      if (!stat.isFile() || stat.size === 0 || stat.size > MAX_FILE_BYTES) continue;
+      if (!stat.isFile()) {
+        skipped.push({ path: shot.path, reason: 'not_a_file' });
+        continue;
+      }
+      if (stat.size === 0) {
+        skipped.push({ path: shot.path, reason: 'empty' });
+        continue;
+      }
+      if (stat.size > MAX_FILE_BYTES) {
+        skipped.push({ path: shot.path, reason: `too_large_${stat.size}b` });
+        continue;
+      }
       const buffer = await fs.readFile(shot.path);
       const filename = path.basename(shot.path) || `screenshot-${uploads.length + 1}.png`;
       uploads.push({ file: buffer, filename, title: shot.caption ?? filename });
-    } catch {
-      // File missing / unreadable — skip it.
+    } catch (err) {
+      skipped.push({ path: shot.path, reason: `unreadable: ${String(err)}` });
     }
   }
+
+  logStep?.({
+    stage: 'qa.evidence.validated',
+    message: `Screenshot validation: ${uploads.length} ready, ${skipped.length} skipped.`,
+    level: skipped.length > 0 ? 'WARN' : 'INFO',
+    data: { ready: uploads.length, skipped },
+  });
 
   if (uploads.length === 0) {
     logStep?.({
       stage: 'qa.evidence.none',
       message: `No valid screenshots to upload (of ${screenshots.length} listed).`,
       level: 'WARN',
+      data: { skipped },
     });
     return 0;
   }
+
+  const totalBytes = uploads.reduce((sum, u) => sum + u.file.length, 0);
+  logStep?.({
+    stage: 'qa.evidence.upload_attempt',
+    message: `Calling filesUploadV2 with ${uploads.length} file(s) (~${Math.round(totalBytes / 1024)}KB) — requires the bot 'files:write' scope.`,
+    data: { count: uploads.length, totalBytes, filenames: uploads.map(u => u.filename), channelId, threadTs },
+  });
 
   try {
     await slack.filesUploadV2({
@@ -115,15 +157,54 @@ export async function uploadScreenshots(params: {
     logStep?.({
       stage: 'qa.evidence.uploaded',
       message: `Uploaded ${uploads.length} screenshot(s) to the QA thread.`,
-      data: { count: uploads.length },
+      data: { count: uploads.length, totalBytes },
     });
     return uploads.length;
   } catch (error) {
+    const info = describeSlackError(error);
+    // Surface the `files:write` scope gap explicitly — it's the single most
+    // common reason QA screenshots silently don't appear, and the raw Slack
+    // error (`missing_scope`) is otherwise easy to miss in the log noise.
+    if (info.isMissingScope) {
+      logStep?.({
+        stage: 'qa.evidence.missing_scope',
+        level: 'ERROR',
+        message:
+          "Screenshot upload rejected: the bot token lacks the 'files:write' scope. " +
+          'Add it as a Bot Token Scope on the miniOG Slack app and reinstall to the workspace ' +
+          `(needed=${info.needed ?? 'files:write'}, provided=${info.provided ?? 'unknown'}). ` +
+          'The QA text report still posted; only the screenshots were dropped.',
+        data: { count: uploads.length, needed: info.needed, provided: info.provided, slackError: info.slackError },
+      });
+      return 0;
+    }
     logStep?.({
       stage: 'qa.evidence.upload_failed',
-      message: `Screenshot upload failed: ${String(error)}`,
+      message: `Screenshot upload failed (${uploads.length} file(s)): ${info.slackError ?? String(error)}`,
       level: 'WARN',
+      data: { count: uploads.length, slackError: info.slackError },
     });
     return 0;
   }
+}
+
+/**
+ * Pull the useful bits out of a thrown Slack Web API error. `@slack/web-api`
+ * attaches the raw API response to `error.data` (e.g.
+ * `{ ok:false, error:'missing_scope', needed:'files:write', provided:'chat:write,...' }`),
+ * which lets us classify the `files:write` scope gap precisely rather than
+ * stringifying an opaque error.
+ */
+function describeSlackError(error: unknown): {
+  slackError?: string;
+  needed?: string;
+  provided?: string;
+  isMissingScope: boolean;
+} {
+  const data = (error as { data?: Record<string, unknown> } | null)?.data;
+  const slackError = typeof data?.error === 'string' ? (data.error as string) : undefined;
+  const needed = typeof data?.needed === 'string' ? (data.needed as string) : undefined;
+  const provided = typeof data?.provided === 'string' ? (data.provided as string) : undefined;
+  const isMissingScope = slackError === 'missing_scope' || /missing_scope/.test(String(error));
+  return { slackError, needed, provided, isMissingScope };
 }

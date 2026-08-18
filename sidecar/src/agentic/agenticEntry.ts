@@ -358,6 +358,11 @@ async function runWebappQa(params: RunAgenticEntryParams): Promise<WorkflowResul
 
     const { visibleText, screenshots } = parseScreenshotManifest(result.reply);
     const reportText = visibleText || 'QA run completed but produced no report text.';
+    logStep?.({
+      stage: 'qa.evidence.parsed',
+      message: `Parsed QA report: ${screenshots.length} screenshot(s) in the manifest, report text ${reportText.length} chars.`,
+      data: { screenshotsInManifest: screenshots.length, reportChars: reportText.length },
+    });
     const slackPosted = await postReply(reportText);
 
     const uploaded = await uploadScreenshots({
@@ -366,6 +371,13 @@ async function runWebappQa(params: RunAgenticEntryParams): Promise<WorkflowResul
       threadTs: task.event.threadTs,
       screenshots,
       logStep,
+    });
+
+    logStep?.({
+      stage: 'qa.evidence.summary',
+      message: `QA evidence: ${screenshots.length} captured, ${uploaded} uploaded to Slack.`,
+      level: screenshots.length > 0 && uploaded === 0 ? 'WARN' : 'INFO',
+      data: { captured: screenshots.length, uploaded },
     });
 
     return {

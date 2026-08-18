@@ -837,6 +837,27 @@ export function buildApprovalMessage(feedbackRounds: number): string {
   const prefix = feedbackRounds > 0 ? `After ${feedbackRounds} revision${feedbackRounds > 1 ? 's' : ''}, plan` : 'Plan';
   return `${prefix} approved \u2014 I'll code it up, then review and verify.`;
 }
+/** True when the coder's JSON explicitly declares it could not act (#413). */
+export function coderDeclaredBlocked(output: Record<string, unknown>): boolean {
+  return typeof output.status === 'string' && output.status.trim().toLowerCase() === 'blocked';
+}
+
+/** The coder's own words for what it needs, falling back to its summary. */
+function coderBlockedReason(output: Record<string, unknown>): string {
+  const candidates = [output.blockedReason, output.summary];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim().length > 0) return candidate.trim();
+  }
+  return '';
+}
+
+/** Turns a coder's blocked reason into something worth reading in Slack. */
+export function buildCoderBlockedQuestion(reason: string): string {
+  return [reason, 'Reply in this thread with that and I\'ll pick it straight back up — or say "cancel" to stop.'].join(
+    '\n\n',
+  );
+}
+
 export function buildCoderFollowUpQuestion(
   ctx: AgentContext,
   planMarkdown: string,
@@ -864,6 +885,34 @@ export function buildCoderFollowUpQuestion(
   return lines.join('\n');
 }
 
+/**
+ * Reads an already-approved plan off a planner step seeded into
+ * `ctx.previousSteps`. The fields were stamped by `stampApprovedPlan()` before
+ * the pipeline started, so no re-normalization is needed — this just surfaces
+ * them for the in-pipeline consumers that would otherwise only see a planner
+ * that ran inside the loop.
+ */
+function normalizedFromSeededPlanner(seeded: AgentStepResult[]): NormalizedPlannerOutput | undefined {
+  const plannerStep = seeded.find(s => s.role === 'planner');
+  if (!plannerStep) return undefined;
+
+  const normalized = normalizePlannerOutput(plannerStep.output, getActiveBackendId());
+
+  // The stamped values win. `stampApprovedPlan()` writes exactly what the admin
+  // signed off on onto the step, whereas the normalizer's codex branch rebuilds
+  // planMarkdown from a `plan` array that a stamped step doesn't carry — which
+  // would drop the approved plan all over again.
+  const stampedMarkdown = plannerStep.output.planMarkdown;
+  if (typeof stampedMarkdown === 'string' && stampedMarkdown.trim().length > 0) {
+    normalized.planMarkdown = stampedMarkdown.trim();
+  }
+  const stampedFiles = plannerStep.output.affectedFiles;
+  if (Array.isArray(stampedFiles) && stampedFiles.length > 0) {
+    normalized.affectedFiles = stampedFiles.filter((f): f is string => typeof f === 'string');
+  }
+  return normalized;
+}
+
 export async function runAgentPipeline(params: {
   ctx: AgentContext;
   slack: WebClient;
@@ -883,7 +932,16 @@ export async function runAgentPipeline(params: {
   } = ctx.pipelineConfig;
 
   const pipelineStart = Date.now();
+  // Steps produced by THIS run. Kept separate from `ctx.previousSteps` so the
+  // persisted steps_json and the returned `result.steps` stay scoped to this
+  // pipeline — but every prompt is built from BOTH via promptSteps() below.
+  // #413: prompts used to be built from `steps` alone, which silently dropped
+  // the admin-approved planner step that implementationWorkflow seeds into
+  // ctx.previousSteps. Every coder run since #126 was told "No plan markdown
+  // available." and re-derived the task from raw Slack text.
   const steps: AgentStepResult[] = [];
+  const seededSteps: AgentStepResult[] = ctx.previousSteps ?? [];
+  const promptSteps = (): AgentStepResult[] => [...seededSteps, ...steps];
   let retryLoops = 0;
   let aborted = false;
   let pendingNeedsInput = false;
@@ -917,7 +975,10 @@ export async function runAgentPipeline(params: {
 
   // Track plan message so we can append a completion marker after the coder runs.
   let planMessageTs: string | undefined;
-  let plannerNormalized: NormalizedPlannerOutput | undefined;
+  // Seeded from an externally-approved planner step when there is one (the
+  // approval-gated implementation path plans BEFORE the pipeline starts), so the
+  // needs-input question can quote the plan the admin actually signed off on.
+  let plannerNormalized: NormalizedPlannerOutput | undefined = normalizedFromSeededPlanner(seededSteps);
 
   // Captured just-in-time before the first coder run; reused to diff against
   // the worktree afterwards so a hallucinated coder JSON can't pass the guard.
@@ -959,7 +1020,7 @@ export async function runAgentPipeline(params: {
 
     const prompt = buildPromptForRole(role, {
       ...ctx,
-      previousSteps: steps,
+      previousSteps: promptSteps(),
       coderDiff,
     });
 
@@ -1023,6 +1084,36 @@ export async function runAgentPipeline(params: {
     const output = result.parsedJson ?? {};
     const findings = extractFindings(output);
     let status = result.ok ? determineStepStatus(output, findings) : 'failed';
+
+    // #413: a coder that cannot map the request to a concrete change declares
+    // `status: "blocked"` instead of returning a passed-looking summary whose
+    // text happens to start with "Blocked:". Route it to the needs-input loop —
+    // which asks the requester in-thread and resumes on their answer — so the
+    // refusal can never become a commit message, a PR title, or a SUCCESS.
+    if (role === 'coder' && coderDeclaredBlocked(output)) {
+      const reason = coderBlockedReason(output);
+      status = 'failed';
+      findings.push({
+        severity: 'high',
+        category: 'coder-blocked',
+        message: `Coder declared itself blocked: ${reason || 'no reason given'}`,
+        suggestion: 'Answer the question in-thread, or re-run with a concrete file/function scope.',
+      });
+      logStep({
+        stage: 'pipeline.agent.coder.blocked',
+        message: `Coder declared itself blocked — asking the requester instead of shipping. ${reason}`.trim(),
+        level: 'WARN',
+        data: { reason },
+      });
+      pendingNeedsInput = true;
+      needsInputQuestion = reason
+        ? buildCoderBlockedQuestion(reason)
+        : buildCoderFollowUpQuestion(
+            ctx,
+            plannerNormalized?.planMarkdown ?? '',
+            plannerNormalized?.affectedFiles ?? [],
+          );
+    }
 
     // Ground-truth check: self-reported JSON can be hallucinated. The coder
     // only "passed" if the worktree actually has new commits, uncommitted
@@ -1211,10 +1302,11 @@ export async function runAgentPipeline(params: {
           text: `Reviewer flagged issues — sending feedback to the coding agent for revision (attempt ${retryLoops}/${maxRetryLoops}).`,
         });
 
-        // Re-run coder with reviewer feedback in context
+        // Re-run coder with reviewer feedback in context (and the approved plan —
+        // a revision that forgets what it was building is worse than the first try).
         const coderPrompt = buildPromptForRole('coder', {
           ...ctx,
-          previousSteps: steps,
+          previousSteps: promptSteps(),
         });
         const coderProfile = profileForAgentRole('coder', getActiveBackendId());
         const coderSchemaPath = undefined; // coder has no dedicated schema

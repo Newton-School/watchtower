@@ -1,4 +1,6 @@
 import { execFile } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
 import { promisify } from 'node:util';
 import { createPullRequest } from './createPr.js';
 import { logger } from '../logging/logger.js';
@@ -6,6 +8,51 @@ import { sanitizeForBranch, buildSlackThreadLink } from '../workflows/shared/wor
 import { git, hasUncommittedChanges, getDefaultBranch, hasCommitsAheadOfBase } from '../workspaces/gitState.js';
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * Paths that must never ride along in a miniOG PR even when they show up dirty.
+ * Symlinks are handled separately (see `unstageUnsafePaths`) — this list catches
+ * the ones that are real files/dirs in some repos.
+ */
+const NEVER_COMMIT_PREFIXES = ['node_modules', '.next', '.env'];
+
+function isNeverCommit(relPath: string): boolean {
+  return NEVER_COMMIT_PREFIXES.some(prefix => relPath === prefix || relPath.startsWith(`${prefix}/`));
+}
+
+/**
+ * Drop anything from the index that a workspace PR has no business carrying.
+ *
+ * `git add -A` stages whatever `git status` reports, and inside a worktree that
+ * includes the node_modules SYMLINK we create for tooling — a repo whose
+ * .gitignore says `node_modules/` (trailing slash, directories only) does not
+ * ignore it. #413 shipped exactly that to a company repo: a mode-120000 blob
+ * holding an absolute path from the maintainer's laptop.
+ *
+ * Returns the paths it unstaged so the caller can log them.
+ */
+async function unstageUnsafePaths(repoPath: string): Promise<string[]> {
+  const staged = await git(repoPath, ['diff', '--cached', '--name-only']);
+  const paths = staged
+    .split('\n')
+    .map(p => p.trim())
+    .filter(Boolean);
+
+  const unsafe = paths.filter(relPath => {
+    if (isNeverCommit(relPath)) return true;
+    try {
+      return fs.lstatSync(path.join(repoPath, relPath)).isSymbolicLink();
+    } catch {
+      // Deleted or unreadable — a legitimate deletion, leave it staged.
+      return false;
+    }
+  });
+
+  if (unsafe.length > 0) {
+    await git(repoPath, ['restore', '--staged', '--', ...unsafe]);
+  }
+  return unsafe;
+}
 
 /** Check if a PR already exists for the current branch. */
 async function existingPrUrl(cwd: string): Promise<string | undefined> {
@@ -82,9 +129,24 @@ export async function createPrFromWorkspace(params: {
     // Stage and commit any uncommitted changes
     if (hasUncommitted) {
       await git(repoPath, ['add', '-A']);
-      const commitTitle = summary.length > 72 ? `${summary.slice(0, 69)}...` : summary;
-      await git(repoPath, ['commit', '-m', commitTitle]);
-      onLog?.('Committed changes.');
+      const skipped = await unstageUnsafePaths(repoPath);
+      if (skipped.length > 0) {
+        onLog?.(`Left out of the commit (symlink or never-commit path): ${skipped.join(', ')}.`);
+      }
+
+      const stagedAfterFilter = await git(repoPath, ['diff', '--cached', '--name-only']);
+      if (stagedAfterFilter.length === 0) {
+        // Everything dirty was junk. Without this the commit below throws
+        // ("nothing to commit") and we'd report a generic PR-creation failure.
+        if (!hasAheadCommits) {
+          onLog?.('Nothing to commit once symlinks and ignored paths were dropped — no PR opened.');
+          return undefined;
+        }
+      } else {
+        const commitTitle = summary.length > 72 ? `${summary.slice(0, 69)}...` : summary;
+        await git(repoPath, ['commit', '-m', commitTitle]);
+        onLog?.('Committed changes.');
+      }
     }
 
     // Push the branch

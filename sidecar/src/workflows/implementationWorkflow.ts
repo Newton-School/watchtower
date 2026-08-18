@@ -18,7 +18,13 @@ import { githubAuthModeHint } from '../github/githubAuth.js';
 import { notifyDesktop } from '../notify/desktopNotifier.js';
 import { getBackend } from '../backends/registry.js';
 import type { AgentBackendId } from '../backends/types.js';
-import { runAgentPipeline, formatPlanMessage, waitForApproval, buildApprovalMessage } from '../agents/pipeline.js';
+import {
+  runAgentPipeline,
+  formatPlanMessage,
+  waitForApproval,
+  buildApprovalMessage,
+  coderDeclaredBlocked,
+} from '../agents/pipeline.js';
 import { normalizePlannerOutput } from '../agents/normalizePlannerOutput.js';
 import { inferRepoFromAffectedFiles, readRepoAffinity, repoPathFor, resolveRepoOrAsk } from './shared/repoResolver.js';
 import { enabledRepoKeys, getRepo, repoKeyForWorkspacePath } from '../repos/registry.js';
@@ -1347,14 +1353,6 @@ Write your response as a ready-to-post Slack message describing what you did.
       scope: planScope,
       affectedFiles: planAffectedFiles,
     });
-    if (!planMarkdown || planMarkdown.trim().length === 0) {
-      logStep?.({
-        stage: 'implementation.plan.empty',
-        message: 'Approved plan has empty planMarkdown \u2014 coder will lack a concrete plan.',
-        level: 'WARN',
-        data: { feedbackRounds: loopOutcome.feedbackRounds },
-      });
-    }
     plannerSessionId = loopOutcome.plannerSessionId;
     planMessageTs = loopOutcome.planMessageTs;
     feedbackRounds = loopOutcome.feedbackRounds;
@@ -1372,6 +1370,24 @@ Write your response as a ready-to-post Slack message describing what you did.
       findings: [],
       durationMs: plannerRunResult.durationMs,
     };
+
+    // Assert on the step the agents will actually read, not on the local
+    // planMarkdown variable. #413: the old check inspected `planMarkdown` — which
+    // was correctly populated — while the coder was being handed an empty plan by
+    // a different code path entirely, so this never fired on the job that broke.
+    const seededPlanMarkdown = plannerStep.output.planMarkdown;
+    if (typeof seededPlanMarkdown !== 'string' || seededPlanMarkdown.trim().length === 0) {
+      logStep?.({
+        stage: 'implementation.plan.empty',
+        message: 'Approved planner step carries no planMarkdown — the coder will be flying blind.',
+        level: 'ERROR',
+        data: {
+          feedbackRounds,
+          plannerOutputKeys: Object.keys(plannerStep.output),
+          localPlanMarkdownLength: planMarkdown.length,
+        },
+      });
+    }
 
     const introMsg = buildApprovalMessage(feedbackRounds);
 
@@ -1611,6 +1627,30 @@ Write your response as a ready-to-post Slack message describing what you did.
       rawCoderSummary || 'Pipeline completed but the agent did not return a summary. Check the repo for changes.';
 
     let prUrl = coderStep?.output?.prUrl ? String(coderStep.output.prUrl) : '';
+
+    // #413 belt-and-braces: the pipeline already routes a self-declared block to
+    // the needs-input loop, so this should be unreachable — but a "Blocked: …"
+    // summary must never survive far enough to become a commit message and a PR
+    // title, which is exactly what happened on job 9c632322 (PR #862).
+    if (!prUrl && coderStep && coderDeclaredBlocked(coderStep.output)) {
+      logStep?.({
+        stage: 'implementation.pr.skipped_blocked',
+        message: 'Coder declared itself blocked — posting its question instead of opening a PR.',
+        level: 'WARN',
+      });
+      await slack.chat.postMessage({
+        channel: task.event.channelId,
+        thread_ts: task.event.threadTs,
+        text: summary,
+      });
+      return {
+        workflow: 'IMPLEMENTATION',
+        status: 'PAUSED',
+        message: summary,
+        notifyDesktop: false,
+        slackPosted: true,
+      };
+    }
 
     if (!prUrl) {
       logStep?.({
