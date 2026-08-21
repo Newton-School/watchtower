@@ -63,8 +63,10 @@ export interface ExportLog {
   touch(surface: EgressSurface, channelId: string, threadTs: string): void;
   delete(surface: EgressSurface, channelId: string, threadTs: string): void;
   /**
-   * Threads due for publishing: org-visible, not forgotten, non-empty, quiet
-   * for at least `quietMinutes`, and either never exported, changed since the
+   * Threads due for publishing: org-visible, not forgotten, non-empty,
+   * SYNTHESIZED (title present — the file path slug derives from the title,
+   * so a path must never be locked in before the first synthesis), quiet for
+   * at least `quietMinutes`, and either never exported, changed since the
    * last export attempt, or failed fewer than `maxAttempts` times. A thread
    * that exhausted its attempts is retried only once it changes again.
    */
@@ -176,6 +178,7 @@ export function createExportLog(db: Database.Database): ExportLog {
     WHERE t.visibility = 'org'
       AND t.status != 'forgotten'
       AND t.message_count > 0
+      AND t.title IS NOT NULL
       AND t.last_activity_ts IS NOT NULL
       AND CAST(t.last_activity_ts AS REAL) <= @quietCutoffEpoch
       AND (

@@ -271,6 +271,11 @@ export async function runGithubPublishOnce(
     if (!thread || thread.status === 'forgotten' || thread.visibility !== 'org' || thread.messageCount === 0) {
       continue;
     }
+    // Publish only after first synthesis (mirrors the SQL gate): the path
+    // slug comes from the title and is locked in at first publish.
+    if (!thread.title) {
+      continue;
+    }
     // Newest-first + reverse: getMessages' default ascending LIMIT would keep
     // the OLDEST rows and silently drop the newest on very long threads.
     const messages = conversations.getMessages(thread.id, { limit: 2000, order: 'desc' }).reverse();

@@ -59,6 +59,14 @@ describe('exportLog', () => {
       })),
     });
     if ('skipped' in result) throw new Error('seed thread unexpectedly skipped');
+    // Candidates are gated on a synthesized title — seeds are publishable.
+    conv.saveSynthesis(result.threadId, {
+      title: `Seed ${channelId}`,
+      summary: 'seed summary',
+      decisions: [],
+      actionItems: [],
+      messageCount: (opts.messageTs ?? [threadTs]).length,
+    });
   }
 
   /** recordSuccess/touch stamp real now — pin updated_at by hand when ordering matters. */
