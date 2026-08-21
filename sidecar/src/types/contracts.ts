@@ -108,7 +108,9 @@ export type MiniogSubcommand =
   | { kind: 'forget'; field: DossierForgetField; confirmed: boolean }
   | { kind: 'remember'; text: string }
   | { kind: 'memories' }
-  | { kind: 'forget-memory'; id: number };
+  | { kind: 'forget-memory'; id: number }
+  | { kind: 'forget-thread'; confirmed: boolean }
+  | { kind: 'handoff'; format: 'auto' | 'paste' | 'file' | 'link' };
 export type EventIngestSource = 'socket' | 'catchup' | 'launchpad';
 export type LaunchpadTarget = 'miniog';
 export type LaunchpadRequestStatus =
@@ -317,6 +319,23 @@ export interface PrTarget extends PrContext {
   source: 'trigger' | 'thread';
 }
 
+/**
+ * One Slack thread message as fetched at intake. Structurally identical to
+ * `ThreadMessage` in slack/threadContext.ts — declared here so NormalizedTask
+ * can carry the intake-fetched thread without contracts importing from the
+ * slack layer.
+ */
+export interface NormalizedThreadMessage {
+  text: string;
+  user: string;
+  ts: string;
+  /** Slack message subtype (e.g. 'bot_message'), when present. */
+  subtype?: string;
+  /** Slack bot_id for integration-posted messages, when present. */
+  botId?: string;
+  files?: Array<{ id: string; name: string; mimetype: string; url_private_download: string }>;
+}
+
 export interface NormalizedTask {
   event: SlackEventEnvelope;
   mentionDetected: boolean;
@@ -328,6 +347,13 @@ export interface NormalizedTask {
   prContext?: PrContext;
   /** Every distinct PR URL in the trigger + thread, trigger URLs first. */
   prContexts?: PrTarget[];
+  /**
+   * Thread messages fetched once at intake (index.ts) — the same fetch that
+   * feeds threadTexts into normalizeTask. Carried on the task so downstream
+   * consumers (agentic entry, intent classifier, conversation capture) reuse
+   * it instead of re-fetching from Slack.
+   */
+  threadMessages?: NormalizedThreadMessage[];
   miniogSubcommand?: MiniogSubcommand;
   /**
    * Dossier-derived tone preference, populated by the router after looking up

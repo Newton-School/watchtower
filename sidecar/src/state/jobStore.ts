@@ -23,6 +23,8 @@ import type {
 } from '../types/contracts.js';
 import { createInvestigationStore, type InvestigationStore } from './investigationStore.js';
 import { createDossierStore, type DossierStore } from './dossierStore.js';
+import { createConversationStore, type ConversationStore } from './conversationStore.js';
+import { createExportLog, type ExportLog } from '../egress/exportLog.js';
 
 function normalizeStoredPersonalityMode(mode: unknown): PersonalityMode {
   return mode === 'terse' || mode === 'technical' || mode === 'casual' ? mode : 'normal';
@@ -100,6 +102,8 @@ export class JobStore {
   private db: Database.Database;
   private _investigationStore?: InvestigationStore;
   private _dossierStore?: DossierStore;
+  private _conversationStore?: ConversationStore;
+  private _exportLog?: ExportLog;
 
   // Hot-path statements compiled once. better-sqlite3 does NOT cache prepared
   // statements (every .prepare() compiles a fresh one), so re-preparing on each
@@ -150,6 +154,20 @@ export class JobStore {
       this._dossierStore = createDossierStore(this.db);
     }
     return this._dossierStore;
+  }
+
+  conversationStore(): ConversationStore {
+    if (!this._conversationStore) {
+      this._conversationStore = createConversationStore(this.db);
+    }
+    return this._conversationStore;
+  }
+
+  exportLog(): ExportLog {
+    if (!this._exportLog) {
+      this._exportLog = createExportLog(this.db);
+    }
+    return this._exportLog;
   }
 
   private migrate(): void {
@@ -570,6 +588,85 @@ export class JobStore {
         id INTEGER PRIMARY KEY CHECK (id = 1),
         updated_at TEXT NOT NULL
       );
+
+      -- Conversation layer: every miniOG Slack thread as a first-class object
+      -- plus its full transcript. Deliberately stores raw user text — an
+      -- owner-approved reversal of the dossier layer's no-raw-text invariant,
+      -- scoped to these tables only (dossier rollups and the profile
+      -- synthesizer must never read them). IMs/MPIMs are never captured;
+      -- private channels are tagged visibility='private'. FTS5 virtual tables
+      -- + triggers live in conversationStore.ts (guarded — FTS5 may be absent).
+      CREATE TABLE IF NOT EXISTS conversation_threads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_id TEXT NOT NULL,
+        thread_ts TEXT NOT NULL,
+        channel_name TEXT,
+        channel_type TEXT NOT NULL DEFAULT 'channel',
+        visibility TEXT NOT NULL DEFAULT 'org',
+        status TEXT NOT NULL DEFAULT 'active',
+        title TEXT,
+        summary TEXT,
+        decisions_json TEXT,
+        action_items_json TEXT,
+        participants_json TEXT NOT NULL DEFAULT '[]',
+        message_count INTEGER NOT NULL DEFAULT 0,
+        first_message_ts TEXT,
+        last_activity_ts TEXT,
+        last_captured_at TEXT,
+        synthesized_at TEXT,
+        synthesized_message_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(channel_id, thread_ts)
+      );
+      CREATE INDEX IF NOT EXISTS idx_conversation_threads_activity
+        ON conversation_threads(status, last_activity_ts);
+
+      CREATE TABLE IF NOT EXISTS conversation_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        thread_id INTEGER NOT NULL,
+        channel_id TEXT NOT NULL,
+        thread_ts TEXT NOT NULL,
+        message_ts TEXT NOT NULL,
+        user_id TEXT NOT NULL DEFAULT '',
+        display_name TEXT,
+        is_bot INTEGER NOT NULL DEFAULT 0,
+        subtype TEXT,
+        text TEXT NOT NULL,
+        files_json TEXT,
+        edited INTEGER NOT NULL DEFAULT 0,
+        -- Slack-deleted messages are blanked in place (text cleared,
+        -- deleted=1) rather than row-deleted, so the dedupe key survives and
+        -- a stale in-flight capture snapshot can never resurrect them.
+        deleted INTEGER NOT NULL DEFAULT 0,
+        captured_at TEXT NOT NULL,
+        UNIQUE(channel_id, thread_ts, message_ts)
+      );
+      CREATE INDEX IF NOT EXISTS idx_conversation_messages_thread
+        ON conversation_messages(thread_id, message_ts);
+      CREATE INDEX IF NOT EXISTS idx_conversation_messages_user
+        ON conversation_messages(user_id, message_ts);
+
+      -- Egress audit log: one row per (surface, thread) that has been (or is
+      -- being) exported outside Slack — currently surface='github' (the
+      -- miniog-conversations markdown repo). Doubles as the dedupe/backoff
+      -- state for publishers and the URL source for "handoff link".
+      CREATE TABLE IF NOT EXISTS egress_exports (
+        surface TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        thread_ts TEXT NOT NULL,
+        target_path TEXT,
+        target_url TEXT,
+        content_hash TEXT,
+        commit_sha TEXT,
+        status TEXT NOT NULL DEFAULT 'FAILED',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        last_exported_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (surface, channel_id, thread_ts)
+      );
     `);
 
     try {
@@ -757,6 +854,36 @@ export class JobStore {
       this.db.exec(`UPDATE app_settings SET agent_backend = 'codex' WHERE agent_backend = 'cursor'`);
     } catch {
       /* column may not exist on very old installs; harmless */
+    }
+
+    try {
+      // Covers conversation_messages tables created before the blank-on-delete
+      // semantics landed (same idempotent-ALTER pattern as above).
+      this.db.exec(`ALTER TABLE conversation_messages ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0`);
+    } catch {
+      /* column already exists */
+    }
+
+    // GitHub conversation-egress settings (M4). Same idempotent-ALTER pattern.
+    try {
+      this.db.exec(`ALTER TABLE app_settings ADD COLUMN github_egress_enabled INTEGER NOT NULL DEFAULT 0`);
+    } catch {
+      /* column already exists */
+    }
+    try {
+      this.db.exec(`ALTER TABLE app_settings ADD COLUMN github_egress_repo TEXT NOT NULL DEFAULT ''`);
+    } catch {
+      /* column already exists */
+    }
+    try {
+      this.db.exec(`ALTER TABLE app_settings ADD COLUMN github_egress_branch TEXT NOT NULL DEFAULT 'main'`);
+    } catch {
+      /* column already exists */
+    }
+    try {
+      this.db.exec(`ALTER TABLE app_settings ADD COLUMN github_egress_include_transcript INTEGER NOT NULL DEFAULT 0`);
+    } catch {
+      /* column already exists */
     }
   }
 
@@ -1570,8 +1697,11 @@ export class JobStore {
    * transaction. RUNNING/PAUSED jobs are never deleted (a PAUSED job is swept to
    * FAILED within 24h, so by the cutoff every surviving job is terminal anyway);
    * dossier / user-memory / pinned-fact tables are intentionally preserved —
-   * they carry long-term per-user value, not operational churn. Returns the
-   * per-table deletion counts.
+   * they carry long-term per-user value, not operational churn. The
+   * conversation tables (conversation_threads / conversation_messages) are
+   * likewise exempt: they are the durable org memory, with their own optional
+   * knob (WATCHTOWER_CONVERSATION_RETENTION_DAYS → pruneIdleMessages). Returns
+   * the per-table deletion counts.
    */
   pruneOldRows(retentionDays: number): {
     jobLogs: number;
@@ -2719,6 +2849,66 @@ export class JobStore {
       errorKind: string | null;
       createdAt: string;
     }>;
+  }
+
+  /**
+   * GitHub conversation-egress settings. Env vars take precedence over the
+   * app_settings row (precedent: the claude-code env overrides in #420) so
+   * the publisher can be enabled without the desktop settings UI:
+   *   WATCHTOWER_GITHUB_EGRESS_REPO=owner/name   (implies enabled unless _ENABLED=0)
+   *   WATCHTOWER_GITHUB_EGRESS_ENABLED=1|0
+   *   WATCHTOWER_GITHUB_EGRESS_BRANCH=main
+   *   WATCHTOWER_GITHUB_EGRESS_INCLUDE_TRANSCRIPT=1|0
+   */
+  readGithubEgressSettings(): { enabled: boolean; repo: string; branch: string; includeTranscript: boolean } {
+    let row: { enabled?: number; repo?: string; branch?: string; include_transcript?: number } | undefined;
+    try {
+      row = this.db
+        .prepare(
+          `SELECT COALESCE(github_egress_enabled, 0) AS enabled,
+                  COALESCE(github_egress_repo, '') AS repo,
+                  COALESCE(github_egress_branch, 'main') AS branch,
+                  COALESCE(github_egress_include_transcript, 0) AS include_transcript
+           FROM app_settings WHERE id = 1 LIMIT 1`,
+        )
+        .get() as typeof row;
+    } catch {
+      row = undefined;
+    }
+
+    const envRepo = process.env.WATCHTOWER_GITHUB_EGRESS_REPO?.trim();
+    const envEnabled = process.env.WATCHTOWER_GITHUB_EGRESS_ENABLED?.trim();
+    const envBranch = process.env.WATCHTOWER_GITHUB_EGRESS_BRANCH?.trim();
+    const envTranscript = process.env.WATCHTOWER_GITHUB_EGRESS_INCLUDE_TRANSCRIPT?.trim();
+
+    const repo = envRepo || (row?.repo ?? '').trim();
+    const enabled = envEnabled === '0' ? false : envEnabled === '1' ? true : envRepo ? true : Boolean(row?.enabled);
+    return {
+      enabled: enabled && repo.length > 0,
+      repo,
+      branch: envBranch || (row?.branch ?? '').trim() || 'main',
+      includeTranscript: envTranscript != null ? envTranscript === '1' : Boolean(row?.include_transcript),
+    };
+  }
+
+  /**
+   * Every (channel, thread) miniOG has touched that is still in the jobs /
+   * events tables (30-day retention window). Seed list for the conversation
+   * backfill's cheap pass — Slack is then the source of truth for content.
+   */
+  listKnownThreadRefs(limit = 2000): Array<{ channelId: string; threadTs: string }> {
+    return this.db
+      .prepare(
+        `SELECT DISTINCT channelId, threadTs FROM (
+           SELECT channel_id AS channelId, thread_ts AS threadTs FROM jobs
+           UNION
+           SELECT channel_id AS channelId, thread_ts AS threadTs FROM events
+         )
+         WHERE channelId IS NOT NULL AND channelId != ''
+           AND threadTs IS NOT NULL AND threadTs != ''
+         LIMIT ?`,
+      )
+      .all(limit) as Array<{ channelId: string; threadTs: string }>;
   }
 
   readVaultSettings(): { vaultPath: string; vaultEnabled: boolean } {

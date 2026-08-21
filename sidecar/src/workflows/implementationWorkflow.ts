@@ -753,6 +753,9 @@ export async function runImplementationWorkflow(params: {
           workflow: 'IMPLEMENTATION',
           store: store as unknown as import('../state/jobStore.js').JobStore,
           vaultRoot: store.readVaultSettings?.().vaultPath ?? null,
+          query: task.event.text ?? '',
+          excludeThread: { channelId: task.event.channelId, threadTs: task.event.threadTs },
+          channelId: task.event.channelId,
         });
         if (recall.promptBlock) {
           plannerPrompt = `${recall.promptBlock}\n\n${plannerPrompt}`;

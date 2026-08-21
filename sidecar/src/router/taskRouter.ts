@@ -41,7 +41,7 @@ import { looksLikeFixAffirmation } from './resumeIntentParser.js';
 // conversational workflow then hallucinated a "fix done" reply. Typical
 // successful classifications run 0.85+, so 0.75 is a conservative floor.
 export const CLASSIFIER_CONFIDENCE_FLOOR = 0.75;
-import { isPresencePing } from '../workflows/shared/workflowUtils.js';
+import { formatThreadContextForClassifier, isPresencePing } from '../workflows/shared/workflowUtils.js';
 import { formatDossierForPrompt } from '../state/dossierStore.js';
 
 export async function routeTask(params: {
@@ -151,6 +151,7 @@ export async function routeTask(params: {
       }
       const classification = await classifyWorkflowIntent({
         userMessage,
+        threadContext: formatThreadContextForClassifier(task),
         hasPrUrl,
         mentionType: task.mentionType,
         userDossierSummary,
@@ -380,7 +381,7 @@ export async function routeTask(params: {
   }
 
   if (resolvedIntent === 'MINIOG_DOSSIER') {
-    return runMiniogDossierWorkflow({ task: routedTask, slack, store, logStep, signal });
+    return runMiniogDossierWorkflow({ task: routedTask, slack, store, config, logStep, signal });
   }
 
   if (resolvedIntent === 'DEPLOY') {

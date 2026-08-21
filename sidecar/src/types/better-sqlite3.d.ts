@@ -18,7 +18,7 @@ declare module 'better-sqlite3' {
   }
 
   interface DatabaseConstructor {
-    new (path: string): Database.Database;
+    new (path: string, options?: { readonly?: boolean; fileMustExist?: boolean; timeout?: number }): Database.Database;
   }
 
   const Database: DatabaseConstructor;

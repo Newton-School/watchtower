@@ -326,6 +326,20 @@ export function parseMiniogSubcommand(text: string): MiniogSubcommand | null {
 
   if (head === 'memories') return { kind: 'memories' };
 
+  if (head === 'handoff') {
+    // `handoff [paste|file|link]` — package this thread's context for the
+    // user's own Claude. Viewer-tier via MINIOG_DOSSIER routing, so PMs can
+    // use it anywhere the bot is present. STRICT arity: a natural sentence
+    // like "handoff the deployment to Shiv" must fall through to the
+    // classifier, not dump a transcript.
+    const format = tokens[1]?.toLowerCase();
+    if (tokens.length === 1) return { kind: 'handoff', format: 'auto' };
+    if (tokens.length === 2 && (format === 'paste' || format === 'file' || format === 'link')) {
+      return { kind: 'handoff', format };
+    }
+    return null;
+  }
+
   if (head === 'remember') {
     // Everything after the first word, original case preserved, capped.
     const rest = noMentions.slice(tokens[0].length).trim();
@@ -341,6 +355,13 @@ export function parseMiniogSubcommand(text: string): MiniogSubcommand | null {
 
   if (head === 'forget') {
     const field = tokens[1]?.toLowerCase();
+    // `forget thread` / `forget this thread` tombstones the current thread in
+    // the conversation store (transcript deleted, never re-captured). Gated
+    // downstream to thread participants/admins, with a confirm step.
+    if (field === 'thread' || (field === 'this' && tokens[2]?.toLowerCase() === 'thread')) {
+      const confirmToken = field === 'thread' ? tokens[2] : tokens[3];
+      return { kind: 'forget-thread', confirmed: confirmToken?.toLowerCase() === 'confirm' };
+    }
     // `forget memory <id>` removes a specific pinned fact; lives alongside
     // the per-field clears handled below.
     if (field === 'memory') {
