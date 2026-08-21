@@ -37,6 +37,10 @@ export function dailyNotePath(vaultRoot: string, date: string): string {
   return path.join(vaultRoot, MINIOG_ROOT, 'daily', `${date}.md`);
 }
 
+export function threadNotePath(vaultRoot: string, threadSlug: string): string {
+  return path.join(vaultRoot, MINIOG_ROOT, 'threads', `${threadSlug}.md`);
+}
+
 export function metaNotePath(vaultRoot: string): string {
   return path.join(vaultRoot, MINIOG_ROOT, '_meta.md');
 }

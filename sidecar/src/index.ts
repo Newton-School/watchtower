@@ -29,6 +29,11 @@ import { classifyProduct } from './router/productClassifier.js';
 import { routeTask } from './router/taskRouter.js';
 import { startMentionCatchup } from './slack/mentionCatchup.js';
 import { SocketSlackClient } from './slack/socketClient.js';
+import { captureLiveMessage, captureThreadFromMessages, isSyntheticEnvelope } from './conversation/threadCapture.js';
+import { startThreadSweeper, stopThreadSweeper } from './conversation/threadSweeper.js';
+import { startThreadSynthesizerScheduler, stopThreadSynthesizerScheduler } from './conversation/threadSynthesizer.js';
+import { configureGithubPublisher, shutdownGithubPublisher } from './egress/githubPublisher.js';
+import { runConversationBackfill } from './conversation/threadBackfill.js';
 import { cleanupStaleWorkspaces, cleanupThreadWorkspaces } from './workspaces/workspaceManager.js';
 import { configureVaultWriter, shutdownVaultWriter } from './vault/vaultWriter.js';
 import { configureVaultWatcher, shutdownVaultWatcher } from './vault/vaultWatcher.js';
@@ -392,6 +397,12 @@ async function processReactionFeedback(event: SlackReactionEvent, client: WebCli
   if (!event.channelId || !event.threadTs || !event.userId) {
     return;
   }
+  // With ignoreSelf:false (needed so the conversation tap sees miniOG's own
+  // replies), the bot's own status reactions (:eyes:, :white_check_mark:, …)
+  // now arrive here too — they are not user feedback; drop them.
+  if (event.userId === config.botUserId) {
+    return;
+  }
   if (store.hasEvent(event.eventId)) {
     return;
   }
@@ -713,6 +724,14 @@ async function processEvent(event: SlackEventEnvelope, client: WebClient): Promi
     'slack event received',
   );
 
+  // Conversation live tap: append messages in tracked threads to the
+  // conversation store — including miniOG's own replies, edits and deletions,
+  // which the job gates below intentionally skip. Runs BEFORE those gates
+  // (they are about job creation, not capture) and is internally gated on a
+  // single prepared isTracked SELECT, so untracked channels cost ~nothing per
+  // message. Never throws.
+  captureLiveMessage({ store, config, event });
+
   if (event.messageSubtype && nonActionableSubtypes.has(event.messageSubtype)) {
     logger.info({ eventId: event.eventId, subtype: event.messageSubtype }, 'skip message subtype');
     return;
@@ -820,7 +839,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
   const threadMessages = await fetchThreadContext(eventClient, event.channelId, event.threadTs).catch(() => []);
   const threadTexts = threadMessages.map(message => message.text);
   logger.info({ eventId: event.eventId, messages: threadMessages.length }, 'thread context fetched for intake');
-  let task = normalizeTask(event, config, threadTexts);
+  let task = { ...normalizeTask(event, config, threadTexts), threadMessages };
 
   // If this event resumes a paused workflow that asked the user to reply
   // in-thread, synthesize the bot mention so the no-mention gate below does
@@ -875,6 +894,28 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     logger.info({ eventId: event.eventId }, 'skip non-mention message');
     await removeReaction(client, event.channelId, event.eventTs, 'eyes');
     return;
+  }
+
+  // Conversation capture (intake path): the mention makes this a miniOG
+  // thread — persist the transcript we already fetched, registering the
+  // thread as tracked so the live tap picks up everything that follows.
+  // Placed AFTER the mention gate on purpose: capture-all means all miniOG
+  // threads, not every thread in every channel. Synthetic envelopes (slash
+  // commands, shortcuts, reaction-resume, launchpad) are skipped — their
+  // threadTs/eventTs are not real Slack messages. Fire-and-forget — capture
+  // must never delay or fail the job.
+  if (!isSyntheticEnvelope(event)) {
+    void captureThreadFromMessages({
+      client: eventClient,
+      store,
+      config,
+      channelId: event.channelId,
+      threadTs: event.threadTs,
+      channelType: event.channelType,
+      messages: threadMessages,
+    }).catch(error =>
+      logger.warn({ eventId: event.eventId, error: String(error) }, 'intake conversation capture failed'),
+    );
   }
 
   // Policy engine check — block requests that violate critical or non-master rules
@@ -1467,6 +1508,11 @@ async function main(): Promise<void> {
   // concurrency capped at 2 LLM calls in flight.
   startProfileSynthesizerScheduler(store);
 
+  // Conversation-thread synthesizer: turns quiet captured threads into a
+  // durable title/TL;DR/decisions. Same cost discipline as the profile
+  // synthesizer (idle + delta + interval gates, light tier, concurrency 2).
+  startThreadSynthesizerScheduler(store);
+
   // Mark any leftover RUNNING jobs as FAILED — their processes are gone after restart
   const orphaned = store.cleanupOrphanedRunningJobs();
   if (orphaned > 0) {
@@ -1514,6 +1560,9 @@ async function main(): Promise<void> {
     shutdownVaultWriter();
     void shutdownVaultWatcher();
     stopProfileSynthesizerScheduler();
+    stopThreadSynthesizerScheduler();
+    stopThreadSweeper();
+    shutdownGithubPublisher();
     store.close();
     process.exit(0);
   });
@@ -1523,6 +1572,9 @@ async function main(): Promise<void> {
     shutdownVaultWriter();
     void shutdownVaultWatcher();
     stopProfileSynthesizerScheduler();
+    stopThreadSynthesizerScheduler();
+    stopThreadSweeper();
+    shutdownGithubPublisher();
     store.close();
     process.exit(0);
   });
@@ -1660,6 +1712,11 @@ async function main(): Promise<void> {
   // data are preserved. Window defaults to 30 days; override via
   // WATCHTOWER_RETENTION_DAYS (clamped to >= 1 inside pruneOldRows).
   const retentionDays = Number(process.env.WATCHTOWER_RETENTION_DAYS ?? 30) || 30;
+  // Conversation memory is exempt from the sweep above (it IS the durable
+  // org memory). Optional knob: when set (> 0), messages older than the
+  // window are pruned from IDLE threads only — thread rows + synthesis
+  // always survive. Default 0 = keep forever.
+  const conversationRetentionDays = Number(process.env.WATCHTOWER_CONVERSATION_RETENTION_DAYS ?? 0) || 0;
   const runRetentionSweep = (): void => {
     try {
       const pruned = store.pruneOldRows(retentionDays);
@@ -1672,6 +1729,15 @@ async function main(): Promise<void> {
         pruned.jobs;
       if (total > 0) {
         logger.info({ retentionDays, total, ...pruned }, 'retention sweep pruned old rows');
+      }
+      if (conversationRetentionDays > 0) {
+        const prunedMessages = store.conversationStore().pruneIdleMessages(conversationRetentionDays);
+        if (prunedMessages > 0) {
+          logger.info(
+            { conversationRetentionDays, prunedMessages },
+            'retention sweep pruned idle conversation messages',
+          );
+        }
       }
     } catch (err) {
       logger.warn({ err: String(err) }, 'retention sweep tick failed');
@@ -1686,6 +1752,28 @@ async function main(): Promise<void> {
     store,
     enqueue: enqueueSlackEvent,
   });
+
+  // Conversation reconciliation sweeper: re-fetches recently-active tracked
+  // threads so socket downtime can't leave holes in captured transcripts.
+  startThreadSweeper({
+    webClient: client.webClient,
+    config,
+    store,
+  });
+
+  // GitHub conversation publisher (M4): mirrors org-visible captured threads
+  // into the configured markdown knowledge repo. No-op until enabled via
+  // app_settings or WATCHTOWER_GITHUB_EGRESS_* env vars.
+  configureGithubPublisher({ store, slack: client.webClient });
+
+  // Historical conversation backfill (M5): operator-triggered, cursor-
+  // resumable — set WATCHTOWER_CONVERSATION_BACKFILL=1 and restart until it
+  // logs 'complete'. Runs in the background; never blocks event processing.
+  if (process.env.WATCHTOWER_CONVERSATION_BACKFILL === '1') {
+    void runConversationBackfill({ webClient: client.webClient, config, store }).catch(err =>
+      logger.warn({ err: String(err) }, 'conversation backfill failed'),
+    );
+  }
 
   startLaunchpadRequestPoller({
     webClient: client.webClient,

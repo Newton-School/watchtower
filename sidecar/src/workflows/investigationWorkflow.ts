@@ -73,6 +73,9 @@ export async function runInvestigationWorkflow(params: {
         workflow: 'INVESTIGATION',
         store: store as unknown as JobStore,
         vaultRoot: store.readVaultSettings?.().vaultPath ?? null,
+        query: task.event.text ?? '',
+        excludeThread: { channelId: task.event.channelId, threadTs: task.event.threadTs },
+        channelId: task.event.channelId,
       });
       if (recall.promptBlock) {
         recallBlock = `${recall.promptBlock}\n\n`;

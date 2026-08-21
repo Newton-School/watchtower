@@ -61,6 +61,25 @@ export function formatThreadContext(
   return lines.join('\n');
 }
 
+/**
+ * Compact thread render for the intent classifier: the last few prior
+ * messages from the intake-fetched task.threadMessages, clipped hard —
+ * enough for "the banner pls check the complete thread" to classify
+ * correctly, cheap enough for the light-tier classifier call.
+ */
+export function formatThreadContextForClassifier(task: NormalizedTask): string | undefined {
+  const messages = task.threadMessages ?? [];
+  const prior = messages.filter(m => m.ts && m.ts !== task.event.eventTs && m.text.trim());
+  if (prior.length === 0) return undefined;
+  return prior
+    .slice(-6)
+    .map(m => {
+      const text = m.text.length > 200 ? `${m.text.slice(0, 200)}…` : m.text;
+      return `[${m.user}] ${text}`;
+    })
+    .join('\n');
+}
+
 export function stripMentions(text: string): string {
   return text
     .replace(/<@[^>]+>/g, ' ')
