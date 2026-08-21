@@ -70,21 +70,36 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function listChannels(client: WebClient): Promise<string[]> {
-  const ids: string[] = [];
-  let cursor: string | undefined;
-  do {
-    const response = await client.users.conversations({
-      cursor,
-      limit: 200,
-      types: 'public_channel,private_channel',
-      exclude_archived: true,
-    });
-    for (const channel of response.channels ?? []) {
-      if (channel.id) ids.push(channel.id);
-    }
-    cursor = response.response_metadata?.next_cursor || undefined;
-  } while (cursor);
-  return ids;
+  const collect = async (types: string): Promise<string[]> => {
+    const ids: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const response = await client.users.conversations({
+        cursor,
+        limit: 200,
+        types,
+        exclude_archived: true,
+      });
+      for (const channel of response.channels ?? []) {
+        if (channel.id) ids.push(channel.id);
+      }
+      cursor = response.response_metadata?.next_cursor || undefined;
+    } while (cursor);
+    return ids;
+  };
+
+  try {
+    return await collect('public_channel,private_channel');
+  } catch (err) {
+    // Including private_channel requires the groups:read scope; without it
+    // the call fails outright. Degrade to public-only rather than killing
+    // the whole backfill — private channels need the scope added anyway.
+    logger.warn(
+      { err: String(err) },
+      'conversation backfill: private-channel listing failed (missing groups:read?); walking public channels only',
+    );
+    return collect('public_channel');
+  }
 }
 
 function botParticipated(message: Record<string, unknown>, botUserId: string): boolean {
