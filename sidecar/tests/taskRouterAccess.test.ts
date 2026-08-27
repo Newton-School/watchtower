@@ -149,7 +149,7 @@ function makeTask(
       rawEvent: {},
     },
     mentionDetected: true,
-    mentionType: 'bot',
+    mentionType: input.mentionType ?? 'bot',
     isOwnerAuthor: input.userId === 'UOWNER1',
     isCoreDevAuthor: input.userId === 'UOWNER1',
     intent: input.intent ?? 'OWNER_AUTOPILOT',
@@ -275,6 +275,68 @@ describe('routeTask access control', () => {
         text: 'Sorry, this kind of request needs a higher access level than your role allows. Please contact an admin.',
       }),
     );
+  });
+
+  it('runs a read-only owner-mention from a non-allowlisted author (no access-denied reply)', async () => {
+    const config = makeConfig('enforce');
+    const slack = makeSlack();
+    const logStep = vi.fn();
+    classifyWorkflowIntent.mockResolvedValueOnce({
+      intent: 'INVESTIGATION',
+      confidence: 0.72,
+      reasoning: 'bug report',
+    });
+
+    const result = await routeTask({
+      task: makeTask({
+        userId: 'UNKNOWN', // not on any access list
+        channelId: 'C-RANDOM', // not in any group's channel list
+        text: '<@UOWNER1> could you please look & fix this issue',
+        mentionType: 'owner',
+        intent: 'UNKNOWN',
+      }),
+      config,
+      slack: slack as never,
+      store: {} as never,
+      logStep,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    expect(runInvestigationWorkflow).toHaveBeenCalledOnce();
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'access.owner_mention_grant' }));
+    // No "access denied" reply posted into the human thread.
+    expect(slack.chat.postMessage).not.toHaveBeenCalledWith(
+      expect.objectContaining({ text: expect.stringContaining('access list') }),
+    );
+  });
+
+  it('stays silent (no deny reply) when an owner-mention asks for a write workflow it cannot run', async () => {
+    const config = makeConfig('enforce');
+    const slack = makeSlack();
+    classifyWorkflowIntent.mockResolvedValueOnce({
+      intent: 'IMPLEMENTATION',
+      confidence: 0.82,
+      reasoning: 'fix request',
+    });
+
+    const result = await routeTask({
+      task: makeTask({
+        userId: 'UNKNOWN',
+        channelId: 'C-RANDOM',
+        text: '<@UOWNER1> please fix this in the codebase',
+        mentionType: 'owner',
+        intent: 'UNKNOWN',
+      }),
+      config,
+      slack: slack as never,
+      store: {} as never,
+      logStep: vi.fn(),
+    });
+
+    expect(result.status).toBe('SKIPPED');
+    expect(runImplementationWorkflow).not.toHaveBeenCalled();
+    // Indirect owner-mention denial is silent — no message posted to the thread.
+    expect(slack.chat.postMessage).not.toHaveBeenCalled();
   });
 
   it('allows admins to use wt commands', async () => {
