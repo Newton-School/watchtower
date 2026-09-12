@@ -279,6 +279,12 @@ export async function waitForApproval(params: {
   botUserId?: string;
 }): Promise<ApprovalResult> {
   const { slack, channelId, threadTs, approverUserIds, approvalPromptTs, logStep, botUserId } = params;
+  // Callers post the prompt before calling, and posting clears Slack's thread
+  // status — this is what puts "is waiting for admin approval" back up.
+  logStep({
+    stage: 'pipeline.approval.waiting',
+    message: 'Waiting for an admin to approve.',
+  });
   const pollIntervalMs = 5_000;
   const notifiedUsers = new Set<string>();
   // Per-call cache: messages we've already classified (and got non-actionable
@@ -627,6 +633,12 @@ export async function waitForRepoChoice(params: {
     signal,
     allowedRepos = REPO_KEYS,
   } = params;
+  // Posted prompt first, so this is what restores the status after Slack's
+  // post-message clear.
+  logStep({
+    stage: 'pipeline.repo_choice.waiting',
+    message: 'Waiting for an admin to pick the target repo.',
+  });
   const pollIntervalMs = 5_000;
   const notifiedUsers = new Set<string>();
   const startedAt = Date.now();
@@ -789,6 +801,12 @@ export async function waitForClarification(params: {
   botUserId?: string;
 }): Promise<ClarificationResult> {
   const { slack, channelId, threadTs, allowedUserIds, promptTs, logStep, botUserId } = params;
+  // Posted prompt first, so this is what restores the status after Slack's
+  // post-message clear.
+  logStep({
+    stage: 'pipeline.clarification.waiting',
+    message: "Waiting for an answer to the planner's clarification.",
+  });
   const pollIntervalMs = 5_000;
 
   while (true) {

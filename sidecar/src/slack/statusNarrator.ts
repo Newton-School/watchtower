@@ -162,6 +162,13 @@ const STAGE_TEXT: Record<string, StageRule> = {
   'implementation.start': { text: 'is sizing up the work…' },
   'pipeline.start': { text: 'is starting the agent pipeline…' },
   'pipeline.agent.planner.start': { text: 'is thinking through the approach…' },
+  // Human-wait gates. Only a gate's entry stage narrates: its outcome stages
+  // (approved, answered, resolved, cancelled…) share the family prefix and must
+  // not read as still waiting once the human has replied.
+  'pipeline.approval.waiting': { text: 'is waiting for admin approval', suspend: true },
+  'pipeline.clarification.waiting': { text: 'is waiting for your answer', suspend: true },
+  'pipeline.repo_choice.waiting': { text: 'is waiting for you to pick a repo', suspend: true },
+  'implementation.approval.revising': { text: 'is revising the plan…' },
   'pipeline.agent.coder.start': { text: 'is writing the code…' },
   'pipeline.agent.reviewer.start': { text: 'is reviewing the changes…' },
   'pipeline.agent.security.start': { text: 'is checking for security issues…' },
@@ -198,16 +205,9 @@ const STAGE_TEXT: Record<string, StageRule> = {
 
 /**
  * Prefix rules, longest-match-wins. These catch whole families at once — every
- * approval / clarification gate suspends, every deploy poll reads the same.
+ * deploy poll reads the same, however it is suffixed.
  */
 const STAGE_PREFIX: Array<[string, StageRule]> = [
-  ['pipeline.approval', { text: 'is waiting for your approval', suspend: true }],
-  ['pipeline.clarification', { text: 'is waiting for your answer', suspend: true }],
-  ['pipeline.repo_choice', { text: 'is waiting for you to pick a repo', suspend: true }],
-  ['planner.clarification', { text: 'is waiting for your answer', suspend: true }],
-  ['awaiting_approval', { text: 'is waiting for your approval', suspend: true }],
-  ['approval.waiting', { text: 'is waiting for your approval', suspend: true }],
-  ['clarification.asking', { text: 'is waiting for your answer', suspend: true }],
   ['deploy.marketing.poll', { text: 'is waiting for the deploy to finish…' }],
   ['investigation.scope', { text: 'is scoping the investigation…' }],
   ['agentic.repo_refresh', { text: 'is refreshing the repo…' }],
