@@ -109,6 +109,37 @@ describe('createThreadStatus', () => {
     expect(setStatus).toHaveBeenCalledTimes(1);
   });
 
+  it('suspend() in the same tick as set() holds after the pending send lands', async () => {
+    const setStatus = vi.fn().mockResolvedValue({ ok: true });
+    const { status } = harness(setStatus);
+
+    // The production order: logStep calls set() then suspend() before the
+    // throttled send goes out. That send's success must not re-arm the keepalive.
+    status.set('is waiting for admin approval');
+    status.suspend();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sentTexts(setStatus)).toEqual(['is waiting for admin approval']);
+
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(setStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it('set() after suspend() resumes the keepalive', async () => {
+    const setStatus = vi.fn().mockResolvedValue({ ok: true });
+    const { status } = harness(setStatus);
+
+    status.set('is waiting for admin approval');
+    status.suspend();
+    await vi.advanceTimersByTimeAsync(10);
+
+    status.set('is writing the code…');
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(sentTexts(setStatus)).toEqual(['is waiting for admin approval', 'is writing the code…']);
+
+    await vi.advanceTimersByTimeAsync(95_000);
+    expect(setStatus).toHaveBeenCalledTimes(3);
+  });
+
   it('latches off after a fatal error and logs exactly one WARN', async () => {
     const setStatus = vi.fn().mockRejectedValue(slackError('missing_scope'));
     const { status, logs } = harness(setStatus);

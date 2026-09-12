@@ -90,6 +90,8 @@ export function createThreadStatus(params: {
   let keepaliveTimer: ReturnType<typeof setTimeout> | undefined;
   let lastSentAt = 0;
   let consecutiveFailures = 0;
+  /** A human-wait gate asked for no refresh; the next `set()` lifts it. */
+  let suspended = false;
 
   function clearFlushTimer(): void {
     if (flushTimer) {
@@ -106,7 +108,7 @@ export function createThreadStatus(params: {
   }
 
   function armKeepalive(): void {
-    if (disabled || disposed) return;
+    if (disabled || disposed || suspended) return;
     stopKeepalive();
     keepaliveTimer = setTimeout(() => {
       keepaliveTimer = undefined;
@@ -217,11 +219,16 @@ export function createThreadStatus(params: {
       if (disabled || disposed) return;
       const trimmed = text.trim();
       if (!trimmed) return;
+      suspended = false;
       desired = trimmed;
       scheduleFlush();
     },
 
     suspend(): void {
+      // A latch, not a one-shot: logStep calls this in the same tick as set(),
+      // so the throttled send is still pending and its success would otherwise
+      // re-arm the keepalive and pin the status for the whole wait.
+      suspended = true;
       stopKeepalive();
     },
 

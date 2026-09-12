@@ -134,10 +134,28 @@ describe('narrateStep — workflow stages', () => {
 
   it('marks human-wait gates as suspend so the status is not pinned for hours', () => {
     const approval = narrateStep({ stage: 'pipeline.approval.waiting', message: '' });
-    expect(approval).toEqual({ text: 'is waiting for your approval', suspend: true });
+    expect(approval).toEqual({ text: 'is waiting for admin approval', suspend: true });
 
-    const clarify = narrateStep({ stage: 'pipeline.clarification.asking', message: '' });
-    expect(clarify?.suspend).toBe(true);
+    const clarify = narrateStep({ stage: 'pipeline.clarification.waiting', message: '' });
+    expect(clarify).toEqual({ text: 'is waiting for your answer', suspend: true });
+
+    const repo = narrateStep({ stage: 'pipeline.repo_choice.waiting', message: '' });
+    expect(repo).toEqual({ text: 'is waiting for you to pick a repo', suspend: true });
+  });
+
+  it('does not narrate a gate outcome as still waiting', () => {
+    const outcomes = [
+      'pipeline.approval.approved',
+      'pipeline.approval.feedback',
+      'pipeline.approval.rejected',
+      'pipeline.clarification.answered',
+      'pipeline.clarification.cancelled',
+      'pipeline.repo_choice.resolved',
+    ];
+    for (const stage of outcomes) {
+      expect(narrateStep({ stage, message: '' })).toBeUndefined();
+    }
+    expect(narrateStep({ stage: 'implementation.approval.revising', message: '' })?.text).toBe('is revising the plan…');
   });
 
   it('returns undefined for unmapped bookkeeping stages rather than echoing the stage name', () => {
