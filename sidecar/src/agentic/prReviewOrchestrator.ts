@@ -3,6 +3,7 @@ import type { AgentBackendId } from '../backends/types.js';
 import type { PrMetadata } from '../github/prReviewSupport.js';
 import type { PrReviewDeps } from './prReviewAgent.js';
 import { NEVER_POST_RULE, SEVERITY_RUBRIC } from './prReviewAgent.js';
+import { STE_REVIEW_TEXT_RULE } from '../codex/replyStyle.js';
 import type { RepoReviewSkill } from './reviewSkills.js';
 import { highReasoningProfile } from '../codex/modelProfiles.js';
 import { getActiveBackendId } from '../codex/runCodex.js';
@@ -192,6 +193,7 @@ Rules:
   Real observations that cannot be mapped to an exact diff location go in "summaryNotes" — never invent a location.
 ${SEVERITY_RUBRIC}
 ${NEVER_POST_RULE}
+${STE_REVIEW_TEXT_RULE}
 - Your final message must be ONLY this JSON object (no prose, no code fences):
 
 {

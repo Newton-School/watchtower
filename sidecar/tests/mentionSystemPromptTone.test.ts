@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { buildMentionSystemPrompt } from '../src/codex/mentionSystemPrompt.js';
+import { STE_REPLY_STYLE_BLOCK } from '../src/codex/replyStyle.js';
 import type { NormalizedTask } from '../src/types/contracts.js';
 
 function makeTask(): NormalizedTask {
@@ -45,5 +46,14 @@ describe('mentionSystemPrompt tone branches', () => {
   it('emits a casual line when toneMode is casual', () => {
     const prompt = buildMentionSystemPrompt({ task: makeTask(), workflow: 'CONVERSATIONAL', toneMode: 'casual' });
     expect(prompt).toContain('Tone preference: casual');
+  });
+});
+
+describe('mentionSystemPrompt STE writing style', () => {
+  it('includes the ASD-STE100 block for every tone', () => {
+    for (const toneMode of ['normal', 'terse', 'technical', 'casual'] as const) {
+      const prompt = buildMentionSystemPrompt({ task: makeTask(), workflow: 'IMPLEMENTATION', toneMode });
+      expect(prompt).toContain(STE_REPLY_STYLE_BLOCK);
+    }
   });
 });

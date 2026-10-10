@@ -42,6 +42,7 @@ import type {
 import { isAnchorInDiff, parseDiffHunks } from '../github/diffHunks.js';
 import { resolveWorkspace } from '../workspaces/workspaceManager.js';
 import { withAgentCallContext } from '../state/runContext.js';
+import { STE_REVIEW_TEXT_RULE } from '../codex/replyStyle.js';
 
 /**
  * Per-PR review outcome. A job reviewing N PRs carries N of these in
@@ -161,6 +162,7 @@ Rules:
   Real observations that cannot be mapped to an exact diff location go in "summaryNotes" — never invent a location.
 ${SEVERITY_RUBRIC}
 ${NEVER_POST_RULE}
+${STE_REVIEW_TEXT_RULE}
 - Your final message must be ONLY this JSON object (no prose, no code fences):
 
 {
@@ -362,6 +364,7 @@ Rules:
   Real observations that cannot be mapped to an exact diff location go in "summaryNotes" — never invent a location.
 ${SEVERITY_RUBRIC}
 ${NEVER_POST_RULE}
+${STE_REVIEW_TEXT_RULE}
 - Your final message must be ONLY this JSON object (no prose, no code fences):
 
 {
