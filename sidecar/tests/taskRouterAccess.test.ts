@@ -904,6 +904,8 @@ describe('routeTask runs the tool-router in shadow (issue #456)', () => {
 
     expect(result.status).toBe('SUCCESS');
     expect(shadowLog(logStep).data).toMatchObject({ agree: false, routerWouldRun: 'FAILED' });
+    // A shadow call decides nothing, so a failed one is not worth a second.
+    expect(decideTool).toHaveBeenCalledTimes(1);
   });
 
   it('does not run in legacy mode', async () => {
@@ -938,19 +940,21 @@ describe('routeTask lets the tool-router decide when it is on (issue #456)', () 
   async function route(
     text: string,
     task: Record<string, unknown> = {},
-    options: { store?: Record<string, unknown>; config?: AppConfig; log?: boolean } = {},
+    options: { store?: Record<string, unknown>; config?: AppConfig; log?: boolean; signal?: AbortSignal } = {},
   ) {
     const logStep = vi.fn();
+    const slack = makeSlack();
     const { mentionType = 'bot', ...input } = task as { mentionType?: 'bot' | 'owner' };
     const result = await routeTask({
       task: { ...makeTask({ userId: 'UOWNER1', channelId: 'C-VIEW', text, ...input }), mentionType },
       config: options.config ?? makeConfig('audit'),
-      slack: makeSlack() as never,
+      slack: slack as never,
       store: (options.store ?? onStore()) as never,
+      signal: options.signal,
       ...(options.log === false ? {} : { logStep }),
     });
     await settle();
-    return { result, logStep };
+    return { result, logStep, slack };
   }
 
   it('uses the router where the classifier was, with one call and no classifier call', async () => {
@@ -999,20 +1003,74 @@ describe('routeTask lets the tool-router decide when it is on (issue #456)', () 
     },
   );
 
-  it('falls back like the classifier when the router call fails: a lookup for a direct mention', async () => {
-    decideTool.mockResolvedValue({ ok: false, error: 'router call failed (exit 1)', durationMs: 3 });
+  const routerFails = { ok: false, error: 'router call failed (exit 1)', durationMs: 3 };
 
-    const { result, logStep } = await route('<@UBOT1> fix the login redirect', { intent: 'IMPLEMENTATION' });
+  it('tries once more when the router call fails, and acts on the second answer (issue #440)', async () => {
+    routerSays('change_code');
+    decideTool.mockResolvedValueOnce(routerFails);
 
-    expect(result.workflow).toBe('INFORMATIONAL');
-    expect(runImplementationWorkflow).not.toHaveBeenCalled();
-    expect(stageLog(logStep, 'router.decision.fallback')).toMatchObject({
+    const { result, logStep, slack } = await route('<@UBOT1> replace "See how" with "Apply Now" on the DS page', {
+      intent: 'IMPLEMENTATION',
+    });
+
+    expect(decideTool).toHaveBeenCalledTimes(2);
+    expect(result.workflow).toBe('IMPLEMENTATION');
+    expect(runImplementationWorkflow).toHaveBeenCalledOnce();
+    expect(stageLog(logStep, 'router.decision.retry')).toMatchObject({
       level: 'WARN',
       data: { error: 'router call failed (exit 1)' },
     });
+    expect(slack.chat.postMessage).not.toHaveBeenCalled();
+  });
+
+  it('says it could not read the message when the router fails twice, and runs nothing (issue #440)', async () => {
+    const { ROUTER_FAILED_REPLY } = await import('../src/router/taskRouter.js');
+    decideTool.mockResolvedValue(routerFails);
+
+    const { result, logStep, slack } = await route('<@UBOT1> replace "See how" with "Apply Now" on the DS page', {
+      intent: 'IMPLEMENTATION',
+    });
+
+    expect(decideTool).toHaveBeenCalledTimes(2);
+    // Not a lookup that describes the change without making it, and not the keyword seed either.
+    expect(runAgenticEntry).not.toHaveBeenCalled();
+    expect(runImplementationWorkflow).not.toHaveBeenCalled();
+    expect(slack.chat.postMessage).toHaveBeenCalledExactlyOnceWith({
+      channel: 'C-VIEW',
+      thread_ts: '111.22',
+      text: ROUTER_FAILED_REPLY,
+    });
+    expect(result).toMatchObject({ workflow: 'UNKNOWN', status: 'FAILED', slackPosted: true });
+    expect(stageLog(logStep, 'router.decision.failed')).toMatchObject({ level: 'ERROR' });
     expect(stageLog(logStep, 'router.decision').message).toBe(
       'Router chose nothing (the call failed); running INFORMATIONAL.',
     );
+  });
+
+  it('gives a requester who would be denied the denial, not the could-not-read reply', async () => {
+    decideTool.mockResolvedValue(routerFails);
+
+    const { result, slack } = await route(
+      '<@UBOT1> how does login work?',
+      { userId: 'USTRANGER', channelId: 'C-VIEW' },
+      { config: makeConfig('enforce') },
+    );
+
+    expect(result.status).toBe('SKIPPED');
+    expect(slack.chat.postMessage).toHaveBeenCalledOnce();
+    expect(slack.chat.postMessage.mock.calls[0][0].text).not.toContain("couldn't work out");
+  });
+
+  it('neither retries nor replies once the job is cancelled', async () => {
+    decideTool.mockResolvedValue(routerFails);
+    const controller = new AbortController();
+    controller.abort();
+
+    const { result, slack } = await route('<@UBOT1> fix the login redirect', {}, { signal: controller.signal });
+
+    expect(decideTool).toHaveBeenCalledTimes(1);
+    expect(slack.chat.postMessage).not.toHaveBeenCalled();
+    expect(result.status).toBe('FAILED');
   });
 
   it('stays silent on an owner mention when the router fails, throws, or says stay_silent', async () => {
@@ -1022,6 +1080,9 @@ describe('routeTask lets the tool-router decide when it is on (issue #456)', () 
     const thrown = await route('<@UOWNER1> fyi the release went out', ownerMention);
     expect(thrown.result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
     expect(stageLog(thrown.logStep, 'router.silent').message).toContain('Router returned NONE');
+    // Two tries, then silence: a failure never makes miniOG speak into people's conversation.
+    expect(decideTool).toHaveBeenCalledTimes(2);
+    expect(thrown.slack.chat.postMessage).not.toHaveBeenCalled();
 
     routerSays('stay_silent');
     const silent = await route('<@UOWNER1> fyi the release went out', ownerMention);

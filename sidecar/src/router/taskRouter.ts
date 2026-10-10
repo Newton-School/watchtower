@@ -103,6 +103,10 @@ function runImplementation({ task, config, slack, store, jobId, logStep, signal 
   });
 }
 
+/** Posted when the tool-router fails twice on a direct mention, in place of a guess (issue #440). */
+export const ROUTER_FAILED_REPLY =
+  "I couldn't work out what you're asking. That's a failure on my side, not your message — please send it again.";
+
 /** Intents routeTask can start a workflow for. */
 export const ROUTED_INTENTS = Object.keys(WORKFLOW_RUNNERS) as WorkflowIntent[];
 
@@ -193,6 +197,7 @@ export async function routeTask(params: {
   const routerShadow = startRouterShadow({ task, userMessage, store, logStep, signal });
   let legacyDecidedBy: LegacyDecidedBy = 'gate';
   let decider = 'AI classifier';
+  let routerCouldNotDecide = false;
 
   // PR_REVIEW can only be seeded pre-classifier by the deterministic gate
   // (isPrReviewRequest in intentParser.ts) — nothing else produces it before
@@ -245,7 +250,10 @@ export async function routeTask(params: {
       if (routerShadow?.decides) {
         legacyDecidedBy = 'router';
         decider = 'Router';
-        classification = await routerShadow.asClassification();
+        const decided = await routerShadow.asClassification();
+        // An owner mention the router could not read stays unanswered, as before.
+        routerCouldNotDecide = decided.failed && decided.intent !== 'NONE';
+        classification = decided;
       } else {
         legacyDecidedBy = 'classifier';
         classification = await classifyWithLegacyClassifier({ task, userMessage, store, logStep, signal });
@@ -423,6 +431,35 @@ export async function routeTask(params: {
         channelId: task.event.channelId,
       },
     });
+  }
+
+  // The router failed twice on a message addressed to miniOG. Say so instead of
+  // answering it as a lookup: the requester cannot tell a lookup that describes
+  // their change from one that made it (issue #440). Placed after the access
+  // check, so someone who would be denied gets the denial and nothing else.
+  if (routerCouldNotDecide) {
+    logStep?.({
+      stage: 'router.decision.failed',
+      message: signal?.aborted
+        ? 'Router call failed and the job was cancelled — ran nothing.'
+        : 'Router could not decide after two calls — told the requester and ran nothing.',
+      level: 'ERROR',
+      data: { seedIntent: task.intent, userMessage },
+    });
+    if (!signal?.aborted) {
+      await slack.chat.postMessage({
+        channel: task.event.channelId,
+        thread_ts: task.event.threadTs,
+        text: ROUTER_FAILED_REPLY,
+      });
+    }
+    return {
+      workflow: 'UNKNOWN',
+      status: 'FAILED',
+      message: 'The router could not decide what this message asks for (two failed calls); nothing was run.',
+      notifyDesktop: false,
+      slackPosted: true,
+    };
   }
 
   const runWorkflow = WORKFLOW_RUNNERS[resolvedIntent];

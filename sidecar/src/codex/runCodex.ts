@@ -390,6 +390,9 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
             level: 'ERROR',
             data: {
               timeoutMs: request.timeoutMs,
+              // Wall-clock time since spawn. A timer cannot fire while the host
+              // sleeps, so this can be far past timeoutMs (issue #440).
+              elapsedMs: Date.now() - spawnedAt,
             },
           });
           child.kill('SIGKILL');

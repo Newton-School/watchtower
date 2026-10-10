@@ -78,6 +78,12 @@ export function routerWouldRun(outcome: RouterOutcome): string {
 const sameWorkflow = (legacy: WorkflowIntent, router: string): boolean =>
   (legacy === 'OWNER_AUTOPILOT' ? 'IMPLEMENTATION' : legacy) === router;
 
+/** A router decision in the classifier's shape. */
+export interface RouterClassification extends IntentClassification {
+  /** The router could not decide, even on a second try. `intent` is then the low-risk fallback. */
+  failed: boolean;
+}
+
 export interface RouterShadow {
   /** True in `on` mode: the router's decision is used where the classifier's was. */
   decides: boolean;
@@ -85,7 +91,7 @@ export interface RouterShadow {
    * The router's decision in the shape the classifier returned, for the code
    * that consumed a classification. Waits for the call; never rejects.
    */
-  asClassification(): Promise<IntentClassification>;
+  asClassification(): Promise<RouterClassification>;
   /** Call once a workflow is settled on. Logs what the router said; returns at once. */
   compare(legacy: { intent: WorkflowIntent; decidedBy: LegacyDecidedBy }): void;
 }
@@ -108,12 +114,27 @@ export function startRouterShadow(params: {
 
   const facts = buildRouterFacts(task, userMessage);
   // A shadow call gets no logger: it must not move the Slack status line.
-  const pending = (params.decide ?? decideTool)({
-    facts,
-    signal,
-    role: decides ? 'router' : 'router_shadow',
-    ...(decides ? { logStep } : {}),
-  }).catch((error): RouterOutcome => ({ ok: false, error: String(error), durationMs: 0 }));
+  const call = (): Promise<RouterOutcome> =>
+    (params.decide ?? decideTool)({
+      facts,
+      signal,
+      role: decides ? 'router' : 'router_shadow',
+      ...(decides ? { logStep } : {}),
+    }).catch((error): RouterOutcome => ({ ok: false, error: String(error), durationMs: 0 }));
+  // A deciding call gets one more try: a failure here used to become a silent
+  // lookup or silence (issue #440). A shadow call decides nothing, so it does not.
+  const pending = decides
+    ? call().then(first => {
+        if (first.ok || signal?.aborted) return first;
+        logStep?.({
+          stage: 'router.decision.retry',
+          message: 'Router call failed — trying once more.',
+          level: 'WARN',
+          data: { error: first.error, durationMs: first.durationMs },
+        });
+        return call();
+      })
+    : call();
 
   return {
     decides,
@@ -123,7 +144,7 @@ export function startRouterShadow(params: {
       if (!outcome.ok) {
         logStep?.({
           stage: 'router.decision.fallback',
-          message: `Router call failed — using ${intent} fallback.`,
+          message: `Router call failed twice — using ${intent} fallback.`,
           level: 'WARN',
           data: { error: outcome.error, durationMs: outcome.durationMs },
         });
@@ -132,9 +153,15 @@ export function startRouterShadow(params: {
           intent,
           confidence: facts.addressing === 'owner_mention' ? 0.5 : 0,
           reasoning: `Router failed; using low-risk ${intent} fallback.`,
+          failed: true,
         };
       }
-      return { intent, confidence: outcome.decision.confidence, reasoning: outcome.decision.reason };
+      return {
+        intent,
+        confidence: outcome.decision.confidence,
+        reasoning: outcome.decision.reason,
+        failed: false,
+      };
     },
     compare(legacy) {
       if (!logStep) return;
