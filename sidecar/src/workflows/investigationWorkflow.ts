@@ -1,4 +1,5 @@
 import type { WebClient } from '@slack/web-api';
+import { cancelledResult } from './shared/cancelState.js';
 import type { AppConfig, NormalizedTask, WorkflowResult, WorkflowStepLogger } from '../types/contracts.js';
 import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
 import { assembleRecall } from '../codex/recallAssembler.js';
@@ -7,6 +8,7 @@ import { buildMentionSystemPrompt } from '../codex/mentionSystemPrompt.js';
 import { prepareWorkflowContext } from './shared/workflowUtils.js';
 import { assertThreadParentExists, fetchThreadContext } from '../slack/threadContext.js';
 import { classifyInvestigationScope, type InvestigationScope } from '../router/investigationScope.js';
+import { enabledRepoPaths } from '../repos/registry.js';
 import type { McpServerConfig } from '../types/contracts.js';
 import type { PipelineStore } from '../agents/pipeline.js';
 import type { InvestigationStore } from '../state/investigationStore.js';
@@ -35,12 +37,16 @@ export async function runInvestigationWorkflow(params: {
   const scope = await classifyInvestigationScope({
     bugReport: task.event.text ?? '',
     threadMessages: scopeThread.map(m => m.text),
-    webPath: config.repoPaths.newtonWeb,
-    apiPath: config.repoPaths.newtonApi,
+    repoGrepPaths: enabledRepoPaths(config),
     logStep,
+    signal,
   });
 
-  const ctx = await prepareWorkflowContext({ task, config, slack, logStep, repoOverride: scope.scope });
+  const ctx = await prepareWorkflowContext({ task, config, slack, logStep, repoOverride: scope.scope, signal });
+  // Cancelled while asking which repo: no "routing to the desktop queue" copy (issue #264).
+  if (signal?.aborted) {
+    return cancelledResult('INVESTIGATION');
+  }
 
   if (ctx.desktopOnly) {
     await slack.chat
@@ -72,6 +78,9 @@ export async function runInvestigationWorkflow(params: {
         workflow: 'INVESTIGATION',
         store: store as unknown as JobStore,
         vaultRoot: store.readVaultSettings?.().vaultPath ?? null,
+        query: task.event.text ?? '',
+        excludeThread: { channelId: task.event.channelId, threadTs: task.event.threadTs },
+        channelId: task.event.channelId,
       });
       if (recall.promptBlock) {
         recallBlock = `${recall.promptBlock}\n\n`;
@@ -106,9 +115,20 @@ export async function runInvestigationWorkflow(params: {
     data: { scope: scope.scope },
   });
 
+  const marketingConfigured = Boolean(config.repoPaths.newtonMarketingWeb);
+  const marketingScopeNote =
+    scope.scope === 'newton-marketing-web'
+      ? `
+- This is the PUBLIC MARKETING site (static export served behind a Cloudflare Worker). Some newtonschool.co paths are still served by Webflow — \`worker/paths.js\` decides which. A "broken marketing page" may not be in this code at all: check the path routing there FIRST before attributing the symptom to code.`
+      : '';
   const environmentBlock =
     scope.scope === 'broad'
-      ? `- Working directory: ${repoPath} — this directory contains BOTH the newton-web (frontend) and newton-api (backend) repos. Grep/Read across BOTH to trace the bug end-to-end.
+      ? `- Working directory: ${repoPath} — this directory contains the newton-web (product frontend) and newton-api (backend) repos. Grep/Read across BOTH to trace the bug end-to-end.${
+          marketingConfigured
+            ? `
+- The newton-marketing-web clone is also present here but is OUT OF SCOPE for this broad sweep — it is a static marketing site with no product/backend coupling. Ignore it unless the evidence explicitly points at a public newtonschool.co landing page.`
+            : ''
+        }
 - The bug could not be localized to one layer, so investigate the full stack: correlate the UI symptom → the API contract/response → the underlying data.${
           useMetabase
             ? `
@@ -118,7 +138,7 @@ export async function runInvestigationWorkflow(params: {
 - No database access is available this run; investigate the repos only and note in \`summary\` if a data-layer check would help confirm the diagnosis.`
         }
 - Read-only mode: Read, Grep, Glob, read-only git/bash (git log, git show, git blame, git diff)${useMetabase ? ', and read-only Metabase queries' : ''}. Do NOT invoke Edit, Write, any worktree-mutating bash, or any mutating MCP tool.`
-      : `- Working directory: ${repoPath}${repoName ? ` (${repoName})` : ''}
+      : `- Working directory: ${repoPath}${repoName ? ` (${repoName})` : ''}${marketingScopeNote}
 - Read-only mode: you may use Read, Grep, Glob, and read-only git/bash (git log, git show, git blame, git diff). Do NOT invoke Edit, Write, or any bash command that mutates the worktree.`;
 
   const investigatorPrompt = `${recallBlock}${`
@@ -180,17 +200,24 @@ Return strict JSON:
     cwd: repoPath,
     prompt: investigatorPrompt,
     githubToken: ctx.githubToken,
+    imagePaths: ctx.imagePaths.length > 0 ? ctx.imagePaths : undefined,
     model: profile.model,
     reasoningEffort: profile.reasoningEffort,
     mcpServers,
-    // No per-agent timeoutMs. Substantive investigations on Claude Opus at
-    // max reasoning routinely exceed a fractional sub-budget (e.g. 40% of
-    // bugFixTimeoutMs = 18 min) on real feature scoping, and a forced
+    // No per-agent timeoutMs. Substantive investigations on the high-reasoning
+    // tier (Opus at xhigh) routinely exceed a fractional sub-budget (e.g. 40%
+    // of bugFixTimeoutMs = 18 min) on real feature scoping, and a forced
     // SIGKILL produces no plan content and no actionable error. The outer
     // workflow's abort signal (passed below) is the safety net.
     onLog: logStep,
     signal,
   });
+
+  // Cancelled mid-run: the dead agent is not a failed investigation, and the
+  // "couldn't complete" copy below would be wrong (issue #438).
+  if (signal?.aborted) {
+    return cancelledResult('INVESTIGATION');
+  }
 
   if (!investigatorResult.ok || !investigatorResult.parsedJson) {
     logStep?.({
@@ -303,9 +330,12 @@ function scopeAckText(scope: InvestigationScope, useMetabase: boolean): string {
   if (scope === 'newton-api') {
     return 'Looks data/backend-related — digging into *newton-api*. I’ll share what I find.';
   }
+  if (scope === 'newton-marketing-web') {
+    return 'Looks like a marketing-site issue — digging into *newton-marketing-web*. I’ll share what I find.';
+  }
   return useMetabase
-    ? 'Couldn’t localize this to one layer — sweeping *newton-web* + *newton-api* + Metabase (read-only) to trace it end-to-end.'
-    : 'Couldn’t localize this to one layer — sweeping *newton-web* + *newton-api* to trace it end-to-end.';
+    ? 'Tracing this end-to-end through *newton-web*, *newton-api*, and database. I’ll share what I find.'
+    : 'Tracing this end-to-end through *newton-web* and *newton-api*. I’ll share what I find.';
 }
 
 function formatInvestigationMessage(findings: {

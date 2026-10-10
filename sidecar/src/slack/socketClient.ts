@@ -83,6 +83,13 @@ export class SocketSlackClient {
       appToken: config.slackAppToken,
       socketMode: true,
       logLevel: LogLevel.INFO,
+      // Bolt's default ignoreSelf middleware drops every event the bot itself
+      // authored — which would blind the conversation-capture live tap to
+      // miniOG's own replies (a transcript of questions with no answers).
+      // Self events are instead filtered where they matter: processEvent's
+      // bot gate still blocks job creation, and the reaction handler skips
+      // bot-authored reactions explicitly.
+      ignoreSelf: false,
     });
 
     this.registerHandlers();

@@ -1,17 +1,24 @@
 import type { WebClient } from '@slack/web-api';
-import type { NormalizedTask, WorkflowResult, WorkflowStepLogger } from '../types/contracts.js';
+import type { AppConfig, NormalizedTask, WorkflowResult, WorkflowStepLogger } from '../types/contracts.js';
 import { formatDossierForHuman } from '../state/dossierStore.js';
+import { buildHandoffBundle, handoffFileName } from '../egress/handoffBuilder.js';
+import { scheduleVaultRender } from '../vault/vaultWriter.js';
 import type { JobStore } from '../state/jobStore.js';
+
+/** Bundles longer than this go up as a .md file instead of an in-thread paste. */
+const HANDOFF_PASTE_MAX_CHARS = 11_500;
 
 export async function runMiniogDossierWorkflow(params: {
   task: NormalizedTask;
   slack: WebClient;
   store: JobStore;
+  /** Optional (older call sites/tests omit it); handoff uses botUserId when present. */
+  config?: AppConfig;
   logStep?: WorkflowStepLogger;
   /** Accepted for parity with other workflows; this is a fast read-only path. */
   signal?: AbortSignal;
 }): Promise<WorkflowResult> {
-  const { task, slack, store, logStep } = params;
+  const { task, slack, store, config, logStep } = params;
   void params.signal;
   const sub = task.miniogSubcommand;
 
@@ -233,6 +240,174 @@ export async function runMiniogDossierWorkflow(params: {
       workflow: 'MINIOG_DOSSIER',
       status: 'SUCCESS',
       message: `Removed pinned fact ${sub.id}.`,
+      notifyDesktop: false,
+      slackPosted: true,
+    };
+  }
+
+  if (sub.kind === 'handoff') {
+    const bundle = await buildHandoffBundle({
+      slack,
+      store,
+      channelId: channel,
+      threadTs,
+      botUserId: config?.botUserId,
+    });
+    if (!bundle) {
+      await reply("I couldn't read this thread to build a handoff — try again in a moment.");
+      return {
+        workflow: 'MINIOG_DOSSIER',
+        status: 'FAILED',
+        message: 'Handoff: thread unreadable.',
+        notifyDesktop: false,
+        slackPosted: true,
+      };
+    }
+
+    const postAsFile = async (note?: string): Promise<void> => {
+      if (note) await reply(note);
+      await slack.filesUploadV2({
+        channel_id: channel,
+        thread_ts: threadTs,
+        initial_comment:
+          'Here’s the context bundle — add it to your own Claude chat (or a Project) and continue there.',
+        file_uploads: [
+          {
+            file: Buffer.from(bundle.markdown, 'utf8'),
+            filename: handoffFileName(bundle.title),
+            title: bundle.title,
+          },
+        ],
+      });
+    };
+
+    const postAsPaste = async (): Promise<void> => {
+      // Neutralize inner fences so the paste block can't be broken open.
+      const safe = bundle.markdown.replace(/```/g, "'''");
+      await reply(`Copy this into your own Claude to continue with full context:\n\`\`\`\n${safe}\n\`\`\``);
+    };
+
+    try {
+      if (sub.format === 'link') {
+        if (bundle.githubUrl) {
+          await reply(`*${bundle.title}* is in the knowledge base: ${bundle.githubUrl}`);
+        } else {
+          await postAsFile(
+            "This thread isn't published to the knowledge base (yet, or it's private) — here's the bundle as a file instead:",
+          );
+        }
+      } else if (sub.format === 'file') {
+        await postAsFile();
+      } else if (sub.format === 'paste' && bundle.markdown.length <= HANDOFF_PASTE_MAX_CHARS) {
+        await postAsPaste();
+      } else if (sub.format === 'paste') {
+        await postAsFile('Too long to paste inline — attached as a file instead:');
+      } else if (bundle.markdown.length <= HANDOFF_PASTE_MAX_CHARS) {
+        await postAsPaste();
+      } else {
+        await postAsFile();
+      }
+    } catch (err) {
+      logStep?.({
+        stage: 'miniog.handoff.post_failed',
+        level: 'ERROR',
+        message: `Handoff delivery failed: ${String(err)}`,
+        data: { format: sub.format, chars: bundle.markdown.length },
+      });
+      await reply(`Couldn't deliver the handoff (${String(err).slice(0, 120)}).`).catch(() => {});
+      return {
+        workflow: 'MINIOG_DOSSIER',
+        status: 'FAILED',
+        message: 'Handoff delivery failed.',
+        notifyDesktop: false,
+        slackPosted: true,
+      };
+    }
+
+    logStep?.({
+      stage: 'miniog.handoff.posted',
+      message: `Posted handoff bundle (${bundle.source}, ${bundle.markdown.length} chars, format=${sub.format}).`,
+      data: { source: bundle.source, chars: bundle.markdown.length, format: sub.format, githubUrl: bundle.githubUrl },
+    });
+    return {
+      workflow: 'MINIOG_DOSSIER',
+      status: 'SUCCESS',
+      message: 'Handoff bundle posted.',
+      notifyDesktop: false,
+      slackPosted: true,
+    };
+  }
+
+  if (sub.kind === 'forget-thread') {
+    const conversations = store.conversationStore();
+    const thread = conversations.getThread(channel, threadTs);
+    if (!thread || thread.status === 'forgotten') {
+      await reply("I don't have this thread in my conversation memory, so there's nothing to forget.");
+      return {
+        workflow: 'MINIOG_DOSSIER',
+        status: 'SKIPPED',
+        message: 'Forget-thread: thread not tracked.',
+        notifyDesktop: false,
+        slackPosted: true,
+      };
+    }
+
+    // Gate: thread participants may forget their own thread; admins/owner may
+    // forget any. Everyone else is refused — this deletes shared org memory.
+    // beforeTs: participation must come from a message OLDER than this
+    // command, so posting "forget thread" can never self-grant the right to
+    // delete a thread the requester never took part in. (Command messages are
+    // also excluded from capture entirely — this is belt and braces.)
+    const allowed =
+      task.isOwnerAuthor ||
+      task.isCoreDevAuthor ||
+      conversations.isParticipant(channel, threadTs, userId, { beforeTs: task.event.eventTs });
+    if (!allowed) {
+      await reply('Only people who took part in this thread (or an admin) can ask me to forget it.');
+      logStep?.({
+        stage: 'miniog.dossier.forget_thread.denied',
+        level: 'WARN',
+        message: 'Non-participant attempted forget thread; denied.',
+        data: { requesterId: userId, channel, threadTs },
+      });
+      return {
+        workflow: 'MINIOG_DOSSIER',
+        status: 'SKIPPED',
+        message: 'Forget-thread denied: not a participant or admin.',
+        notifyDesktop: false,
+        slackPosted: true,
+      };
+    }
+
+    if (!sub.confirmed) {
+      await reply(
+        `That permanently deletes my memory of this thread (${thread.messageCount} message(s) + its summary) and I'll never re-capture it. Reply with \`forget thread confirm\` if you're sure.`,
+      );
+      return {
+        workflow: 'MINIOG_DOSSIER',
+        status: 'SKIPPED',
+        message: 'Forget-thread requested without confirmation.',
+        notifyDesktop: false,
+        slackPosted: true,
+      };
+    }
+
+    const result = conversations.forgetThread(channel, threadTs);
+    // Forget must reach the vault mirror too — the render pass deletes the
+    // note for a forgotten thread (no-op when the vault is disabled).
+    scheduleVaultRender({ kind: 'thread', channelId: channel, threadTs });
+    await reply(
+      `Done — forgot this thread (${result?.messagesDeleted ?? 0} message(s) deleted). I won't capture it again.`,
+    );
+    logStep?.({
+      stage: 'miniog.dossier.forget_thread',
+      message: 'Thread tombstoned in the conversation store.',
+      data: { channel, threadTs, messagesDeleted: result?.messagesDeleted ?? 0 },
+    });
+    return {
+      workflow: 'MINIOG_DOSSIER',
+      status: 'SUCCESS',
+      message: 'Thread forgotten.',
       notifyDesktop: false,
       slackPosted: true,
     };

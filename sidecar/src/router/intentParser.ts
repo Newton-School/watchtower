@@ -26,29 +26,95 @@ export function containsMetabaseUrl(text: string | undefined | null): boolean {
   return METABASE_URL_REGEX.test(text);
 }
 
+const DEPLOY_VERB_RE = /\b(deploy|ship|release|push to prod|push prod)\b/;
+// Tokens that pick the MARKETING deploy flow. Deliberately narrow: generic
+// words like "landing" or "homepage" also describe newton-web product screens
+// and would let an incidental mention hijack (or veto) a production deploy.
+const MARKETING_DEPLOY_REF_RE = /\b(marketing|mweb|nmw|newton[- ]?marketing([- ]?web)?|webflow|wrangler|cloudflare)\b/;
+// An explicitly named newton-web target always wins, even when marketing is
+// mentioned incidentally ("deploy newton-web to prod — marketing needs the
+// banner live").
+const NEWTON_WEB_REF_RE = /\bnewton[- ]?web\b/;
+// Targets that are genuinely ambiguous between the two frontends (NSAT/NST
+// pages exist in both: public admission landing pages in marketing, the
+// logged-in timeline/test flows in newton-web). A deploy ask naming only
+// these must not deterministically fire EITHER prod deploy.
+const AMBIGUOUS_DEPLOY_TARGET_RE = /\b(landing([- ]?pages?)?|homepage|newton[- ]?school|nsat|nst)\b/;
+
+function normalizeDeployText(text: string): string {
+  return (
+    text
+      .replace(/<@[^>]+>/g, ' ')
+      // A link is not an instruction: a newton-web PR URL must not count as
+      // naming the deploy target (issue #428). A Slack link keeps its label.
+      .replace(/<https?:[^>|]*(?:\|([^>]*))?>/g, ' $1 ')
+      .replace(/https?:\/\/\S+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .toLowerCase()
+      .trim()
+  );
+}
+
+export type DeployTarget = 'newton-web' | 'newton-marketing-web' | 'ambiguous';
+
 /**
- * Deterministic check: does the message ask to deploy newton-web to production?
- * This runs before the AI classifier so deploy requests are never misrouted.
+ * Deterministic deploy-target classification. This is the ONLY producer of
+ * the DEPLOY intent (the AI intent classifier cannot emit DEPLOY), so every
+ * deploy-shaped ask must resolve here — including the ambiguous ones.
+ *
+ * Precedence:
+ * - Explicit signals for BOTH repos in one message ⇒ 'ambiguous'. Picking a
+ *   winner is unsafe in both directions (either repo could be hijacked into
+ *   a wrong production deploy by an incidental mention of the other).
+ * - Exactly one explicit repo signal ⇒ that repo.
+ * - Frontend-ambiguous nouns (landing/homepage/newton school/NSAT/NST) WITH a
+ *   prod token ⇒ 'ambiguous' — never guess a prod deploy from those. Without
+ *   a prod token they are not a deploy ask at all: deploy verbs double as
+ *   ordinary chatter ("release the NSAT results page fix", "ship the
+ *   homepage banner"), which must keep flowing to the normal classifier.
+ * - Bare "deploy to prod" / "deploy the frontend" ⇒ newton-web (historical
+ *   behavior; prod was the only deploy target before marketing existed).
+ *
+ * The deploy workflow resolves 'ambiguous' with config: hosts without the
+ * marketing clone have exactly one deployable frontend and behave as before;
+ * hosts with it get a clarify reply instead of a guessed production deploy.
+ */
+export function classifyDeployTarget(text: string): DeployTarget | null {
+  const normalized = normalizeDeployText(text);
+  if (!DEPLOY_VERB_RE.test(normalized)) return null;
+
+  const namesNewtonWeb = NEWTON_WEB_REF_RE.test(normalized);
+  const namesMarketing = MARKETING_DEPLOY_REF_RE.test(normalized);
+  if (namesNewtonWeb && namesMarketing) return 'ambiguous';
+  if (namesNewtonWeb) return 'newton-web';
+  if (namesMarketing) return 'newton-marketing-web';
+
+  const hasProdTarget = /\b(prod|production)\b/.test(normalized);
+  if (AMBIGUOUS_DEPLOY_TARGET_RE.test(normalized)) {
+    return hasProdTarget ? 'ambiguous' : null;
+  }
+
+  const hasAppRef = /\bfrontend\b/.test(normalized);
+  return hasProdTarget || hasAppRef ? 'newton-web' : null;
+}
+
+/**
+ * Deterministic check: does the message unambiguously ask to deploy
+ * newton-web to production? Runs before the AI classifier so deploy requests
+ * are never misrouted.
  */
 export function isDeployRequest(text: string): boolean {
-  const normalized = text
-    .replace(/<@[^>]+>/g, ' ')
-    .replace(/\s+/g, ' ')
-    .toLowerCase()
-    .trim();
+  return classifyDeployTarget(text) === 'newton-web';
+}
 
-  // Must contain a deploy verb
-  const hasDeployVerb = /\b(deploy|ship|release|push to prod|push prod)\b/.test(normalized);
-  if (!hasDeployVerb) return false;
-
-  // Must reference production target
-  const hasProdTarget = /\b(prod|production)\b/.test(normalized);
-  // Must reference the app (or be unambiguous enough with just "deploy prod")
-  const hasAppRef = /\b(newton[- ]?web|newton[- ]?school|frontend)\b/.test(normalized);
-
-  // "deploy to prod" / "deploy prod" is unambiguous enough even without app name
-  // "deploy newton-web" without "prod" is also valid (prod is the only deploy target)
-  return hasProdTarget || hasAppRef;
+/**
+ * Deterministic check: does the message unambiguously ask to deploy the
+ * MARKETING site (newton-marketing-web)? Kept separate from isDeployRequest
+ * so the two deploy mechanisms (newton-web prod skill vs marketing GitHub
+ * Actions dispatch) can never be confused for each other.
+ */
+export function isMarketingDeployRequest(text: string): boolean {
+  return classifyDeployTarget(text) === 'newton-marketing-web';
 }
 
 export function detectMention(
@@ -266,6 +332,20 @@ export function parseMiniogSubcommand(text: string): MiniogSubcommand | null {
 
   if (head === 'memories') return { kind: 'memories' };
 
+  if (head === 'handoff') {
+    // `handoff [paste|file|link]` — package this thread's context for the
+    // user's own Claude. Viewer-tier via MINIOG_DOSSIER routing, so PMs can
+    // use it anywhere the bot is present. STRICT arity: a natural sentence
+    // like "handoff the deployment to Shiv" must fall through to the
+    // classifier, not dump a transcript.
+    const format = tokens[1]?.toLowerCase();
+    if (tokens.length === 1) return { kind: 'handoff', format: 'auto' };
+    if (tokens.length === 2 && (format === 'paste' || format === 'file' || format === 'link')) {
+      return { kind: 'handoff', format };
+    }
+    return null;
+  }
+
   if (head === 'remember') {
     // Everything after the first word, original case preserved, capped.
     const rest = noMentions.slice(tokens[0].length).trim();
@@ -281,6 +361,13 @@ export function parseMiniogSubcommand(text: string): MiniogSubcommand | null {
 
   if (head === 'forget') {
     const field = tokens[1]?.toLowerCase();
+    // `forget thread` / `forget this thread` tombstones the current thread in
+    // the conversation store (transcript deleted, never re-captured). Gated
+    // downstream to thread participants/admins, with a confirm step.
+    if (field === 'thread' || (field === 'this' && tokens[2]?.toLowerCase() === 'thread')) {
+      const confirmToken = field === 'thread' ? tokens[2] : tokens[3];
+      return { kind: 'forget-thread', confirmed: confirmToken?.toLowerCase() === 'confirm' };
+    }
     // `forget memory <id>` removes a specific pinned fact; lives alongside
     // the per-field clears handled below.
     if (field === 'memory') {
@@ -324,8 +411,16 @@ function inferIntent(
     return { intent: 'DEV_ASSIST' };
   }
 
-  // Deterministic deploy detection — routed before the AI classifier.
-  if (mention.detected && isDeployRequest(event.text ?? '')) {
+  // Deterministic deploy detection — routed before the AI classifier, which
+  // cannot emit DEPLOY. Every deploy-shaped ask (newton-web, marketing, or
+  // ambiguous between the frontends) lands on the DEPLOY intent here;
+  // deployWorkflow re-derives the target the same way and resolves
+  // 'ambiguous' with config.
+  //
+  // Direct address only (an @miniOG mention or a DM). A message that merely
+  // tags the owner is a conversation between people; its wording must never
+  // start a production deploy (issue #428).
+  if (mention.detected && mention.type === 'bot' && classifyDeployTarget(event.text ?? '') !== null) {
     return { intent: 'DEPLOY' };
   }
 

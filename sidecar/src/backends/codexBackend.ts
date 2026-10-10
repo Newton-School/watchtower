@@ -77,6 +77,15 @@ export function buildCodexPath(existingPath?: string): string {
   return Array.from(parts).join(pathDelimiter);
 }
 
+/**
+ * process.env with the toolchain PATH. The app is launched by the GUI, so the
+ * sidecar inherits a minimal PATH without Homebrew or Node; anything it spawns
+ * directly (`gh`, `git`, `npm`) needs this or fails with ENOENT (issue #444).
+ */
+export function toolchainEnv(): NodeJS.ProcessEnv {
+  return { ...process.env, PATH: buildCodexPath(process.env.PATH) };
+}
+
 function resolveCodexBinary(): string {
   const envOverride = process.env.CODEX_BIN?.trim();
   if (envOverride) {
@@ -139,7 +148,10 @@ export const codexBackend: AgentBackend = {
   },
 
   buildArgs(request: AgentRunRequest, outputPath: string): string[] {
-    const args = ['exec', '--cd', request.cwd, '--full-auto', '--skip-git-repo-check'];
+    // `--json` streams JSONL events to stdout so runCodex can narrate progress
+    // live. It coexists with --output-last-message (verified): the final
+    // message file is still written, so parseOutput is unaffected.
+    const args = ['exec', '--json', '--cd', request.cwd, '--full-auto', '--skip-git-repo-check'];
     if (request.model) {
       args.push('-m', request.model);
     }

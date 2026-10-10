@@ -41,7 +41,7 @@ import { looksLikeFixAffirmation } from './resumeIntentParser.js';
 // conversational workflow then hallucinated a "fix done" reply. Typical
 // successful classifications run 0.85+, so 0.75 is a conservative floor.
 export const CLASSIFIER_CONFIDENCE_FLOOR = 0.75;
-import { isPresencePing } from '../workflows/shared/workflowUtils.js';
+import { formatThreadContextForClassifier, isPresencePing } from '../workflows/shared/workflowUtils.js';
 import { formatDossierForPrompt } from '../state/dossierStore.js';
 
 export async function routeTask(params: {
@@ -151,10 +151,12 @@ export async function routeTask(params: {
       }
       const classification = await classifyWorkflowIntent({
         userMessage,
+        threadContext: formatThreadContextForClassifier(task),
         hasPrUrl,
         mentionType: task.mentionType,
         userDossierSummary,
         logStep,
+        signal,
       });
       classificationReasoning = classification.reasoning;
 
@@ -379,11 +381,11 @@ export async function routeTask(params: {
   }
 
   if (resolvedIntent === 'MINIOG_DOSSIER') {
-    return runMiniogDossierWorkflow({ task: routedTask, slack, store, logStep, signal });
+    return runMiniogDossierWorkflow({ task: routedTask, slack, store, config, logStep, signal });
   }
 
   if (resolvedIntent === 'DEPLOY') {
-    return runDeployWorkflow({ task: routedTask, config, slack, logStep, signal });
+    return runDeployWorkflow({ task: routedTask, config, slack, store, logStep, signal });
   }
 
   // Check file-based workflow templates before falling through to unknown
@@ -415,6 +417,10 @@ async function runTemplateWorkflow(params: {
   const { task, config, slack, template, logStep, signal } = params;
 
   const prompt = renderPromptTemplate(template.promptTemplate, task, config);
+  // Keep the historical cwd: host-authored templates may assume they run
+  // inside the newton-web clone (relative paths, bare npm/git commands).
+  // Templates that target another repo reference it via the absolute
+  // {{repo_api}} / {{repo_marketing}} vars, which don't depend on cwd.
   const cwd = config.repoPaths.newtonWeb;
 
   await slack.chat

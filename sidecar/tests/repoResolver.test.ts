@@ -171,14 +171,39 @@ describe('resolveRepoOrAsk', () => {
       slack,
       threadMessages: [{ text: 'follow-up note' }],
       planAffectedFiles: ['handlers/create.py'],
-      repoAffinity: { newtonApiHits: 12 },
+      repoAffinity: { 'newton-api': 12 },
     });
     const args = vi.mocked(classifyRepo).mock.calls[0][0];
     expect(args.planAffectedFiles).toEqual(['handlers/create.py']);
-    expect(args.affinity).toEqual({ newtonApiHits: 12 });
+    expect(args.affinity).toEqual({ 'newton-api': 12 });
     expect(args.task).toBe('update handlers');
     expect(args.threadMessages).toEqual(['follow-up note']);
     expect(args.threshold).toBe(0.75);
+    // Grep paths cover exactly the ENABLED repos — marketing is unset in
+    // baseConfig, so it must not appear.
+    expect(args.repoGrepPaths).toEqual([
+      { key: 'newton-web', path: '/repos/web' },
+      { key: 'newton-api', path: '/repos/api' },
+    ]);
+  });
+
+  it('treats a classifier verdict for an unconfigured repo as uncertain', async () => {
+    vi.mocked(classifyRepo).mockResolvedValueOnce({
+      selectedRepo: 'newton-marketing-web',
+      confidence: 0.95,
+      reasoning: 'marketing vocabulary',
+      uncertain: false,
+    });
+    // No admins configured + gate disabled → uncertain lands on desktop_only
+    // instead of resolving to a repo whose path lookup would throw.
+    const res = await resolveRepoOrAsk({
+      task: baseTask('fix the landing page CTA'),
+      config: baseConfig(),
+      slack,
+      threadMessages: [],
+      askAdminsOnUncertain: false,
+    });
+    expect(res.outcome).toBe('desktop_only');
   });
 
   it('routes to the admin gate when the classifier is uncertain', async () => {
@@ -315,10 +340,37 @@ describe('resolveRepoOrAsk', () => {
     ).toBeNull();
   });
 
+  it('inferRepoFromAffectedFiles resolves newton-marketing-web without newton-web substring bleed', () => {
+    // 'newton-marketing-web' paths do NOT contain the substring 'newton-web',
+    // so a marketing-only list resolves to marketing — never to newton-web.
+    const allMarketing = [
+      '/repos/newton-marketing-web/src/features/nst/Hero.tsx',
+      '/repos/newton-marketing-web/src/app/(landing)/nst/page.tsx',
+    ];
+    expect(inferRepoFromAffectedFiles(allMarketing)).toBe('newton-marketing-web');
+
+    // Mixed marketing + web hits → defer to the LLM.
+    expect(
+      inferRepoFromAffectedFiles([
+        '/repos/newton-marketing-web/src/features/nst/Hero.tsx',
+        '/repos/newton-marketing-web/src/features/nst/content.ts',
+        '/repos/newton-web/src/containers/Nsat/index.js',
+        '/repos/newton-web/src/containers/Nsat/constants.js',
+      ]),
+    ).toBeNull();
+  });
+
   it('repoPathFor returns the configured path for the given repo', () => {
     const cfg = baseConfig();
     expect(repoPathFor('newton-web', cfg)).toBe('/repos/web');
     expect(repoPathFor('newton-api', cfg)).toBe('/repos/api');
+    expect(
+      repoPathFor('newton-marketing-web', {
+        ...cfg,
+        repoPaths: { ...cfg.repoPaths, newtonMarketingWeb: '/repos/marketing' },
+      }),
+    ).toBe('/repos/marketing');
+    expect(() => repoPathFor('newton-marketing-web', cfg)).toThrow(/not configured/);
   });
 
   it('returns cancelled when admin replies cancel', async () => {

@@ -23,6 +23,8 @@ import type {
 } from '../types/contracts.js';
 import { createInvestigationStore, type InvestigationStore } from './investigationStore.js';
 import { createDossierStore, type DossierStore } from './dossierStore.js';
+import { createConversationStore, type ConversationStore } from './conversationStore.js';
+import { createExportLog, type ExportLog } from '../egress/exportLog.js';
 
 function normalizeStoredPersonalityMode(mode: unknown): PersonalityMode {
   return mode === 'terse' || mode === 'technical' || mode === 'casual' ? mode : 'normal';
@@ -100,6 +102,8 @@ export class JobStore {
   private db: Database.Database;
   private _investigationStore?: InvestigationStore;
   private _dossierStore?: DossierStore;
+  private _conversationStore?: ConversationStore;
+  private _exportLog?: ExportLog;
 
   // Hot-path statements compiled once. better-sqlite3 does NOT cache prepared
   // statements (every .prepare() compiles a fresh one), so re-preparing on each
@@ -150,6 +154,20 @@ export class JobStore {
       this._dossierStore = createDossierStore(this.db);
     }
     return this._dossierStore;
+  }
+
+  conversationStore(): ConversationStore {
+    if (!this._conversationStore) {
+      this._conversationStore = createConversationStore(this.db);
+    }
+    return this._conversationStore;
+  }
+
+  exportLog(): ExportLog {
+    if (!this._exportLog) {
+      this._exportLog = createExportLog(this.db);
+    }
+    return this._exportLog;
   }
 
   private migrate(): void {
@@ -437,6 +455,27 @@ export class JobStore {
       );
       CREATE INDEX IF NOT EXISTS idx_investigation_findings_channel ON investigation_findings(channel_id, thread_ts);
 
+      CREATE TABLE IF NOT EXISTS pr_review_findings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pr_url TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        pr_number INTEGER NOT NULL,
+        pr_head_sha TEXT,
+        job_id TEXT NOT NULL,
+        author TEXT,
+        role TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        category TEXT NOT NULL,
+        message TEXT NOT NULL,
+        file TEXT,
+        line INTEGER,
+        suggestion TEXT,
+        applied_skills TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_pr_review_findings_pr ON pr_review_findings(pr_url, created_at);
+      CREATE INDEX IF NOT EXISTS idx_pr_review_findings_repo ON pr_review_findings(repo, created_at);
+
       CREATE TABLE IF NOT EXISTS user_dossiers (
         user_id TEXT PRIMARY KEY,
         display_name TEXT,
@@ -548,6 +587,85 @@ export class JobStore {
       CREATE TABLE IF NOT EXISTS access_cache_signals (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         updated_at TEXT NOT NULL
+      );
+
+      -- Conversation layer: every miniOG Slack thread as a first-class object
+      -- plus its full transcript. Deliberately stores raw user text — an
+      -- owner-approved reversal of the dossier layer's no-raw-text invariant,
+      -- scoped to these tables only (dossier rollups and the profile
+      -- synthesizer must never read them). IMs/MPIMs are never captured;
+      -- private channels are tagged visibility='private'. FTS5 virtual tables
+      -- + triggers live in conversationStore.ts (guarded — FTS5 may be absent).
+      CREATE TABLE IF NOT EXISTS conversation_threads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_id TEXT NOT NULL,
+        thread_ts TEXT NOT NULL,
+        channel_name TEXT,
+        channel_type TEXT NOT NULL DEFAULT 'channel',
+        visibility TEXT NOT NULL DEFAULT 'org',
+        status TEXT NOT NULL DEFAULT 'active',
+        title TEXT,
+        summary TEXT,
+        decisions_json TEXT,
+        action_items_json TEXT,
+        participants_json TEXT NOT NULL DEFAULT '[]',
+        message_count INTEGER NOT NULL DEFAULT 0,
+        first_message_ts TEXT,
+        last_activity_ts TEXT,
+        last_captured_at TEXT,
+        synthesized_at TEXT,
+        synthesized_message_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(channel_id, thread_ts)
+      );
+      CREATE INDEX IF NOT EXISTS idx_conversation_threads_activity
+        ON conversation_threads(status, last_activity_ts);
+
+      CREATE TABLE IF NOT EXISTS conversation_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        thread_id INTEGER NOT NULL,
+        channel_id TEXT NOT NULL,
+        thread_ts TEXT NOT NULL,
+        message_ts TEXT NOT NULL,
+        user_id TEXT NOT NULL DEFAULT '',
+        display_name TEXT,
+        is_bot INTEGER NOT NULL DEFAULT 0,
+        subtype TEXT,
+        text TEXT NOT NULL,
+        files_json TEXT,
+        edited INTEGER NOT NULL DEFAULT 0,
+        -- Slack-deleted messages are blanked in place (text cleared,
+        -- deleted=1) rather than row-deleted, so the dedupe key survives and
+        -- a stale in-flight capture snapshot can never resurrect them.
+        deleted INTEGER NOT NULL DEFAULT 0,
+        captured_at TEXT NOT NULL,
+        UNIQUE(channel_id, thread_ts, message_ts)
+      );
+      CREATE INDEX IF NOT EXISTS idx_conversation_messages_thread
+        ON conversation_messages(thread_id, message_ts);
+      CREATE INDEX IF NOT EXISTS idx_conversation_messages_user
+        ON conversation_messages(user_id, message_ts);
+
+      -- Egress audit log: one row per (surface, thread) that has been (or is
+      -- being) exported outside Slack — currently surface='github' (the
+      -- miniog-conversations markdown repo). Doubles as the dedupe/backoff
+      -- state for publishers and the URL source for "handoff link".
+      CREATE TABLE IF NOT EXISTS egress_exports (
+        surface TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        thread_ts TEXT NOT NULL,
+        target_path TEXT,
+        target_url TEXT,
+        content_hash TEXT,
+        commit_sha TEXT,
+        status TEXT NOT NULL DEFAULT 'FAILED',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        last_exported_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (surface, channel_id, thread_ts)
       );
     `);
 
@@ -736,6 +854,36 @@ export class JobStore {
       this.db.exec(`UPDATE app_settings SET agent_backend = 'codex' WHERE agent_backend = 'cursor'`);
     } catch {
       /* column may not exist on very old installs; harmless */
+    }
+
+    try {
+      // Covers conversation_messages tables created before the blank-on-delete
+      // semantics landed (same idempotent-ALTER pattern as above).
+      this.db.exec(`ALTER TABLE conversation_messages ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0`);
+    } catch {
+      /* column already exists */
+    }
+
+    // GitHub conversation-egress settings (M4). Same idempotent-ALTER pattern.
+    try {
+      this.db.exec(`ALTER TABLE app_settings ADD COLUMN github_egress_enabled INTEGER NOT NULL DEFAULT 0`);
+    } catch {
+      /* column already exists */
+    }
+    try {
+      this.db.exec(`ALTER TABLE app_settings ADD COLUMN github_egress_repo TEXT NOT NULL DEFAULT ''`);
+    } catch {
+      /* column already exists */
+    }
+    try {
+      this.db.exec(`ALTER TABLE app_settings ADD COLUMN github_egress_branch TEXT NOT NULL DEFAULT 'main'`);
+    } catch {
+      /* column already exists */
+    }
+    try {
+      this.db.exec(`ALTER TABLE app_settings ADD COLUMN github_egress_include_transcript INTEGER NOT NULL DEFAULT 0`);
+    } catch {
+      /* column already exists */
     }
   }
 
@@ -970,9 +1118,10 @@ export class JobStore {
   /**
    * Find the job (if any) currently RUNNING or PAUSED for a given Slack
    * message ts. Used by the `message_deleted` handler to cancel jobs whose
-   * source message the author just removed. Unlike `activeJobForThread`,
-   * this matches the underlying message identity (`payload_json.eventTs`)
-   * rather than the thread root — so it catches the case where the deleted
+   * source message the author just removed. Unlike the same-thread lock
+   * (`activeJobIdForThread` in state/activeJobs.ts), this matches the
+   * underlying message identity (`payload_json.eventTs`) rather than the
+   * thread root — so it catches the case where the deleted
    * message was a top-level mention that owns its own thread.
    */
   activeJobForEventTs(
@@ -1267,8 +1416,8 @@ export class JobStore {
 
   /**
    * Find a PAUSED job in this thread that should be resumed by the next
-   * @miniOG mention. Uses a wider stale window than activeJobForThread
-   * (24h vs 45min) since paused jobs can sit overnight waiting for the user.
+   * @miniOG mention. The stale window is 24h since paused jobs can sit
+   * overnight waiting for the user.
    */
   pausedJobForThread(
     channelId: string,
@@ -1414,46 +1563,6 @@ export class JobStore {
       .run(new Date().toISOString(), jobId);
   }
 
-  /**
-   * Find the currently-RUNNING job in a thread (if any) — the one that's
-   * actively holding a worker slot. PAUSED jobs are intentionally NOT
-   * considered active here: they've released their slot and a new @miniOG
-   * mention should start a fresh job (a later PR can wire up "resume the
-   * paused job in place" using the persisted resumeContext; today the
-   * resumeContext is forward-compat groundwork + the sweeper's input).
-   */
-  activeJobForThread(
-    channelId: string,
-    threadTs: string,
-    staleMinutes = 45,
-  ): { id: string; workflow: WorkflowIntent; status: JobRecord['status']; updatedAt: string } | undefined {
-    const row = this.db
-      .prepare(
-        `SELECT id, workflow, status, updated_at
-         FROM jobs
-         WHERE channel_id = ?
-           AND thread_ts = ?
-           AND status = 'RUNNING'
-           AND updated_at > datetime('now', '-' || ? || ' minutes')
-         ORDER BY updated_at DESC
-         LIMIT 1`,
-      )
-      .get(channelId, threadTs, staleMinutes) as
-      | { id?: string; workflow?: WorkflowIntent; status?: JobRecord['status']; updated_at?: string }
-      | undefined;
-
-    if (!row?.id || !row?.workflow || !row?.status || !row?.updated_at) {
-      return undefined;
-    }
-
-    return {
-      id: row.id,
-      workflow: row.workflow,
-      status: row.status,
-      updatedAt: row.updated_at,
-    };
-  }
-
   hasDedupeKey(dedupeKey: string): boolean {
     const row = this.db
       .prepare(
@@ -1525,6 +1634,42 @@ export class JobStore {
    * Their processes are gone (sidecar restarted) but SQLite still has them as RUNNING.
    * Returns the number of orphaned jobs cleaned up.
    */
+  /**
+   * RUNNING jobs with the stage of their newest log entry. Read at startup,
+   * before cleanupOrphanedRunningJobs fails them, to find the ones that were
+   * waiting on a person so their thread can be told (issue #436).
+   */
+  listRunningJobsWithLastStage(): Array<{
+    id: string;
+    channelId: string;
+    threadTs: string;
+    requestedBy?: string;
+    lastStage?: string;
+  }> {
+    const rows = this.db
+      .prepare(
+        `SELECT j.id, j.channel_id, j.thread_ts,
+                json_extract(j.payload_json, '$.requestUserId') AS requested_by,
+                (SELECT l.stage FROM job_logs l WHERE l.job_id = j.id ORDER BY l.created_at DESC, l.id DESC LIMIT 1) AS last_stage
+         FROM jobs j
+         WHERE j.status = 'RUNNING'`,
+      )
+      .all() as Array<{
+      id: string;
+      channel_id: string;
+      thread_ts: string;
+      requested_by: string | null;
+      last_stage: string | null;
+    }>;
+    return rows.map(row => ({
+      id: row.id,
+      channelId: row.channel_id,
+      threadTs: row.thread_ts,
+      requestedBy: row.requested_by ?? undefined,
+      lastStage: row.last_stage ?? undefined,
+    }));
+  }
+
   cleanupOrphanedRunningJobs(): number {
     const now = new Date().toISOString();
     const result = this.db
@@ -1549,8 +1694,11 @@ export class JobStore {
    * transaction. RUNNING/PAUSED jobs are never deleted (a PAUSED job is swept to
    * FAILED within 24h, so by the cutoff every surviving job is terminal anyway);
    * dossier / user-memory / pinned-fact tables are intentionally preserved —
-   * they carry long-term per-user value, not operational churn. Returns the
-   * per-table deletion counts.
+   * they carry long-term per-user value, not operational churn. The
+   * conversation tables (conversation_threads / conversation_messages) are
+   * likewise exempt: they are the durable org memory, with their own optional
+   * knob (WATCHTOWER_CONVERSATION_RETENTION_DAYS → pruneIdleMessages). Returns
+   * the per-table deletion counts.
    */
   pruneOldRows(retentionDays: number): {
     jobLogs: number;
@@ -2700,6 +2848,66 @@ export class JobStore {
     }>;
   }
 
+  /**
+   * GitHub conversation-egress settings. Env vars take precedence over the
+   * app_settings row (precedent: the claude-code env overrides in #420) so
+   * the publisher can be enabled without the desktop settings UI:
+   *   WATCHTOWER_GITHUB_EGRESS_REPO=owner/name   (implies enabled unless _ENABLED=0)
+   *   WATCHTOWER_GITHUB_EGRESS_ENABLED=1|0
+   *   WATCHTOWER_GITHUB_EGRESS_BRANCH=main
+   *   WATCHTOWER_GITHUB_EGRESS_INCLUDE_TRANSCRIPT=1|0
+   */
+  readGithubEgressSettings(): { enabled: boolean; repo: string; branch: string; includeTranscript: boolean } {
+    let row: { enabled?: number; repo?: string; branch?: string; include_transcript?: number } | undefined;
+    try {
+      row = this.db
+        .prepare(
+          `SELECT COALESCE(github_egress_enabled, 0) AS enabled,
+                  COALESCE(github_egress_repo, '') AS repo,
+                  COALESCE(github_egress_branch, 'main') AS branch,
+                  COALESCE(github_egress_include_transcript, 0) AS include_transcript
+           FROM app_settings WHERE id = 1 LIMIT 1`,
+        )
+        .get() as typeof row;
+    } catch {
+      row = undefined;
+    }
+
+    const envRepo = process.env.WATCHTOWER_GITHUB_EGRESS_REPO?.trim();
+    const envEnabled = process.env.WATCHTOWER_GITHUB_EGRESS_ENABLED?.trim();
+    const envBranch = process.env.WATCHTOWER_GITHUB_EGRESS_BRANCH?.trim();
+    const envTranscript = process.env.WATCHTOWER_GITHUB_EGRESS_INCLUDE_TRANSCRIPT?.trim();
+
+    const repo = envRepo || (row?.repo ?? '').trim();
+    const enabled = envEnabled === '0' ? false : envEnabled === '1' ? true : envRepo ? true : Boolean(row?.enabled);
+    return {
+      enabled: enabled && repo.length > 0,
+      repo,
+      branch: envBranch || (row?.branch ?? '').trim() || 'main',
+      includeTranscript: envTranscript != null ? envTranscript === '1' : Boolean(row?.include_transcript),
+    };
+  }
+
+  /**
+   * Every (channel, thread) miniOG has touched that is still in the jobs /
+   * events tables (30-day retention window). Seed list for the conversation
+   * backfill's cheap pass — Slack is then the source of truth for content.
+   */
+  listKnownThreadRefs(limit = 2000): Array<{ channelId: string; threadTs: string }> {
+    return this.db
+      .prepare(
+        `SELECT DISTINCT channelId, threadTs FROM (
+           SELECT channel_id AS channelId, thread_ts AS threadTs FROM jobs
+           UNION
+           SELECT channel_id AS channelId, thread_ts AS threadTs FROM events
+         )
+         WHERE channelId IS NOT NULL AND channelId != ''
+           AND threadTs IS NOT NULL AND threadTs != ''
+         LIMIT ?`,
+      )
+      .all(limit) as Array<{ channelId: string; threadTs: string }>;
+  }
+
   readVaultSettings(): { vaultPath: string; vaultEnabled: boolean } {
     try {
       const row = this.db
@@ -2831,6 +3039,118 @@ export class JobStore {
     }
 
     return undefined;
+  }
+
+  /**
+   * Persist a completed PR review's findings — the durable memory an
+   * interactive session structurally lacks. Feeds the PRIOR REVIEW context on
+   * re-reviews and, later, cross-PR recall ("this bug class shipped in PR #X").
+   * Deliberately NOT pruned by pruneOldRows (long-term value, like the dossier
+   * tables). Failures must never fail a review — callers wrap in try/catch.
+   */
+  recordPrReviewFindings(input: {
+    jobId: string;
+    prUrl: string;
+    repo: string;
+    prNumber: number;
+    prHeadSha?: string;
+    author?: string;
+    appliedSkills?: string[];
+    findings: Array<{
+      role: string;
+      severity: string;
+      category: string;
+      message: string;
+      file?: string;
+      line?: number;
+      suggestion?: string;
+    }>;
+  }): void {
+    if (input.findings.length === 0) return;
+    const now = new Date().toISOString();
+    const appliedSkills =
+      input.appliedSkills && input.appliedSkills.length > 0 ? JSON.stringify(input.appliedSkills) : null;
+    const insert = this.db.prepare(
+      `INSERT INTO pr_review_findings
+        (pr_url, repo, pr_number, pr_head_sha, job_id, author, role, severity, category, message, file, line, suggestion, applied_skills, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const tx = this.db.transaction(() => {
+      for (const finding of input.findings) {
+        insert.run(
+          input.prUrl,
+          input.repo,
+          input.prNumber,
+          input.prHeadSha ?? null,
+          input.jobId,
+          input.author ?? null,
+          finding.role,
+          finding.severity,
+          finding.category,
+          finding.message,
+          finding.file ?? null,
+          finding.line ?? null,
+          finding.suggestion ?? null,
+          appliedSkills,
+          now,
+        );
+      }
+    });
+    tx();
+  }
+
+  /** Findings persisted by a prior review of this PR (optionally one job's). */
+  getPrReviewFindings(input: { prUrl: string; jobId?: string; limit?: number }): Array<{
+    jobId: string;
+    prHeadSha?: string;
+    role: string;
+    severity: string;
+    category: string;
+    message: string;
+    file?: string;
+    line?: number;
+    suggestion?: string;
+    createdAt: string;
+  }> {
+    const limit = Math.max(1, Math.min(input.limit ?? 50, 200));
+    const rows = (
+      input.jobId
+        ? this.db
+            .prepare(
+              `SELECT job_id, pr_head_sha, role, severity, category, message, file, line, suggestion, created_at
+               FROM pr_review_findings WHERE pr_url = ? AND job_id = ? ORDER BY id ASC LIMIT ?`,
+            )
+            .all(input.prUrl, input.jobId, limit)
+        : this.db
+            .prepare(
+              `SELECT job_id, pr_head_sha, role, severity, category, message, file, line, suggestion, created_at
+               FROM pr_review_findings WHERE pr_url = ? ORDER BY id DESC LIMIT ?`,
+            )
+            .all(input.prUrl, limit)
+    ) as Array<{
+      job_id: string;
+      pr_head_sha: string | null;
+      role: string;
+      severity: string;
+      category: string;
+      message: string;
+      file: string | null;
+      line: number | null;
+      suggestion: string | null;
+      created_at: string;
+    }>;
+    return rows.map(row => ({
+      jobId: row.job_id,
+      prHeadSha: row.pr_head_sha ?? undefined,
+      role: row.role,
+      severity: row.severity,
+      category: row.category,
+      message: row.message,
+      file: row.file ?? undefined,
+      line: row.line ?? undefined,
+      suggestion: row.suggestion ?? undefined,
+      createdAt: row.created_at,
+    }));
   }
 
   getDevStatusSnapshot(): {

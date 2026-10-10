@@ -1,5 +1,8 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { claudeCodeBackend } from '../src/backends/claudeCodeBackend.js';
+import { claudeCodeBackend, stripPlanHarnessMeta } from '../src/backends/claudeCodeBackend.js';
 
 describe('claudeCodeBackend.parseOutput', () => {
   it('unwraps Claude Code wrapper and extracts inner structured JSON', () => {
@@ -90,6 +93,33 @@ describe('claudeCodeBackend.parseOutput', () => {
       cacheCreationTokens: 200,
       cacheReadTokens: 800,
     });
+  });
+
+  // The installed CLI emits `total_cost_usd`; reading only the legacy
+  // `cost_usd` key meant real runs recorded no cost in agent_calls at all,
+  // while these fixtures kept passing.
+  it('extracts cost from total_cost_usd as emitted by the current CLI', () => {
+    const wrapper = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      result: 'Plain reply.',
+      session_id: 'sess-cost',
+      total_cost_usd: 0.142377,
+    });
+
+    expect(claudeCodeBackend.parseOutput(wrapper).costUsd).toBe(0.142377);
+  });
+
+  it('prefers total_cost_usd when both keys are present', () => {
+    const wrapper = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      result: 'Plain reply.',
+      total_cost_usd: 0.5,
+      cost_usd: 0.1,
+    });
+
+    expect(claudeCodeBackend.parseOutput(wrapper).costUsd).toBe(0.5);
   });
 
   it('returns undefined usage when envelope has no usage block', () => {
@@ -201,6 +231,166 @@ describe('claudeCodeBackend.parseOutput', () => {
       expect(parsed.parsedJson?.summary).toBe('fell back to result text');
     });
   });
+
+  describe('plan-file CLIs (no headless ExitPlanMode — issue #408)', () => {
+    // On Claude Code ≥~2.1.2xx (observed 2.1.209), `-p --permission-mode plan`
+    // does NOT register ExitPlanMode: permission_denials stays empty, the
+    // model writes the plan to ~/.claude/plans/<slug>.md and mentions that
+    // path in its final text. These fixtures mirror the live 2026-07-14
+    // incident (job a1079d24).
+    const planMarkdown = '# Plan: add floating WhatsApp pill\n\n## Files to touch\n- `src/features/x.tsx`\n';
+
+    function writeTempPlanFile(): string {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wt-plan-'));
+      const planPath = path.join(dir, '.claude', 'plans', 'user-context-auto-generated-test.md');
+      fs.mkdirSync(path.dirname(planPath), { recursive: true });
+      fs.writeFileSync(planPath, planMarkdown);
+      return planPath;
+    }
+
+    it('recovers the plan from the plan file named in the final text (plan mode)', () => {
+      const planPath = writeTempPlanFile();
+      const wrapper = JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result:
+          `I've written the plan to \`${planPath}\`. \`ExitPlanMode\` isn't available as a callable tool in this session ` +
+          `(it isn't registered as a deferred tool either), so I'll stop here and hand off — the coder agent reads the plan file verbatim.`,
+        session_id: 'plan-session-3',
+        permission_denials: [],
+      });
+
+      const parsed = claudeCodeBackend.parseOutput(wrapper, { planMode: true });
+      expect(parsed.strategy).toBe('claude_unwrap+plan_file');
+      expect(parsed.parsedJson?.planMarkdown).toBe(planMarkdown.trim());
+      expect(parsed.parsedJson?.summary).toBe(planMarkdown.trim());
+    });
+
+    it('sanitizes harness meta-text from the summary when the plan file is unreadable', () => {
+      const wrapper = JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result:
+          "I've written the plan to `/nonexistent/.claude/plans/gone.md`. `ExitPlanMode` isn't available as a callable tool in this session, so I'll stop here.\n\n" +
+          '**Summary:** Add the floating WhatsApp pill to the NSAT route.',
+        permission_denials: [],
+      });
+
+      const parsed = claudeCodeBackend.parseOutput(wrapper, { planMode: true });
+      expect(parsed.strategy).toBe('claude_unwrap+plain_text');
+      const summary = String(parsed.parsedJson?.summary ?? '');
+      expect(summary).not.toContain('ExitPlanMode');
+      expect(summary).not.toContain('written the plan to');
+      expect(summary).toContain('floating WhatsApp pill');
+    });
+
+    it('keeps the original text when stripping would leave nothing (fail-open)', () => {
+      expect(stripPlanHarnessMeta('`ExitPlanMode` is not available.')).toBe('`ExitPlanMode` is not available.');
+    });
+
+    it('does not mutilate text that merely DISCUSSES plan-mode internals', () => {
+      const answer =
+        'The backend passes `--permission-mode plan` so the planner is read-only.\n' +
+        'ExitPlanMode used to be the harvest channel; see claudeCodeBackend.ts.';
+      expect(stripPlanHarnessMeta(answer)).toBe(answer);
+    });
+
+    it('recovers from tool_input.planFilePath when the denial carries no inline plan', () => {
+      const planPath = writeTempPlanFile();
+      const wrapper = JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result: '',
+        permission_denials: [{ tool_name: 'ExitPlanMode', tool_input: { plan: '', planFilePath: planPath } }],
+      });
+
+      const parsed = claudeCodeBackend.parseOutput(wrapper);
+      expect(parsed.strategy).toBe('claude_unwrap+exit_plan_mode');
+      expect(parsed.parsedJson?.planMarkdown).toBe(planMarkdown.trim());
+    });
+
+    it('does not misreport errors: envelope error status survives the sanitizer', () => {
+      const wrapper = JSON.stringify({
+        type: 'result',
+        subtype: 'error_during_execution',
+        is_error: true,
+        result: 'You have hit your usage limit.',
+        permission_denials: [],
+      });
+
+      const parsed = claudeCodeBackend.parseOutput(wrapper, { planMode: true });
+      expect(parsed.strategy).toBe('claude_unwrap+plain_text');
+      expect(parsed.parsedJson?.status).toBe('error');
+      expect(parsed.parsedJson?.summary).toBe('You have hit your usage limit.');
+    });
+
+    it('NEVER hijacks non-plan runs that mention a plans path (review defect)', () => {
+      const planPath = writeTempPlanFile();
+      // (a) a valid JSON result naming the plans file keeps its JSON.
+      const jsonWrapper = JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result: JSON.stringify({
+          status: 'success',
+          summary: `the stale plan at ${planPath} was the culprit`,
+          actions: [],
+          prUrl: '',
+        }),
+        permission_denials: [],
+      });
+      const parsedJsonRun = claudeCodeBackend.parseOutput(jsonWrapper);
+      expect(parsedJsonRun.strategy).not.toBe('claude_unwrap+plan_file');
+      expect(String(parsedJsonRun.parsedJson?.summary)).toContain('was the culprit');
+
+      // (b) a plain-text non-plan answer naming the plans file is untouched.
+      const textWrapper = JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result: `RCA: the planner wrote ${planPath} but the harvest failed. ExitPlanMode was not available on this CLI.`,
+        permission_denials: [],
+      });
+      const parsedTextRun = claudeCodeBackend.parseOutput(textWrapper);
+      expect(parsedTextRun.strategy).toBe('claude_unwrap+plain_text');
+      expect(String(parsedTextRun.parsedJson?.summary)).toContain('the harvest failed');
+    });
+
+    it('a long final-message plan that cites an old plan file is NOT displaced by the file (review defect)', () => {
+      const planPath = writeTempPlanFile();
+      const realPlan =
+        '# Plan: rework harvest\n\n' +
+        `## Context\nThe prior incident artifact lives at ${planPath} and shows the failure shape.\n\n` +
+        '## Steps\n' +
+        Array.from({ length: 12 }, (_, i) => `${i + 1}. Step ${i + 1} does a concrete thing to a concrete file.`).join(
+          '\n',
+        ) +
+        '\n\nScope: medium\nRequires code changes: yes';
+      const wrapper = JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result: realPlan,
+        permission_denials: [],
+      });
+
+      const parsed = claudeCodeBackend.parseOutput(wrapper, { planMode: true });
+      expect(parsed.strategy).toBe('claude_unwrap+plain_text');
+      expect(String(parsed.parsedJson?.summary)).toContain('rework harvest');
+      expect(String(parsed.parsedJson?.summary)).not.toBe(planMarkdown.trim());
+    });
+
+    it('plan-file regex returns quickly on slash-dense tokens (ReDoS regression)', () => {
+      const slashBomb = `https://bucket.s3.amazonaws.com/${'a/'.repeat(200)}object?sig=${'b/'.repeat(120)}end`;
+      const wrapper = JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result: `Uploaded to ${slashBomb} — done.`,
+        permission_denials: [],
+      });
+      const startedAt = Date.now();
+      const parsed = claudeCodeBackend.parseOutput(wrapper, { planMode: true });
+      expect(Date.now() - startedAt).toBeLessThan(1000);
+      expect(parsed.strategy).toBe('claude_unwrap+plain_text');
+    });
+  });
 });
 
 describe('claudeCodeBackend.buildArgs', () => {
@@ -215,12 +405,58 @@ describe('claudeCodeBackend.buildArgs', () => {
     expect(args).not.toContain('--permission-mode');
   });
 
+  it('requests stream-json so tool activity can be narrated live', () => {
+    const args = claudeCodeBackend.buildArgs(baseRequest, '/tmp/out.json');
+    const idx = args.indexOf('--output-format');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('stream-json');
+    // The CLI rejects stream-json under --print without --verbose.
+    expect(args).toContain('--verbose');
+  });
+
+  it('still streams in plan mode', () => {
+    const args = claudeCodeBackend.buildArgs({ ...baseRequest, planMode: true }, '/tmp/out.json');
+    expect(args[args.indexOf('--output-format') + 1]).toBe('stream-json');
+    expect(args).toContain('--verbose');
+    expect(args[args.indexOf('--permission-mode') + 1]).toBe('plan');
+  });
+
   it('uses --permission-mode plan and omits skip-permissions when planMode is true', () => {
     const args = claudeCodeBackend.buildArgs({ ...baseRequest, planMode: true }, '/tmp/out.json');
     expect(args).not.toContain('--dangerously-skip-permissions');
     const idx = args.indexOf('--permission-mode');
     expect(idx).toBeGreaterThanOrEqual(0);
     expect(args[idx + 1]).toBe('plan');
+  });
+
+  it('passes images by path + --add-dir, never the nonexistent --image flag', () => {
+    const imagePaths = ['/tmp/slack-a/F1-shot.png', '/tmp/slack-a/F2-shot.png', '/tmp/slack-b/F3-shot.png'];
+    const args = claudeCodeBackend.buildArgs({ ...baseRequest, planMode: true, imagePaths }, '/tmp/out.json');
+    // The installed CLI exits with "unknown option '--image'".
+    expect(args).not.toContain('--image');
+    const prompt = args[args.indexOf('-p') + 1];
+    expect(prompt.startsWith('hello')).toBe(true);
+    for (const p of imagePaths) expect(prompt).toContain(`- ${p}`);
+    expect(prompt).toContain('Read tool');
+    // One --add-dir with each image dir once; variadic, so it must follow the prompt.
+    const addDir = args.indexOf('--add-dir');
+    expect(addDir).toBeGreaterThan(args.indexOf('-p') + 1);
+    expect(args.slice(addDir + 1, addDir + 3)).toEqual(['/tmp/slack-a', '/tmp/slack-b']);
+    expect(args.filter(a => a === '--add-dir')).toHaveLength(1);
+  });
+
+  it('leaves the prompt and args alone when there are no images', () => {
+    const args = claudeCodeBackend.buildArgs({ ...baseRequest, imagePaths: [] }, '/tmp/out.json');
+    expect(args[args.indexOf('-p') + 1]).toBe('hello');
+    expect(args).not.toContain('--add-dir');
+  });
+
+  it('adds image paths to a resumed run too', () => {
+    const args = claudeCodeBackend.buildArgs(
+      { ...baseRequest, resumeSessionId: 'sess-1', imagePaths: ['/tmp/slack-a/F1-shot.png'] },
+      '/tmp/out.json',
+    );
+    expect(args[args.indexOf('-p') + 1]).toContain('- /tmp/slack-a/F1-shot.png');
   });
 
   it('marks plain-text output from an error envelope as status error, not success (issue #342)', () => {
@@ -292,12 +528,23 @@ describe('claudeCodeBackend MCP + env wiring (scoped investigation)', () => {
       const env = claudeCodeBackend.buildEnv(baseRequest, '/usr/bin');
       expect(env.HOME).toBe('/Users/tester');
       expect(env.USER).toBe('tester');
-      expect(env.PATH).toBe('/usr/bin');
+      expect(env.PATH.split(':')).toContain('/usr/bin');
     } finally {
       if (prevHome === undefined) delete process.env.HOME;
       else process.env.HOME = prevHome;
       if (prevUser === undefined) delete process.env.USER;
       else process.env.USER = prevUser;
     }
+  });
+
+  it('gives agents the toolchain PATH, not the bare PATH a GUI-launched app inherits (issue #444)', () => {
+    const dirs = claudeCodeBackend.buildEnv(baseRequest, '/usr/bin:/bin:/custom/tools').PATH.split(':');
+    // Homebrew (gh) and the sidecar's own Node directory (node, npm, npx).
+    expect(dirs).toContain('/opt/homebrew/bin');
+    expect(dirs).toContain('/usr/local/bin');
+    expect(dirs).toContain(path.dirname(process.execPath));
+    // Whatever was already there is kept.
+    expect(dirs).toContain('/custom/tools');
+    expect(new Set(dirs).size).toBe(dirs.length);
   });
 });

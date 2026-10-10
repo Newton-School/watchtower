@@ -11,6 +11,13 @@ export function diagnoseFailure(input: {
   message: string;
   logs: WorkflowStepLog[];
 }): FailureDiagnosis | undefined {
+  // A cancelled run is not a failure to diagnose. Its log data (a "timeoutMs"
+  // field is enough) used to match the generic timeout rule below, so an
+  // owner's cancel was reported as WORKFLOW_TIMEOUT (issue #438).
+  if (input.logs.some(entry => entry.stage === 'agent.cancelled' || entry.stage === 'job.cancelled')) {
+    return undefined;
+  }
+
   const haystack = `${input.message}\n${input.logs
     .map(entry => `${entry.stage} ${entry.message} ${JSON.stringify(entry.data ?? {})}`)
     .join('\n')}`.toLowerCase();
@@ -221,7 +228,7 @@ export function diagnoseFailure(input: {
       actions: [
         'Check that the repo classifier resolved a valid repository (look for workflow.repo.classified in logs).',
         'Ensure the target repo path exists and is accessible.',
-        'Retry and mention the repo name explicitly (e.g., "in newton-web").',
+        'Retry and mention the repo name explicitly (e.g., "in newton-web" or "in newton-marketing-web").',
       ],
     };
   }

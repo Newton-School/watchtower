@@ -1,5 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { runImplementationWorkflow } from '../src/workflows/implementationWorkflow.js';
+import {
+  __quickActionConfirm,
+  QUICK_ACTION_APPROVE_REFUSAL,
+  QUICK_ACTION_DEPLOY_REDIRECT,
+  QUICK_ACTION_DEPLOY_RE,
+  runImplementationWorkflow,
+} from '../src/workflows/implementationWorkflow.js';
 import { runCodex } from '../src/codex/runCodex.js';
 import { runAgenticEntry } from '../src/agentic/agenticEntry.js';
 
@@ -84,24 +90,35 @@ function makeSlack() {
   };
 }
 
-function makeTask(text: string) {
+const PR_URL = 'https://github.com/Newton-School/newton-web/pull/9300';
+
+function makeTask(text: string, options: { byOwner?: boolean; withPr?: boolean } = {}) {
+  const prContext = { url: PR_URL, owner: 'Newton-School', repo: 'newton-web', number: 9300 };
   return {
     event: {
       eventId: 'EvNoCode',
       channelId: 'C1',
       threadTs: '111.22',
       eventTs: '111.22',
-      userId: 'UBUILDER',
+      userId: options.byOwner ? 'UOWNER1' : 'UBUILDER',
       text,
       rawEvent: {},
     },
     mentionDetected: true,
     mentionType: 'bot' as const,
-    isOwnerAuthor: false,
+    isOwnerAuthor: Boolean(options.byOwner),
     isCoreDevAuthor: false,
     intent: 'IMPLEMENTATION' as const,
+    ...(options.withPr ? { prContext } : {}),
   };
 }
+
+// Merge / close / revert asked by someone other than the owner now wait for
+// the owner's confirmation (issue #429). Default to "the owner confirmed" so
+// suites about what happens afterwards keep exercising it.
+beforeEach(() => {
+  __quickActionConfirm.wait = vi.fn().mockResolvedValue({ outcome: 'confirmed', userId: 'UOWNER1' });
+});
 
 // Planner verdict: no code changes needed (the codex backend reads
 // requiresCodeChanges straight off parsedJson).
@@ -169,5 +186,252 @@ describe('implementationWorkflow — no code needed (#348 RC2)', () => {
     // planner + quick-action codex call.
     expect(runCodex).toHaveBeenCalledTimes(2);
     expect(result.workflow).toBe('IMPLEMENTATION');
+  });
+});
+
+describe('implementationWorkflow — quick action never deploys (#407)', () => {
+  beforeEach(() => {
+    vi.mocked(runCodex).mockReset().mockResolvedValue(plannerNoCodeResult());
+    vi.mocked(runAgenticEntry).mockReset();
+  });
+
+  async function run(text: string) {
+    const slack = makeSlack();
+    const result = await runImplementationWorkflow({
+      task: makeTask(text),
+      config,
+      slack: slack as unknown as import('@slack/web-api').WebClient,
+    });
+    return { result, slack };
+  }
+
+  it.each([
+    '<@UBOT1> release the NSAT results page fix',
+    '<@UBOT1> ship it',
+    '<@UBOT1> deploy this',
+    '<@UBOT1> roll back the last change',
+    '<@UBOT1> rollback prod',
+    '<@UBOT1> push this to production',
+  ])('redirects %s to the deploy command instead of running an agent', async text => {
+    const { result, slack } = await run(text);
+
+    // Only the planner ran: no quick-action agent, no informational agent.
+    expect(runCodex).toHaveBeenCalledTimes(1);
+    expect(runAgenticEntry).not.toHaveBeenCalled();
+    expect(result.status).toBe('SKIPPED');
+    expect(result.message).toBe(QUICK_ACTION_DEPLOY_REDIRECT);
+    const posted = slack.chat.postMessage.mock.calls.map(call => call[0].text);
+    expect(posted).toContain(QUICK_ACTION_DEPLOY_REDIRECT);
+    expect(QUICK_ACTION_DEPLOY_REDIRECT).toContain('deploy newton-web to prod');
+  });
+
+  it('keeps the other operation in a mixed ask, and tells the agent never to deploy', async () => {
+    const { result } = await run('<@UBOT1> merge this PR and deploy it');
+
+    expect(runCodex).toHaveBeenCalledTimes(2);
+    const quickPrompt = vi.mocked(runCodex).mock.calls[1][0].prompt;
+    expect(quickPrompt).toContain('Never deploy, release, ship or roll back anything');
+    expect(quickPrompt).not.toContain('(merge PR, deploy,');
+    expect(result.workflow).toBe('IMPLEMENTATION');
+  });
+
+  it('carries the same guardrail on a plain merge', async () => {
+    await run('<@UBOT1> merge this PR');
+    expect(vi.mocked(runCodex).mock.calls[1][0].prompt).toContain('never run a deploy command, script or skill');
+  });
+
+  it('does not treat words that merely contain a deploy verb as a deploy ask', () => {
+    expect(QUICK_ACTION_DEPLOY_RE.test('check the relationship table and the shipment page')).toBe(false);
+    expect(QUICK_ACTION_DEPLOY_RE.test('redeployment notes')).toBe(false);
+  });
+});
+
+describe('implementationWorkflow — quick-action merge needs the owner (#429)', () => {
+  beforeEach(() => {
+    vi.mocked(runCodex).mockReset().mockResolvedValue(plannerNoCodeResult());
+    vi.mocked(runAgenticEntry).mockReset();
+  });
+
+  async function run(text: string, options: { byOwner?: boolean; withPr?: boolean } = {}, overrides = {}) {
+    const slack = makeSlack();
+    const logs: { stage: string; data?: Record<string, unknown> }[] = [];
+    const result = await runImplementationWorkflow({
+      task: makeTask(text, options),
+      config: { ...config, ...overrides },
+      slack: slack as unknown as import('@slack/web-api').WebClient,
+      logStep: entry => logs.push(entry),
+    });
+    const posted = slack.chat.postMessage.mock.calls.map(call => call[0].text as string);
+    return { result, posted, logs };
+  }
+
+  const outcome = (value: string) => {
+    __quickActionConfirm.wait = vi.fn().mockResolvedValue({ outcome: value });
+  };
+
+  it('asks the owner, by exact phrase, before merging for someone else', async () => {
+    const { posted, logs } = await run(`<@UBOT1> merge ${PR_URL}`, { withPr: true });
+
+    const prompt = posted.find(text => text.includes('confirm merge'));
+    expect(prompt).toContain('<@UBUILDER> asked me to merge');
+    expect(prompt).toContain(PR_URL);
+    expect(prompt).toContain('<@UOWNER1>, reply `confirm merge` within 10 minutes');
+    expect(__quickActionConfirm.wait).toHaveBeenCalledWith(
+      expect.objectContaining({
+        promptTs: '123.45',
+        phrase: 'confirm merge',
+        allowedUserIds: ['UOWNER1'],
+        stagePrefix: 'implementation.quick_action.confirm',
+      }),
+    );
+    // Confirmed: the quick action runs, and the run is auditable.
+    expect(runCodex).toHaveBeenCalledTimes(2);
+    const audit = logs.find(entry => entry.stage === 'implementation.quick_action.pr_action');
+    expect(audit?.data).toEqual({ action: 'merge', prUrls: [PR_URL], requestedBy: 'UBUILDER', confirmedBy: 'UOWNER1' });
+  });
+
+  it('does not let the requester, or any other admin, be the one who confirms', async () => {
+    await run(
+      `<@UBOT1> merge ${PR_URL}`,
+      { withPr: true },
+      { coreDevSlackUserIds: ['UOWNER1', 'UBUILDER', 'UADMIN2'] },
+    );
+    expect(vi.mocked(__quickActionConfirm.wait).mock.calls[0][0].allowedUserIds).toEqual(['UOWNER1']);
+  });
+
+  it.each([
+    ['expired', 'SKIPPED', 'so nothing was changed'],
+    ['declined', 'SKIPPED', 'Okay, leaving it as it is.'],
+    ['cancelled', 'CANCELLED', 'Stopped before the merge was confirmed.'],
+  ])('runs no agent when the confirmation is %s', async (value, status, message) => {
+    outcome(value);
+    const { result } = await run(`<@UBOT1> merge ${PR_URL}`, { withPr: true });
+
+    expect(runCodex).toHaveBeenCalledTimes(1); // the planner only
+    expect(result.status).toBe(status);
+    expect(result.message).toContain(message);
+  });
+
+  it('uses the action in the phrase for close and revert', async () => {
+    await run('<@UBOT1> close this PR', { withPr: true });
+    expect(vi.mocked(__quickActionConfirm.wait).mock.calls[0][0].phrase).toBe('confirm close');
+
+    await run('<@UBOT1> revert this PR', { withPr: true });
+    expect(vi.mocked(__quickActionConfirm.wait).mock.lastCall?.[0].phrase).toBe('confirm revert');
+  });
+
+  it("runs the owner's own merge without asking the owner to confirm", async () => {
+    const { logs } = await run(`<@UBOT1> merge ${PR_URL}`, { byOwner: true, withPr: true });
+
+    expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
+    expect(runCodex).toHaveBeenCalledTimes(2);
+    const audit = logs.find(entry => entry.stage === 'implementation.quick_action.pr_action');
+    expect(audit?.data).toMatchObject({ requestedBy: 'UOWNER1', confirmedBy: 'UOWNER1' });
+  });
+
+  it('refuses when no owner is configured to confirm', async () => {
+    const { result } = await run(`<@UBOT1> merge ${PR_URL}`, { withPr: true }, { ownerSlackUserIds: [] });
+
+    expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
+    expect(runCodex).toHaveBeenCalledTimes(1);
+    expect(result.status).toBe('SKIPPED');
+    expect(result.message).toContain('no owner configured');
+  });
+
+  it('declines an approve-only ask without running an agent', async () => {
+    const { result, posted } = await run('<@UBOT1> approve this PR', { withPr: true });
+
+    expect(runCodex).toHaveBeenCalledTimes(1);
+    expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
+    expect(result.status).toBe('SKIPPED');
+    expect(posted).toContain(QUICK_ACTION_APPROVE_REFUSAL);
+  });
+
+  it('never lets the agent approve, and limits it to the named pull requests', async () => {
+    await run(`<@UBOT1> approve and merge ${PR_URL}`, { withPr: true });
+
+    expect(vi.mocked(__quickActionConfirm.wait).mock.calls[0][0].phrase).toBe('confirm merge');
+    const quickPrompt = vi.mocked(runCodex).mock.calls[1][0].prompt;
+    expect(quickPrompt).toContain('Never submit an approving review');
+    expect(quickPrompt).toContain(`Pull requests you may act on: ${PR_URL}.`);
+    expect(quickPrompt).toContain('Do not merge, close or revert any other pull request.');
+  });
+
+  it('leaves other quick operations, such as re-running tests, unconfirmed', async () => {
+    await run('<@UBOT1> rerun the tests');
+    expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
+    expect(runCodex).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('implementationWorkflow — cancelled runs post no failure copy (#438)', () => {
+  beforeEach(() => {
+    vi.mocked(runCodex).mockReset();
+    vi.mocked(runAgenticEntry).mockReset();
+  });
+
+  it('returns CANCELLED when stopped during the quick action, without "Quick action completed."', async () => {
+    const controller = new AbortController();
+    vi.mocked(runCodex)
+      .mockResolvedValueOnce(plannerNoCodeResult())
+      .mockImplementationOnce(async () => {
+        controller.abort();
+        return { ok: false, exitCode: 143, timedOut: false, stdout: '', stderr: '', lastMessage: '' };
+      });
+    const slack = makeSlack();
+
+    const result = await runImplementationWorkflow({
+      task: makeTask('<@UBOT1> rerun the tests'),
+      config,
+      slack: slack as unknown as import('@slack/web-api').WebClient,
+      signal: controller.signal,
+    });
+
+    expect(result.status).toBe('CANCELLED');
+    const posted = slack.chat.postMessage.mock.calls.map(call => call[0].text);
+    expect(posted).not.toContain('Quick action completed.');
+  });
+
+  it('returns CANCELLED when stopped during planning, and never asks for a merge confirmation', async () => {
+    const controller = new AbortController();
+    vi.mocked(runCodex).mockImplementationOnce(async () => {
+      controller.abort();
+      return plannerNoCodeResult();
+    });
+    const slack = makeSlack();
+
+    const result = await runImplementationWorkflow({
+      task: makeTask(`<@UBOT1> merge ${PR_URL}`, { withPr: true }),
+      config,
+      slack: slack as unknown as import('@slack/web-api').WebClient,
+      signal: controller.signal,
+    });
+
+    expect(result.status).toBe('CANCELLED');
+    expect(runCodex).toHaveBeenCalledTimes(1);
+    expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
+  });
+});
+
+describe('implementationWorkflow — the abort signal reaches the planner (#264)', () => {
+  beforeEach(() => {
+    vi.mocked(runCodex).mockReset().mockResolvedValue(plannerNoCodeResult());
+    vi.mocked(runAgenticEntry).mockReset();
+  });
+
+  it("passes the job's signal to the planner run, so a cancel stops it", async () => {
+    const controller = new AbortController();
+    const slack = makeSlack();
+
+    await runImplementationWorkflow({
+      task: makeTask('<@UBOT1> rerun the tests'),
+      config,
+      slack: slack as unknown as import('@slack/web-api').WebClient,
+      signal: controller.signal,
+    });
+
+    // Planner, then the quick action: both must be stoppable.
+    expect(vi.mocked(runCodex).mock.calls[0][0].signal).toBe(controller.signal);
+    expect(vi.mocked(runCodex).mock.calls[1][0].signal).toBe(controller.signal);
   });
 });

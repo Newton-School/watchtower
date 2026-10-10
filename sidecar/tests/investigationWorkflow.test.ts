@@ -50,17 +50,45 @@ function investigatorOk() {
   };
 }
 
+const baseCtx = {
+  cwd: '/repos',
+  repoName: undefined,
+  threadContext: 'thread',
+  imagePaths: [],
+  imageContext: '',
+  githubToken: undefined,
+  desktopOnly: undefined,
+};
+
 beforeEach(() => {
   runCodex.mockReset().mockResolvedValue(investigatorOk());
   getActiveBackendId.mockReset().mockReturnValue('claude-code');
   classifyInvestigationScope.mockReset();
-  prepareWorkflowContext.mockReset().mockResolvedValue({
-    cwd: '/repos',
-    repoName: undefined,
-    threadContext: 'thread',
-    imageContext: '',
-    githubToken: undefined,
-    desktopOnly: undefined,
+  prepareWorkflowContext.mockReset().mockResolvedValue(baseCtx);
+});
+
+describe('runInvestigationWorkflow thread images', () => {
+  beforeEach(() => {
+    classifyInvestigationScope.mockResolvedValue({
+      scope: 'newton-web',
+      confidence: 0.9,
+      reasoning: 'ui',
+      method: 'llm',
+    });
+  });
+
+  it('hands downloaded thread screenshots to the investigator', async () => {
+    prepareWorkflowContext.mockResolvedValue({ ...baseCtx, imagePaths: ['/tmp/slack-files/F1-image.png'] });
+
+    await runInvestigationWorkflow({ task: makeTask('pls remove this section'), config, slack: slackStub() as any });
+
+    expect(runCodex.mock.calls[0][0].imagePaths).toEqual(['/tmp/slack-files/F1-image.png']);
+  });
+
+  it('passes no imagePaths when the thread has none', async () => {
+    await runInvestigationWorkflow({ task: makeTask('button is misaligned'), config, slack: slackStub() as any });
+
+    expect(runCodex.mock.calls[0][0].imagePaths).toBeUndefined();
   });
 });
 
@@ -106,6 +134,65 @@ describe('runInvestigationWorkflow scope wiring', () => {
     expect(prompt).toMatch(/mcp__metabase__/);
   });
 
+  it('marketing scope pins the marketing worktree and warns about Webflow path routing', async () => {
+    classifyInvestigationScope.mockResolvedValue({
+      scope: 'newton-marketing-web',
+      confidence: 0.9,
+      reasoning: 'landing page symptom',
+      method: 'llm',
+    });
+    const slack = slackStub();
+    const marketingConfig = {
+      ...config,
+      repoPaths: { ...config.repoPaths, newtonMarketingWeb: '/repos/newton-marketing-web' },
+    };
+
+    await runInvestigationWorkflow({
+      task: makeTask('images 404 on the AI course landing page'),
+      config: marketingConfig,
+      slack: slack as any,
+    });
+
+    expect(prepareWorkflowContext).toHaveBeenCalledWith(
+      expect.objectContaining({ repoOverride: 'newton-marketing-web' }),
+    );
+    // The scope classifier greps all enabled clones, marketing included.
+    expect(classifyInvestigationScope).toHaveBeenCalledWith(
+      expect.objectContaining({
+        repoGrepPaths: [
+          { key: 'newton-web', path: '/repos/newton-web' },
+          { key: 'newton-api', path: '/repos/newton-api' },
+          { key: 'newton-marketing-web', path: '/repos/newton-marketing-web' },
+        ],
+      }),
+    );
+    const acks = slack.chat.postMessage.mock.calls.map(c => c[0].text as string);
+    expect(acks.some(t => t.includes('newton-marketing-web'))).toBe(true);
+    // The investigator is told to check worker/paths.js before blaming code.
+    const prompt = runCodex.mock.calls[0][0].prompt as string;
+    expect(prompt).toContain('worker/paths.js');
+  });
+
+  it('broad scope excludes the marketing clone when it is configured', async () => {
+    classifyInvestigationScope.mockResolvedValue({
+      scope: 'broad',
+      confidence: 0.3,
+      reasoning: 'vague',
+      method: 'llm',
+    });
+    const marketingConfig = {
+      ...config,
+      repoPaths: { ...config.repoPaths, newtonMarketingWeb: '/repos/newton-marketing-web' },
+    };
+
+    await runInvestigationWorkflow({ task: makeTask('broken'), config: marketingConfig, slack: slackStub() as any });
+    expect(runCodex.mock.calls[0][0].prompt as string).toContain('OUT OF SCOPE');
+
+    runCodex.mockClear();
+    await runInvestigationWorkflow({ task: makeTask('broken'), config, slack: slackStub() as any });
+    expect(runCodex.mock.calls[0][0].prompt as string).not.toContain('OUT OF SCOPE');
+  });
+
   it('broad scope degrades to repos-only on the codex backend', async () => {
     getActiveBackendId.mockReturnValue('codex');
     classifyInvestigationScope.mockResolvedValue({
@@ -137,5 +224,98 @@ describe('runInvestigationWorkflow scope wiring', () => {
     expect(runCodex.mock.calls[0][0].mcpServers).toBeUndefined();
     const prompt = runCodex.mock.calls[0][0].prompt as string;
     expect(prompt).toMatch(/No database access is available/);
+  });
+});
+
+describe('runInvestigationWorkflow cancelled mid-run (issue #438)', () => {
+  beforeEach(() => {
+    classifyInvestigationScope.mockResolvedValue({
+      scope: 'newton-web',
+      confidence: 0.9,
+      reasoning: 'ui',
+      method: 'llm',
+    });
+  });
+
+  it('returns CANCELLED and posts no failure copy when the run was aborted', async () => {
+    const controller = new AbortController();
+    // The agent dies with the abort: no output, not ok.
+    runCodex.mockImplementation(async () => {
+      controller.abort();
+      return { ok: false, exitCode: 143, cancelled: true, parsedJson: undefined };
+    });
+    const slack = slackStub();
+
+    const result = await runInvestigationWorkflow({
+      task: makeTask('checkout page is broken'),
+      config,
+      slack: slack as any,
+      signal: controller.signal,
+    });
+
+    expect(result.status).toBe('CANCELLED');
+    expect(result.slackPosted).toBe(false);
+    const posted = slack.chat.postMessage.mock.calls.map((call: any[]) => call[0].text as string);
+    expect(posted.some(text => text.includes("couldn't complete the investigation"))).toBe(false);
+  });
+
+  it('still reports a genuine failure when nothing was cancelled', async () => {
+    runCodex.mockResolvedValue({ ok: false, exitCode: 1, parsedJson: undefined });
+    const slack = slackStub();
+
+    const result = await runInvestigationWorkflow({
+      task: makeTask('checkout page is broken'),
+      config,
+      slack: slack as any,
+    });
+
+    expect(result.status).toBe('FAILED');
+    const posted = slack.chat.postMessage.mock.calls.map((call: any[]) => call[0].text as string);
+    expect(posted.some(text => text.includes("couldn't complete the investigation"))).toBe(true);
+  });
+});
+
+describe('runInvestigationWorkflow cancelled while asking which repo (issue #264)', () => {
+  beforeEach(() => {
+    classifyInvestigationScope.mockResolvedValue({
+      scope: 'newton-web',
+      confidence: 0.9,
+      reasoning: 'ui',
+      method: 'llm',
+    });
+  });
+
+  it("hands the job's signal to the context step that asks which repo", async () => {
+    const controller = new AbortController();
+
+    await runInvestigationWorkflow({
+      task: makeTask('checkout page is broken'),
+      config,
+      slack: slackStub() as any,
+      signal: controller.signal,
+    });
+
+    expect(prepareWorkflowContext.mock.calls[0][0].signal).toBe(controller.signal);
+  });
+
+  it('returns CANCELLED, with no "desktop queue" copy and no agent run, when cancelled during that step', async () => {
+    const controller = new AbortController();
+    // What the repo-choice wait leaves behind once the abort ends it.
+    prepareWorkflowContext.mockImplementation(async () => {
+      controller.abort();
+      return { ...baseCtx, desktopOnly: { reason: 'admin cancelled', cancelled: true } };
+    });
+    const slack = slackStub();
+
+    const result = await runInvestigationWorkflow({
+      task: makeTask('checkout page is broken'),
+      config,
+      slack: slack as any,
+      signal: controller.signal,
+    });
+
+    expect(result.status).toBe('CANCELLED');
+    expect(slack.chat.postMessage).not.toHaveBeenCalled();
+    expect(runCodex).not.toHaveBeenCalled();
   });
 });

@@ -68,6 +68,13 @@ export async function waitForClarificationWithIdle(params: {
     signal,
   } = params;
 
+  // The caller posts the question before calling, and posting clears Slack's
+  // thread status — this is what puts "is waiting for your answer" back up.
+  logStep({
+    stage: 'pipeline.clarification.waiting',
+    message: 'Waiting for an answer to the clarification.',
+  });
+
   const pollIntervalMs = 5_000;
   const startedAt = Date.now();
   let nudged = false;

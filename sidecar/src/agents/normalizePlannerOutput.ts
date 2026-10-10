@@ -93,15 +93,23 @@ function looksLikeFilePath(candidate: string): boolean {
   if (candidate.length === 0 || candidate.length > 200) return false;
   if (/\s/.test(candidate)) return false;
   if (/^https?:\/\//i.test(candidate)) return false;
+  // Harness bookkeeping paths are never repo files (#408): home-anchored
+  // paths (`~/…`, `/Users/x/.claude/…`) and plan files anywhere. A
+  // repo-RELATIVE `.claude/...` (e.g. `.claude/skills/x/SKILL.md`, which this
+  // repo tracks) stays a legitimate affected file.
+  if (candidate.startsWith('~/')) return false;
+  if (/^\/.*\/\.claude\//.test(candidate)) return false;
+  if (/(^|\/)\.claude\/plans\//.test(candidate)) return false;
   // Reject function-call-shaped tokens (`foo()`, `foo(arg)`) but allow path
   // segments with parens like Next.js route groups (`src/app/(marketing)/page.tsx`).
   if ((candidate.includes('(') || candidate.includes(')')) && !candidate.includes('/')) return false;
   // Reject schemeless URLs whose first segment is host-shaped (`github.com/org/repo`).
-  // `./foo` and `../foo` are allowed (`.`/`..` aren't hosts).
+  // `./foo`, `../foo`, and dot-directories (`.claude/skills/x`, `.github/workflows/y`)
+  // are allowed — hostnames never start with a dot.
   const slashIdx = candidate.indexOf('/');
   if (slashIdx > 0) {
     const firstSegment = candidate.slice(0, slashIdx);
-    if (firstSegment !== '.' && firstSegment !== '..' && firstSegment.includes('.')) return false;
+    if (!firstSegment.startsWith('.') && firstSegment.includes('.')) return false;
   }
   const base = basenameOf(candidate);
   if (KNOWN_BASENAMES.has(base)) return true;

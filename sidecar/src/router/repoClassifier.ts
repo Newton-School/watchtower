@@ -2,14 +2,11 @@ import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
 import { lightweightProfile } from '../codex/modelProfiles.js';
+import { REPO_KEYS, type RepoKey } from '../repos/registry.js';
 import type { RepoClassificationResult, WorkflowStepLogger } from '../types/contracts.js';
 
-export interface RepoAffinity {
-  /** Hits in the user's last 30 days for newton-web. */
-  newtonWebHits?: number;
-  /** Hits in the user's last 30 days for newton-api. */
-  newtonApiHits?: number;
-}
+/** Per-repo hits in the user's last 30 days, keyed by repo. */
+export type RepoAffinity = Partial<Record<RepoKey, number>>;
 
 export interface ClassifyRepoParams {
   /** The user's current request — the message that triggered this classification. */
@@ -27,18 +24,18 @@ export interface ClassifyRepoParams {
    */
   planMarkdown?: string;
   /**
-   * Absolute paths to the configured repo checkouts. When provided, the
-   * classifier runs a deterministic `git grep` for distinctive entities
+   * Absolute paths to the configured (enabled) repo checkouts. When provided,
+   * the classifier runs a deterministic `git grep` for distinctive entities
    * pulled from the task text (experiment names, function names, quoted
-   * identifiers). If one repo has matches and the other has none AND any
-   * matching entity is distinctive enough (≥ 12 chars), we short-circuit
-   * the LLM with confidence 0.95. Otherwise the hit counts are injected
-   * into the prompt as a high-signal hint. Added 2026-05-26 after a
-   * frontend A/B-test request was mis-routed to newton-api.
+   * identifiers). If exactly one repo has matches AND any matching entity is
+   * distinctive enough (≥ 12 chars), we short-circuit the LLM with confidence
+   * 0.95. Otherwise the hit counts are injected into the prompt as a
+   * high-signal hint. Added 2026-05-26 after a frontend A/B-test request was
+   * mis-routed to newton-api.
    */
-  webPath?: string;
-  apiPath?: string;
+  repoGrepPaths?: Array<{ key: RepoKey; path: string }>;
   logStep?: WorkflowStepLogger;
+  signal?: AbortSignal;
 }
 
 const ENTITY_MAX_PER_REQUEST = 8;
@@ -82,12 +79,18 @@ export function extractEntities(text: string): string[] {
 
 export interface RepoGrepSignals {
   entities: string[];
-  /** Entities that have at least one match in newton-web. */
-  webHittingEntities: string[];
-  /** Entities that have at least one match in newton-api. */
-  apiHittingEntities: string[];
+  /** Entities that have at least one match, per repo. Every RepoKey is present. */
+  hitsByRepo: Record<RepoKey, string[]>;
   /** True if any hitting entity is ≥ {@link ENTITY_DISTINCTIVE_LENGTH} chars. */
   hasDistinctiveHit: boolean;
+}
+
+function emptyHitsByRepo(): Record<RepoKey, string[]> {
+  const hits = {} as Record<RepoKey, string[]>;
+  for (const key of REPO_KEYS) {
+    hits[key] = [];
+  }
+  return hits;
 }
 
 /**
@@ -107,64 +110,94 @@ export const __gitGrepHasHit = {
   },
 };
 
-export function gatherRepoSignals(params: { entities: string[]; webPath?: string; apiPath?: string }): RepoGrepSignals {
-  const { entities, webPath, apiPath } = params;
-  const webHittingEntities: string[] = [];
-  const apiHittingEntities: string[] = [];
+export function gatherRepoSignals(params: {
+  entities: string[];
+  repoGrepPaths?: Array<{ key: RepoKey; path: string }>;
+}): RepoGrepSignals {
+  const { entities, repoGrepPaths = [] } = params;
+  const hitsByRepo = emptyHitsByRepo();
 
-  if (entities.length === 0) {
-    return { entities, webHittingEntities, apiHittingEntities, hasDistinctiveHit: false };
+  if (entities.length === 0 || repoGrepPaths.length === 0) {
+    return { entities, hitsByRepo, hasDistinctiveHit: false };
   }
 
   for (const entity of entities) {
-    if (webPath && __gitGrepHasHit.fn(webPath, entity)) {
-      webHittingEntities.push(entity);
-    }
-    if (apiPath && __gitGrepHasHit.fn(apiPath, entity)) {
-      apiHittingEntities.push(entity);
+    for (const { key, path } of repoGrepPaths) {
+      if (__gitGrepHasHit.fn(path, entity)) {
+        hitsByRepo[key].push(entity);
+      }
     }
   }
 
-  const hasDistinctiveHit = [...webHittingEntities, ...apiHittingEntities].some(
-    e => e.length >= ENTITY_DISTINCTIVE_LENGTH,
-  );
+  const hasDistinctiveHit = Object.values(hitsByRepo)
+    .flat()
+    .some(e => e.length >= ENTITY_DISTINCTIVE_LENGTH);
 
-  return { entities, webHittingEntities, apiHittingEntities, hasDistinctiveHit };
+  return { entities, hitsByRepo, hasDistinctiveHit };
 }
 
-const CLASSIFY_PROMPT = `You are a repo classifier for miniOG, a developer productivity bot.
+const REPO_PROMPT_BLOCKS: Record<RepoKey, string> = {
+  'newton-web': `- "newton-web" — the PRODUCT frontend (Next.js Pages Router, React, Redux/redux-saga, styled-components/Sass). Owns the logged-in app at my.newtonschool.co: courses, lessons, assignments, assessments/tests, code editors, proctoring, TMS (track management), dashboards, payments UI, profile, notifications, and the NSAT timeline / NSAT test-taking flows — the product features users interact with after logging in.`,
+  'newton-api': `- "newton-api" — the backend repo (Python + Django). Owns HTTP endpoints, request handlers, serializers, models, migrations, Celery tasks, Postgres queries, server-side business logic, integrations with third-party APIs, background jobs, and HTTP 5xx errors.`,
+  'newton-marketing-web': `- "newton-marketing-web" — the PUBLIC MARKETING site (Next.js App Router, React 19, Tailwind, static export served behind a Cloudflare Worker). Owns newtonschool.co landing pages migrated page-by-page from Webflow: the homepage, program/course LANDING pages, the PUBLIC NST/NSAT admission pages (the logged-in NSAT timeline/test flows live in newton-web), SEO/meta/sitemap, Lighthouse/CLS/page-speed work, image rehosting to CloudFront, Webflow cutovers, \`-temp\` preview pages, Cloudflare worker path routing, staging-marketing-web.newtonschool.co.`,
+};
 
-The user has sent a task. Route it to one of two repositories:
-
-- "newton-web" — the frontend repo (React, JavaScript). Owns the customer-facing web app at my.newtonschool.co and other newtonschool.co properties. Owns everything visible in the browser: pages, components, nav bars, sidebars, banners, sections, modals, dialogs, buttons, filters, layouts, navigation, CSS, mobile/desktop styling, Next.js / Vite hydration issues, anything tied to a URL the user can open.
-
-- "newton-api" — the backend repo (Python + Django). Owns HTTP endpoints, request handlers, serializers, models, migrations, Celery tasks, Postgres queries, server-side business logic, integrations with third-party APIs, background jobs, and HTTP 5xx errors.
-
-Repo signals you can use beyond intent:
-
-- newton-web (React) file patterns:
+const REPO_SIGNAL_BLOCKS: Record<RepoKey, string> = {
+  'newton-web': `- newton-web (React product app) file patterns:
   • directories: \`src/containers/\`, \`src/components/\`, \`src/hooks/\`, \`src/utils/\`, \`src/tracking/\`, \`src/pages/\`
   • extensions: \`.tsx\`, \`.jsx\`, \`.ts\`, \`.js\`, \`.styles.js\`, \`.styles.ts\`
-  • keywords inside the plan: \`useState\`, \`useEffect\`, \`useSelector\`, \`useDispatch\`, \`styled-components\`, \`NSTypography\`, \`NSButton\`, \`NSIcon\`, \`@newtonschool/grauity\`, \`useNsatTimelineData\`, \`useSendAnalyticsEvent\`
-- newton-api (Django) file patterns:
+  • keywords inside the plan: \`useState\`, \`useEffect\`, \`useSelector\`, \`useDispatch\`, \`styled-components\`, \`NSTypography\`, \`NSButton\`, \`NSIcon\`, \`@newtonschool/grauity\`, \`useNsatTimelineData\`, \`useSendAnalyticsEvent\``,
+  'newton-api': `- newton-api (Django) file patterns:
   • directories: \`courses/\`, \`users/\`, \`payments/\`, \`migrations/\`, \`management/commands/\`
   • files: \`models.py\`, \`views.py\`, \`serializers.py\`, \`enums.py\`, \`urls.py\`, \`tasks.py\`, \`signals.py\`, \`apps.py\`
-  • keywords: \`Model\`, \`Serializer\`, \`ViewSet\`, \`APIView\`, \`Celery\`, \`@receiver\`, \`migrations.RunPython\`, \`PreferredCampus enum\`
+  • keywords: \`Model\`, \`Serializer\`, \`ViewSet\`, \`APIView\`, \`Celery\`, \`@receiver\`, \`migrations.RunPython\`, \`PreferredCampus enum\``,
+  'newton-marketing-web': `- newton-marketing-web (marketing site) file patterns:
+  • directories: \`src/app/(home)/\`, \`src/app/(landing)/\`, \`src/features/<page>/\`, \`worker/\`, \`out/\`
+  • files: \`worker/paths.js\`, \`wrangler.toml\`, App Router \`page.tsx\`/\`layout.tsx\`, per-page \`content.ts\`/\`images.ts\` feature slices
+  • keywords: Tailwind utility classes, \`export const metadata\`, \`generateStaticParams\`, \`output: 'export'\` — and notably NO styled-components, NO Redux`,
+};
+
+const FRONTEND_DISAMBIGUATION = `TELLING THE TWO FRONTENDS APART — both are React apps "visible on a URL"; a URL or a visual change is NOT enough by itself:
+- URL host is the strongest signal: my.newtonschool.co/… ⇒ newton-web. A bare newtonschool.co/<slug> or www.newtonschool.co public content page ⇒ newton-marketing-web.
+- STRONG marketing signals (decisive ⇒ newton-marketing-web): "marketing site/page", "Webflow", page "migration"/"cutover", "batch<N>", "-temp" page, Lighthouse / CLS / page-speed work, image rehost / CloudFront, wrangler / Cloudflare / worker, staging-marketing-web.newtonschool.co.
+- STRONG product signals (decisive ⇒ newton-web): logged-in flows, course/lesson/assignment as an in-app feature, assessment or test-taking, the NSAT TIMELINE, code editor, proctoring, TMS, dashboards, Redux/useSelector/saga, styled-components, jest tests.
+- SHARED PAGE NOUNS — NEVER decisive alone, they exist in BOTH frontends: "landing page", the homepage, NSAT/NST pages, course pages, SEO / meta tags, banners / CTAs / hero sections, responsive or mobile styling, Next.js, React, @newtonschool/grauity components, port 3000, the words "page"/"component". In particular: marketing owns the PUBLIC NST/NSAT admission landing pages, while newton-web owns the logged-in NSAT timeline and test flows — the noun alone cannot tell them apart.
+- Resolution: a shared noun combined with ONE strong signal (or a URL host, or grep evidence) ⇒ follow that signal. Shared nouns ALONE ⇒ genuinely conflicting ⇒ return null with low confidence so the admin gate asks.`;
+
+export function buildClassifyPrompt(allowedRepos: readonly RepoKey[]): string {
+  const marketingAllowed = allowedRepos.includes('newton-marketing-web');
+
+  const frontendRules = marketingAllowed
+    ? `- A frontend task with NO STRONG marketing signal is "newton-web" — it is by far the more common target. "newton-marketing-web" is opt-in: choose it only on a STRONG marketing signal, a bare/www newtonschool.co URL, or grep evidence.
+- A task about Webflow migration/cutover, the Cloudflare worker, or page speed on newtonschool.co is "newton-marketing-web".
+- If the task is clearly frontend but carries only SHARED PAGE NOUNS (or conflicting product-vs-marketing signals), return null with low confidence — the admin gate will ask. Never guess between the two frontends.`
+    : `- A task that asks to add, remove, hide, or restyle something visible on a URL is almost always "newton-web".`;
+
+  return `You are a repo classifier for miniOG, a developer productivity bot.
+
+The user has sent a task. Route it to one of ${allowedRepos.length} repositories:
+
+${allowedRepos.map(key => REPO_PROMPT_BLOCKS[key]).join('\n\n')}
+
+${marketingAllowed ? `${FRONTEND_DISAMBIGUATION}\n\n` : ''}Repo signals you can use beyond intent:
+
+${allowedRepos.map(key => REPO_SIGNAL_BLOCKS[key]).join('\n')}
 
 Rules:
-- A task that asks to add, remove, hide, or restyle something visible on a URL is almost always "newton-web".
+${frontendRules}
 - A task about an endpoint, request/response shape, server error, database/model change, or background job is "newton-api".
-- A task that needs both: pick the repo where the BULK of the change lives. Cross-repo references (e.g. a frontend plan citing a backend enum for context) DO NOT flip the verdict — the repo with the actual code changes wins.
+- A task that needs more than one repo: pick the repo where the BULK of the change lives. Cross-repo references (e.g. a frontend plan citing a backend enum for context) DO NOT flip the verdict — the repo with the actual code changes wins.
 - If a plan markdown is provided, trust the plan's own per-file rationale over a raw filename. The planner already explored the repos.
 - The current task always wins over thread context. Thread messages are quoted for background only.
-- Only return null if you genuinely cannot tell after considering all signals. Aim for a decisive verdict — ambiguous output makes the bot stall for an admin gate.
+- Otherwise, only return null if you genuinely cannot tell after considering all signals. Aim for a decisive verdict — ambiguous output makes the bot stall for an admin gate.
 
 Return strict JSON:
 {
-  "selectedRepo": "newton-web" | "newton-api" | null,
+  "selectedRepo": ${allowedRepos.map(key => `"${key}"`).join(' | ')} | null,
   "confidence": number between 0 and 1,
   "reasoning": "one short sentence"
 }`;
+}
 
 const FALLBACK: RepoClassificationResult = {
   selectedRepo: null,
@@ -174,8 +207,7 @@ const FALLBACK: RepoClassificationResult = {
 };
 
 export async function classifyRepo(params: ClassifyRepoParams): Promise<RepoClassificationResult> {
-  const { task, threadMessages, threshold, affinity, planAffectedFiles, planMarkdown, webPath, apiPath, logStep } =
-    params;
+  const { task, threadMessages, threshold, affinity, planAffectedFiles, planMarkdown, repoGrepPaths, logStep } = params;
 
   const trimmedTask = typeof task === 'string' ? task.trim() : '';
   if (!trimmedTask) {
@@ -191,16 +223,15 @@ export async function classifyRepo(params: ClassifyRepoParams): Promise<RepoClas
   // from the task text matches files in exactly one configured repo, that's
   // higher signal than anything the LLM can derive from surface wording.
   let grepSignals: RepoGrepSignals | undefined;
-  if (webPath || apiPath) {
+  if (repoGrepPaths && repoGrepPaths.length > 0) {
     const entities = extractEntities(`${trimmedTask}\n${planMarkdown ?? ''}`);
-    grepSignals = gatherRepoSignals({ entities, webPath, apiPath });
+    grepSignals = gatherRepoSignals({ entities, repoGrepPaths });
 
-    const webOnly = grepSignals.webHittingEntities.length > 0 && grepSignals.apiHittingEntities.length === 0;
-    const apiOnly = grepSignals.apiHittingEntities.length > 0 && grepSignals.webHittingEntities.length === 0;
+    const hittingRepos = REPO_KEYS.filter(key => grepSignals!.hitsByRepo[key].length > 0);
 
-    if ((webOnly || apiOnly) && grepSignals.hasDistinctiveHit) {
-      const selectedRepo: 'newton-web' | 'newton-api' = webOnly ? 'newton-web' : 'newton-api';
-      const hits = webOnly ? grepSignals.webHittingEntities : grepSignals.apiHittingEntities;
+    if (hittingRepos.length === 1 && grepSignals.hasDistinctiveHit) {
+      const selectedRepo = hittingRepos[0];
+      const hits = grepSignals.hitsByRepo[selectedRepo];
       const result: RepoClassificationResult = {
         selectedRepo,
         confidence: 0.95,
@@ -212,8 +243,7 @@ export async function classifyRepo(params: ClassifyRepoParams): Promise<RepoClas
         message: `Repo resolved deterministically by grep — ${selectedRepo} (skipped LLM).`,
         data: {
           ...result,
-          webHittingEntities: grepSignals.webHittingEntities,
-          apiHittingEntities: grepSignals.apiHittingEntities,
+          hitsByRepo: grepSignals.hitsByRepo,
         },
       });
       return result;
@@ -244,32 +274,38 @@ export async function classifyRepo(params: ClassifyRepoParams): Promise<RepoClas
       `Planner's full plan markdown (HIGH-SIGNAL — the plan's own per-file rationale is the most trustworthy signal):\n${truncated}`,
     );
   }
-  if (affinity && ((affinity.newtonWebHits ?? 0) > 0 || (affinity.newtonApiHits ?? 0) > 0)) {
+  if (affinity && REPO_KEYS.some(key => (affinity[key] ?? 0) > 0)) {
     sections.push(
       `Requester's recent activity (advisory — current task wins over priors): ` +
-        `newton-web=${affinity.newtonWebHits ?? 0} hits, newton-api=${affinity.newtonApiHits ?? 0} hits`,
+        REPO_KEYS.map(key => `${key}=${affinity[key] ?? 0} hits`).join(', '),
     );
   }
-  if (grepSignals && (grepSignals.webHittingEntities.length > 0 || grepSignals.apiHittingEntities.length > 0)) {
-    // Both repos had hits (or only one side matched but no entity was
+  if (grepSignals && REPO_KEYS.some(key => grepSignals!.hitsByRepo[key].length > 0)) {
+    // Multiple repos had hits (or only one matched but no entity was
     // distinctive enough to short-circuit). Either way, surface the evidence
     // so the LLM weighs it instead of guessing from surface wording.
+    const evidenceLines = REPO_KEYS.map(key => {
+      const hits = grepSignals!.hitsByRepo[key];
+      return `• ${key} matched entities: ${hits.length > 0 ? hits.join(', ') : '(none)'}`;
+    });
     sections.push(
       `Deterministic grep evidence (HIGH-SIGNAL — actual file matches in the configured checkouts):\n` +
-        `• newton-web matched entities: ${grepSignals.webHittingEntities.length > 0 ? grepSignals.webHittingEntities.join(', ') : '(none)'}\n` +
-        `• newton-api matched entities: ${grepSignals.apiHittingEntities.length > 0 ? grepSignals.apiHittingEntities.join(', ') : '(none)'}\n` +
+        `${evidenceLines.join('\n')}\n` +
         `Lean toward the repo where the more distinctive identifiers matched.`,
     );
   }
 
-  const prompt = `${CLASSIFY_PROMPT}\n\n${sections.join('\n\n')}\n\nClassify the current task.`;
+  // Only offer the repos that are actually configured on this host — the
+  // resolver guards the result the same way, so prompt and acceptance agree.
+  const allowedRepos = repoGrepPaths && repoGrepPaths.length > 0 ? repoGrepPaths.map(p => p.key) : [...REPO_KEYS];
+  const prompt = `${buildClassifyPrompt(allowedRepos)}\n\n${sections.join('\n\n')}\n\nClassify the current task.`;
 
   logStep?.({
     stage: 'router.repo_classify.start',
     message: 'Running AI repo classifier.',
     data: {
       planHints: planAffectedFiles?.length ?? 0,
-      hasAffinity: Boolean(affinity && ((affinity.newtonWebHits ?? 0) > 0 || (affinity.newtonApiHits ?? 0) > 0)),
+      hasAffinity: Boolean(affinity && REPO_KEYS.some(key => (affinity[key] ?? 0) > 0)),
     },
   });
 
@@ -280,7 +316,9 @@ export async function classifyRepo(params: ClassifyRepoParams): Promise<RepoClas
       prompt,
       model: profile.model,
       reasoningEffort: profile.reasoningEffort,
-      timeoutMs: 30_000,
+      timeoutMs: 45_000,
+      onLog: params.logStep,
+      signal: params.signal,
     });
 
     if (!result.ok || !result.parsedJson) {
@@ -298,8 +336,9 @@ export async function classifyRepo(params: ClassifyRepoParams): Promise<RepoClas
       confidence?: number;
       reasoning?: string;
     };
-    const selectedRepo: 'newton-web' | 'newton-api' | null =
-      raw.selectedRepo === 'newton-web' || raw.selectedRepo === 'newton-api' ? raw.selectedRepo : null;
+    const selectedRepo: RepoKey | null = REPO_KEYS.includes(raw.selectedRepo as RepoKey)
+      ? (raw.selectedRepo as RepoKey)
+      : null;
     const confidence = typeof raw.confidence === 'number' ? Math.max(0, Math.min(1, raw.confidence)) : 0;
     const reasoning = typeof raw.reasoning === 'string' ? raw.reasoning : '';
     const uncertain = !selectedRepo || confidence < threshold;

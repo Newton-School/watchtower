@@ -4,7 +4,8 @@ import { logger } from '../logging/logger.js';
 import type { JobStore } from '../state/jobStore.js';
 import type { DossierStore } from '../state/dossierStore.js';
 import { renderUserNote } from './vaultRenderer.js';
-import { slugify, userNotePath } from './vaultPaths.js';
+import { slugify, threadNotePath, userNotePath } from './vaultPaths.js';
+import { renderThreadMarkdown } from '../egress/threadMarkdownRenderer.js';
 
 const FLUSH_INTERVAL_MS = 30_000;
 
@@ -15,7 +16,11 @@ const FLUSH_INTERVAL_MS = 30_000;
 // idempotent under repeated identical edits, so any residual ping-pong
 // converges in one cycle.
 
-type DirtyKey = { kind: 'user'; userId: string } | { kind: 'project'; repo: string } | { kind: 'daily'; date: string };
+type DirtyKey =
+  | { kind: 'user'; userId: string }
+  | { kind: 'project'; repo: string }
+  | { kind: 'daily'; date: string }
+  | { kind: 'thread'; channelId: string; threadTs: string };
 
 interface VaultWriterRuntime {
   enabled: boolean;
@@ -96,6 +101,8 @@ function dirtyKeyString(key: DirtyKey): string {
       return `project:${key.repo}`;
     case 'daily':
       return `daily:${key.date}`;
+    case 'thread':
+      return `thread:${key.channelId}:${key.threadTs}`;
   }
 }
 
@@ -158,6 +165,38 @@ async function renderUserKey(rt: VaultWriterRuntime, userId: string): Promise<vo
 }
 
 /**
+ * Conversation-thread mirror note (M5). The slug is channelId + ts — stable
+ * across title changes, so a re-synthesis updates the same file — and the
+ * note is a read-only mirror (no watcher lifts edits back). A forgotten
+ * thread's note is DELETED: forget must reach the vault too.
+ */
+async function renderThreadKey(rt: VaultWriterRuntime, channelId: string, threadTs: string): Promise<void> {
+  if (!rt.vaultRoot) return;
+  const conversations = rt.store.conversationStore();
+  const thread = conversations.getThread(channelId, threadTs);
+  const filePath = threadNotePath(rt.vaultRoot, `${slugify(channelId)}-${threadTs.replace(/\./g, '-')}`);
+  if (!thread || thread.status === 'forgotten') {
+    await fs.rm(filePath, { force: true });
+    return;
+  }
+  const messages = conversations.getMessages(thread.id, { limit: 500, order: 'desc' }).reverse();
+  const body = renderThreadMarkdown(thread, messages, { includeTranscript: false });
+  const content = [
+    '---',
+    `miniog_rendered_at: ${new Date().toISOString()}`,
+    `channel_id: ${channelId}`,
+    `thread_ts: "${threadTs}"`,
+    '---',
+    '',
+    body,
+  ].join('\n');
+  const wrote = await atomicWriteIfChanged(filePath, content);
+  if (wrote) {
+    logger.info({ channelId, threadTs, filePath }, 'vault thread note written');
+  }
+}
+
+/**
  * Drain the dirty queue. Exported for tests; production calls happen on a
  * setInterval owned by configureVaultWriter.
  */
@@ -176,6 +215,8 @@ export async function flushVault(): Promise<void> {
       try {
         if (key.kind === 'user') {
           await renderUserKey(runtime, key.userId);
+        } else if (key.kind === 'thread') {
+          await renderThreadKey(runtime, key.channelId, key.threadTs);
         }
         // project and daily renders are scaffolded but not yet wired to data
         // sources beyond what the dossier already exposes; fill them in when

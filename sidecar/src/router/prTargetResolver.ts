@@ -62,7 +62,17 @@ export function extractAllPrContexts(params: { triggerText?: string; threadTexts
 }
 
 const SELECTOR_ALL_RE = /\b(both|all|these|every)\b/;
-const SELECTOR_WEB_RE = /\b(frontend|front-end|web|newton-web)\b/;
+// Marketing phrases are CONSUMED from the text before the web/api selectors
+// run: \bweb\b matches inside "marketing web" and inside the repo slug
+// "newton-marketing-web" (hyphens are word boundaries), so testing order and
+// removal are load-bearing here.
+const SELECTOR_MARKETING_RE =
+  /\b(marketing(?:[- ]?(?:web|site|pages?))?|mweb|nmw|mkt|landing(?:[- ]?pages?)?|newton-marketing-web)\b/;
+// Exact repo name → that repo only; generic frontend words → the frontend
+// family (newton-web + newton-marketing-web), disambiguated by which repos
+// actually have PRs in the thread.
+const SELECTOR_WEB_EXACT_RE = /\bnewton-web\b/;
+const SELECTOR_FRONTEND_RE = /\b(frontend|front-end|web)\b/;
 const SELECTOR_API_RE = /\b(backend|back-end|api|newton-api)\b/;
 const SELECTOR_NUMBER_RE = /#(\d{2,})\b/g;
 
@@ -110,17 +120,36 @@ export function resolvePrReviewTargets(params: {
     return capped({ mode: 'selector', targets: all, selector: 'all' });
   }
 
-  const wantsWeb = SELECTOR_WEB_RE.test(normalized);
-  const wantsApi = SELECTOR_API_RE.test(normalized);
-  if (wantsWeb !== wantsApi) {
-    const repo = wantsWeb ? 'newton-web' : 'newton-api';
-    const byRepo = all.filter(t => t.repo === repo);
-    if (byRepo.length > 0) {
-      return capped({ mode: 'selector', targets: byRepo, selector: repo });
+  const wantsMarketing = SELECTOR_MARKETING_RE.test(normalized);
+  const withoutMarketing = normalized.replace(new RegExp(SELECTOR_MARKETING_RE.source, 'g'), ' ');
+  const wantsWebExact = SELECTOR_WEB_EXACT_RE.test(withoutMarketing);
+  const wantsFrontend = SELECTOR_FRONTEND_RE.test(withoutMarketing);
+  const wantsApi = SELECTOR_API_RE.test(withoutMarketing);
+
+  const selectedRepos = new Set<string>();
+  if (wantsMarketing) selectedRepos.add('newton-marketing-web');
+  if (wantsWebExact) selectedRepos.add('newton-web');
+  else if (wantsFrontend) {
+    // Generic "frontend"/"web" spans both frontends; the thread's actual PRs
+    // narrow it down below.
+    selectedRepos.add('newton-web');
+    selectedRepos.add('newton-marketing-web');
+  }
+  if (wantsApi) selectedRepos.add('newton-api');
+
+  if (selectedRepos.size > 0) {
+    const selector = [...selectedRepos].join(',');
+    const byRepo = all.filter(t => selectedRepos.has(t.repo));
+    const distinctRepos = new Set(byRepo.map(t => t.repo));
+    if (distinctRepos.size === 1) {
+      // The selector plus the thread's PRs pin exactly one repo — review all
+      // of that repo's PRs (preserves the multi-PR-same-repo behavior).
+      return capped({ mode: 'selector', targets: byRepo, selector });
     }
-    // The user named a repo that has no PR in this thread — don't silently
-    // review something else; ask.
-    return { mode: 'ambiguous', targets: [], candidates: all, selector: repo };
+    // Zero matching PRs (user named a repo with no PR here) or PRs from more
+    // than one selected repo (e.g. "the web PR" with both frontend PRs in the
+    // thread) — never guess; ask.
+    return { mode: 'ambiguous', targets: [], candidates: all, selector };
   }
 
   // 3. A single distinct thread PR is unambiguous.

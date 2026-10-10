@@ -12,6 +12,7 @@ function makeSettings(): AppSettings {
     bugsAndUpdatesChannelId: 'C01H25RNLJH',
     newtonWebPath: '/Users/dipesh/code/newton-web',
     newtonApiPath: '/Users/dipesh/code/newton-api',
+    newtonMarketingWebPath: '',
     maxConcurrentJobs: 2,
     repoClassifierThreshold: 0.75,
     themePreset: 'watchtower-midnight',
@@ -137,6 +138,33 @@ describe('SettingsPage', () => {
             }),
           }),
         }),
+      }),
+    );
+  });
+
+  it('maps the optional newton-marketing-web path into onSettingsChange', () => {
+    const onSettingsChange = vi.fn();
+    render(
+      <SettingsPage
+        onSettingsChange={onSettingsChange}
+        onImportNotificationAudio={vi.fn().mockResolvedValue(undefined)}
+        onPreviewNotification={vi.fn()}
+        onSubmit={vi.fn()}
+        previewingNotificationTone={null}
+        savingSettings={false}
+        settings={makeSettings()}
+        settingsConfigured
+        settingsMessage={null}
+        uploadingNotificationAudioTone={null}
+      />,
+    );
+
+    fireEvent.click(screen.getByText('Connections'));
+    const input = screen.getByPlaceholderText('/Users/you/code/mini-og/newton-marketing-web');
+    fireEvent.change(input, { target: { value: '/Users/dipesh/code/mini-og/newton-marketing-web' } });
+    expect(onSettingsChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        newtonMarketingWebPath: '/Users/dipesh/code/mini-og/newton-marketing-web',
       }),
     );
   });

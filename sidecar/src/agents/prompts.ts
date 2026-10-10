@@ -67,6 +67,7 @@ IMPORTANT: "requiresCodeChanges" rules:
 - The user's explicit request takes priority. If they say "I want to…", "add…", "implement…", "fix…", "block…", "create…", "change…", or "update…" — that is an implementation request and requiresCodeChanges MUST be true.
 - Set to false for purely informational requests (explain, describe, list, check status, answer a question) where NO file changes are needed.
 - Set to false for operational/lifecycle actions that do NOT modify source code: merge PR, close PR, deploy, run tests, restart service, check CI status, approve PR, assign reviewers.
+- A deploy, release or rollback ask is never executed by this pipeline. Still set false for it; it is redirected to the deploy command, which asks for confirmation.
 - The key distinction: if the user wants to CHANGE source code files → true. If the user wants to perform a git/GitHub/infrastructure action on existing code → false.
 
 CLARIFICATION (\`clarificationNeeded\`):
@@ -89,7 +90,9 @@ Return strict JSON:
 
 export function buildPlannerPlanModePrompt(ctx: AgentContext): string {
   return `
-You are the PLANNER for a multi-agent coding pipeline. You are running in plan mode: explore the repo with read-only tools, then produce a concrete implementation plan via ExitPlanMode.
+You are the PLANNER for a multi-agent coding pipeline. You are running in plan mode: explore the repo with read-only tools, then produce a concrete implementation plan.
+
+DELIVERY CONTRACT: your FINAL message must be exactly the full plan markdown and nothing else — no preamble, no closing remarks, and no notes about tools, plan files you wrote, or session mechanics. If your environment also asks you to record the plan elsewhere (a plan file or a plan tool), do that too — but ALWAYS end by outputting the complete plan markdown as your final message. The downstream coder agent reads it verbatim.
 
 Workflow: ${ctx.workflowIntent}
 Repository: ${ctx.repoPath}
@@ -100,12 +103,12 @@ ${ctx.threadContext}
 
 ${ctx.prContext ? `PR context: ${ctx.prContext.url} (${ctx.prContext.owner}/${ctx.prContext.repo}#${ctx.prContext.number})` : ''}
 
-What to produce in your ExitPlanMode plan (markdown is fine; the downstream coder agent reads it verbatim):
+What the plan must contain (markdown):
 - A short summary of the user's intent.
 - The concrete files you expect to touch, with brief rationale per file.
 - An ordered list of implementation steps.
 - A scope tag on its own line, exactly one of: \`Scope: small\`, \`Scope: medium\`, or \`Scope: large\`. Treat anything under ~50 lines across 1–2 files as small; multi-file feature work as medium; cross-cutting refactors or new subsystems as large. Coder agent uses this to decide whether to include tests in the PR.
-- A code-changes tag on its own line, exactly one of: \`Requires code changes: yes\` or \`Requires code changes: no\`. Set \`no\` ONLY for purely informational requests (explain, describe, list, check status, answer a question) or operational/lifecycle actions that do NOT modify source (merge PR, close PR, deploy, run tests, restart service). For ANY implementation, feature, fix, change, or modification of source files set \`yes\`; when in doubt, \`yes\`.
+- A code-changes tag on its own line, exactly one of: \`Requires code changes: yes\` or \`Requires code changes: no\`. Set \`no\` ONLY for purely informational requests (explain, describe, list, check status, answer a question) or operational/lifecycle actions that do NOT modify source (merge PR, close PR, deploy, run tests, restart service; a deploy, release or rollback ask is not executed by this pipeline, it is redirected to the deploy command). For ANY implementation, feature, fix, change, or modification of source files set \`yes\`; when in doubt, \`yes\`.
 - Anything the coder MUST avoid (existing patterns, deprecated APIs, owner conventions).
 
 Use the read tools (grep, file reads) to ground every claim — do not guess at file paths or function signatures. If the task is genuinely ambiguous and you cannot safely pick a direction, say so at the top of the plan with a short clarifying question; otherwise commit to a direction.
@@ -123,6 +126,7 @@ Your role: Implement the plan from the planner agent. Write code, create tests, 
 
 Workflow: ${ctx.workflowIntent}
 Repository: ${ctx.repoPath}
+Policy: ${policyBlock(ctx)}
 Plan scope: ${scope}
 ${affectedFiles.length > 0 ? `Likely files to touch: ${affectedFiles.map(f => `\`${f}\``).join(', ')}` : ''}
 
@@ -154,9 +158,18 @@ Requirements:
    **Thread:** ${ctx.task.event.threadTs}
 5. When creating the PR with \`gh pr create\`, include the flag \`--label miniog\` to tag it
 6. Do not run destructive git commands
+7. If you cannot map the request to a concrete change — the plan above is missing, the terminology
+   doesn't resolve to anything in this repo, or you'd be guessing at which code the requester means —
+   do NOT guess and do NOT commit anything. Return \`"status": "blocked"\` with \`blockedReason\` set to
+   the question you need answered, addressed to the requester. Blocked runs are asked back in Slack;
+   they never open a PR, so a block costs the requester one reply and a wrong guess costs them a bad
+   change on a live page. Only use this when you are genuinely stuck — a plan you can follow is not a
+   reason to block.
 
 Return strict JSON:
 {
+  "status": string,        // "done" once you've implemented the change, or "blocked" per requirement 7
+  "blockedReason": string, // required when status is "blocked": what you need, phrased as a question. "" otherwise
   "filesChanged": string[],
   "summary": string,
   "testsAdded": string[],
@@ -290,6 +303,7 @@ Your role: Verify that all previous agent outputs are consistent, tests pass, an
 
 Workflow: ${ctx.workflowIntent}
 Repository: ${ctx.repoPath}
+Policy: ${policyBlock(ctx)}
 
 Approved plan (verify the code fulfils THIS):
 ${planMarkdown || 'No plan markdown available.'}

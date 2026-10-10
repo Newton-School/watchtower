@@ -219,33 +219,8 @@ describe('jobStore', () => {
   });
 });
 
-describe('activeJobForThread', () => {
-  it('returns undefined when no jobs exist', () => {
-    const store = new JobStore(tempDbPath());
-    expect(store.activeJobForThread('C1', 'T1')).toBeUndefined();
-    store.close();
-  });
-
-  it('returns the active job when status is RUNNING', () => {
-    const store = new JobStore(tempDbPath());
-    store.createJob({
-      id: 'job-run',
-      eventId: 'e1',
-      dedupeKey: 'C1:T1:e1:IMPLEMENTATION',
-      workflow: 'IMPLEMENTATION',
-      channelId: 'C1',
-      threadTs: 'T1',
-      payload: {},
-    });
-    const active = store.activeJobForThread('C1', 'T1');
-    expect(active).toBeDefined();
-    expect(active?.id).toBe('job-run');
-    expect(active?.status).toBe('RUNNING');
-    expect(active?.workflow).toBe('IMPLEMENTATION');
-    store.close();
-  });
-
-  it('does NOT return PAUSED jobs from activeJobForThread (slot is freed); pausedJobForThread returns it instead', () => {
+describe('thread job lookups', () => {
+  it('pausedJobForThread returns a PAUSED job', () => {
     const store = new JobStore(tempDbPath());
     store.createJob({
       id: 'job-pause',
@@ -257,32 +232,10 @@ describe('activeJobForThread', () => {
       payload: {},
     });
     store.markJob('job-pause', 'PAUSED');
-    expect(store.activeJobForThread('C1', 'T2')).toBeUndefined();
     const paused = store.pausedJobForThread('C1', 'T2');
     expect(paused).toBeDefined();
     expect(paused?.id).toBe('job-pause');
     expect(paused?.workflow).toBe('IMPLEMENTATION');
-    store.close();
-  });
-
-  it('returns undefined for terminal statuses', () => {
-    const store = new JobStore(tempDbPath());
-    const statuses = ['SUCCESS', 'FAILED', 'CANCELLED', 'SKIPPED'] as const;
-    for (const [i, status] of statuses.entries()) {
-      const jobId = `job-term-${i}`;
-      const threadTs = `T-${i}`;
-      store.createJob({
-        id: jobId,
-        eventId: `e-${i}`,
-        dedupeKey: `C1:${threadTs}:e-${i}:IMPLEMENTATION`,
-        workflow: 'IMPLEMENTATION',
-        channelId: 'C1',
-        threadTs,
-        payload: {},
-      });
-      store.markJob(jobId, status);
-      expect(store.activeJobForThread('C1', threadTs)).toBeUndefined();
-    }
     store.close();
   });
 
@@ -306,49 +259,75 @@ describe('activeJobForThread', () => {
     expect(store.hasDedupeKey('C1:T-cancel:e-cancel:IMPLEMENTATION')).toBe(false);
     store.close();
   });
+});
 
-  it('returns undefined when job is stale beyond threshold', () => {
-    const store = new JobStore(tempDbPath());
+describe('listRunningJobsWithLastStage (issue #436)', () => {
+  function makeJob(store: JobStore, id: string, threadTs: string, requestUserId?: string): void {
     store.createJob({
-      id: 'job-stale',
-      eventId: 'e-stale',
-      dedupeKey: 'C1:T-stale:e-stale:IMPLEMENTATION',
+      id,
+      eventId: `e-${id}`,
+      dedupeKey: `C1:${threadTs}:e-${id}:IMPLEMENTATION`,
       workflow: 'IMPLEMENTATION',
       channelId: 'C1',
-      threadTs: 'T-stale',
-      payload: {},
+      threadTs,
+      payload: requestUserId ? { requestUserId } : {},
     });
-    // Manually backdate updated_at to 60 minutes ago
-    store['db'].prepare("UPDATE jobs SET updated_at = datetime('now', '-60 minutes') WHERE id = ?").run('job-stale');
-    expect(store.activeJobForThread('C1', 'T-stale')).toBeUndefined();
-    // With a larger threshold it should still be found
-    expect(store.activeJobForThread('C1', 'T-stale', 120)).toBeDefined();
+  }
+
+  it('returns each RUNNING job with the stage of its newest log entry and who asked for it', () => {
+    const store = new JobStore(tempDbPath());
+    makeJob(store, 'job-waiting', 'T-wait', 'UREQ');
+    store.appendJobLog({ jobId: 'job-waiting', stage: 'pipeline.agent.planner.start', level: 'INFO', message: 'plan' });
+    store.appendJobLog({
+      jobId: 'job-waiting',
+      stage: 'implementation.approval.waiting',
+      level: 'INFO',
+      message: 'wait',
+    });
+    makeJob(store, 'job-coding', 'T-code');
+    store.appendJobLog({ jobId: 'job-coding', stage: 'pipeline.agent.coder.start', level: 'INFO', message: 'code' });
+
+    const jobs = store.listRunningJobsWithLastStage().sort((a, b) => a.id.localeCompare(b.id));
+
+    expect(jobs).toEqual([
+      {
+        id: 'job-coding',
+        channelId: 'C1',
+        threadTs: 'T-code',
+        requestedBy: undefined,
+        lastStage: 'pipeline.agent.coder.start',
+      },
+      {
+        id: 'job-waiting',
+        channelId: 'C1',
+        threadTs: 'T-wait',
+        requestedBy: 'UREQ',
+        lastStage: 'implementation.approval.waiting',
+      },
+    ]);
     store.close();
   });
 
-  it('returns the most recently updated job when multiple active jobs exist', () => {
+  it('leaves out jobs that are not RUNNING, and copes with a job that has no logs', () => {
     const store = new JobStore(tempDbPath());
-    store.createJob({
-      id: 'job-old',
-      eventId: 'e-old',
-      dedupeKey: 'C1:T-multi:e-old:IMPLEMENTATION',
-      workflow: 'IMPLEMENTATION',
-      channelId: 'C1',
-      threadTs: 'T-multi',
-      payload: {},
-    });
-    store['db'].prepare("UPDATE jobs SET updated_at = datetime('now', '-10 minutes') WHERE id = ?").run('job-old');
-    store.createJob({
-      id: 'job-new',
-      eventId: 'e-new',
-      dedupeKey: 'C1:T-multi:e-new:IMPLEMENTATION',
-      workflow: 'IMPLEMENTATION',
-      channelId: 'C1',
-      threadTs: 'T-multi',
-      payload: {},
-    });
-    const active = store.activeJobForThread('C1', 'T-multi');
-    expect(active?.id).toBe('job-new');
+    makeJob(store, 'job-done', 'T-done');
+    store.markJob('job-done', 'SUCCESS');
+    makeJob(store, 'job-paused', 'T-paused');
+    store.markJob('job-paused', 'PAUSED');
+    makeJob(store, 'job-new', 'T-new');
+
+    expect(store.listRunningJobsWithLastStage()).toEqual([
+      { id: 'job-new', channelId: 'C1', threadTs: 'T-new', requestedBy: undefined, lastStage: undefined },
+    ]);
+    store.close();
+  });
+
+  it('is read before the orphan cleanup, which then fails those jobs', () => {
+    const store = new JobStore(tempDbPath());
+    makeJob(store, 'job-orphan', 'T-orphan');
+    expect(store.listRunningJobsWithLastStage()).toHaveLength(1);
+    expect(store.cleanupOrphanedRunningJobs()).toBe(1);
+    expect(store.listRunningJobsWithLastStage()).toEqual([]);
     store.close();
   });
 });
@@ -413,7 +392,7 @@ describe('pause / resume lifecycle', () => {
     store.markJob('job-flip', 'PAUSED', { result: { stage: 'awaiting_approval', dummy: true } });
     store.markJobRunning('job-flip');
     // After the flip the row should be RUNNING again, and resume context should be cleared.
-    expect(store.activeJobForThread('C1', 'T-flip')?.id).toBe('job-flip');
+    expect(store['db'].prepare('SELECT status FROM jobs WHERE id = ?').get('job-flip')).toEqual({ status: 'RUNNING' });
     expect(store.loadResumeContext('job-flip')).toBeUndefined();
     store.close();
   });
@@ -868,6 +847,65 @@ describe('time-window snapshots (julianday → sargable ISO-threshold rewrite)',
     const detail = plan.map(r => r.detail).join(' ');
     expect(detail).toContain('idx_jobs_created_at');
     expect(detail).not.toMatch(/SCAN jobs(?! USING)/i);
+    store.close();
+  });
+});
+
+describe('pr_review_findings (durable review memory)', () => {
+  it('records and reads back a review job findings, filtered by job id', () => {
+    const dbPath = tempDbPath();
+    const store = new JobStore(dbPath);
+
+    store.recordPrReviewFindings({
+      jobId: 'job-review-1',
+      prUrl: 'https://github.com/Newton-School/newton-api/pull/42',
+      repo: 'newton-api',
+      prNumber: 42,
+      prHeadSha: 'aaaa1111',
+      author: 'octo-dev',
+      appliedSkills: ['newton-api-pr-review'],
+      findings: [
+        { role: 'security', severity: 'high', category: 'authz', message: 'missing check', file: 'src/a.py', line: 12 },
+        { role: 'reviewer', severity: 'low', category: 'style', message: 'nit', suggestion: 'rename' },
+      ],
+    });
+    store.recordPrReviewFindings({
+      jobId: 'job-review-2',
+      prUrl: 'https://github.com/Newton-School/newton-api/pull/42',
+      repo: 'newton-api',
+      prNumber: 42,
+      prHeadSha: 'bbbb2222',
+      findings: [{ role: 'performance', severity: 'medium', category: 'n+1', message: 'query in loop' }],
+    });
+
+    const byJob = store.getPrReviewFindings({
+      prUrl: 'https://github.com/Newton-School/newton-api/pull/42',
+      jobId: 'job-review-1',
+    });
+    expect(byJob).toHaveLength(2);
+    expect(byJob[0]).toMatchObject({
+      jobId: 'job-review-1',
+      prHeadSha: 'aaaa1111',
+      role: 'security',
+      severity: 'high',
+      file: 'src/a.py',
+      line: 12,
+    });
+    expect(byJob[1]).toMatchObject({ role: 'reviewer', suggestion: 'rename', file: undefined, line: undefined });
+
+    const all = store.getPrReviewFindings({ prUrl: 'https://github.com/Newton-School/newton-api/pull/42' });
+    expect(all).toHaveLength(3);
+
+    // Zero-finding reviews record nothing (the head-SHA dedup covers "reviewed clean").
+    store.recordPrReviewFindings({
+      jobId: 'job-review-3',
+      prUrl: 'https://github.com/Newton-School/newton-api/pull/43',
+      repo: 'newton-api',
+      prNumber: 43,
+      findings: [],
+    });
+    expect(store.getPrReviewFindings({ prUrl: 'https://github.com/Newton-School/newton-api/pull/43' })).toHaveLength(0);
+
     store.close();
   });
 });

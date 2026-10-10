@@ -99,6 +99,49 @@ describe('prReviewSupport', () => {
     expect(summary).not.toContain('comments posted on PR');
   });
 
+  it('appends the applied repo skills to the Slack summary (and stays byte-identical without them)', () => {
+    const outputs = [
+      normalizePrReviewAgentOutput(
+        'reviewer',
+        codexResult({
+          findings: [
+            { severity: 'medium', category: 'logic', message: 'Attachable issue', file: 'src/a.ts', line: 10 },
+          ],
+          summaryNotes: [],
+        }),
+      ),
+    ];
+    const prUrl = 'https://github.com/Newton-School/newton-api/pull/42';
+
+    const plain = formatSlackReviewSummary(outputs, prUrl);
+    const withSkills = formatSlackReviewSummary(outputs, prUrl, undefined, ['newton-api-pr-review']);
+
+    expect(plain).not.toContain('Reviewed with');
+    expect(withSkills).toContain('_Reviewed with newton-api-pr-review + standard security/perf lenses_');
+    expect(withSkills.startsWith(plain)).toBe(true);
+  });
+
+  it('prepends the applied repo skills to the GitHub review summary', () => {
+    const outputs = [
+      normalizePrReviewAgentOutput(
+        'reviewer',
+        codexResult({
+          findings: [
+            { severity: 'medium', category: 'logic', message: 'Attachable issue', file: 'src/a.ts', line: 10 },
+          ],
+          summaryNotes: [],
+        }),
+      ),
+    ];
+
+    const plain = buildGithubReviewSummary(outputs);
+    const withSkills = buildGithubReviewSummary(outputs, ['newton-api-pr-review', 'pre-pr']);
+
+    expect(plain).not.toContain('Reviewed with repo skill(s)');
+    expect(withSkills).toContain('Reviewed with repo skill(s): newton-api-pr-review, pre-pr');
+    expect(withSkills).toContain('Watchtower found 1 issue(s) in this PR.');
+  });
+
   it('formats partial Slack completion when only some findings are attachable', () => {
     const outputs = [
       normalizePrReviewAgentOutput(

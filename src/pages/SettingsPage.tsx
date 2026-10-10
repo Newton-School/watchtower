@@ -780,6 +780,17 @@ export function SettingsPage({
                         Save-time validation requires absolute paths that already exist on disk.
                       </small>
                     </label>
+
+                    <label className="field">
+                      <span>newton-marketing-web Path (optional)</span>
+                      <input
+                        type="text"
+                        value={settings.newtonMarketingWebPath}
+                        onChange={event => updateSettings({ newtonMarketingWebPath: event.target.value })}
+                        placeholder="/Users/you/code/mini-og/newton-marketing-web"
+                      />
+                      <small className="field-hint">Leave blank to disable marketing-site routing on this host.</small>
+                    </label>
                   </div>
                 </SectionCard>
               </div>

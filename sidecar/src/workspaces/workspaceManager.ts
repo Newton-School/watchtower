@@ -28,6 +28,44 @@ async function git(args: string[], opts: { cwd: string; timeoutMs: number }): Pr
   return stdout.toString().trim();
 }
 
+/**
+ * Hide the symlinked node_modules from git inside a worktree.
+ *
+ * A `.gitignore` pattern that ends in a slash — `node_modules/`, which is what
+ * most repos ship — matches directories only. Our node_modules is a SYMLINK, so
+ * git sees an untracked file and reports `?? node_modules`. That single line did
+ * real damage in #413: `git add -A` committed the symlink (mode 120000, holding
+ * an absolute path from this machine) into a company PR, and it also made
+ * `checkCoderProducedChanges` believe a coder that touched nothing had been
+ * productive, defeating the empty-output guard.
+ *
+ * `.git/info/exclude` is local-only and never pushed. It lives in the common git
+ * dir, so this also covers the parent clone — harmless, since every repo we work
+ * in ignores node_modules anyway; the pattern is only doing the job the trailing
+ * slash prevented.
+ */
+async function excludeNodeModulesFromGit(wsPath: string): Promise<void> {
+  const PATTERN = '/node_modules';
+  try {
+    const commonDir = await git(['rev-parse', '--git-common-dir'], { cwd: wsPath, timeoutMs: 10_000 });
+    const resolvedCommonDir = path.isAbsolute(commonDir) ? commonDir : path.join(wsPath, commonDir);
+    const excludePath = path.join(resolvedCommonDir, 'info', 'exclude');
+
+    const existing = fs.existsSync(excludePath) ? fs.readFileSync(excludePath, 'utf8') : '';
+    if (existing.split('\n').some(line => line.trim() === PATTERN)) return;
+
+    fs.mkdirSync(path.dirname(excludePath), { recursive: true });
+    const separator = existing.length > 0 && !existing.endsWith('\n') ? '\n' : '';
+    fs.appendFileSync(
+      excludePath,
+      `${separator}# watchtower (#413): the worktree node_modules is a symlink, which "node_modules/" does not ignore\n${PATTERN}\n`,
+    );
+    logger.info({ wsPath, excludePath }, 'excluded node_modules symlink from git');
+  } catch (error) {
+    logger.warn({ wsPath, error: String(error) }, 'failed to exclude node_modules from git');
+  }
+}
+
 function sanitizeThreadTs(threadTs: string): string {
   return threadTs.replace(/[^a-zA-Z0-9.-]/g, '_');
 }
@@ -76,6 +114,8 @@ export async function resolveWorkspace(repoPath: string, threadTs: string): Prom
       const defaultBranch = await resolveDefaultRemoteBranch(repoPath);
       await git(['reset', '--hard', defaultBranch], { cwd: wsPath, timeoutMs: 15_000 });
       await git(['clean', '-fd'], { cwd: wsPath, timeoutMs: 15_000 });
+      // Worktrees created before #413 have an un-excluded symlink; fix on reuse.
+      await excludeNodeModulesFromGit(wsPath);
       logger.info(
         { repoPath, threadTs, wsPath, startPoint: defaultBranch },
         'refreshed reused workspace to default branch',
@@ -120,6 +160,9 @@ export async function resolveWorkspace(repoPath: string, threadTs: string): Prom
         logger.warn({ wsPath, error: String(symlinkError) }, 'failed to symlink node_modules into worktree');
       }
     }
+    // Unconditional: the exclude must exist even when the symlink was created by
+    // an earlier run, and it costs nothing when there's no node_modules at all.
+    await excludeNodeModulesFromGit(wsPath);
 
     logger.info({ repoPath, threadTs, wsPath, startPoint: defaultBranch }, 'created workspace via git worktree');
     return wsPath;

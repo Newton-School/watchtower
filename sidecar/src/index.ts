@@ -23,21 +23,40 @@ import { notifyDesktop } from './notify/desktopNotifier.js';
 import { assertMacOS } from './platform.js';
 import { evaluatePolicy, loadPolicies } from './policies/evaluator.js';
 import { agentCallContext } from './state/runContext.js';
-import { normalizeTask } from './router/intentParser.js';
+import { detectMention, normalizeTask } from './router/intentParser.js';
 import { decidePausedResume } from './router/pausedResume.js';
 import { classifyProduct } from './router/productClassifier.js';
 import { routeTask } from './router/taskRouter.js';
 import { startMentionCatchup } from './slack/mentionCatchup.js';
 import { SocketSlackClient } from './slack/socketClient.js';
+import { captureLiveMessage, captureThreadFromMessages, isSyntheticEnvelope } from './conversation/threadCapture.js';
+import { startThreadSweeper, stopThreadSweeper } from './conversation/threadSweeper.js';
+import { startThreadSynthesizerScheduler, stopThreadSynthesizerScheduler } from './conversation/threadSynthesizer.js';
+import { configureGithubPublisher, shutdownGithubPublisher } from './egress/githubPublisher.js';
+import { runConversationBackfill } from './conversation/threadBackfill.js';
 import { cleanupStaleWorkspaces, cleanupThreadWorkspaces } from './workspaces/workspaceManager.js';
 import { configureVaultWriter, shutdownVaultWriter } from './vault/vaultWriter.js';
 import { configureVaultWatcher, shutdownVaultWatcher } from './vault/vaultWatcher.js';
 import { startProfileSynthesizerScheduler, stopProfileSynthesizerScheduler } from './learning/profileSynthesizer.js';
 import { loadWorkflowTemplates } from './workflows/registry.js';
+import { narrateStep } from './slack/statusNarrator.js';
 import { fetchThreadContext } from './slack/threadContext.js';
+import { createThreadStatus, type ThreadStatus } from './slack/threadStatus.js';
 import { resolveUserGroup } from './slack/userGroupResolver.js';
-import { registerActiveJob, unregisterActiveJob, cancelJob } from './state/activeJobs.js';
+import { isOlderVersion, readSidecarBuild } from './runtime/buildInfo.js';
+import { buildRestartNotice, humanGateForStage } from './runtime/restartNotice.js';
+import { acquireInstanceLock, instanceLockPath, releaseInstanceLock } from './runtime/instanceLock.js';
+import {
+  registerActiveJob,
+  unregisterActiveJob,
+  cancelJob,
+  takeCancelReason,
+  activeJobIdForThread,
+  activeJobForThread,
+} from './state/activeJobs.js';
+import { decideStop } from './router/stopIntent.js';
 import { JobStore } from './state/jobStore.js';
+import { settleAbortedResult } from './workflows/shared/cancelState.js';
 import type { AccessGroupKey, SlackEventEnvelope, SlackReactionEvent, WorkflowStepLog } from './types/contracts.js';
 
 assertMacOS();
@@ -45,6 +64,37 @@ loadPolicies();
 loadWorkflowTemplates();
 
 const dbPath = process.env.WATCHTOWER_DB_PATH ?? path.resolve(process.cwd(), 'watchtower.db');
+
+// Stamped on every job so a run can be traced to the bundle that handled it
+// (issue #450).
+const sidecarBuild = readSidecarBuild({ pid: process.pid, argv: process.argv, env: process.env });
+
+// One sidecar per database. Take the instance lock before touching the DB or
+// Slack; a second sidecar waits here until the first one exits.
+const lockPath = instanceLockPath(dbPath);
+let standbyPolls = 0;
+const { replaced: staleLock } = await acquireInstanceLock({
+  lockPath,
+  self: {
+    pid: sidecarBuild.sidecarPid,
+    entry: sidecarBuild.sidecarEntry,
+    version: sidecarBuild.appVersion,
+    startedAt: new Date().toISOString(),
+  },
+  onStandby: holder => {
+    // First poll, then every 5 minutes at the default 5s interval.
+    if (standbyPolls++ % 60 === 0) {
+      logger.warn(
+        { lockPath, holder, ...sidecarBuild },
+        'another watchtower sidecar holds the instance lock — standing by until it exits',
+      );
+    }
+  },
+});
+process.on('exit', () => releaseInstanceLock(lockPath));
+if (staleLock) {
+  logger.info({ lockPath, staleLock }, 'took over a stale sidecar instance lock');
+}
 
 let config: ReturnType<typeof loadConfigFromDb>;
 try {
@@ -260,7 +310,10 @@ function buildEventAwareClient(client: WebClient, event: SlackEventEnvelope): We
         // delete the orphan and continue without cancellation.
         const active = store.activeJobForEventTs(event.channelId, event.eventTs);
         if (active) {
-          cancelJob(active.id);
+          cancelJob(active.id, {
+            source: 'source_deleted',
+            message: 'Source message deleted during post (orphan-promoted reply).',
+          });
           store.markJob(active.id, 'CANCELLED', {
             errorMessage: 'Source message deleted during post (orphan-promoted reply).',
           });
@@ -346,7 +399,7 @@ async function processMessageDeleted(event: SlackEventEnvelope, client: WebClien
     return;
   }
 
-  const cancelled = cancelJob(active.id);
+  const cancelled = cancelJob(active.id, { source: 'source_deleted', message: 'Source message deleted by author.' });
   store.markJob(active.id, 'CANCELLED', {
     errorMessage: 'Source message deleted by author.',
   });
@@ -388,6 +441,12 @@ async function processMessageDeleted(event: SlackEventEnvelope, client: WebClien
 
 async function processReactionFeedback(event: SlackReactionEvent, client: WebClient): Promise<void> {
   if (!event.channelId || !event.threadTs || !event.userId) {
+    return;
+  }
+  // With ignoreSelf:false (needed so the conversation tap sees miniOG's own
+  // replies), the bot's own status reactions (:eyes:, :white_check_mark:, …)
+  // now arrive here too — they are not user feedback; drop them.
+  if (event.userId === config.botUserId) {
     return;
   }
   if (store.hasEvent(event.eventId)) {
@@ -677,9 +736,64 @@ async function enqueueSlackEvent(
   client: WebClient,
   source: 'socket' | 'catchup' | 'launchpad',
 ): Promise<void> {
+  // A stop must not wait in the queue behind the job it is meant to stop.
+  if (source !== 'launchpad' && (await tryHandleStopControl(event, client))) {
+    return;
+  }
   queue.push({ event, client });
   logger.info({ queueDepth: queue.length, eventId: event.eventId, source }, 'event queued for processing');
   await processNext();
+}
+
+/** Stop messages already acted on. Slack delivers one message as both `app_mention` and `message`. */
+const handledStopMessages = new Set<string>();
+
+/**
+ * "@miniOG stop" in a thread with a running job cancels that job at once
+ * (issue #435). It used to be dropped by the same-thread lock, or queued
+ * behind the job and answered "nothing's running" once it had finished.
+ * Returns true when the event was a stop and must not be queued.
+ */
+async function tryHandleStopControl(event: SlackEventEnvelope, client: WebClient): Promise<boolean> {
+  if (event.messageSubtype) return false;
+  const messageKey = `${event.channelId}:${event.eventTs}`;
+  if (handledStopMessages.has(messageKey)) return true;
+
+  const active = activeJobForThread(event.channelId, event.threadTs);
+  const decision = decideStop({
+    isBotMention: detectMention(event.text, config, event.channelType).type === 'bot',
+    text: event.text,
+    senderId: event.userId,
+    activeJob: active,
+    adminUserIds: getAdminUserIds(config),
+    ownerUserIds: config.ownerSlackUserIds,
+  });
+  if (!decision.stop || !active) return false;
+
+  handledStopMessages.add(messageKey);
+  if (handledStopMessages.size > 500) {
+    handledStopMessages.delete(handledStopMessages.values().next().value as string);
+  }
+  store.recordEvent(event.eventId, event.channelId, event.threadTs);
+
+  const reason = { source: 'slack_stop' as const, message: `Stopped from Slack by <@${event.userId}>.` };
+  if (!cancelJob(active.jobId, reason)) {
+    // Already stopping: a second "stop" needs no second reply.
+    return true;
+  }
+  store.markJob(active.jobId, 'CANCELLED', { errorMessage: reason.message });
+  store.appendJobLog({
+    jobId: active.jobId,
+    stage: 'job.stopped_from_slack',
+    level: 'WARN',
+    message: `Stopped from Slack by <@${event.userId}>.`,
+    data: { stoppedBy: event.userId, requestedBy: active.requestedBy ?? null, eventTs: event.eventTs },
+  });
+  logger.info({ jobId: active.jobId, stoppedBy: event.userId, eventId: event.eventId }, 'job stopped from Slack');
+  await client.chat
+    .postMessage({ channel: event.channelId, thread_ts: event.threadTs, text: 'Stopped.' })
+    .catch(() => {});
+  return true;
 }
 
 async function processNext(): Promise<void> {
@@ -710,6 +824,14 @@ async function processEvent(event: SlackEventEnvelope, client: WebClient): Promi
     },
     'slack event received',
   );
+
+  // Conversation live tap: append messages in tracked threads to the
+  // conversation store — including miniOG's own replies, edits and deletions,
+  // which the job gates below intentionally skip. Runs BEFORE those gates
+  // (they are about job creation, not capture) and is internally gated on a
+  // single prepared isTracked SELECT, so untracked channels cost ~nothing per
+  // message. Never throws.
+  captureLiveMessage({ store, config, event });
 
   if (event.messageSubtype && nonActionableSubtypes.has(event.messageSubtype)) {
     logger.info({ eventId: event.eventId, subtype: event.messageSubtype }, 'skip message subtype');
@@ -766,18 +888,18 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     return;
   }
 
-  // Thread-level dedup: skip if this thread already has a running/paused job
-  const activeThreadJob = store.activeJobForThread(event.channelId, event.threadTs);
-  if (activeThreadJob) {
+  // Thread-level dedup: one in-flight job per thread. Asked of the in-process
+  // registry, not the jobs table — a time window on jobs.updated_at let the
+  // lock lapse under a long job (issue #261).
+  const activeThreadJobId = activeJobIdForThread(event.channelId, event.threadTs);
+  if (activeThreadJobId) {
     store.recordEvent(event.eventId, event.channelId, event.threadTs);
     logger.info(
       {
         eventId: event.eventId,
         channelId: event.channelId,
         threadTs: event.threadTs,
-        activeJobId: activeThreadJob.id,
-        activeJobStatus: activeThreadJob.status,
-        activeJobWorkflow: activeThreadJob.workflow,
+        activeJobId: activeThreadJobId,
       },
       'skipped: thread already has an active job',
     );
@@ -818,7 +940,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
   const threadMessages = await fetchThreadContext(eventClient, event.channelId, event.threadTs).catch(() => []);
   const threadTexts = threadMessages.map(message => message.text);
   logger.info({ eventId: event.eventId, messages: threadMessages.length }, 'thread context fetched for intake');
-  let task = normalizeTask(event, config, threadTexts);
+  let task = { ...normalizeTask(event, config, threadTexts), threadMessages };
 
   // If this event resumes a paused workflow that asked the user to reply
   // in-thread, synthesize the bot mention so the no-mention gate below does
@@ -873,6 +995,28 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     logger.info({ eventId: event.eventId }, 'skip non-mention message');
     await removeReaction(client, event.channelId, event.eventTs, 'eyes');
     return;
+  }
+
+  // Conversation capture (intake path): the mention makes this a miniOG
+  // thread — persist the transcript we already fetched, registering the
+  // thread as tracked so the live tap picks up everything that follows.
+  // Placed AFTER the mention gate on purpose: capture-all means all miniOG
+  // threads, not every thread in every channel. Synthetic envelopes (slash
+  // commands, shortcuts, reaction-resume, launchpad) are skipped — their
+  // threadTs/eventTs are not real Slack messages. Fire-and-forget — capture
+  // must never delay or fail the job.
+  if (!isSyntheticEnvelope(event)) {
+    void captureThreadFromMessages({
+      client: eventClient,
+      store,
+      config,
+      channelId: event.channelId,
+      threadTs: event.threadTs,
+      channelType: event.channelType,
+      messages: threadMessages,
+    }).catch(error =>
+      logger.warn({ eventId: event.eventId, error: String(error) }, 'intake conversation capture failed'),
+    );
   }
 
   // Policy engine check — block requests that violate critical or non-master rules
@@ -934,10 +1078,19 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
   });
 
   const abortController = new AbortController();
-  registerActiveJob(jobId, abortController);
+  registerActiveJob(jobId, abortController, {
+    channelId: event.channelId,
+    threadTs: event.threadTs,
+    requestedBy: event.userId,
+  });
 
   const stepLogs: WorkflowStepLog[] = [];
 
+  // `status` is declared below but referenced inside logStep: the two are
+  // mutually dependent (logStep drives the status line; the status module
+  // reports its own failures back through logStep). Safe because
+  // createThreadStatus never invokes logStep synchronously, so `status` is
+  // always initialized before any logStep call can read it.
   const logStep = (step: WorkflowStepLog): void => {
     stepLogs.push({
       level: step.level ?? 'INFO',
@@ -982,7 +1135,32 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
         'failed to persist workflow step log',
       );
     }
+
+    // Drive the Slack status line. Wrapped because status is decoration: a
+    // narration bug must never break logging or abort a job.
+    try {
+      const narrated = narrateStep(step);
+      if (narrated && status) {
+        status.set(narrated.text);
+        // Human-wait gates idle for hours; stop refreshing so the status
+        // expires on its own instead of being pinned.
+        if (narrated.suspend) status.suspend();
+      }
+    } catch (error) {
+      logger.warn({ jobId, stage: step.stage, error: String(error) }, 'status narration failed');
+    }
   };
+
+  // Live "miniOG is …" thread status. Every workflow lights up for free:
+  // logStep is the one choke point all ~200 stages — and the CLI tool events
+  // from the stream decoder — flow through.
+  const status: ThreadStatus = createThreadStatus({
+    slack: client,
+    channelId: event.channelId,
+    threadTs: event.threadTs,
+    logStep,
+  });
+  status.set('is getting started…');
 
   logStep({
     stage: 'job.created',
@@ -997,6 +1175,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
       threadMessages: threadMessages.length,
       ingestSource: event.ingestSource ?? 'socket',
       launchpadRequestId: event.launchpadRequestId ?? null,
+      ...sidecarBuild,
     },
   });
 
@@ -1006,6 +1185,39 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     store,
     logStep,
   });
+
+  // A cancel from the desktop app is silent in Slack otherwise; whoever
+  // deleted the source message needs no reply.
+  const postCancelNote = async (source: string | undefined): Promise<void> => {
+    if (source !== 'ui') return;
+    await eventClient.chat
+      .postMessage({
+        channel: event.channelId,
+        thread_ts: event.threadTs,
+        text: 'Stopped — this run was cancelled from the Watchtower app.',
+      })
+      .catch(() => {});
+  };
+
+  // An abort that surfaces as an exception is still a cancel (issue #438): no
+  // failure copy, no diagnosis, no desktop failure alert, and the job stays
+  // CANCELLED instead of being overwritten with FAILED.
+  const finalizeCancelledJob = async (detail: string): Promise<void> => {
+    const cancelReason = takeCancelReason(jobId);
+    logStep({
+      stage: 'job.cancelled',
+      message: 'Run was cancelled — recording CANCELLED, not a failure.',
+      level: 'WARN',
+      data: { detail, cancelSource: cancelReason?.source },
+    });
+    await cleanupThreadWorkspaces(event.threadTs);
+    unregisterActiveJob(jobId);
+    failLaunchpadWorkflow({ event, errorMessage: 'Cancelled.', store, logStep });
+    store.markJob(jobId, 'CANCELLED', { errorMessage: cancelReason?.message ?? 'Cancelled.' });
+    await postCancelNote(cancelReason?.source);
+    await removeReaction(client, event.channelId, event.eventTs, 'eyes');
+    await addReaction(client, event.channelId, event.eventTs, 'x');
+  };
 
   try {
     let attempt = 0;
@@ -1041,7 +1253,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
           }
         }
 
-        const result = await agentCallContext.run({ jobId, store }, () =>
+        const workflowResult = await agentCallContext.run({ jobId, store }, () =>
           routeTask({
             task: routedTask,
             config,
@@ -1052,6 +1264,23 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
             signal: abortController.signal,
           }),
         );
+        // An aborted run is cancelled, whatever the workflow made of its dead
+        // agent (issue #438). Settled before the diagnosis and the status write
+        // below, which used to report it as a failed job with a "timeout".
+        const result = settleAbortedResult(workflowResult, abortController.signal.aborted);
+        const cancelReason = abortController.signal.aborted ? takeCancelReason(jobId) : undefined;
+        if (result !== workflowResult) {
+          logStep({
+            stage: 'job.cancelled',
+            message: 'Run was cancelled — recording CANCELLED, not the workflow failure.',
+            level: 'WARN',
+            data: {
+              workflowStatus: workflowResult.status,
+              workflowMessage: workflowResult.message,
+              cancelSource: cancelReason?.source,
+            },
+          });
+        }
         const hasPrInResult =
           result.result?.prUrl && typeof result.result.prUrl === 'string' && result.result.prUrl !== '';
         const diagnosis =
@@ -1101,7 +1330,13 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
         } else if (result.status === 'SKIPPED') {
           store.markJob(jobId, 'SKIPPED', { result: result.result, executedWorkflow });
         } else if (result.status === 'CANCELLED') {
-          store.markJob(jobId, 'CANCELLED', { result: result.result, executedWorkflow });
+          store.markJob(jobId, 'CANCELLED', {
+            // Keep who cancelled it; markJob would otherwise blank the reason.
+            errorMessage: cancelReason?.message,
+            result: result.result,
+            executedWorkflow,
+          });
+          await postCancelNote(cancelReason?.source);
         } else {
           store.markJob(jobId, 'FAILED', {
             errorMessage: result.message,
@@ -1210,7 +1445,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
             error: msg,
           },
         });
-        if (!transient || attempt >= 3) {
+        if (abortController.signal.aborted || !transient || attempt >= 3) {
           break;
         }
         logStep({
@@ -1223,6 +1458,11 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
           },
         });
       }
+    }
+
+    if (abortController.signal.aborted) {
+      await finalizeCancelledJob(String(lastError));
+      return;
     }
 
     const errorMessage = `Workflow failed after retries: ${String(lastError)}`;
@@ -1327,6 +1567,10 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     }
   } catch (error) {
     const errorMessage = String(error);
+    if (abortController.signal.aborted) {
+      await finalizeCancelledJob(errorMessage);
+      return;
+    }
     const diagnosis = diagnoseFailure({
       workflow: routedTask.intent,
       message: errorMessage,
@@ -1397,12 +1641,39 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     } catch {
       // ignore persistence failures in terminal error path
     }
+  } finally {
+    // The same-thread lock lives in this process (issue #261), so it must be
+    // released on every way out, including a throw inside the handlers above.
+    // Idempotent: the normal paths have already unregistered.
+    unregisterActiveJob(jobId);
+
+    // Slack clears the status automatically whenever miniOG posts a message,
+    // but SKIPPED jobs can end without ever posting — clear explicitly so the
+    // thread does not keep showing "miniOG is …" after the job is done.
+    // dispose() then releases the keepalive timer, which would otherwise hold a
+    // reference to the client and the job for the life of the sidecar.
+    await status.clear();
+    status.dispose();
   }
 }
 
 async function main(): Promise<void> {
-  logger.info({ dbPath, maxConcurrentJobs: config.maxConcurrentJobs }, 'watchtower sidecar starting');
+  logger.info({ dbPath, maxConcurrentJobs: config.maxConcurrentJobs, ...sidecarBuild }, 'watchtower sidecar starting');
   await cleanupStaleWorkspaces();
+
+  // An older bundle starting after a newer one is how two builds ended up
+  // serving the same Slack app (issue #450). The lock stops them overlapping;
+  // this makes a rollback-by-accident visible.
+  const lastAppVersion = store.getState('last_app_version');
+  if (lastAppVersion && isOlderVersion(sidecarBuild.appVersion, lastAppVersion)) {
+    logger.warn({ lastAppVersion, ...sidecarBuild }, 'this build is older than the one that last used this database');
+    notifyDesktop(
+      'Older Watchtower build started',
+      `Running ${sidecarBuild.appVersion}, but ${lastAppVersion} last used this database. Quit this copy unless that is intended.`,
+    );
+  } else if (sidecarBuild.appVersion !== 'dev') {
+    store.setState('last_app_version', sidecarBuild.appVersion);
+  }
 
   // Boot the optional Obsidian-compatible vault writer. When disabled (or no
   // path configured), scheduleVaultRender calls become no-ops; the dossier
@@ -1427,10 +1698,43 @@ async function main(): Promise<void> {
   // concurrency capped at 2 LLM calls in flight.
   startProfileSynthesizerScheduler(store);
 
+  // Conversation-thread synthesizer: turns quiet captured threads into a
+  // durable title/TL;DR/decisions. Same cost discipline as the profile
+  // synthesizer (idle + delta + interval gates, light tier, concurrency 2).
+  startThreadSynthesizerScheduler(store);
+
+  // Jobs that were waiting on a person when the previous process went away.
+  // Read before the cleanup below fails them; their threads are told after.
+  const parkedAtRestart = store
+    .listRunningJobsWithLastStage()
+    .map(job => ({ ...job, gate: humanGateForStage(job.lastStage) }))
+    .filter(job => job.gate !== undefined);
+
   // Mark any leftover RUNNING jobs as FAILED — their processes are gone after restart
   const orphaned = store.cleanupOrphanedRunningJobs();
   if (orphaned > 0) {
     logger.warn({ orphaned }, 'cleaned up orphaned RUNNING jobs from previous session');
+  }
+
+  // A plan awaiting approval used to vanish on a restart without a word
+  // (issue #436). Best effort, and never blocks startup.
+  if (parkedAtRestart.length > 0 && config.slackBotToken) {
+    const noticeClient = new WebClient(config.slackBotToken);
+    for (const job of parkedAtRestart) {
+      const text = buildRestartNotice({ gate: job.gate!, requestedBy: job.requestedBy });
+      void noticeClient.chat
+        .postMessage({ channel: job.channelId, thread_ts: job.threadTs, text })
+        .then(() =>
+          store.appendJobLog({
+            jobId: job.id,
+            stage: 'job.restart_notice',
+            level: 'WARN',
+            message: `Told the thread the request was dropped by a restart (was waiting: ${job.gate}).`,
+            data: { gate: job.gate, lastStage: job.lastStage },
+          }),
+        )
+        .catch(err => logger.warn({ jobId: job.id, err: String(err) }, 'restart notice failed'));
+    }
   }
 
   // Revert launchpad requests stranded in CLAIMED/QUEUED back to PENDING so
@@ -1474,6 +1778,9 @@ async function main(): Promise<void> {
     shutdownVaultWriter();
     void shutdownVaultWatcher();
     stopProfileSynthesizerScheduler();
+    stopThreadSynthesizerScheduler();
+    stopThreadSweeper();
+    shutdownGithubPublisher();
     store.close();
     process.exit(0);
   });
@@ -1483,6 +1790,9 @@ async function main(): Promise<void> {
     shutdownVaultWriter();
     void shutdownVaultWatcher();
     stopProfileSynthesizerScheduler();
+    stopThreadSynthesizerScheduler();
+    stopThreadSweeper();
+    shutdownGithubPublisher();
     store.close();
     process.exit(0);
   });
@@ -1579,7 +1889,7 @@ async function main(): Promise<void> {
   setInterval(() => {
     const pendingIds = store.popPendingCancels();
     for (const jobId of pendingIds) {
-      const cancelled = cancelJob(jobId);
+      const cancelled = cancelJob(jobId, { source: 'ui', message: 'Cancelled from Watchtower UI.' });
       if (cancelled) {
         store.markJob(jobId, 'CANCELLED', { errorMessage: 'Cancelled from Watchtower UI.' });
         logger.info({ jobId }, 'job cancelled from UI');
@@ -1620,6 +1930,11 @@ async function main(): Promise<void> {
   // data are preserved. Window defaults to 30 days; override via
   // WATCHTOWER_RETENTION_DAYS (clamped to >= 1 inside pruneOldRows).
   const retentionDays = Number(process.env.WATCHTOWER_RETENTION_DAYS ?? 30) || 30;
+  // Conversation memory is exempt from the sweep above (it IS the durable
+  // org memory). Optional knob: when set (> 0), messages older than the
+  // window are pruned from IDLE threads only — thread rows + synthesis
+  // always survive. Default 0 = keep forever.
+  const conversationRetentionDays = Number(process.env.WATCHTOWER_CONVERSATION_RETENTION_DAYS ?? 0) || 0;
   const runRetentionSweep = (): void => {
     try {
       const pruned = store.pruneOldRows(retentionDays);
@@ -1632,6 +1947,15 @@ async function main(): Promise<void> {
         pruned.jobs;
       if (total > 0) {
         logger.info({ retentionDays, total, ...pruned }, 'retention sweep pruned old rows');
+      }
+      if (conversationRetentionDays > 0) {
+        const prunedMessages = store.conversationStore().pruneIdleMessages(conversationRetentionDays);
+        if (prunedMessages > 0) {
+          logger.info(
+            { conversationRetentionDays, prunedMessages },
+            'retention sweep pruned idle conversation messages',
+          );
+        }
       }
     } catch (err) {
       logger.warn({ err: String(err) }, 'retention sweep tick failed');
@@ -1646,6 +1970,28 @@ async function main(): Promise<void> {
     store,
     enqueue: enqueueSlackEvent,
   });
+
+  // Conversation reconciliation sweeper: re-fetches recently-active tracked
+  // threads so socket downtime can't leave holes in captured transcripts.
+  startThreadSweeper({
+    webClient: client.webClient,
+    config,
+    store,
+  });
+
+  // GitHub conversation publisher (M4): mirrors org-visible captured threads
+  // into the configured markdown knowledge repo. No-op until enabled via
+  // app_settings or WATCHTOWER_GITHUB_EGRESS_* env vars.
+  configureGithubPublisher({ store, slack: client.webClient });
+
+  // Historical conversation backfill (M5): operator-triggered, cursor-
+  // resumable — set WATCHTOWER_CONVERSATION_BACKFILL=1 and restart until it
+  // logs 'complete'. Runs in the background; never blocks event processing.
+  if (process.env.WATCHTOWER_CONVERSATION_BACKFILL === '1') {
+    void runConversationBackfill({ webClient: client.webClient, config, store }).catch(err =>
+      logger.warn({ err: String(err) }, 'conversation backfill failed'),
+    );
+  }
 
   startLaunchpadRequestPoller({
     webClient: client.webClient,

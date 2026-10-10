@@ -104,6 +104,68 @@ describe('loadConfigFromDb', () => {
     expect(config.allowedChannelsForBugFix).toEqual(['C01H25RNLJH', 'C02BUGS']);
     expect(config.bugsAndUpdatesChannelId).toBe('C01H25RNLJH');
     expect(config.repoPaths.newtonWeb).toBe(newtonWeb);
+    // The fixture schema predates newton_marketing_web_path, so this also
+    // proves the self-migration ran and a blank column disables the repo.
+    expect(config.repoPaths.newtonMarketingWeb).toBeUndefined();
+  });
+
+  it('loads an optional newton-marketing-web path when configured under the root', () => {
+    const { dbPath, miniOgRoot, newtonWeb, newtonApi } = makeFixture();
+    const marketingWeb = path.join(miniOgRoot, 'newton-marketing-web');
+    fs.mkdirSync(marketingWeb, { recursive: true });
+
+    const db = new Database(dbPath);
+    db.exec(`ALTER TABLE app_settings ADD COLUMN newton_marketing_web_path TEXT NOT NULL DEFAULT ''`);
+    db.prepare(
+      `
+      UPDATE app_settings
+      SET slack_bot_token = ?,
+          slack_app_token = ?,
+          owner_slack_user_ids = ?,
+          bot_user_id = ?,
+          newton_web_path = ?,
+          newton_api_path = ?,
+          newton_marketing_web_path = ?
+      WHERE id = 1
+    `,
+    ).run('xoxb-valid', 'xapp-valid', 'U1', 'UBOT', newtonWeb, newtonApi, marketingWeb);
+    db.close();
+
+    const config = loadConfigFromDb(dbPath);
+    expect(config.repoPaths.newtonMarketingWeb).toBe(fs.realpathSync(marketingWeb));
+  });
+
+  it('refuses config when the marketing path is outside the mini-og root', () => {
+    const { dbPath, newtonWeb, newtonApi } = makeFixture();
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'watchtower-mkt-outside-'));
+    const outsideMarketing = path.join(outside, 'newton-marketing-web');
+    fs.mkdirSync(outsideMarketing, { recursive: true });
+
+    const db = new Database(dbPath);
+    db.exec(`ALTER TABLE app_settings ADD COLUMN newton_marketing_web_path TEXT NOT NULL DEFAULT ''`);
+    db.prepare(
+      `
+      UPDATE app_settings
+      SET slack_bot_token = ?,
+          slack_app_token = ?,
+          owner_slack_user_ids = ?,
+          bot_user_id = ?,
+          newton_web_path = ?,
+          newton_api_path = ?,
+          newton_marketing_web_path = ?
+      WHERE id = 1
+    `,
+    ).run('xoxb-valid', 'xapp-valid', 'U1', 'UBOT', newtonWeb, newtonApi, outsideMarketing);
+    db.close();
+
+    let thrown: unknown;
+    try {
+      loadConfigFromDb(dbPath);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(MiniOgRepoRootViolationError);
+    expect(String(thrown)).toContain('newton_marketing_web_path');
   });
 
   it('self-migrates the mini_og_repo_root column when the DB predates it', () => {

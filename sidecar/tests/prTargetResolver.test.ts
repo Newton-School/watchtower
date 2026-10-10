@@ -3,6 +3,7 @@ import { extractAllPrContexts, resolvePrReviewTargets, MAX_REVIEW_TARGETS } from
 
 const API_PR = 'https://github.com/Newton-School/newton-api/pull/5781';
 const WEB_PR = 'https://github.com/Newton-School/newton-web/pull/8652';
+const MARKETING_PR = 'https://github.com/Newton-School/newton-marketing-web/pull/42';
 
 // The issue #334 incident thread: parent lists the backend PR first, then the
 // frontend PR. Every "first URL wins" regression reproduces against this.
@@ -103,6 +104,55 @@ describe('resolvePrReviewTargets (issue #334 bug A)', () => {
 
     expect(resolution.mode).toBe('ambiguous');
     expect(resolution.candidates).toHaveLength(1);
+  });
+
+  it('"review the marketing web PR" picks the marketing PR — \\bweb\\b must not leak (two frontends in thread)', () => {
+    for (const phrase of ['review the marketing web PR', 'review the marketing PR', 'review the nmw PR']) {
+      const resolution = resolvePrReviewTargets({
+        triggerText: phrase,
+        threadTexts: [`frontend : ${WEB_PR}\nmarketing : ${MARKETING_PR}`],
+      });
+      expect(resolution.mode).toBe('selector');
+      expect(resolution.targets).toHaveLength(1);
+      expect(resolution.targets[0]).toMatchObject({ repo: 'newton-marketing-web', number: 42 });
+    }
+  });
+
+  it('"review the frontend PR" with only a marketing PR in the thread picks it (frontend family)', () => {
+    const resolution = resolvePrReviewTargets({
+      triggerText: 'review the frontend PR',
+      threadTexts: [`marketing : ${MARKETING_PR}`],
+    });
+    expect(resolution.mode).toBe('selector');
+    expect(resolution.targets[0]).toMatchObject({ repo: 'newton-marketing-web', number: 42 });
+  });
+
+  it('"review the web PR" with BOTH frontend PRs in the thread goes ambiguous — never guess between frontends', () => {
+    const resolution = resolvePrReviewTargets({
+      triggerText: 'review the web PR',
+      threadTexts: [`frontend : ${WEB_PR}\nmarketing : ${MARKETING_PR}`],
+    });
+    expect(resolution.mode).toBe('ambiguous');
+    expect(resolution.targets).toEqual([]);
+    expect(resolution.candidates).toHaveLength(2);
+  });
+
+  it('"review the newton-web PR" stays exact even with a marketing PR present', () => {
+    const resolution = resolvePrReviewTargets({
+      triggerText: 'review the newton-web PR',
+      threadTexts: [`frontend : ${WEB_PR}\nmarketing : ${MARKETING_PR}`],
+    });
+    expect(resolution.mode).toBe('selector');
+    expect(resolution.targets[0]).toMatchObject({ repo: 'newton-web', number: 8652 });
+  });
+
+  it('a marketing PR URL alone never matches the web selector (slug contains "web")', () => {
+    const resolution = resolvePrReviewTargets({
+      triggerText: 'review the api PR',
+      threadTexts: [`marketing : ${MARKETING_PR}\nbackend : ${API_PR}`],
+    });
+    expect(resolution.mode).toBe('selector');
+    expect(resolution.targets[0]).toMatchObject({ repo: 'newton-api', number: 5781 });
   });
 
   it('resolves a single thread PR without qualifiers (the happy path)', () => {

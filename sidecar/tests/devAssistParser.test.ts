@@ -23,10 +23,11 @@ describe('devAssistParser', () => {
   });
 
   it('parses wt trace command with optional lines', () => {
+    // Default raised to 60: a per-tool-call trail makes a 20-line tail useless.
     expect(parseDevAssistCommand('<@UBOT1> wt trace abc123')).toEqual({
       type: 'TRACE',
       jobId: 'abc123',
-      limit: 20,
+      limit: 60,
     });
     expect(parseDevAssistCommand('<@UBOT1> wt trace abc123 40')).toEqual({
       type: 'TRACE',

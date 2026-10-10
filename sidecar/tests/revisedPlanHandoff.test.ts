@@ -87,6 +87,42 @@ describe('revised plan handoff (#388)', () => {
     expect(prompt).toContain('Plan scope: medium');
   });
 
+  // Regression for the plannerBackend threading fix: on claude-code the revision
+  // schema is unenforced, so the planner returns prose wrapped as
+  // {status, summary, actions, prUrl}. Normalizing that with 'codex' (the old
+  // hardcode at the revision site) yields an EMPTY planMarkdown — the workflow
+  // then silently kept the stale pre-feedback plan. Normalizing with the real
+  // backend recovers the revised plan.
+  it('claude-code prose revision replaces the plan when normalized with the real backend', () => {
+    const proseRevision = {
+      status: 'success',
+      summary: `## Revised plan\n- ${REVISED_STEPS[0]} in \`src/containers/WelcomeStep/index.js\`\n- ${REVISED_STEPS[1]}\n\nScope: small\nRequires code changes: yes`,
+      actions: [],
+      prUrl: '',
+    };
+
+    // The bug: codex normalization of a claude-code envelope loses everything.
+    const wrongBackend = normalizePlannerOutput(proseRevision, 'codex');
+    expect(wrongBackend.planMarkdown).toBe('');
+    expect(wrongBackend.affectedFiles).toEqual([]);
+
+    // The fix: claude-code normalization recovers the revised plan.
+    const normalized = normalizePlannerOutput(proseRevision, 'claude-code');
+    expect(normalized.planMarkdown).toContain(REVISED_STEPS[0]);
+    expect(normalized.scope).toBe('small');
+    expect(normalized.affectedFiles).toContain('src/containers/WelcomeStep/index.js');
+
+    const raw: Record<string, unknown> = { ...proseRevision };
+    stampApprovedPlan(raw, {
+      planMarkdown: normalized.planMarkdown,
+      scope: normalized.scope,
+      affectedFiles: normalized.affectedFiles,
+    });
+    const prompt = buildCoderPrompt(makeCoderCtx(raw));
+    expect(prompt).not.toContain('No plan markdown available.');
+    expect(prompt).toContain(REVISED_STEPS[1]);
+  });
+
   it('stampApprovedPlan returns the same object with fields set', () => {
     const target: Record<string, unknown> = { plan: ['x'] };
     const result = stampApprovedPlan(target, {

@@ -9,7 +9,7 @@ import type {
   WorkflowResult,
   WorkflowStepLogger,
 } from '../types/contracts.js';
-import { getAdminUserIds } from '../access/control.js';
+import { formatAdminMention, getAdminUserIds } from '../access/control.js';
 import { runCodex, getActiveBackendId, selectBackendForUser } from '../codex/runCodex.js';
 import { assembleRecall } from '../codex/recallAssembler.js';
 import { highReasoningProfile } from '../codex/modelProfiles.js';
@@ -17,9 +17,18 @@ import { buildMentionSystemPrompt } from '../codex/mentionSystemPrompt.js';
 import { githubAuthModeHint } from '../github/githubAuth.js';
 import { notifyDesktop } from '../notify/desktopNotifier.js';
 import { getBackend } from '../backends/registry.js';
-import { runAgentPipeline, formatPlanMessage, waitForApproval, buildApprovalMessage } from '../agents/pipeline.js';
+import type { AgentBackendId } from '../backends/types.js';
+import {
+  runAgentPipeline,
+  formatPlanMessage,
+  waitForApproval,
+  buildApprovalMessage,
+  coderDeclaredBlocked,
+} from '../agents/pipeline.js';
 import { normalizePlannerOutput } from '../agents/normalizePlannerOutput.js';
-import { inferRepoFromAffectedFiles, repoPathFor, resolveRepoOrAsk } from './shared/repoResolver.js';
+import { inferRepoFromAffectedFiles, readRepoAffinity, repoPathFor, resolveRepoOrAsk } from './shared/repoResolver.js';
+import { enabledRepoKeys, getRepo, repoKeyForWorkspacePath } from '../repos/registry.js';
+import type { RepoAffinity } from '../router/repoClassifier.js';
 import { waitForClarificationWithIdle, detectClarificationLoop } from './shared/clarificationGuards.js';
 import type { ClarificationRound } from './shared/clarificationGuards.js';
 import { profileForAgentRole } from '../codex/modelProfiles.js';
@@ -27,6 +36,8 @@ import { buildPlannerPrompt, buildPlannerPlanModePrompt } from '../agents/prompt
 import { resolveWorkspace } from '../workspaces/workspaceManager.js';
 import { createPrFromWorkspace } from '../github/postPipelinePr.js';
 import { fetchUnresolvedReviewThreadCount } from '../github/prReviewComments.js';
+import { waitForExactConfirmation } from './shared/confirmationGate.js';
+import { cancelledResult } from './shared/cancelState.js';
 import type { PipelineStore } from '../agents/pipeline.js';
 import type { AgentStepResult, PipelineConfig } from '../agents/types.js';
 import type { InvestigationStore } from '../state/investigationStore.js';
@@ -43,7 +54,7 @@ function buildOwnerPrimaryPrompt(params: {
   threadContext: string;
   imageContext: string;
 }): string {
-  const { task, workspaceRoot, githubToken, threadContext, imageContext } = params;
+  const { task, config, workspaceRoot, githubToken, threadContext, imageContext } = params;
   return `
 ${buildMentionSystemPrompt({ task, workflow: 'IMPLEMENTATION', toneMode: task.toneMode })}
 
@@ -53,7 +64,7 @@ The request below was sent by a configured owner Slack user.
 
 Environment:
 - Working directory: ${workspaceRoot}
-- Known repositories: newton-web, newton-api
+- Known repositories: ${enabledRepoKeys(config).join(', ')}
 - GitHub auth mode: ${githubAuthModeHint(Boolean(githubToken))}
 
 Guardrails:
@@ -86,7 +97,7 @@ function buildOwnerRelaxedPrompt(params: {
   threadContext: string;
   imageContext: string;
 }): string {
-  const { task, workspaceRoot, githubToken, threadContext, imageContext } = params;
+  const { task, config, workspaceRoot, githubToken, threadContext, imageContext } = params;
   return `
 ${buildMentionSystemPrompt({ task, workflow: 'IMPLEMENTATION', toneMode: task.toneMode })}
 
@@ -94,7 +105,7 @@ You are running Watchtower implementation mode in relaxed output mode.
 
 Environment:
 - Working directory: ${workspaceRoot}
-- Known repositories: newton-web, newton-api
+- Known repositories: ${enabledRepoKeys(config).join(', ')}
 - GitHub auth mode: ${githubAuthModeHint(Boolean(githubToken))}
 
 Guardrails:
@@ -113,15 +124,36 @@ Your response will be posted DIRECTLY to a Slack thread as-is. Write a ready-to-
 `.trim();
 }
 
+/**
+ * Repo-scoped policy pack for the agent pipeline. Rendered into planner,
+ * coder, reviewer, and verifier prompts via `policyBlock`. Placed as an
+ * explicit override so recalled per-user habits from OTHER repos (jest
+ * tests, /public assets, styled-components) can't leak into repos whose
+ * conventions differ.
+ */
+function repoPolicyPackForCwd(cwd: string, config: AppConfig): { packName: string; rules: string[] } | undefined {
+  const key = repoKeyForWorkspacePath(cwd, config);
+  if (!key) return undefined;
+  const rules = getRepo(key).guardrails;
+  if (rules.length === 0) return undefined;
+  return {
+    packName: `repo:${key}`,
+    rules: ['These repo rules OVERRIDE any prior habits or recalled conventions from other repos.', ...rules],
+  };
+}
+
 function buildGuardrailedPrompt(params: {
   task: NormalizedTask;
+  config: AppConfig;
   repoPath: string;
   repoName: string;
   githubToken?: string;
   threadContext: string;
   imageContext: string;
 }): string {
-  const { task, repoPath, repoName, githubToken, threadContext, imageContext } = params;
+  const { task, config, repoPath, repoName, githubToken, threadContext, imageContext } = params;
+  const repoPack = repoPolicyPackForCwd(repoPath, config);
+  const repoRules = repoPack ? `\n${repoPack.rules.map(rule => `- ${rule}`).join('\n')}` : '';
   return `
 ${buildMentionSystemPrompt({ task, workflow: 'IMPLEMENTATION', toneMode: task.toneMode })}
 
@@ -134,7 +166,7 @@ Environment:
 
 GUARDRAILS:
 - Work only within this repository directory. Do not access or modify files outside of it.
-- Do not run destructive git commands (force push, reset --hard, etc.).
+- Do not run destructive git commands (force push, reset --hard, etc.).${repoRules}
 
 Task:
 Implement the requested changes within the repository. Create a branch, commit your changes, and open a PR to the default branch.
@@ -155,6 +187,115 @@ Return strict JSON with:
 }
 
 const MAX_FEEDBACK_ITERATIONS = 5;
+/** A plan waiting for approval re-pings the approvers after 15 minutes and again after 2 hours (issue #436). */
+export const PLAN_APPROVAL_REMINDERS_MS = [15 * 60 * 1000, 2 * 60 * 60 * 1000];
+
+/** Deploy semantics in a no-code ask. Wider than the deploy gate on purpose: here a match only withholds an action. */
+export const QUICK_ACTION_DEPLOY_RE =
+  /\b(deploy|release|ship|roll ?back|push (?:it |this |that )?to prod(?:uction)?)\b/i;
+
+export const QUICK_ACTION_DEPLOY_REDIRECT =
+  "I don't deploy or roll back from here. If you want something shipped, ask me directly — `@miniOG deploy newton-web to prod` or `@miniOG deploy marketing to prod` — and I'll confirm with you before anything goes out.";
+
+/** Quick actions that change a pull request and cannot be taken back cheaply. */
+const QUICK_ACTION_PR_ACTION_RE = /\b(merge|close|revert)\b/i;
+type QuickPrAction = 'merge' | 'close' | 'revert';
+
+export const QUICK_ACTION_APPROVE_REFUSAL =
+  "I don't approve pull requests. Ask me to review one and I'll post comments; the approval is a person's call.";
+
+/** Internal seam — tests stub the wait instead of scripting Slack replies. */
+export const __quickActionConfirm = { wait: waitForExactConfirmation };
+
+/**
+ * Merge, close and revert run under the owner's GitHub identity, so when
+ * someone else asks, the owner confirms first (issue #429). Returns the
+ * confirming user, or the result to return with nothing changed.
+ */
+async function confirmQuickPrAction(params: {
+  task: NormalizedTask;
+  config: AppConfig;
+  slack: WebClient;
+  action: QuickPrAction;
+  prUrls: string[];
+  unresolvedCount?: number;
+  logStep?: WorkflowStepLogger;
+  signal?: AbortSignal;
+}): Promise<{ confirmedBy: string } | { result: WorkflowResult }> {
+  const { task, config, slack, action, prUrls, unresolvedCount, logStep, signal } = params;
+  const { channelId, threadTs, userId } = task.event;
+  const phrase = `confirm ${action}`;
+  const owners = config.ownerSlackUserIds;
+  const ownerMentions = owners.map(id => `<@${id}>`).join(' or ');
+  const stop = (status: WorkflowResult['status'], message: string, slackPosted: boolean) => ({
+    result: {
+      workflow: 'IMPLEMENTATION',
+      status,
+      message,
+      notifyDesktop: status === 'FAILED',
+      slackPosted,
+    } satisfies WorkflowResult,
+  });
+  const say = (text: string) =>
+    slack.chat
+      .postMessage({ channel: channelId, thread_ts: threadTs, text })
+      .then(() => true)
+      .catch(() => false);
+
+  if (owners.length === 0) {
+    const msg = `I can't ${action} on request here: there is no owner configured to confirm it.`;
+    return stop('SKIPPED', msg, await say(msg));
+  }
+
+  const target = prUrls.length > 0 ? prUrls.join(', ') : 'the pull request in this thread';
+  const unresolvedNote =
+    unresolvedCount && unresolvedCount > 0
+      ? ` It has ${unresolvedCount} unresolved review comment${unresolvedCount > 1 ? 's' : ''}.`
+      : '';
+  let promptTs: string | undefined;
+  try {
+    const prompt = await slack.chat.postMessage({
+      channel: channelId,
+      thread_ts: threadTs,
+      text: `<@${userId}> asked me to ${action} ${target}.${unresolvedNote} ${ownerMentions}, reply \`${phrase}\` within 10 minutes and I'll do it. Without that, nothing changes.`,
+    });
+    promptTs = typeof prompt.ts === 'string' ? prompt.ts : undefined;
+  } catch {
+    // Handled below: without an anchored prompt there is nothing safe to wait on.
+  }
+  if (!promptTs) {
+    const msg = `Couldn't post the ${action} confirmation, so nothing was changed.`;
+    logStep?.({ stage: 'implementation.quick_action.confirm.prompt_failed', message: msg, level: 'ERROR' });
+    return stop('FAILED', msg, false);
+  }
+  logStep?.({
+    stage: 'implementation.quick_action.confirm.asked',
+    message: `Asked the owner to confirm: ${action} requested by <@${userId}>.`,
+    data: { action, prUrls, requestedBy: userId, promptTs },
+  });
+
+  const confirmation = await __quickActionConfirm.wait({
+    slack,
+    channelId,
+    threadTs,
+    promptTs,
+    phrase,
+    allowedUserIds: owners,
+    botUserId: config.botUserId,
+    stagePrefix: 'implementation.quick_action.confirm',
+    logStep,
+    signal,
+  });
+  if (confirmation.outcome === 'confirmed') return { confirmedBy: confirmation.userId ?? owners[0] };
+  if (confirmation.outcome === 'cancelled')
+    return stop('CANCELLED', `Stopped before the ${action} was confirmed.`, false);
+
+  const msg =
+    confirmation.outcome === 'declined'
+      ? 'Okay, leaving it as it is.'
+      : `No \`${phrase}\` from ${ownerMentions} in 10 minutes, so nothing was changed. Ask again when they're around.`;
+  return stop('SKIPPED', msg, await say(msg));
+}
 const MAX_PAUSE_CYCLES = 10;
 
 type ApprovalLoopState = {
@@ -170,6 +311,7 @@ type ApprovalLoopOutcome =
   | ({ kind: 'approved'; feedbackRounds: number; pipelineCwd: string } & ApprovalLoopState)
   | { kind: 'rejected_then_cancelled'; message: string }
   | { kind: 'exhausted' }
+  | { kind: 'cancelled' }
   | { kind: 'paused'; resumeContext: ImplementationApprovalResume };
 
 /**
@@ -213,12 +355,16 @@ async function runApprovalLoop(input: {
   pauseCountStart: number;
   plannerSchemaPath: string;
   plannerProfile: ReturnType<typeof profileForAgentRole>;
+  /** Backend the planner ran on — decides how revision output is normalized. */
+  plannerBackend: AgentBackendId;
   workflowTimeoutMs: number;
   githubToken?: string;
   /** When set, the first loop iteration uses this ts as the wait-cutoff instead of posting a fresh prompt. */
   resumeApprovalPromptTs?: string;
   workflowIntent: 'IMPLEMENTATION' | 'OWNER_AUTOPILOT';
   logStep?: WorkflowStepLogger;
+  /** The job's abort signal: ends the approval wait and stops a revision run (issue #264). */
+  signal?: AbortSignal;
 }): Promise<ApprovalLoopOutcome> {
   const {
     slack,
@@ -230,10 +376,12 @@ async function runApprovalLoop(input: {
     pauseCountStart,
     plannerSchemaPath,
     plannerProfile,
+    plannerBackend,
     githubToken,
     resumeApprovalPromptTs,
     workflowIntent,
     logStep,
+    signal,
   } = input;
 
   const adminUserIds = getAdminUserIds(config);
@@ -306,6 +454,7 @@ async function runApprovalLoop(input: {
       message: `Waiting for admin approval of plan (iteration ${iteration + 1}).`,
     });
 
+    const approverMention = formatAdminMention(config);
     let approval = await waitForApproval({
       slack,
       channelId: task.event.channelId,
@@ -315,7 +464,17 @@ async function runApprovalLoop(input: {
       approvalPromptTs,
       logStep: logStep ?? (() => {}),
       botUserId: config.botUserId,
+      signal,
+      reminders: {
+        afterMs: PLAN_APPROVAL_REMINDERS_MS,
+        text: `${approverMention} <@${task.event.userId}>'s plan above still needs a yes or no.`,
+      },
+      approverMention,
     });
+
+    if (approval.outcome === 'cancelled') {
+      return { kind: 'cancelled' };
+    }
 
     if (approval.outcome === 'paused') {
       pauseCount++;
@@ -380,7 +539,12 @@ async function runApprovalLoop(input: {
         approvalPromptTs: askReviseTs,
         logStep: logStep ?? (() => {}),
         botUserId: config.botUserId,
+        signal,
       });
+
+      if (followUp.outcome === 'cancelled') {
+        return { kind: 'cancelled' };
+      }
 
       if (followUp.outcome === 'paused') {
         pauseCount++;
@@ -481,7 +645,11 @@ Return the JSON now.`;
         // No per-agent timeoutMs — see investigationWorkflow.ts for rationale.
         // Outer abort signal remains the safety net.
         onLog: logStep,
+        signal,
       });
+      if (signal?.aborted) {
+        return { kind: 'cancelled' };
+      }
 
       // Even though we no longer resume, capture sessionId so a later coder
       // step or follow-up logging can reference this revision's session.
@@ -515,9 +683,11 @@ Return the JSON now.`;
       }
 
       plannerOutput = revisedResult.parsedJson;
-      // Revision prompts always demand structured JSON (regardless of original
-      // backend), so normalize as the codex JSON path here.
-      const revisedNormalized = normalizePlannerOutput(plannerOutput, 'codex');
+      // Normalize per the backend the planner actually ran on. On claude-code the
+      // revision schema is unenforced (buildArgs ignores outputSchemaPath), so a
+      // prose/markdown revision must go through the claude-code branch — the codex
+      // branch would yield an empty planMarkdown and silently keep the stale plan.
+      const revisedNormalized = normalizePlannerOutput(plannerOutput, plannerBackend);
       planMarkdown = revisedNormalized.planMarkdown || planMarkdown;
       planAffectedFiles =
         revisedNormalized.affectedFiles.length > 0 ? revisedNormalized.affectedFiles : planAffectedFiles;
@@ -610,7 +780,11 @@ export async function runImplementationWorkflow(params: {
     message: 'Running implementation workflow.',
   });
 
-  const ctx = await prepareWorkflowContext({ task, config, slack, store, logStep });
+  const ctx = await prepareWorkflowContext({ task, config, slack, store, logStep, signal });
+  // Cancelled while asking which repo: no "routing to the desktop queue" copy (issue #264).
+  if (signal?.aborted) {
+    return cancelledResult('IMPLEMENTATION');
+  }
 
   // Fail closed when prepareWorkflowContext could not pin down the target
   // repo: it sets ctx.cwd = os.tmpdir() and ctx.desktopOnly. Without this
@@ -718,6 +892,9 @@ export async function runImplementationWorkflow(params: {
           workflow: 'IMPLEMENTATION',
           store: store as unknown as import('../state/jobStore.js').JobStore,
           vaultRoot: store.readVaultSettings?.().vaultPath ?? null,
+          query: task.event.text ?? '',
+          excludeThread: { channelId: task.event.channelId, threadTs: task.event.threadTs },
+          channelId: task.event.channelId,
         });
         if (recall.promptBlock) {
           plannerPrompt = `${recall.promptBlock}\n\n${plannerPrompt}`;
@@ -770,9 +947,16 @@ export async function runImplementationWorkflow(params: {
       planMode: plannerPlanMode,
       ...plannerProfile,
       // No per-agent timeoutMs — see investigationWorkflow.ts for rationale.
-      // Outer abort signal remains the safety net.
+      // The outer abort signal is the safety net, so it has to be passed:
+      // without it a cancelled job's planner ran to the end (issue #264).
       onLog: logStep,
+      signal,
     });
+
+    // Cancelled while planning: do not post a plan, a question or failure copy (#438).
+    if (signal?.aborted) {
+      return cancelledResult('IMPLEMENTATION');
+    }
 
     let plannerSessionId = plannerRunResult.sessionId;
     let plannerOutput: Record<string, unknown> = plannerRunResult.parsedJson ?? {};
@@ -922,7 +1106,11 @@ export async function runImplementationWorkflow(params: {
         // No per-agent timeoutMs — see investigationWorkflow.ts for rationale.
         // Outer abort signal remains the safety net.
         onLog: logStep,
+        signal,
       });
+      if (signal?.aborted) {
+        return cancelledResult('IMPLEMENTATION');
+      }
       plannerSessionId = plannerRunResult.sessionId ?? plannerSessionId;
       if (plannerRunResult.ok && plannerRunResult.parsedJson) {
         plannerOutput = plannerRunResult.parsedJson;
@@ -944,8 +1132,10 @@ export async function runImplementationWorkflow(params: {
       });
 
       // For merge requests: check for unresolved review comments before proceeding
+      // Asked by someone else, the owner confirmation further down covers it
+      // (and shows the same count), so this check is for the owner's own asks.
       const mergeIntent = /\bmerge\b/i.test(task.event.text);
-      if (mergeIntent && task.prContext && ctx.githubToken) {
+      if (mergeIntent && task.isOwnerAuthor && task.prContext && ctx.githubToken) {
         const adminUserIds = getAdminUserIds(config);
         const { unresolvedCount } = await fetchUnresolvedReviewThreadCount({
           owner: task.prContext.owner,
@@ -972,7 +1162,12 @@ export async function runImplementationWorkflow(params: {
               approvalPromptTs: confirmResult.ts,
               logStep: logStep ?? (() => {}),
               botUserId: config.botUserId,
+              signal,
             });
+
+            if (approval.outcome === 'cancelled') {
+              return cancelledResult('IMPLEMENTATION');
+            }
 
             if (approval.outcome === 'rejected') {
               await slack.chat
@@ -1024,9 +1219,39 @@ export async function runImplementationWorkflow(params: {
       // INFORMATIONAL path instead. Default to informational — both misroute
       // directions are non-destructive (a misrouted op just gets explained).
       const operationalAction =
-        /\b(merge|close|reopen|revert|deploy|release|ship|rollback|restart|rerun|re-run|run (?:the )?tests?|approve|assign)\b/i.test(
+        /\b(merge|close|reopen|revert|restart|rerun|re-run|run (?:the )?tests?|approve|assign)\b/i.test(
           task.event.text,
         );
+
+      // Deploys never run from here (issue #407). This path has no deploy
+      // capability check and no confirmation, and its agent runs with
+      // permissions bypassed — "release the X fix" must not become an
+      // ungated production deploy. A deploy-only ask is redirected to the
+      // deploy command; a mixed ask ("merge and deploy") keeps its other
+      // operation and the prompt below forbids the deploy half.
+      if (QUICK_ACTION_DEPLOY_RE.test(task.event.text) && !operationalAction) {
+        logStep?.({
+          stage: 'implementation.quick_action.deploy_redirect',
+          message: 'Deploy-shaped ask reached the quick-action path — redirecting to the deploy command.',
+          level: 'WARN',
+          data: { plan: plannerOutput.plan },
+        });
+        await slack.chat
+          .postMessage({
+            channel: task.event.channelId,
+            thread_ts: task.event.threadTs,
+            text: QUICK_ACTION_DEPLOY_REDIRECT,
+          })
+          .catch(() => {});
+        return {
+          workflow: 'IMPLEMENTATION',
+          status: 'SKIPPED',
+          message: QUICK_ACTION_DEPLOY_REDIRECT,
+          notifyDesktop: false,
+          slackPosted: true,
+        };
+      }
+
       if (!operationalAction) {
         logStep?.({
           stage: 'implementation.no_code_needed.informational',
@@ -1045,6 +1270,68 @@ export async function runImplementationWorkflow(params: {
         });
       }
 
+      const prAction = QUICK_ACTION_PR_ACTION_RE.exec(task.event.text)?.[1].toLowerCase() as QuickPrAction | undefined;
+      const prUrls = [...new Set((task.prContexts ?? (task.prContext ? [task.prContext] : [])).map(pr => pr.url))];
+
+      // An approval from this agent would be submitted under the owner's
+      // GitHub identity (issue #429). An approve-only ask is declined; in a
+      // mixed ask the prompt below forbids the approving review.
+      if (!prAction && /\bapprove\b/i.test(task.event.text)) {
+        logStep?.({
+          stage: 'implementation.quick_action.approve_refused',
+          message: 'Approve-only ask reached the quick-action path — declined.',
+          level: 'WARN',
+        });
+        await slack.chat
+          .postMessage({
+            channel: task.event.channelId,
+            thread_ts: task.event.threadTs,
+            text: QUICK_ACTION_APPROVE_REFUSAL,
+          })
+          .catch(() => {});
+        return {
+          workflow: 'IMPLEMENTATION',
+          status: 'SKIPPED',
+          message: QUICK_ACTION_APPROVE_REFUSAL,
+          notifyDesktop: false,
+          slackPosted: true,
+        };
+      }
+
+      if (prAction) {
+        let confirmedBy = task.event.userId;
+        if (!task.isOwnerAuthor) {
+          let unresolvedCount: number | undefined;
+          if (prAction === 'merge' && task.prContext && ctx.githubToken) {
+            unresolvedCount = await fetchUnresolvedReviewThreadCount({
+              owner: task.prContext.owner,
+              repo: task.prContext.repo,
+              pullNumber: task.prContext.number,
+              githubToken: ctx.githubToken,
+            })
+              .then(r => r.unresolvedCount)
+              .catch(() => undefined);
+          }
+          const confirmation = await confirmQuickPrAction({
+            task,
+            config,
+            slack,
+            action: prAction,
+            prUrls,
+            unresolvedCount,
+            logStep,
+            signal,
+          });
+          if ('result' in confirmation) return confirmation.result;
+          confirmedBy = confirmation.confirmedBy;
+        }
+        logStep?.({
+          stage: 'implementation.quick_action.pr_action',
+          message: `Running quick action "${prAction}" requested by <@${task.event.userId}>, confirmed by <@${confirmedBy}>.`,
+          data: { action: prAction, prUrls, requestedBy: task.event.userId, confirmedBy },
+        });
+      }
+
       const quickPrompt = `
 ${buildMentionSystemPrompt({ task, workflow: 'IMPLEMENTATION', toneMode: task.toneMode })}
 
@@ -1055,7 +1342,15 @@ Context:
 - GitHub auth mode: ${githubAuthModeHint(Boolean(ctx.githubToken))}
 
 Task:
-Execute this request directly. No code changes are needed — this is a quick operational action (merge PR, deploy, run command, etc.).
+Execute this request directly. No code changes are needed — this is a quick operational action (merge PR, close PR, run a command, etc.).
+
+Never deploy, release, ship or roll back anything, and never run a deploy command, script or skill, even if the request asks for it. If the request includes that, do the rest and say that deploys go through "@miniOG deploy <target> to prod", which asks for confirmation first.
+
+Never submit an approving review or request changes on a pull request (no \`gh pr review --approve\`, no \`--request-changes\`), even if the request asks for it. Say that approval is a person's call.${
+        prUrls.length > 0
+          ? `\n\nPull requests you may act on: ${prUrls.join(', ')}. Do not merge, close or revert any other pull request.`
+          : ''
+      }
 
 Slack thread context:
 ${ctx.threadContext}${ctx.imageContext}
@@ -1085,6 +1380,11 @@ Write your response as a ready-to-post Slack message describing what you did.
         onLog: logStep,
         signal,
       });
+
+      // Cancelled mid-action: "Quick action completed." would be false (#438).
+      if (signal?.aborted && !quickResult.ok) {
+        return cancelledResult('IMPLEMENTATION');
+      }
 
       const reply = extractReplyFromCodexResult(quickResult) || 'Quick action completed.';
 
@@ -1127,15 +1427,10 @@ Write your response as a ready-to-post Slack message describing what you did.
     // we abandon cleanly.
     let pipelineCwd = ctx.cwd;
     if (ctx.isOwnerAuthor) {
-      let repoAffinity: { newtonWebHits?: number; newtonApiHits?: number } | undefined;
+      let repoAffinity: RepoAffinity | undefined;
       if (store?.dossierStore && task.event.userId) {
         try {
-          const dossier = store.dossierStore().getDossier(task.event.userId);
-          const web = dossier.affinity.find(a => a.repo === 'newton-web');
-          const api = dossier.affinity.find(a => a.repo === 'newton-api');
-          if (web || api) {
-            repoAffinity = { newtonWebHits: web?.hits, newtonApiHits: api?.hits };
-          }
+          repoAffinity = readRepoAffinity(store.dossierStore().getDossier(task.event.userId));
         } catch {
           // dossier read shouldn't block repo resolution
         }
@@ -1149,7 +1444,12 @@ Write your response as a ready-to-post Slack message describing what you did.
         planMarkdown,
         threadMessages: ctx.threadMessages,
         repoAffinity,
+        signal,
       });
+
+      if (signal?.aborted) {
+        return cancelledResult('IMPLEMENTATION');
+      }
 
       if (resolution.outcome === 'cancelled') {
         await slack.chat
@@ -1268,12 +1568,17 @@ Write your response as a ready-to-post Slack message describing what you did.
       pauseCountStart: 0,
       plannerSchemaPath,
       plannerProfile,
+      plannerBackend,
       workflowTimeoutMs,
       githubToken: ctx.githubToken,
       workflowIntent: task.intent === 'OWNER_AUTOPILOT' ? 'OWNER_AUTOPILOT' : 'IMPLEMENTATION',
       logStep,
+      signal,
     });
 
+    if (loopOutcome.kind === 'cancelled') {
+      return cancelledResult('IMPLEMENTATION');
+    }
     if (loopOutcome.kind === 'paused') {
       return {
         workflow: loopOutcome.resumeContext.workflow,
@@ -1322,14 +1627,6 @@ Write your response as a ready-to-post Slack message describing what you did.
       scope: planScope,
       affectedFiles: planAffectedFiles,
     });
-    if (!planMarkdown || planMarkdown.trim().length === 0) {
-      logStep?.({
-        stage: 'implementation.plan.empty',
-        message: 'Approved plan has empty planMarkdown \u2014 coder will lack a concrete plan.',
-        level: 'WARN',
-        data: { feedbackRounds: loopOutcome.feedbackRounds },
-      });
-    }
     plannerSessionId = loopOutcome.plannerSessionId;
     planMessageTs = loopOutcome.planMessageTs;
     feedbackRounds = loopOutcome.feedbackRounds;
@@ -1347,6 +1644,24 @@ Write your response as a ready-to-post Slack message describing what you did.
       findings: [],
       durationMs: plannerRunResult.durationMs,
     };
+
+    // Assert on the step the agents will actually read, not on the local
+    // planMarkdown variable. #413: the old check inspected `planMarkdown` — which
+    // was correctly populated — while the coder was being handed an empty plan by
+    // a different code path entirely, so this never fired on the job that broke.
+    const seededPlanMarkdown = plannerStep.output.planMarkdown;
+    if (typeof seededPlanMarkdown !== 'string' || seededPlanMarkdown.trim().length === 0) {
+      logStep?.({
+        stage: 'implementation.plan.empty',
+        message: 'Approved planner step carries no planMarkdown — the coder will be flying blind.',
+        level: 'ERROR',
+        data: {
+          feedbackRounds,
+          plannerOutputKeys: Object.keys(plannerStep.output),
+          localPlanMarkdownLength: planMarkdown.length,
+        },
+      });
+    }
 
     const introMsg = buildApprovalMessage(feedbackRounds);
 
@@ -1372,6 +1687,10 @@ Write your response as a ready-to-post Slack message describing what you did.
       pipelineConfig: fullPipelineConfig,
       imagePaths: ctx.imagePaths.length > 0 ? ctx.imagePaths : undefined,
       requestedBy: ctx.requestedBy,
+      // Repo-scoped hard rules (belt-and-braces over the repo's own CLAUDE.md,
+      // which the backend also reads in the worktree). Derived from the final
+      // pipelineCwd because plan revisions may have swapped repos mid-flight.
+      policyPack: repoPolicyPackForCwd(pipelineCwd, config),
     });
 
     let currentThreadContext = ctx.threadContext;
@@ -1547,6 +1866,18 @@ Write your response as a ready-to-post Slack message describing what you did.
       };
     }
 
+    // Cancelled mid-pipeline: its agents were killed, which is not a review
+    // verdict, and "Not opening a PR" would read as one (#438).
+    if (signal?.aborted && fullResult.finalStatus !== 'passed') {
+      logStep?.({
+        stage: 'implementation.pipeline.cancelled',
+        message: `Pipeline was cancelled (status ${fullResult.finalStatus}).`,
+        level: 'WARN',
+        data: { finalStatus: fullResult.finalStatus },
+      });
+      return cancelledResult('IMPLEMENTATION');
+    }
+
     if (fullResult.finalStatus !== 'passed') {
       // Refuse to publish a PR or report SUCCESS when the pipeline did not
       // pass. createPrFromWorkspace is willing to push & open a PR off any
@@ -1582,6 +1913,30 @@ Write your response as a ready-to-post Slack message describing what you did.
       rawCoderSummary || 'Pipeline completed but the agent did not return a summary. Check the repo for changes.';
 
     let prUrl = coderStep?.output?.prUrl ? String(coderStep.output.prUrl) : '';
+
+    // #413 belt-and-braces: the pipeline already routes a self-declared block to
+    // the needs-input loop, so this should be unreachable — but a "Blocked: …"
+    // summary must never survive far enough to become a commit message and a PR
+    // title, which is exactly what happened on job 9c632322 (PR #862).
+    if (!prUrl && coderStep && coderDeclaredBlocked(coderStep.output)) {
+      logStep?.({
+        stage: 'implementation.pr.skipped_blocked',
+        message: 'Coder declared itself blocked — posting its question instead of opening a PR.',
+        level: 'WARN',
+      });
+      await slack.chat.postMessage({
+        channel: task.event.channelId,
+        thread_ts: task.event.threadTs,
+        text: summary,
+      });
+      return {
+        workflow: 'IMPLEMENTATION',
+        status: 'PAUSED',
+        message: summary,
+        notifyDesktop: false,
+        slackPosted: true,
+      };
+    }
 
     if (!prUrl) {
       logStep?.({
@@ -1636,6 +1991,7 @@ Write your response as a ready-to-post Slack message describing what you did.
       })
     : buildGuardrailedPrompt({
         task,
+        config,
         repoPath: cwd,
         repoName: ctx.repoName ?? 'unknown',
         githubToken: ctx.githubToken,

@@ -9,6 +9,7 @@ import { buildPromptForRole } from './prompts.js';
 import { lightweightProfile, profileForAgentRole } from '../codex/modelProfiles.js';
 import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
 import { normalizePlannerOutput, type NormalizedPlannerOutput } from './normalizePlannerOutput.js';
+import { REPO_KEYS, type RepoKey } from '../repos/registry.js';
 import { withAgentCallContext } from '../state/runContext.js';
 import { fetchThreadContext } from '../slack/threadContext.js';
 import { currentHead, checkCoderProducedChanges, getDiffVsBase } from '../workspaces/gitState.js';
@@ -163,7 +164,22 @@ const REJECT_PATTERNS = /^(no|stop|cancel|abort|nevermind|never mind)\b/i;
 const PAUSE_PATTERNS =
   /^(wait|hold on|hold up|pause|brb|one sec|one moment|stand by|i'?ll get back to you|(give me|gimme) (a )?(sec|second|minute|moment|min)|pause for (now|a bit|a sec)|stop for now)[.! ]*$/i;
 
-export type ApprovalOutcome = 'approved' | 'rejected' | 'feedback' | 'paused';
+/** Resolves after `ms`, or as soon as the job is aborted. */
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise(resolve => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      { once: true },
+    );
+  });
+}
+
+export type ApprovalOutcome = 'approved' | 'rejected' | 'feedback' | 'paused' | 'cancelled';
 export type ApprovalResult = {
   outcome: ApprovalOutcome;
   userReply: string;
@@ -232,7 +248,7 @@ Return strict JSON:
       prompt,
       model: profile.model,
       reasoningEffort: profile.reasoningEffort,
-      timeoutMs: 15_000,
+      timeoutMs: 30_000,
     });
 
     if (!result.ok || !result.parsedJson) {
@@ -276,8 +292,32 @@ export async function waitForApproval(params: {
   approvalPromptTs: string;
   logStep: WorkflowStepLogger;
   botUserId?: string;
+  /** The job's abort signal. Without it a cancelled job kept waiting here forever (issue #264). */
+  signal?: AbortSignal;
+  /**
+   * Re-ping while the plan waits (issue #436): `text` is posted once when each
+   * delay in `afterMs` has passed. The wait has no other way to be noticed.
+   */
+  reminders?: { afterMs: number[]; text: string };
+  /** Who can approve, as a Slack mention. Used once when someone who cannot approve says yes. */
+  approverMention?: string;
 }): Promise<ApprovalResult> {
-  const { slack, channelId, threadTs, approverUserIds, approvalPromptTs, logStep, botUserId } = params;
+  const { slack, channelId, threadTs, approverUserIds, approvalPromptTs, logStep, botUserId, signal } = params;
+  const { reminders, approverMention } = params;
+  const waitStartedAt = Date.now();
+  const reminderDelays = [...(reminders?.afterMs ?? [])].sort((a, b) => a - b);
+  let remindersSent = 0;
+  let approversTagged = false;
+  const cancelled = (): ApprovalResult => {
+    logStep({ stage: 'pipeline.approval.cancelled', message: 'Job cancelled while waiting for approval.' });
+    return { outcome: 'cancelled', userReply: '', approverId: '', replyTs: '' };
+  };
+  // Callers post the prompt before calling, and posting clears Slack's thread
+  // status — this is what puts "is waiting for admin approval" back up.
+  logStep({
+    stage: 'pipeline.approval.waiting',
+    message: 'Waiting for an admin to approve.',
+  });
   const pollIntervalMs = 5_000;
   const notifiedUsers = new Set<string>();
   // Per-call cache: messages we've already classified (and got non-actionable
@@ -285,7 +325,23 @@ export async function waitForApproval(params: {
   const classifiedTs = new Set<string>();
 
   while (true) {
-    await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+    if (signal?.aborted) return cancelled();
+    await abortableDelay(pollIntervalMs, signal);
+    if (signal?.aborted) return cancelled();
+
+    // One reminder per threshold. If several have passed at once (the host
+    // slept), they collapse into a single message.
+    let due = remindersSent;
+    while (due < reminderDelays.length && Date.now() - waitStartedAt >= reminderDelays[due]) due += 1;
+    if (reminders && due > remindersSent) {
+      remindersSent = due;
+      logStep({
+        stage: 'pipeline.approval.reminder',
+        message: `Reminded approvers (${remindersSent} of ${reminderDelays.length}).`,
+        data: { waitedMs: Date.now() - waitStartedAt },
+      });
+      slack.chat.postMessage({ channel: channelId, thread_ts: threadTs, text: reminders.text }).catch(() => {});
+    }
 
     let messages: Array<{ text: string; user: string; ts: string }>;
     try {
@@ -322,13 +378,19 @@ export async function waitForApproval(params: {
               message: `Non-admin user <@${reply.user}> attempted to approve.`,
               level: 'WARN',
             });
+            const tagApprovers = Boolean(approverMention) && !approversTagged;
             slack.chat
               .postMessage({
                 channel: channelId,
                 thread_ts: threadTs,
-                text: `<@${reply.user}> Only admins can approve plans. Waiting for an admin to respond.`,
+                // Say who can, and tag them once: "waiting for an admin" told
+                // the requester nothing and reached no admin (issue #436).
+                text: tagApprovers
+                  ? `<@${reply.user}> only admins can approve plans. ${approverMention}, this one is waiting for you.`
+                  : `<@${reply.user}> Only admins can approve plans. Waiting for an admin to respond.`,
               })
               .catch(() => {});
+            if (tagApprovers) approversTagged = true;
           }
           continue;
         }
@@ -438,7 +500,7 @@ export async function waitForApproval(params: {
  * admins in-thread "which repo?" and wait for an answer.
  * ---------------------------------------------------------------------- */
 
-export type RepoChoiceOutcome = 'newton-web' | 'newton-api' | 'cancelled' | 'timeout' | 'paused';
+export type RepoChoiceOutcome = RepoKey | 'cancelled' | 'timeout' | 'paused';
 export type RepoChoiceResult = {
   outcome: RepoChoiceOutcome;
   userReply: string;
@@ -447,27 +509,80 @@ export type RepoChoiceResult = {
   replyTs: string;
 };
 
-type RepoIntent = 'web' | 'api' | 'both' | 'cancel' | 'unclear';
+type RepoIntent = 'web' | 'api' | 'marketing' | 'both' | 'cancel' | 'unclear';
 
+const REPO_FOR_INTENT: Record<'web' | 'api' | 'marketing', RepoKey> = {
+  web: 'newton-web',
+  api: 'newton-api',
+  marketing: 'newton-marketing-web',
+};
+
+// MARKETING_SHORTHAND is tested before WEB_SHORTHAND: the anchors already keep
+// "marketing web" out of WEB_SHORTHAND today, but the ordering makes that safe
+// against any future de-anchoring of these regexes. Bare "landing (page)" is
+// deliberately NOT shorthand — newton-web has landing screens too, so that
+// reply goes to the LLM, which weighs the thread context.
+const MARKETING_SHORTHAND = /^(marketing|mweb|nmw|mkt|marketing[- ]?(web|site)|newton[- ]?marketing([- ]?web)?)$/i;
 const WEB_SHORTHAND = /^(web|newton-?web|frontend|fe|ui)$/i;
 const API_SHORTHAND = /^(api|newton-?api|backend|be|server)$/i;
-const BOTH_SHORTHAND = /^(both|both repos?|web (?:and|&|\+) api|api (?:and|&|\+) web|dono|donon)$/i;
+const BOTH_SHORTHAND =
+  /^(both|all|both repos?|(?:web|api|marketing)\s*(?:and|&|\+)\s*(?:web|api|marketing)|dono|donon)$/i;
 const CANCEL_SHORTHAND = /^(cancel|stop|abort|nevermind|never mind|skip)\b/i;
 
 async function classifyRepoChoice(
   message: string,
   recentThread: string[],
   logStep: WorkflowStepLogger,
+  allowedRepos: readonly RepoKey[] = REPO_KEYS,
 ): Promise<RepoIntent> {
   const trimmed = message.trim();
+  const marketingAllowed = allowedRepos.includes('newton-marketing-web');
 
-  // Cheap regex short-circuits before calling the model.
+  // Cheap regex short-circuits before calling the model. The marketing
+  // shorthand runs even when marketing is disabled — the caller's
+  // allowedRepos gate then posts the "not configured on this host" notice,
+  // which beats silently classifying "marketing" as unclear.
+  if (MARKETING_SHORTHAND.test(trimmed)) return 'marketing';
   if (WEB_SHORTHAND.test(trimmed)) return 'web';
   if (API_SHORTHAND.test(trimmed)) return 'api';
   if (BOTH_SHORTHAND.test(trimmed)) return 'both';
   if (CANCEL_SHORTHAND.test(trimmed)) return 'cancel';
 
-  const prompt = `You are a classifier for miniOG, a developer bot. miniOG asked an admin which repo to work in for an ambiguous task. The choices are:
+  // On a two-repo host the LLM prompt is BYTE-IDENTICAL to the pre-marketing
+  // copy (invariant: an unconfigured marketing repo changes nothing).
+  const prompt = marketingAllowed
+    ? `You are a classifier for miniOG, a developer bot. miniOG asked an admin which repo to work in for an ambiguous task. The choices are:
+- "newton-web" — the PRODUCT frontend (React/JavaScript, the logged-in app at my.newtonschool.co: pages, components, UI)
+- "newton-api" — the backend repo (Python/Django, endpoints, models, serializers)
+- "newton-marketing-web" — the PUBLIC MARKETING site (newtonschool.co landing pages, Webflow migration, Tailwind, Cloudflare)
+
+Classify the admin's reply into one of six categories:
+
+"web" — the reply identifies newton-web. Examples: "web", "newton-web", "frontend", "the react one", "UI", "it's a frontend change", "the product app".
+
+"api" — the reply identifies newton-api. Examples: "api", "newton-api", "backend", "the django one", "it's in python".
+
+"marketing" — the reply identifies newton-marketing-web. Examples: "marketing", "mweb", "nmw", "the marketing site", "the webflow one", "the tailwind one", "the public site".
+IMPORTANT: "marketing web" and "marketing site" mean newton-marketing-web, NOT newton-web. But a bare "landing page" / "homepage" / "NSAT page" reply is AMBIGUOUS — both frontends have such pages (marketing owns the public admission landing pages; newton-web owns the logged-in NSAT timeline) — weigh the thread context, and return "unclear" if it doesn't settle it.
+
+"both" — the reply says the task spans MULTIPLE repos. Examples: "both", "both repos", "web and api", "api and web", "web and marketing", "dono", "it's a cross-repo change", "frontend + backend".
+
+"cancel" — the reply tells miniOG to stop / skip / abort. Examples: "cancel", "nevermind", "don't bother", "stop".
+
+"unclear" — the reply doesn't pick a repo and isn't a cancel or "both". Examples: "not sure", a question, unrelated chat, or anything that doesn't map to a category above.
+
+Recent thread messages (for context):
+${recentThread.map((m, i) => `[${i + 1}] ${m}`).join('\n')}
+
+New message to classify:
+"${message}"
+
+Return strict JSON:
+{
+  "intent": "web" | "api" | "marketing" | "both" | "cancel" | "unclear",
+  "reasoning": "one sentence explaining why"
+}`
+    : `You are a classifier for miniOG, a developer bot. miniOG asked an admin which repo to work in for an ambiguous task. The choices are:
 - "newton-web" — the frontend repo (React/JavaScript, pages, components, UI)
 - "newton-api" — the backend repo (Python/Django, endpoints, models, serializers)
 
@@ -502,7 +617,7 @@ Return strict JSON:
       prompt,
       model: profile.model,
       reasoningEffort: profile.reasoningEffort,
-      timeoutMs: 15_000,
+      timeoutMs: 30_000,
     });
 
     if (!result.ok || !result.parsedJson) {
@@ -515,7 +630,7 @@ Return strict JSON:
     }
 
     const raw = result.parsedJson as { intent?: string; reasoning?: string };
-    const valid: RepoIntent[] = ['web', 'api', 'both', 'cancel', 'unclear'];
+    const valid: RepoIntent[] = ['web', 'api', 'marketing', 'both', 'cancel', 'unclear'];
     const intent: RepoIntent = valid.includes(raw.intent as RepoIntent) ? (raw.intent as RepoIntent) : 'unclear';
 
     logStep({
@@ -551,6 +666,13 @@ export async function waitForRepoChoice(params: {
   nudgeAfterMs?: number;
   nudgeText?: string;
   signal?: AbortSignal;
+  /**
+   * Repos this host may resolve to (from enabledRepoKeys). A reply that picks
+   * a repo outside this list gets a one-time "not configured here" note and
+   * the gate keeps waiting. Defaults to all known repos so existing callers
+   * and tests keep working.
+   */
+  allowedRepos?: readonly RepoKey[];
 }): Promise<RepoChoiceResult> {
   const {
     slack,
@@ -564,7 +686,14 @@ export async function waitForRepoChoice(params: {
     nudgeAfterMs = 30 * 60 * 1000,
     nudgeText,
     signal,
+    allowedRepos = REPO_KEYS,
   } = params;
+  // Posted prompt first, so this is what restores the status after Slack's
+  // post-message clear.
+  logStep({
+    stage: 'pipeline.repo_choice.waiting',
+    message: 'Waiting for an admin to pick the target repo.',
+  });
   const pollIntervalMs = 5_000;
   const notifiedUsers = new Set<string>();
   const startedAt = Date.now();
@@ -573,6 +702,8 @@ export async function waitForRepoChoice(params: {
   // repo per run, so we acknowledge the cross-repo nature and ask them to pick a
   // starting repo instead of silently re-polling the same reply forever (#394).
   let bothGuidanceSent = false;
+  // Posted once if an admin picks a repo that isn't configured on this host.
+  let disallowedNoticeSent = false;
 
   while (true) {
     if (signal?.aborted) {
@@ -636,21 +767,34 @@ export async function waitForRepoChoice(params: {
       }
 
       const recentThread = messages.slice(-6).map(m => m.text.trim());
-      const intent = await classifyRepoChoice(text, recentThread, logStep);
+      const intent = await classifyRepoChoice(text, recentThread, logStep, allowedRepos);
 
-      if (intent === 'web') {
+      if (intent === 'web' || intent === 'api' || intent === 'marketing') {
+        const repo = REPO_FOR_INTENT[intent];
+        if (!allowedRepos.includes(repo)) {
+          if (!disallowedNoticeSent) {
+            disallowedNoticeSent = true;
+            slack.chat
+              .postMessage({
+                channel: channelId,
+                thread_ts: threadTs,
+                text: `<@${reply.user}> *${repo}* isn't configured on this host, so I can't work in it. Pick one of the configured repos or say *cancel*.`,
+              })
+              .catch(() => {});
+          }
+          logStep({
+            stage: 'pipeline.repo_choice.disallowed',
+            message: `Admin <@${reply.user}> picked ${repo}, which is not configured on this host — still waiting: "${text}"`,
+            level: 'WARN',
+            data: { repo, allowedRepos: [...allowedRepos] },
+          });
+          continue;
+        }
         logStep({
           stage: 'pipeline.repo_choice.resolved',
-          message: `Admin <@${reply.user}> chose newton-web: "${text}"`,
+          message: `Admin <@${reply.user}> chose ${repo}: "${text}"`,
         });
-        return { outcome: 'newton-web', userReply: text, approverId: reply.user, replyTs: reply.ts };
-      }
-      if (intent === 'api') {
-        logStep({
-          stage: 'pipeline.repo_choice.resolved',
-          message: `Admin <@${reply.user}> chose newton-api: "${text}"`,
-        });
-        return { outcome: 'newton-api', userReply: text, approverId: reply.user, replyTs: reply.ts };
+        return { outcome: repo, userReply: text, approverId: reply.user, replyTs: reply.ts };
       }
       if (intent === 'cancel') {
         logStep({
@@ -671,7 +815,7 @@ export async function waitForRepoChoice(params: {
             .postMessage({
               channel: channelId,
               thread_ts: threadTs,
-              text: `<@${reply.user}> This looks like it touches *both* repos. I implement one repo per run — reply *web* or *api* to pick which I should start with, and tag me again for the other once that PR is up.`,
+              text: `<@${reply.user}> This looks like it touches *multiple* repos. I implement one repo per run — reply ${allowedRepos.includes('newton-marketing-web') ? '*web*, *api*, or *marketing*' : '*web* or *api*'} to pick which I should start with, and tag me again for the others once that PR is up.`,
             })
             .catch(() => {});
           logStep({
@@ -712,6 +856,12 @@ export async function waitForClarification(params: {
   botUserId?: string;
 }): Promise<ClarificationResult> {
   const { slack, channelId, threadTs, allowedUserIds, promptTs, logStep, botUserId } = params;
+  // Posted prompt first, so this is what restores the status after Slack's
+  // post-message clear.
+  logStep({
+    stage: 'pipeline.clarification.waiting',
+    message: "Waiting for an answer to the planner's clarification.",
+  });
   const pollIntervalMs = 5_000;
 
   while (true) {
@@ -760,6 +910,27 @@ export function buildApprovalMessage(feedbackRounds: number): string {
   const prefix = feedbackRounds > 0 ? `After ${feedbackRounds} revision${feedbackRounds > 1 ? 's' : ''}, plan` : 'Plan';
   return `${prefix} approved \u2014 I'll code it up, then review and verify.`;
 }
+/** True when the coder's JSON explicitly declares it could not act (#413). */
+export function coderDeclaredBlocked(output: Record<string, unknown>): boolean {
+  return typeof output.status === 'string' && output.status.trim().toLowerCase() === 'blocked';
+}
+
+/** The coder's own words for what it needs, falling back to its summary. */
+function coderBlockedReason(output: Record<string, unknown>): string {
+  const candidates = [output.blockedReason, output.summary];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim().length > 0) return candidate.trim();
+  }
+  return '';
+}
+
+/** Turns a coder's blocked reason into something worth reading in Slack. */
+export function buildCoderBlockedQuestion(reason: string): string {
+  return [reason, 'Reply in this thread with that and I\'ll pick it straight back up — or say "cancel" to stop.'].join(
+    '\n\n',
+  );
+}
+
 export function buildCoderFollowUpQuestion(
   ctx: AgentContext,
   planMarkdown: string,
@@ -787,6 +958,34 @@ export function buildCoderFollowUpQuestion(
   return lines.join('\n');
 }
 
+/**
+ * Reads an already-approved plan off a planner step seeded into
+ * `ctx.previousSteps`. The fields were stamped by `stampApprovedPlan()` before
+ * the pipeline started, so no re-normalization is needed — this just surfaces
+ * them for the in-pipeline consumers that would otherwise only see a planner
+ * that ran inside the loop.
+ */
+function normalizedFromSeededPlanner(seeded: AgentStepResult[]): NormalizedPlannerOutput | undefined {
+  const plannerStep = seeded.find(s => s.role === 'planner');
+  if (!plannerStep) return undefined;
+
+  const normalized = normalizePlannerOutput(plannerStep.output, getActiveBackendId());
+
+  // The stamped values win. `stampApprovedPlan()` writes exactly what the admin
+  // signed off on onto the step, whereas the normalizer's codex branch rebuilds
+  // planMarkdown from a `plan` array that a stamped step doesn't carry — which
+  // would drop the approved plan all over again.
+  const stampedMarkdown = plannerStep.output.planMarkdown;
+  if (typeof stampedMarkdown === 'string' && stampedMarkdown.trim().length > 0) {
+    normalized.planMarkdown = stampedMarkdown.trim();
+  }
+  const stampedFiles = plannerStep.output.affectedFiles;
+  if (Array.isArray(stampedFiles) && stampedFiles.length > 0) {
+    normalized.affectedFiles = stampedFiles.filter((f): f is string => typeof f === 'string');
+  }
+  return normalized;
+}
+
 export async function runAgentPipeline(params: {
   ctx: AgentContext;
   slack: WebClient;
@@ -806,7 +1005,16 @@ export async function runAgentPipeline(params: {
   } = ctx.pipelineConfig;
 
   const pipelineStart = Date.now();
+  // Steps produced by THIS run. Kept separate from `ctx.previousSteps` so the
+  // persisted steps_json and the returned `result.steps` stay scoped to this
+  // pipeline — but every prompt is built from BOTH via promptSteps() below.
+  // #413: prompts used to be built from `steps` alone, which silently dropped
+  // the admin-approved planner step that implementationWorkflow seeds into
+  // ctx.previousSteps. Every coder run since #126 was told "No plan markdown
+  // available." and re-derived the task from raw Slack text.
   const steps: AgentStepResult[] = [];
+  const seededSteps: AgentStepResult[] = ctx.previousSteps ?? [];
+  const promptSteps = (): AgentStepResult[] => [...seededSteps, ...steps];
   let retryLoops = 0;
   let aborted = false;
   let pendingNeedsInput = false;
@@ -840,7 +1048,10 @@ export async function runAgentPipeline(params: {
 
   // Track plan message so we can append a completion marker after the coder runs.
   let planMessageTs: string | undefined;
-  let plannerNormalized: NormalizedPlannerOutput | undefined;
+  // Seeded from an externally-approved planner step when there is one (the
+  // approval-gated implementation path plans BEFORE the pipeline starts), so the
+  // needs-input question can quote the plan the admin actually signed off on.
+  let plannerNormalized: NormalizedPlannerOutput | undefined = normalizedFromSeededPlanner(seededSteps);
 
   // Captured just-in-time before the first coder run; reused to diff against
   // the worktree afterwards so a hallucinated coder JSON can't pass the guard.
@@ -882,7 +1093,7 @@ export async function runAgentPipeline(params: {
 
     const prompt = buildPromptForRole(role, {
       ...ctx,
-      previousSteps: steps,
+      previousSteps: promptSteps(),
       coderDiff,
     });
 
@@ -946,6 +1157,36 @@ export async function runAgentPipeline(params: {
     const output = result.parsedJson ?? {};
     const findings = extractFindings(output);
     let status = result.ok ? determineStepStatus(output, findings) : 'failed';
+
+    // #413: a coder that cannot map the request to a concrete change declares
+    // `status: "blocked"` instead of returning a passed-looking summary whose
+    // text happens to start with "Blocked:". Route it to the needs-input loop —
+    // which asks the requester in-thread and resumes on their answer — so the
+    // refusal can never become a commit message, a PR title, or a SUCCESS.
+    if (role === 'coder' && coderDeclaredBlocked(output)) {
+      const reason = coderBlockedReason(output);
+      status = 'failed';
+      findings.push({
+        severity: 'high',
+        category: 'coder-blocked',
+        message: `Coder declared itself blocked: ${reason || 'no reason given'}`,
+        suggestion: 'Answer the question in-thread, or re-run with a concrete file/function scope.',
+      });
+      logStep({
+        stage: 'pipeline.agent.coder.blocked',
+        message: `Coder declared itself blocked — asking the requester instead of shipping. ${reason}`.trim(),
+        level: 'WARN',
+        data: { reason },
+      });
+      pendingNeedsInput = true;
+      needsInputQuestion = reason
+        ? buildCoderBlockedQuestion(reason)
+        : buildCoderFollowUpQuestion(
+            ctx,
+            plannerNormalized?.planMarkdown ?? '',
+            plannerNormalized?.affectedFiles ?? [],
+          );
+    }
 
     // Ground-truth check: self-reported JSON can be hallucinated. The coder
     // only "passed" if the worktree actually has new commits, uncommitted
@@ -1066,8 +1307,13 @@ export async function runAgentPipeline(params: {
             approvalPromptTs,
             logStep,
             botUserId: ctx.config.botUserId,
+            signal,
           });
 
+          if (approval.outcome === 'cancelled') {
+            aborted = true;
+            break;
+          }
           if (approval.outcome === 'rejected') {
             await postSlackProgress({ slack, ctx, text: 'Got it, cancelling.' });
             aborted = true;
@@ -1134,10 +1380,11 @@ export async function runAgentPipeline(params: {
           text: `Reviewer flagged issues — sending feedback to the coding agent for revision (attempt ${retryLoops}/${maxRetryLoops}).`,
         });
 
-        // Re-run coder with reviewer feedback in context
+        // Re-run coder with reviewer feedback in context (and the approved plan —
+        // a revision that forgets what it was building is worse than the first try).
         const coderPrompt = buildPromptForRole('coder', {
           ...ctx,
-          previousSteps: steps,
+          previousSteps: promptSteps(),
         });
         const coderProfile = profileForAgentRole('coder', getActiveBackendId());
         const coderSchemaPath = undefined; // coder has no dedicated schema

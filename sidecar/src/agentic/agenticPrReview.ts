@@ -14,10 +14,19 @@ import { assertThreadParentExists, fetchThreadContext } from '../slack/threadCon
 import { resolvePrReviewTargets } from '../router/prTargetResolver.js';
 import { assembleRecall } from '../codex/recallAssembler.js';
 import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
-import { buildOutOfScopePrReply, mapRepoPath, fetchPrHeadSha } from '../github/prReviewSupport.js';
+import {
+  buildOutOfScopePrReply,
+  mapRepoPath,
+  fetchPrHeadSha,
+  fetchPrState,
+  type PrState,
+} from '../github/prReviewSupport.js';
+import { isRepoEnabled } from '../repos/registry.js';
+import { extractUserFocus } from './reviewFocus.js';
 import { reviewSinglePr, type PrReviewDeps, type PrReviewOutcome } from './prReviewAgent.js';
 
 export type AgenticPrReviewStore = Pick<JobStore, 'findLatestReviewedPrHeadSha' | 'getChannelPolicyPack'> &
+  Partial<Pick<JobStore, 'recordPrReviewFindings' | 'getPrReviewFindings'>> &
   Partial<PipelineStore> &
   RecallCapableStore;
 
@@ -34,6 +43,26 @@ export type AgenticPrReviewStore = Pick<JobStore, 'findLatestReviewedPrHeadSha' 
  * - recall stages `workflow.recall.injected` / `workflow.recall.failed`;
  * - submitPrReview (hunk-validating) is the only GitHub write path.
  */
+/** The requester knows the PR has shipped and wants it reviewed regardless. */
+export function wantsPostMergeReview(text: string): boolean {
+  return /\bpost[- ]?merge\b|\banyway\b/i.test(text);
+}
+
+/** What to say instead of reviewing a PR that is already merged or closed. */
+export function buildNotOpenReply(entries: Array<{ target: PrTarget; state: PrState }>): string {
+  const describe = ({ target, state }: { target: PrTarget; state: PrState }) => {
+    const when = state.at ? ` (${state.at.slice(0, 10)})` : '';
+    const what = state.state === 'merged' ? `already merged${when}` : `closed without merging${when}`;
+    return `\`${target.repo}#${target.number}\` is ${what}`;
+  };
+  const urls = entries.map(({ target }) => target.url).join(' ');
+  const subject =
+    entries.length === 1
+      ? `${describe(entries[0])}, so I haven't reviewed it.`
+      : `${entries.map(describe).join('; ')}, so I haven't reviewed ${entries.length === 2 ? 'either' : 'them'}.`;
+  return `${subject} For a post-merge review, say \`post-merge review ${urls}\`. If you had a question about ${entries.length === 1 ? 'it' : 'them'} instead, @ me with the question and I'll answer.`;
+}
+
 export async function runAgenticPrReview(params: {
   task: NormalizedTask;
   config: AppConfig;
@@ -45,13 +74,15 @@ export async function runAgenticPrReview(params: {
   signal?: AbortSignal;
   deps?: Partial<PrReviewDeps>;
 }): Promise<WorkflowResult> {
-  const { task, config, slack, store, resolvePrHeadSha, jobId: _jobId, logStep, signal } = params;
+  const { task, config, slack, store, resolvePrHeadSha, jobId, logStep, signal } = params;
   const deps: Partial<PrReviewDeps> = {
     ...(resolvePrHeadSha ? { resolveHeadSha: resolvePrHeadSha } : {}),
     ...params.deps,
   };
 
   const postToThread = async (text: string) => {
+    // After a cancel there is nothing true left to say about the review (#438).
+    if (signal?.aborted) return;
     await slack.chat
       .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text })
       .catch(() => {});
@@ -148,7 +179,7 @@ export async function runAgenticPrReview(params: {
     await slack.chat.postMessage({
       channel: task.event.channelId,
       thread_ts: task.event.threadTs,
-      text: `${selectorNote}I found ${resolution.candidates?.length ?? 0} PRs in this thread:\n${candidateList}\nReply with the link (or "web"/"api"/"#number") to review, or "both" for all of them.`,
+      text: `${selectorNote}I found ${resolution.candidates?.length ?? 0} PRs in this thread:\n${candidateList}\nReply with the link (or ${isRepoEnabled(config, 'newton-marketing-web') ? '"web"/"api"/"marketing"/"#number"' : '"web"/"api"/"#number"'}) to review, or "both" for all of them.`,
     });
 
     return {
@@ -205,6 +236,46 @@ export async function runAgenticPrReview(params: {
 
   const githubToken = await resolveGithubTokenForCodex();
 
+  // A merged or closed PR is not reviewed unless a post-merge review is asked
+  // for: its findings cannot be "addressed before merge", and a question about
+  // a PR that had already shipped was getting a full review (issue #447). An
+  // unreadable state counts as open, so a GitHub blip never blocks a review.
+  const fetchState = deps.fetchState ?? fetchPrState;
+  const states = await Promise.all(
+    reviewable.map(({ target }) =>
+      fetchState({ prContext: target as PrContext, githubToken, logStep }).catch(() => undefined),
+    ),
+  );
+  const stateByUrl = new Map<string, PrState | undefined>(reviewable.map((entry, i) => [entry.target.url, states[i]]));
+  const notOpen = reviewable.filter(({ target }) => {
+    const state = stateByUrl.get(target.url)?.state;
+    return state === 'merged' || state === 'closed';
+  });
+  if (notOpen.length > 0 && !wantsPostMergeReview(task.event.text ?? '')) {
+    for (const { target } of notOpen) {
+      logStep?.({
+        stage: 'agentic.pr_review.guard.not_open',
+        message: `${target.repo}#${target.number} is ${stateByUrl.get(target.url)?.state} — not reviewing it.`,
+        level: 'WARN',
+        data: { prUrl: target.url, ...stateByUrl.get(target.url) },
+      });
+    }
+    await postToThread(
+      buildNotOpenReply(notOpen.map(({ target }) => ({ target, state: stateByUrl.get(target.url)! }))),
+    );
+    const stillOpen = reviewable.filter(entry => !notOpen.includes(entry));
+    reviewable.splice(0, reviewable.length, ...stillOpen);
+    if (reviewable.length === 0) {
+      return {
+        workflow: 'PR_REVIEW',
+        status: 'SKIPPED',
+        message: 'No open PR to review; told the requester and offered a post-merge review.',
+        notifyDesktop: false,
+        slackPosted: true,
+      };
+    }
+  }
+
   // Recall assembled once per job and prepended to every per-PR prompt —
   // same stage names as every other workflow (dossier invariant).
   let recallBlock = '';
@@ -239,6 +310,16 @@ export async function runAgenticPrReview(params: {
     ? [`Active policy pack: ${policyPack.packName}`, ...policyPack.rules.map(rule => `- ${rule}`)].join('\n')
     : 'No explicit policy pack assigned for this channel.';
 
+  // User focus extracted once per job: the requester's instruction becomes a
+  // first-class prompt section instead of ambient thread text (fails open).
+  const { focusBlock: userFocusBlock } = await extractUserFocus({
+    triggerText: task.event.text ?? '',
+    threadTexts,
+    runAgent: deps.runAgent,
+    logStep,
+    signal,
+  });
+
   // Single ack. Single-PR keeps the message users know; multi-PR lists the
   // batch (and names anything dropped by the target cap — never silent).
   const truncationNote =
@@ -247,10 +328,11 @@ export async function runAgenticPrReview(params: {
           .map(t => `${t.repo}#${t.number}`)
           .join(', ')}; reply with a PR link or "#number" to review those next)`
       : '';
+  const focusNote = userFocusBlock ? ' Noted your focus instructions.' : '';
   await postToThread(
     reviewable.length === 1
-      ? 'PR review in progress. I will drop findings here shortly.'
-      : `Reviewing ${reviewable.length} PRs: ${reviewable.map(r => `${r.target.repo}#${r.target.number}`).join(', ')}${truncationNote} — posting each verdict here as it finishes.`,
+      ? `PR review in progress. I will drop findings here shortly.${focusNote}`
+      : `Reviewing ${reviewable.length} PRs: ${reviewable.map(r => `${r.target.repo}#${r.target.number}`).join(', ')}${truncationNote} — posting each verdict here as it finishes.${focusNote}`,
   );
   logStep?.({
     stage: 'agentic.pr_review.ack_posted',
@@ -275,6 +357,61 @@ export async function runAgenticPrReview(params: {
       prUrl: target.url,
     });
 
+    // Prior findings feed the orchestrator's PRIOR REVIEW section on
+    // re-reviews (addressed / unaddressed / regressed). Best-effort.
+    let priorFindings: ReturnType<NonNullable<AgenticPrReviewStore['getPrReviewFindings']>> | undefined;
+    if (previousReview && store?.getPrReviewFindings) {
+      try {
+        priorFindings = store.getPrReviewFindings({ prUrl: target.url, jobId: previousReview.jobId });
+      } catch (error) {
+        logStep?.({
+          stage: 'agentic.pr_review.prior_findings.failed',
+          level: 'WARN',
+          message: `Could not load prior findings (non-fatal): ${String(error)}`,
+          data: { prUrl: target.url, previousJobId: previousReview.jobId },
+        });
+      }
+    }
+
+    // Findings persistence — the durable memory layer. Never fails a review.
+    const persistFindings =
+      jobId && store?.recordPrReviewFindings
+        ? (input: {
+            findings: Array<{
+              role: string;
+              severity: string;
+              category: string;
+              message: string;
+              file?: string;
+              line?: number;
+              suggestion?: string;
+            }>;
+            appliedSkills: string[];
+            prHeadSha?: string;
+            author?: string;
+          }) => {
+            try {
+              store.recordPrReviewFindings?.({
+                jobId,
+                prUrl: target.url,
+                repo: target.repo,
+                prNumber: target.number,
+                prHeadSha: input.prHeadSha,
+                author: input.author,
+                appliedSkills: input.appliedSkills,
+                findings: input.findings,
+              });
+            } catch (error) {
+              logStep?.({
+                stage: 'agentic.pr_review.persist_findings.failed',
+                level: 'WARN',
+                message: `Could not persist findings (non-fatal): ${String(error)}`,
+                data: { prUrl: target.url },
+              });
+            }
+          }
+        : undefined;
+
     const outcome = await reviewSinglePr({
       task,
       config,
@@ -284,8 +421,12 @@ export async function runAgenticPrReview(params: {
       recallBlock,
       policyBlock,
       threadContext,
+      userFocusBlock,
       githubToken,
+      prState: stateByUrl.get(target.url)?.state,
       previousReview,
+      priorFindings,
+      persistFindings,
       deps,
       logStep,
       signal,
@@ -296,7 +437,9 @@ export async function runAgenticPrReview(params: {
   const failed = outcomes.filter(o => o.status === 'FAILED');
   const completed = outcomes.filter(o => o.status === 'SUCCESS');
   const skipped = outcomes.filter(o => o.status === 'SKIPPED');
-  const aborted = Boolean(signal?.aborted) && outcomes.length < reviewable.length;
+  // Aborted unless every PR was reviewed or skipped before the cancel landed.
+  // Counting only unstarted PRs made a cancelled single-PR review a FAILED one (#438).
+  const aborted = Boolean(signal?.aborted) && completed.length + skipped.length < reviewable.length;
   const firstWithSha = outcomes.find(o => o.prHeadSha);
 
   logStep?.({

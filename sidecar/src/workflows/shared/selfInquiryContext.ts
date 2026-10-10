@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AppConfig } from '../../types/contracts.js';
 import { highReasoningProfile } from '../../codex/modelProfiles.js';
+import { enabledRepoKeys } from '../../repos/registry.js';
 
 const SIDECAR_PACKAGE_NAME = 'watchtower-sidecar';
 const MAX_WALK_DEPTH = 8;
@@ -40,7 +41,7 @@ export async function buildLiveStateSnapshot(config: AppConfig): Promise<string>
   lines.push(`- High-reasoning model: \`${profile.model}\` (effort: ${profile.reasoningEffort})`);
   lines.push(`- Multi-agent pipeline enabled: ${config.multiAgentEnabled ? 'yes' : 'no'}`);
 
-  const configuredRepos: string[] = ['newton-web', 'newton-api'];
+  const configuredRepos: string[] = [...enabledRepoKeys(config)];
   if (config.repoPaths.watchtower) configuredRepos.push('watchtower (self)');
   lines.push(`- Configured product repos: ${configuredRepos.join(', ')}`);
 

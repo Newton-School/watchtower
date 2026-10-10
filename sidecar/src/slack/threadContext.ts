@@ -5,8 +5,40 @@ export type ThreadMessage = {
   text: string;
   user: string;
   ts: string;
+  /** Slack message subtype (e.g. 'bot_message'), when present. */
+  subtype?: string;
+  /** Slack bot_id for integration-posted messages, when present. */
+  botId?: string;
   files?: SlackFileAttachment[];
 };
+
+function mapSlackMessage(message: Record<string, unknown>): ThreadMessage {
+  const rawFiles = message.files as Array<Record<string, unknown>> | undefined;
+
+  const files: SlackFileAttachment[] | undefined = rawFiles
+    ?.filter(
+      f =>
+        typeof f.id === 'string' &&
+        typeof f.name === 'string' &&
+        typeof f.mimetype === 'string' &&
+        typeof f.url_private_download === 'string',
+    )
+    .map(f => ({
+      id: f.id as string,
+      name: f.name as string,
+      mimetype: f.mimetype as string,
+      url_private_download: f.url_private_download as string,
+    }));
+
+  return {
+    text: typeof message.text === 'string' ? message.text : '',
+    user: typeof message.user === 'string' ? message.user : '',
+    ts: typeof message.ts === 'string' ? message.ts : '',
+    subtype: typeof message.subtype === 'string' ? message.subtype : undefined,
+    botId: typeof message.bot_id === 'string' ? message.bot_id : undefined,
+    files: files && files.length > 0 ? files : undefined,
+  };
+}
 
 /**
  * Returns `false` if Slack reports the thread parent does not exist
@@ -48,29 +80,45 @@ export async function fetchThreadContext(
   });
 
   const messages = response.messages ?? [];
-  return messages.map(message => {
-    const rawFiles = (message as Record<string, unknown>).files as Array<Record<string, unknown>> | undefined;
+  return messages.map(message => mapSlackMessage(message as unknown as Record<string, unknown>));
+}
 
-    const files: SlackFileAttachment[] | undefined = rawFiles
-      ?.filter(
-        f =>
-          typeof f.id === 'string' &&
-          typeof f.name === 'string' &&
-          typeof f.mimetype === 'string' &&
-          typeof f.url_private_download === 'string',
-      )
-      .map(f => ({
-        id: f.id as string,
-        name: f.name as string,
-        mimetype: f.mimetype as string,
-        url_private_download: f.url_private_download as string,
-      }));
+/**
+ * Fetch every thread reply strictly newer than `oldestTs`, paginating past the
+ * single-page 200-message ceiling of `fetchThreadContext`. Used by the
+ * conversation-capture sweeper to pick up messages posted after the last
+ * captured one (pass `oldestTs = '0'` for a full-thread walk). Returns
+ * oldest-first. Errors propagate to the caller — the sweeper decides whether a
+ * failed thread is retried next tick.
+ */
+export async function fetchThreadRepliesSince(
+  client: WebClient,
+  channel: string,
+  threadTs: string,
+  oldestTs: string,
+): Promise<ThreadMessage[]> {
+  const collected: ThreadMessage[] = [];
+  let cursor: string | undefined;
 
-    return {
-      text: message.text ?? '',
-      user: message.user ?? '',
-      ts: message.ts ?? '',
-      files: files && files.length > 0 ? files : undefined,
-    };
-  });
+  do {
+    const response = await client.conversations.replies({
+      channel,
+      ts: threadTs,
+      oldest: oldestTs === '0' ? undefined : oldestTs,
+      inclusive: false,
+      limit: 200,
+      cursor,
+    });
+    for (const message of response.messages ?? []) {
+      collected.push(mapSlackMessage(message as unknown as Record<string, unknown>));
+    }
+    cursor = response.response_metadata?.next_cursor || undefined;
+  } while (cursor);
+
+  // `oldest` + inclusive:false still returns the thread parent on the first
+  // page in some Slack API versions; drop anything at or below the cursor.
+  const floor = Number(oldestTs);
+  return collected
+    .filter(m => m.ts && (!Number.isFinite(floor) || floor <= 0 || Number(m.ts) > floor))
+    .sort((a, b) => Number(a.ts) - Number(b.ts));
 }
