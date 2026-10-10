@@ -257,6 +257,9 @@ function isReviewRequestVerb(normalized: string): boolean {
 const CONFLICTING_CHANGE_VERB_RE =
   /\b(create|open|raise|fix|implement|merge|close|revert|rebase|update|address|resolve)\b/;
 
+/** "review and merge", "review, approve, merge", "review & approve": a review ask with more after it. */
+const REVIEW_THEN_MERGE_RE = /\breview\s*(?:,|&|\+|\/|\band\b|\bthen\b)\s*(?:approve|merge)\b/;
+
 /** `<https://x|label>` and `<https://x>` → `https://x`, as the sender typed it. */
 function unwrapSlackLinks(text: string): string {
   return text
@@ -323,7 +326,12 @@ export function isPrReviewRequest(
   // first: without the old "no change verb" fallback, "review <link>" would
   // otherwise miss the gate it is the plainest case for.
   const verbText = options.explicitOnly ? unwrapSlackLinks(normalized) : normalized;
-  const hasReviewVerb = isReviewRequestVerb(verbText);
+  // "Review and merge" asks for a review first, whatever follows it. Outside
+  // explicit mode "merge" is a conflicting verb and the classifier decided,
+  // which sent the same sentence to a review, to the change pipeline or to
+  // nothing on different days (issue #430).
+  const hasReviewVerb =
+    isReviewRequestVerb(verbText) || Boolean(options.explicitOnly && REVIEW_THEN_MERGE_RE.test(verbText));
   const hasConflictingVerb = CONFLICTING_CHANGE_VERB_RE.test(normalized);
 
   if (GITHUB_PR_URL_TEST_RE.test(triggerText)) {
@@ -557,6 +565,19 @@ function inferIntent(
   }
 
   if (directBotMention && isPrReviewRequest(event.text ?? '', threadTexts, { explicitOnly: options.routerDecides })) {
+    return { intent: 'PR_REVIEW' };
+  }
+
+  // A review ask that tags the owner (or the core-dev group) instead of miniOG
+  // gets the same gate, in its explicit forms and with the link in the message
+  // itself. Left to a model call, the same "please review <PR>" was reviewed,
+  // sent to the change pipeline or ignored on different days (issue #430).
+  if (
+    options.routerDecides &&
+    mention.detected &&
+    mention.type === 'owner' &&
+    isPrReviewRequest(event.text ?? '', [], { explicitOnly: true })
+  ) {
     return { intent: 'PR_REVIEW' };
   }
 

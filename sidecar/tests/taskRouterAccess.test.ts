@@ -1317,6 +1317,86 @@ describe('routeTask lets the tool-router decide when it is on (issue #456)', () 
     });
   });
 
+  describe('a message that tags the owner (issue #430)', () => {
+    const tagger = {
+      mentionType: 'owner' as const,
+      userId: 'UBUILDER',
+      channelId: 'C-BUILD',
+      intent: 'UNKNOWN' as const,
+    };
+    const CHANGE = '<@UOWNER1> we need to remove the disclaimer from the S-VYASA landing page, on priority';
+
+    it('asks the tagger before starting a change, and parks on the answer', async () => {
+      routerSays('change_code', 0.92);
+
+      const { result, slack } = await route(CHANGE, tagger, { config: makeConfig('enforce') });
+
+      expect(runImplementationWorkflow).not.toHaveBeenCalled();
+      expect(slack.chat.postMessage).toHaveBeenCalledOnce();
+      expect(slack.chat.postMessage.mock.calls[0][0].text).toContain('<@UBUILDER> Want me to pick this up');
+      expect(result.status).toBe('PAUSED');
+    });
+
+    it('starts the change once the tagger says yes', async () => {
+      routerSays('change_code', 0.9);
+      const clarification = { question: 'Want me to pick this up and make the change?', askedText: CHANGE };
+
+      // The reply resumes as a message to miniOG, checked against the tagger's own access.
+      const { result } = await route(
+        'yes',
+        { userId: 'UBUILDER', channelId: 'C-BUILD', intent: 'IMPLEMENTATION', clarification },
+        { config: makeConfig('enforce') },
+      );
+
+      expect(result.workflow).toBe('IMPLEMENTATION');
+      expect(runImplementationWorkflow).toHaveBeenCalledOnce();
+    });
+
+    it('does not ask someone who could not say yes: the access check comes first, at the change tier', async () => {
+      routerSays('change_code', 0.92);
+
+      const { result, slack } = await route(
+        CHANGE,
+        { ...tagger, userId: 'UVIEWER', channelId: 'C-VIEW' },
+        { config: makeConfig('enforce') },
+      );
+
+      expect(result.status).toBe('SKIPPED');
+      expect(runImplementationWorkflow).not.toHaveBeenCalled();
+      expect(slack.chat.postMessage.mock.calls.some(call => String(call[0].text).includes('Want me to pick'))).toBe(
+        false,
+      );
+    });
+
+    it('runs a review the gate seeded without waiting on the router', async () => {
+      decideTool.mockResolvedValue({ ok: false, error: 'router call failed (exit 1)', durationMs: 3 });
+
+      const { result } = await route(
+        '<@UOWNER1> please review https://github.com/Newton-School/newton-web/pull/9210',
+        { mentionType: 'owner' as const, userId: 'UREVIEW', channelId: 'C-REVIEW', intent: 'PR_REVIEW' },
+        { config: makeConfig('enforce') },
+      );
+
+      // The model was down for this one, which is the case #430 lost twice.
+      expect(result.workflow).toBe('PR_REVIEW');
+      expect(runAgenticPrReview).toHaveBeenCalledOnce();
+      expect(classifyWorkflowIntent).not.toHaveBeenCalled();
+    });
+
+    it('still reviews a PR posted with only its title, by the router', async () => {
+      routerSays('review_pr', 0.8);
+
+      const { result } = await route(
+        '<@UOWNER1> NS-14362: Map playlists to company https://github.com/Newton-School/newton-web/pull/9318',
+        { ...tagger, userId: 'UREVIEW', channelId: 'C-REVIEW' },
+        { config: makeConfig('enforce') },
+      );
+
+      expect(result.workflow).toBe('PR_REVIEW');
+      expect(runImplementationWorkflow).not.toHaveBeenCalled();
+    });
+  });
+
   describe('a production deploy (issue #428)', () => {
     const DEPLOY_ASK = '<@UBOT1> deploy newton-web to production';
     const NEAR_MISS =

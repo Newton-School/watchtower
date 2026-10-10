@@ -27,6 +27,9 @@ export const LOW_CONFIDENCE_CHANGE_QUESTION =
 /** Not a question to answer in the thread: a deploy is never started from a reply. */
 export const DEPLOY_NEEDS_ONE_MESSAGE_REPLY =
   'If you want a production deploy, say which app in one message to me, for example `deploy newton-web to production`. I can deploy newton-web or the marketing site.';
+/** Asked of someone who tagged the owner with what reads as a change request, before any work starts. */
+export const OWNER_MENTION_CHANGE_QUESTION =
+  "Want me to pick this up and make the change? Reply yes and I'll start with a plan, or tell me what you need instead.";
 export const CLARIFY_GIVE_UP_REPLY =
   "I still can't tell what you need. Mention me again with the full request and I'll pick it up.";
 
@@ -58,14 +61,18 @@ export type ClarifyReason =
   | 'silenced_direct_mention'
   | 'low_confidence_change'
   | 'floor_hold'
-  | 'deploy_without_target';
+  | 'deploy_without_target'
+  | 'owner_mention_change';
 
 /**
  * What to do with a router decision that should not be acted on as given.
  * Pure: the model proposes, this decides.
  *
- * Only direct mentions are asked. A message that merely tags the owner is
- * never answered with a question.
+ * Only direct mentions are asked, with one exception. A message that tags
+ * the owner and reads as a change request was written to a person: starting
+ * code-changing work on it is a guess about what they wanted from miniOG, so
+ * the requester is asked first (the owner's rule of 2026-10-09, issue #430).
+ * Anything else on an owner mention runs as decided or stays silent.
  */
 export function decideClarify(params: {
   tool: RouterTool;
@@ -81,6 +88,9 @@ export function decideClarify(params: {
   deployAllowed?: boolean;
 }): ClarifyAction {
   const { tool, confidence, addressing, answering, heldByFloor, confidenceFloor } = params;
+  if (addressing === 'owner_mention' && tool === 'change_code' && !answering) {
+    return { kind: 'ask', question: OWNER_MENTION_CHANGE_QUESTION, reason: 'owner_mention_change' };
+  }
   if (addressing !== 'direct') return { kind: 'run' };
 
   let ask: { question: string; reason: ClarifyReason; park?: boolean } | undefined;
