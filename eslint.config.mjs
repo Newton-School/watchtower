@@ -17,7 +17,7 @@ export default tseslint.config(
     ],
   },
   {
-    files: ['scripts/**/*.mjs'],
+    files: ['scripts/**/*.mjs', 'sidecar/scripts/**/*.mjs'],
     languageOptions: {
       globals: {
         console: 'readonly',
