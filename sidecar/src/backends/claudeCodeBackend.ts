@@ -3,7 +3,7 @@ import os from 'node:os';
 import path, { delimiter as pathDelimiter } from 'node:path';
 import type { AgentBackend, AgentRunRequest, ParseOutputOptions, ParsedBackendOutput } from './types.js';
 import type { TokenUsage } from '../types/contracts.js';
-import { parseStructuredOutput } from './codexBackend.js';
+import { buildCodexPath, parseStructuredOutput } from './codexBackend.js';
 
 function asFiniteNumber(value: unknown): number | undefined {
   if (typeof value !== 'number') return undefined;
@@ -261,7 +261,9 @@ export const claudeCodeBackend: AgentBackend = {
 
   buildEnv(request: AgentRunRequest, basePath: string): Record<string, string> {
     const env: Record<string, string> = {};
-    env.PATH = basePath;
+    // Same toolchain PATH the codex backend gets. Without it agents cannot
+    // find gh, node or npm and re-export PATH in every Bash call (issue #444).
+    env.PATH = buildCodexPath(basePath);
     // HOME (and USER) are required for Claude Code to find its config and the
     // Keychain/credentials store where MCP OAuth tokens live — without HOME an
     // HTTP/OAuth MCP server (e.g. Metabase) silently fails to connect in the

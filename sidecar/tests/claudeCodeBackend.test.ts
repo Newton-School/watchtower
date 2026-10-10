@@ -528,12 +528,23 @@ describe('claudeCodeBackend MCP + env wiring (scoped investigation)', () => {
       const env = claudeCodeBackend.buildEnv(baseRequest, '/usr/bin');
       expect(env.HOME).toBe('/Users/tester');
       expect(env.USER).toBe('tester');
-      expect(env.PATH).toBe('/usr/bin');
+      expect(env.PATH.split(':')).toContain('/usr/bin');
     } finally {
       if (prevHome === undefined) delete process.env.HOME;
       else process.env.HOME = prevHome;
       if (prevUser === undefined) delete process.env.USER;
       else process.env.USER = prevUser;
     }
+  });
+
+  it('gives agents the toolchain PATH, not the bare PATH a GUI-launched app inherits (issue #444)', () => {
+    const dirs = claudeCodeBackend.buildEnv(baseRequest, '/usr/bin:/bin:/custom/tools').PATH.split(':');
+    // Homebrew (gh) and the sidecar's own Node directory (node, npm, npx).
+    expect(dirs).toContain('/opt/homebrew/bin');
+    expect(dirs).toContain('/usr/local/bin');
+    expect(dirs).toContain(path.dirname(process.execPath));
+    // Whatever was already there is kept.
+    expect(dirs).toContain('/custom/tools');
+    expect(new Set(dirs).size).toBe(dirs.length);
   });
 });

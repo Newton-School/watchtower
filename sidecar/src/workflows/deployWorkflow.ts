@@ -14,13 +14,14 @@ import { extractReplyFromCodexResult } from './shared/workflowUtils.js';
 import { waitForExactConfirmation } from './shared/confirmationGate.js';
 import { classifyDeployTarget } from '../router/intentParser.js';
 import { getRepo, isRepoEnabled, repoPathOrNull } from '../repos/registry.js';
+import { toolchainEnv } from '../backends/codexBackend.js';
 
 const execFileAsync = promisify(execFile);
 
 /** Internal seam — overridden by tests to avoid spawning the real `gh` CLI. */
 export const __ghCli = {
   async exec(args: string[], cwd: string, timeoutMs: number): Promise<string> {
-    const { stdout } = await execFileAsync('gh', args, { cwd, timeout: timeoutMs });
+    const { stdout } = await execFileAsync('gh', args, { cwd, timeout: timeoutMs, env: toolchainEnv() });
     return stdout;
   },
 };
