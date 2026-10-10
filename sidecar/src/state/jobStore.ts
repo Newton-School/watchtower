@@ -1634,6 +1634,42 @@ export class JobStore {
    * Their processes are gone (sidecar restarted) but SQLite still has them as RUNNING.
    * Returns the number of orphaned jobs cleaned up.
    */
+  /**
+   * RUNNING jobs with the stage of their newest log entry. Read at startup,
+   * before cleanupOrphanedRunningJobs fails them, to find the ones that were
+   * waiting on a person so their thread can be told (issue #436).
+   */
+  listRunningJobsWithLastStage(): Array<{
+    id: string;
+    channelId: string;
+    threadTs: string;
+    requestedBy?: string;
+    lastStage?: string;
+  }> {
+    const rows = this.db
+      .prepare(
+        `SELECT j.id, j.channel_id, j.thread_ts,
+                json_extract(j.payload_json, '$.requestUserId') AS requested_by,
+                (SELECT l.stage FROM job_logs l WHERE l.job_id = j.id ORDER BY l.created_at DESC, l.id DESC LIMIT 1) AS last_stage
+         FROM jobs j
+         WHERE j.status = 'RUNNING'`,
+      )
+      .all() as Array<{
+      id: string;
+      channel_id: string;
+      thread_ts: string;
+      requested_by: string | null;
+      last_stage: string | null;
+    }>;
+    return rows.map(row => ({
+      id: row.id,
+      channelId: row.channel_id,
+      threadTs: row.thread_ts,
+      requestedBy: row.requested_by ?? undefined,
+      lastStage: row.last_stage ?? undefined,
+    }));
+  }
+
   cleanupOrphanedRunningJobs(): number {
     const now = new Date().toISOString();
     const result = this.db

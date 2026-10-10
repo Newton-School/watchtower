@@ -1147,6 +1147,114 @@ describe('waitForApproval', () => {
     });
   }
 
+  // Issue #436: the wait had no reminder, so a plan could sit unseen for a day.
+  describe('reminders', () => {
+    const MIN = 60_000;
+    const reminders = {
+      afterMs: [15 * MIN, 120 * MIN],
+      text: "<!subteam^S1> <@UTRIGGER>'s plan above still needs a yes or no.",
+    };
+    const reminderPosts = () =>
+      mockSlack.chat.postMessage.mock.calls.filter((call: any[]) => call[0].text === reminders.text).length;
+
+    it('re-pings once after 15 minutes and once after 2 hours, and not before', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([]);
+      const controller = new AbortController();
+      const promise = runApproval({ reminders, signal: controller.signal });
+
+      await vi.advanceTimersByTimeAsync(14 * MIN);
+      expect(reminderPosts()).toBe(0);
+
+      await vi.advanceTimersByTimeAsync(2 * MIN);
+      expect(reminderPosts()).toBe(1);
+      expect(mockSlack.chat.postMessage.mock.calls[0][0]).toMatchObject({ channel: 'C1', thread_ts: '100.00' });
+
+      await vi.advanceTimersByTimeAsync(60 * MIN);
+      expect(reminderPosts()).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(50 * MIN);
+      expect(reminderPosts()).toBe(2);
+
+      await vi.advanceTimersByTimeAsync(600 * MIN);
+      expect(reminderPosts()).toBe(2);
+
+      controller.abort();
+      await promise;
+    });
+
+    it('sends one message, not two, when both thresholds have passed at once', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([]);
+      const controller = new AbortController();
+      const promise = runApproval({ reminders: { ...reminders, afterMs: [1000, 2000] }, signal: controller.signal });
+
+      await vi.advanceTimersByTimeAsync(6000); // the first poll is already past both
+      expect(reminderPosts()).toBe(1);
+
+      controller.abort();
+      await promise;
+    });
+
+    it('sends nothing when no reminders are configured', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([]);
+      const controller = new AbortController();
+      const promise = runApproval({ signal: controller.signal });
+
+      await vi.advanceTimersByTimeAsync(200 * MIN);
+      expect(mockSlack.chat.postMessage).not.toHaveBeenCalled();
+
+      controller.abort();
+      await promise;
+    });
+
+    it('still approves on an admin yes after a reminder', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([]);
+      const promise = runApproval({ reminders });
+      await vi.advanceTimersByTimeAsync(16 * MIN);
+      vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'yes', user: 'UCOREDEV', ts: '200.00' }]);
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect((await promise).outcome).toBe('approved');
+    });
+  });
+
+  describe('a yes from someone who cannot approve', () => {
+    const texts = () => mockSlack.chat.postMessage.mock.calls.map((call: any[]) => call[0].text as string);
+
+    it('names who can approve and tags them once', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([
+        { text: 'yes', user: 'UREQUESTER', ts: '200.00' },
+        { text: 'yes', user: 'UOTHER', ts: '201.00' },
+      ]);
+      const controller = new AbortController();
+      const promise = runApproval({ approverMention: '<!subteam^S1>', signal: controller.signal });
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect(texts()).toEqual([
+        '<@UREQUESTER> only admins can approve plans. <!subteam^S1>, this one is waiting for you.',
+        '<@UOTHER> Only admins can approve plans. Waiting for an admin to respond.',
+      ]);
+
+      // And it is not repeated on later polls.
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(texts()).toHaveLength(2);
+
+      controller.abort();
+      await promise;
+    });
+
+    it('keeps the plain reply when it does not know who can approve', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'yes', user: 'UREQUESTER', ts: '200.00' }]);
+      const controller = new AbortController();
+      const promise = runApproval({ signal: controller.signal });
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect(texts()).toEqual(['<@UREQUESTER> Only admins can approve plans. Waiting for an admin to respond.']);
+
+      controller.abort();
+      await promise;
+    });
+  });
+
   // Issue #264: a cancelled job used to wait here until an admin replied.
   it('returns cancelled as soon as the job is aborted, without waiting out the poll', async () => {
     vi.mocked(fetchThreadContext).mockResolvedValue([]);

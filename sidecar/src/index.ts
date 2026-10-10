@@ -44,6 +44,7 @@ import { fetchThreadContext } from './slack/threadContext.js';
 import { createThreadStatus, type ThreadStatus } from './slack/threadStatus.js';
 import { resolveUserGroup } from './slack/userGroupResolver.js';
 import { isOlderVersion, readSidecarBuild } from './runtime/buildInfo.js';
+import { buildRestartNotice, humanGateForStage } from './runtime/restartNotice.js';
 import { acquireInstanceLock, instanceLockPath, releaseInstanceLock } from './runtime/instanceLock.js';
 import {
   registerActiveJob,
@@ -1702,10 +1703,38 @@ async function main(): Promise<void> {
   // synthesizer (idle + delta + interval gates, light tier, concurrency 2).
   startThreadSynthesizerScheduler(store);
 
+  // Jobs that were waiting on a person when the previous process went away.
+  // Read before the cleanup below fails them; their threads are told after.
+  const parkedAtRestart = store
+    .listRunningJobsWithLastStage()
+    .map(job => ({ ...job, gate: humanGateForStage(job.lastStage) }))
+    .filter(job => job.gate !== undefined);
+
   // Mark any leftover RUNNING jobs as FAILED — their processes are gone after restart
   const orphaned = store.cleanupOrphanedRunningJobs();
   if (orphaned > 0) {
     logger.warn({ orphaned }, 'cleaned up orphaned RUNNING jobs from previous session');
+  }
+
+  // A plan awaiting approval used to vanish on a restart without a word
+  // (issue #436). Best effort, and never blocks startup.
+  if (parkedAtRestart.length > 0 && config.slackBotToken) {
+    const noticeClient = new WebClient(config.slackBotToken);
+    for (const job of parkedAtRestart) {
+      const text = buildRestartNotice({ gate: job.gate!, requestedBy: job.requestedBy });
+      void noticeClient.chat
+        .postMessage({ channel: job.channelId, thread_ts: job.threadTs, text })
+        .then(() =>
+          store.appendJobLog({
+            jobId: job.id,
+            stage: 'job.restart_notice',
+            level: 'WARN',
+            message: `Told the thread the request was dropped by a restart (was waiting: ${job.gate}).`,
+            data: { gate: job.gate, lastStage: job.lastStage },
+          }),
+        )
+        .catch(err => logger.warn({ jobId: job.id, err: String(err) }, 'restart notice failed'));
+    }
   }
 
   // Revert launchpad requests stranded in CLAIMED/QUEUED back to PENDING so

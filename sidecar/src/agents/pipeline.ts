@@ -294,8 +294,20 @@ export async function waitForApproval(params: {
   botUserId?: string;
   /** The job's abort signal. Without it a cancelled job kept waiting here forever (issue #264). */
   signal?: AbortSignal;
+  /**
+   * Re-ping while the plan waits (issue #436): `text` is posted once when each
+   * delay in `afterMs` has passed. The wait has no other way to be noticed.
+   */
+  reminders?: { afterMs: number[]; text: string };
+  /** Who can approve, as a Slack mention. Used once when someone who cannot approve says yes. */
+  approverMention?: string;
 }): Promise<ApprovalResult> {
   const { slack, channelId, threadTs, approverUserIds, approvalPromptTs, logStep, botUserId, signal } = params;
+  const { reminders, approverMention } = params;
+  const waitStartedAt = Date.now();
+  const reminderDelays = [...(reminders?.afterMs ?? [])].sort((a, b) => a - b);
+  let remindersSent = 0;
+  let approversTagged = false;
   const cancelled = (): ApprovalResult => {
     logStep({ stage: 'pipeline.approval.cancelled', message: 'Job cancelled while waiting for approval.' });
     return { outcome: 'cancelled', userReply: '', approverId: '', replyTs: '' };
@@ -316,6 +328,20 @@ export async function waitForApproval(params: {
     if (signal?.aborted) return cancelled();
     await abortableDelay(pollIntervalMs, signal);
     if (signal?.aborted) return cancelled();
+
+    // One reminder per threshold. If several have passed at once (the host
+    // slept), they collapse into a single message.
+    let due = remindersSent;
+    while (due < reminderDelays.length && Date.now() - waitStartedAt >= reminderDelays[due]) due += 1;
+    if (reminders && due > remindersSent) {
+      remindersSent = due;
+      logStep({
+        stage: 'pipeline.approval.reminder',
+        message: `Reminded approvers (${remindersSent} of ${reminderDelays.length}).`,
+        data: { waitedMs: Date.now() - waitStartedAt },
+      });
+      slack.chat.postMessage({ channel: channelId, thread_ts: threadTs, text: reminders.text }).catch(() => {});
+    }
 
     let messages: Array<{ text: string; user: string; ts: string }>;
     try {
@@ -352,13 +378,19 @@ export async function waitForApproval(params: {
               message: `Non-admin user <@${reply.user}> attempted to approve.`,
               level: 'WARN',
             });
+            const tagApprovers = Boolean(approverMention) && !approversTagged;
             slack.chat
               .postMessage({
                 channel: channelId,
                 thread_ts: threadTs,
-                text: `<@${reply.user}> Only admins can approve plans. Waiting for an admin to respond.`,
+                // Say who can, and tag them once: "waiting for an admin" told
+                // the requester nothing and reached no admin (issue #436).
+                text: tagApprovers
+                  ? `<@${reply.user}> only admins can approve plans. ${approverMention}, this one is waiting for you.`
+                  : `<@${reply.user}> Only admins can approve plans. Waiting for an admin to respond.`,
               })
               .catch(() => {});
+            if (tagApprovers) approversTagged = true;
           }
           continue;
         }
