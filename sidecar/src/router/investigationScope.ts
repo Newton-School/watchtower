@@ -114,6 +114,7 @@ export async function classifyInvestigationScope(params: {
     const threadBlock = threadMessages.length > 0 ? `\n\nThread context:\n${threadMessages.join('\n')}` : '';
     const result = await runCodex({
       cwd: os.tmpdir(),
+      noTools: true,
       prompt: `${buildScopePrompt(marketingEnabled)}\n\nBug report:\n"${bugReport}"${threadBlock}\n\nClassify this bug.`,
       model: profile.model,
       reasoningEffort: profile.reasoningEffort,

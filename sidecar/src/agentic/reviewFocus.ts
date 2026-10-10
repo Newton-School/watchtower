@@ -73,6 +73,7 @@ export async function extractUserFocus(params: {
       const result = await withAgentCallContext({ role: 'focus' }, () =>
         runAgent({
           cwd: os.tmpdir(),
+          noTools: true,
           prompt: buildFocusPrompt(triggerText, threadTexts),
           model: profile.model,
           reasoningEffort: profile.reasoningEffort,

@@ -172,6 +172,7 @@ export async function synthesizeUserProfile(opts: {
 
   const result = await runCodex({
     cwd: os.tmpdir(),
+    noTools: true,
     prompt,
     model: profile.model,
     reasoningEffort: profile.reasoningEffort,
