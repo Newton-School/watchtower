@@ -42,11 +42,17 @@ const NEWTON_WEB_REF_RE = /\bnewton[- ]?web\b/;
 const AMBIGUOUS_DEPLOY_TARGET_RE = /\b(landing([- ]?pages?)?|homepage|newton[- ]?school|nsat|nst)\b/;
 
 function normalizeDeployText(text: string): string {
-  return text
-    .replace(/<@[^>]+>/g, ' ')
-    .replace(/\s+/g, ' ')
-    .toLowerCase()
-    .trim();
+  return (
+    text
+      .replace(/<@[^>]+>/g, ' ')
+      // A link is not an instruction: a newton-web PR URL must not count as
+      // naming the deploy target (issue #428). A Slack link keeps its label.
+      .replace(/<https?:[^>|]*(?:\|([^>]*))?>/g, ' $1 ')
+      .replace(/https?:\/\/\S+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .toLowerCase()
+      .trim()
+  );
 }
 
 export type DeployTarget = 'newton-web' | 'newton-marketing-web' | 'ambiguous';
@@ -410,7 +416,11 @@ function inferIntent(
   // ambiguous between the frontends) lands on the DEPLOY intent here;
   // deployWorkflow re-derives the target the same way and resolves
   // 'ambiguous' with config.
-  if (mention.detected && classifyDeployTarget(event.text ?? '') !== null) {
+  //
+  // Direct address only (an @miniOG mention or a DM). A message that merely
+  // tags the owner is a conversation between people; its wording must never
+  // start a production deploy (issue #428).
+  if (mention.detected && mention.type === 'bot' && classifyDeployTarget(event.text ?? '') !== null) {
     return { intent: 'DEPLOY' };
   }
 
