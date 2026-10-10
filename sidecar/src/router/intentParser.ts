@@ -257,6 +257,14 @@ function isReviewRequestVerb(normalized: string): boolean {
 const CONFLICTING_CHANGE_VERB_RE =
   /\b(create|open|raise|fix|implement|merge|close|revert|rebase|update|address|resolve)\b/;
 
+/** `<https://x|label>` and `<https://x>` → `https://x`, as the sender typed it. */
+function unwrapSlackLinks(text: string): string {
+  return text
+    .replace(/<(https?:\/\/[^>|\s]+)(?:\|[^>]*)?>/g, ' $1 ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 /** The footer Slack adds to a message a person sends through the Claude app. */
 const SENT_USING_FOOTER_RE = /\*sent using\*\s*<@[^>]+>\s*$/i;
 
@@ -310,7 +318,12 @@ export function isPrReviewRequest(
     .replace(/\s+/g, ' ')
     .toLowerCase()
     .trim();
-  const hasReviewVerb = isReviewRequestVerb(normalized);
+  // Slack delivers a link as <https://…> or <https://…|label>. The verb test
+  // looks for "review https://", so in explicit mode the brackets come off
+  // first: without the old "no change verb" fallback, "review <link>" would
+  // otherwise miss the gate it is the plainest case for.
+  const verbText = options.explicitOnly ? unwrapSlackLinks(normalized) : normalized;
+  const hasReviewVerb = isReviewRequestVerb(verbText);
   const hasConflictingVerb = CONFLICTING_CHANGE_VERB_RE.test(normalized);
 
   if (GITHUB_PR_URL_TEST_RE.test(triggerText)) {
