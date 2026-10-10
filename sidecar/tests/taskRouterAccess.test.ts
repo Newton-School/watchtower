@@ -790,3 +790,11 @@ describe('deterministic PR_REVIEW seed (issue #334 bug B)', () => {
     expect(runAgenticPrReview).toHaveBeenCalledOnce();
   });
 });
+
+describe('routeTask and the tool registry (issue #456)', () => {
+  it('can start a workflow for exactly the intents the registry says are runnable', async () => {
+    const { ROUTED_INTENTS } = await import('../src/router/taskRouter.js');
+    const { RUNNABLE_INTENTS } = await import('../src/router/toolRegistry.js');
+    expect([...ROUTED_INTENTS].sort()).toEqual([...RUNNABLE_INTENTS].sort());
+  });
+});

@@ -44,6 +44,67 @@ export const CLASSIFIER_CONFIDENCE_FLOOR = 0.75;
 import { formatThreadContextForClassifier, isPresencePing } from '../workflows/shared/workflowUtils.js';
 import { formatDossierForPrompt } from '../state/dossierStore.js';
 
+type WorkflowRunnerContext = {
+  task: NormalizedTask;
+  config: AppConfig;
+  slack: WebClient;
+  store: JobStore;
+  jobId?: string;
+  logStep?: WorkflowStepLogger;
+  signal?: AbortSignal;
+};
+
+const investigationStoreOf = (store: JobStore) =>
+  typeof store?.investigationStore === 'function' ? store.investigationStore() : undefined;
+
+/**
+ * The workflow that carries out each tool, by the intent it runs as. The
+ * registry (router/toolRegistry.ts) says what each tool needs and can do;
+ * this says how to start it. A test keeps the two in step.
+ */
+const WORKFLOW_RUNNERS: Partial<Record<WorkflowIntent, (ctx: WorkflowRunnerContext) => Promise<WorkflowResult>>> = {
+  PR_REVIEW: ({ task, config, slack, store, jobId, logStep, signal }) =>
+    runAgenticPrReview({ task, config, slack, store, jobId, logStep, signal }),
+  IMPLEMENTATION: runImplementation,
+  OWNER_AUTOPILOT: runImplementation,
+  INVESTIGATION: ({ task, config, slack, store, jobId, logStep, signal }) =>
+    runInvestigationWorkflow({
+      task,
+      config,
+      slack,
+      store,
+      investigationStore: investigationStoreOf(store),
+      jobId,
+      logStep,
+      signal,
+    }),
+  INFORMATIONAL: ctx => runAgenticEntry({ mode: 'informational', ...ctx }),
+  CONVERSATIONAL: ctx => runAgenticEntry({ mode: 'conversational', ...ctx }),
+  WEBAPP_QA: ctx => runAgenticEntry({ mode: 'qa', ...ctx }),
+  DEV_ASSIST: ({ task, config, slack, store, logStep, signal }) =>
+    runDevAssistWorkflow({ task, config, slack, store, logStep, signal }),
+  MINIOG_DOSSIER: ({ task, slack, store, config, logStep, signal }) =>
+    runMiniogDossierWorkflow({ task, slack, store, config, logStep, signal }),
+  DEPLOY: ({ task, config, slack, store, logStep, signal }) =>
+    runDeployWorkflow({ task, config, slack, store, logStep, signal }),
+};
+
+function runImplementation({ task, config, slack, store, jobId, logStep, signal }: WorkflowRunnerContext) {
+  return runImplementationWorkflow({
+    task,
+    config,
+    slack,
+    store,
+    investigationStore: investigationStoreOf(store),
+    jobId,
+    logStep,
+    signal,
+  });
+}
+
+/** Intents routeTask can start a workflow for. */
+export const ROUTED_INTENTS = Object.keys(WORKFLOW_RUNNERS) as WorkflowIntent[];
+
 export async function routeTask(params: {
   task: NormalizedTask;
   config: AppConfig;
@@ -331,61 +392,9 @@ export async function routeTask(params: {
     });
   }
 
-  if (resolvedIntent === 'PR_REVIEW') {
-    return runAgenticPrReview({ task: routedTask, config, slack, store, jobId, logStep, signal });
-  }
-
-  const lazyInvestigationStore =
-    typeof store?.investigationStore === 'function' ? store.investigationStore() : undefined;
-
-  if (resolvedIntent === 'IMPLEMENTATION' || resolvedIntent === 'OWNER_AUTOPILOT') {
-    return runImplementationWorkflow({
-      task: routedTask,
-      config,
-      slack,
-      store,
-      investigationStore: lazyInvestigationStore,
-      jobId,
-      logStep,
-      signal,
-    });
-  }
-
-  if (resolvedIntent === 'INVESTIGATION') {
-    return runInvestigationWorkflow({
-      task: routedTask,
-      config,
-      slack,
-      store,
-      investigationStore: lazyInvestigationStore,
-      jobId,
-      logStep,
-      signal,
-    });
-  }
-
-  if (resolvedIntent === 'INFORMATIONAL') {
-    return runAgenticEntry({ mode: 'informational', task: routedTask, config, slack, store, jobId, logStep, signal });
-  }
-
-  if (resolvedIntent === 'CONVERSATIONAL') {
-    return runAgenticEntry({ mode: 'conversational', task: routedTask, config, slack, store, jobId, logStep, signal });
-  }
-
-  if (resolvedIntent === 'WEBAPP_QA') {
-    return runAgenticEntry({ mode: 'qa', task: routedTask, config, slack, store, jobId, logStep, signal });
-  }
-
-  if (resolvedIntent === 'DEV_ASSIST') {
-    return runDevAssistWorkflow({ task: routedTask, config, slack, store, logStep, signal });
-  }
-
-  if (resolvedIntent === 'MINIOG_DOSSIER') {
-    return runMiniogDossierWorkflow({ task: routedTask, slack, store, config, logStep, signal });
-  }
-
-  if (resolvedIntent === 'DEPLOY') {
-    return runDeployWorkflow({ task: routedTask, config, slack, store, logStep, signal });
+  const runWorkflow = WORKFLOW_RUNNERS[resolvedIntent];
+  if (runWorkflow) {
+    return runWorkflow({ task: routedTask, config, slack, store, jobId, logStep, signal });
   }
 
   // Check file-based workflow templates before falling through to unknown
