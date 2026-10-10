@@ -310,6 +310,21 @@ export async function runDeployWorkflow(params: {
     data: { ok: result.ok, exitCode: result.exitCode },
   });
 
+  if (signal?.aborted && !result.ok) {
+    // Cancelled while the deploy agent was running. It is not a failed deploy,
+    // but it may be a half-finished one, so say that rather than nothing (#438).
+    const msg = 'Stopped while the newton-web deploy was running. Check what production is on before deploying again.';
+    logStep?.({ stage: 'deploy.cancelled', message: msg, level: 'WARN' });
+    const slackPosted = await postDeployReplyBestEffort({
+      slack,
+      channelId: task.event.channelId,
+      threadTs: task.event.threadTs,
+      text: msg,
+      logStep,
+    });
+    return { workflow: 'DEPLOY', status: 'CANCELLED', message: msg, notifyDesktop: true, slackPosted };
+  }
+
   const reply = extractReplyFromCodexResult(result) || 'Deploy finished but produced no output. Check logs.';
 
   // The deploy side-effect (runCodex above) has already executed. Any failure to

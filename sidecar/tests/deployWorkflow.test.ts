@@ -747,6 +747,22 @@ describe('runDeployWorkflow confirmation (issue #428)', () => {
     expect(marketing.message).toContain('newton-marketing-web');
   });
 
+  it('reports CANCELLED, with a warning to check production, when stopped while the deploy runs (#438)', async () => {
+    const controller = new AbortController();
+    vi.mocked(runCodex).mockImplementation(async () => {
+      controller.abort();
+      return { ok: false, exitCode: 143, cancelled: true, stdout: '', stderr: '', lastMessage: '' } as any;
+    });
+
+    const result = await runDeployWorkflow({ task: deployTask(), config, slack, signal: controller.signal });
+
+    expect(result.status).toBe('CANCELLED');
+    expect(result.message).toContain('Check what production is on');
+    const texts = postMessage.mock.calls.map(c => c[0].text);
+    expect(texts).toContain(result.message);
+    expect(texts).not.toContain('Deploy finished but produced no output. Check logs.');
+  });
+
   it('deploys for real when the dry-run key is unset', async () => {
     const store = { getState: vi.fn(() => undefined) };
     await runDeployWorkflow({ task: deployTask(), config, slack, store });

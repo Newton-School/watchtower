@@ -37,6 +37,7 @@ import { resolveWorkspace } from '../workspaces/workspaceManager.js';
 import { createPrFromWorkspace } from '../github/postPipelinePr.js';
 import { fetchUnresolvedReviewThreadCount } from '../github/prReviewComments.js';
 import { waitForExactConfirmation } from './shared/confirmationGate.js';
+import { cancelledResult } from './shared/cancelState.js';
 import type { PipelineStore } from '../agents/pipeline.js';
 import type { AgentStepResult, PipelineConfig } from '../agents/types.js';
 import type { InvestigationStore } from '../state/investigationStore.js';
@@ -920,6 +921,11 @@ export async function runImplementationWorkflow(params: {
       onLog: logStep,
     });
 
+    // Cancelled while planning: do not post a plan, a question or failure copy (#438).
+    if (signal?.aborted) {
+      return cancelledResult('IMPLEMENTATION');
+    }
+
     let plannerSessionId = plannerRunResult.sessionId;
     let plannerOutput: Record<string, unknown> = plannerRunResult.parsedJson ?? {};
 
@@ -1333,6 +1339,11 @@ Write your response as a ready-to-post Slack message describing what you did.
         onLog: logStep,
         signal,
       });
+
+      // Cancelled mid-action: "Quick action completed." would be false (#438).
+      if (signal?.aborted && !quickResult.ok) {
+        return cancelledResult('IMPLEMENTATION');
+      }
 
       const reply = extractReplyFromCodexResult(quickResult) || 'Quick action completed.';
 
@@ -1803,6 +1814,18 @@ Write your response as a ready-to-post Slack message describing what you did.
         notifyDesktop: true,
         slackPosted: true,
       };
+    }
+
+    // Cancelled mid-pipeline: its agents were killed, which is not a review
+    // verdict, and "Not opening a PR" would read as one (#438).
+    if (signal?.aborted && fullResult.finalStatus !== 'passed') {
+      logStep?.({
+        stage: 'implementation.pipeline.cancelled',
+        message: `Pipeline was cancelled (status ${fullResult.finalStatus}).`,
+        level: 'WARN',
+        data: { finalStatus: fullResult.finalStatus },
+      });
+      return cancelledResult('IMPLEMENTATION');
     }
 
     if (fullResult.finalStatus !== 'passed') {

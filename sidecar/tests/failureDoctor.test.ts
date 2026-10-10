@@ -152,4 +152,29 @@ describe('failureDoctor', () => {
     expect(diagnosis?.errorKind).toBe('USAGE_LIMIT');
     expect(diagnosis?.actions.join(' ')).toContain('resume');
   });
+
+  it('does not diagnose a cancelled run, even though its logs mention a timeout (issue #438)', () => {
+    const logs = [
+      {
+        stage: 'pipeline.start',
+        message: 'Pipeline started.',
+        level: 'INFO' as const,
+        data: { totalTimeoutMs: 2700000 },
+      },
+      { stage: 'agent.cancelled', message: 'Agent run cancelled.', level: 'WARN' as const },
+    ];
+
+    expect(
+      diagnoseFailure({ workflow: 'IMPLEMENTATION', message: 'Investigator produced no usable output.', logs }),
+    ).toBeUndefined();
+    // The same logs without the cancel are what produced the wrong "timeout" diagnosis.
+    expect(diagnoseFailure({ workflow: 'IMPLEMENTATION', message: 'x', logs: logs.slice(0, 1) })?.errorKind).toBe(
+      'WORKFLOW_TIMEOUT',
+    );
+  });
+
+  it('does not diagnose a run the finalizer recorded as cancelled', () => {
+    const logs = [{ stage: 'job.cancelled', message: 'Run was cancelled.', level: 'WARN' as const }];
+    expect(diagnoseFailure({ workflow: 'DEPLOY', message: 'spawn codex ENOENT', logs })).toBeUndefined();
+  });
 });

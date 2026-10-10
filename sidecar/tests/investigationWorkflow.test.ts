@@ -226,3 +226,51 @@ describe('runInvestigationWorkflow scope wiring', () => {
     expect(prompt).toMatch(/No database access is available/);
   });
 });
+
+describe('runInvestigationWorkflow cancelled mid-run (issue #438)', () => {
+  beforeEach(() => {
+    classifyInvestigationScope.mockResolvedValue({
+      scope: 'newton-web',
+      confidence: 0.9,
+      reasoning: 'ui',
+      method: 'llm',
+    });
+  });
+
+  it('returns CANCELLED and posts no failure copy when the run was aborted', async () => {
+    const controller = new AbortController();
+    // The agent dies with the abort: no output, not ok.
+    runCodex.mockImplementation(async () => {
+      controller.abort();
+      return { ok: false, exitCode: 143, cancelled: true, parsedJson: undefined };
+    });
+    const slack = slackStub();
+
+    const result = await runInvestigationWorkflow({
+      task: makeTask('checkout page is broken'),
+      config,
+      slack: slack as any,
+      signal: controller.signal,
+    });
+
+    expect(result.status).toBe('CANCELLED');
+    expect(result.slackPosted).toBe(false);
+    const posted = slack.chat.postMessage.mock.calls.map((call: any[]) => call[0].text as string);
+    expect(posted.some(text => text.includes("couldn't complete the investigation"))).toBe(false);
+  });
+
+  it('still reports a genuine failure when nothing was cancelled', async () => {
+    runCodex.mockResolvedValue({ ok: false, exitCode: 1, parsedJson: undefined });
+    const slack = slackStub();
+
+    const result = await runInvestigationWorkflow({
+      task: makeTask('checkout page is broken'),
+      config,
+      slack: slack as any,
+    });
+
+    expect(result.status).toBe('FAILED');
+    const posted = slack.chat.postMessage.mock.calls.map((call: any[]) => call[0].text as string);
+    expect(posted.some(text => text.includes("couldn't complete the investigation"))).toBe(true);
+  });
+});

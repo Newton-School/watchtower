@@ -81,6 +81,8 @@ export async function runAgenticPrReview(params: {
   };
 
   const postToThread = async (text: string) => {
+    // After a cancel there is nothing true left to say about the review (#438).
+    if (signal?.aborted) return;
     await slack.chat
       .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text })
       .catch(() => {});
@@ -435,7 +437,9 @@ export async function runAgenticPrReview(params: {
   const failed = outcomes.filter(o => o.status === 'FAILED');
   const completed = outcomes.filter(o => o.status === 'SUCCESS');
   const skipped = outcomes.filter(o => o.status === 'SKIPPED');
-  const aborted = Boolean(signal?.aborted) && outcomes.length < reviewable.length;
+  // Aborted unless every PR was reviewed or skipped before the cancel landed.
+  // Counting only unstarted PRs made a cancelled single-PR review a FAILED one (#438).
+  const aborted = Boolean(signal?.aborted) && completed.length + skipped.length < reviewable.length;
   const firstWithSha = outcomes.find(o => o.prHeadSha);
 
   logStep?.({

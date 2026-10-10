@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { cancelledResult } from '../workflows/shared/cancelState.js';
 import type { WebClient } from '@slack/web-api';
 import type {
   AppConfig,
@@ -413,6 +414,12 @@ export async function runAgenticEntry(params: RunAgenticEntryParams): Promise<Wo
     data: { reason: result.reason, error: result.error, replyLength: result.reply.length },
   });
 
+  // Cancelled mid-run: nothing to post. The agent's "reply" is empty or an
+  // error string, and Slack rejects an empty message (issue #438).
+  if (signal?.aborted && !result.ok) {
+    return cancelledResult(mode === 'informational' ? 'INFORMATIONAL' : 'CONVERSATIONAL');
+  }
+
   // Split off any file manifest before posting, so the bookkeeping JSON never
   // reaches the channel. Only a successful run can have produced files; on
   // failure `result.reply` is an error message and there is nothing to attach.
@@ -421,8 +428,19 @@ export async function runAgenticEntry(params: RunAgenticEntryParams): Promise<Wo
     : { visibleText: result.reply, attachments: [] };
   const replyText = visibleText || result.reply;
 
-  // Post the reply (or the error message) to Slack from TS.
+  // Post the reply (or the error message) to Slack from TS. Never an empty
+  // one: Slack answers `no_text` and the requester sees nothing either way.
   let slackPosted = false;
+  if (!replyText.trim()) {
+    logStep?.({ stage: 'agentic.reply.empty', message: 'Agent produced no text to post.', level: 'WARN' });
+    return {
+      workflow: mode === 'informational' ? 'INFORMATIONAL' : 'CONVERSATIONAL',
+      status: 'FAILED',
+      message: result.error ?? `Agentic ${mode} run produced no reply.`,
+      notifyDesktop: true,
+      slackPosted: false,
+    };
+  }
   try {
     await slack.chat.postMessage({
       channel: task.event.channelId,

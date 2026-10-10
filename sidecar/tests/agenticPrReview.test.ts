@@ -1353,3 +1353,32 @@ describe('agenticPrReview — merged or closed PRs are not reviewed (issue #447)
     expect(result.status).toBe('SUCCESS');
   });
 });
+
+describe('agenticPrReview — a cancelled review is not a failed one (issue #438)', () => {
+  it('returns CANCELLED for a single PR stopped mid-review, and posts nothing after the cancel', async () => {
+    const controller = new AbortController();
+    // Every agent dies with the abort.
+    const runAgent = vi.fn().mockImplementation(async () => {
+      controller.abort();
+      return agentDead();
+    });
+    const deps = makeDeps({ runAgent });
+    const slack = makeSlack([`please review ${API_PR}`]);
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${API_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+      signal: controller.signal,
+    });
+
+    expect(result.status).toBe('CANCELLED');
+    expect(deps.submitReview).not.toHaveBeenCalled();
+    const postedAfterCancel = slack.chat.postMessage.mock.calls
+      .map((c: any[]) => c[0].text as string)
+      .filter((text: string) => !text.includes('PR review in progress'));
+    expect(postedAfterCancel).toEqual([]);
+  });
+});

@@ -1,4 +1,5 @@
 import type { WebClient } from '@slack/web-api';
+import { cancelledResult } from './shared/cancelState.js';
 import type { AppConfig, NormalizedTask, WorkflowResult, WorkflowStepLogger } from '../types/contracts.js';
 import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
 import { assembleRecall } from '../codex/recallAssembler.js';
@@ -207,6 +208,12 @@ Return strict JSON:
     onLog: logStep,
     signal,
   });
+
+  // Cancelled mid-run: the dead agent is not a failed investigation, and the
+  // "couldn't complete" copy below would be wrong (issue #438).
+  if (signal?.aborted) {
+    return cancelledResult('INVESTIGATION');
+  }
 
   if (!investigatorResult.ok || !investigatorResult.parsedJson) {
     logStep?.({
