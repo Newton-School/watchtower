@@ -50,17 +50,45 @@ function investigatorOk() {
   };
 }
 
+const baseCtx = {
+  cwd: '/repos',
+  repoName: undefined,
+  threadContext: 'thread',
+  imagePaths: [],
+  imageContext: '',
+  githubToken: undefined,
+  desktopOnly: undefined,
+};
+
 beforeEach(() => {
   runCodex.mockReset().mockResolvedValue(investigatorOk());
   getActiveBackendId.mockReset().mockReturnValue('claude-code');
   classifyInvestigationScope.mockReset();
-  prepareWorkflowContext.mockReset().mockResolvedValue({
-    cwd: '/repos',
-    repoName: undefined,
-    threadContext: 'thread',
-    imageContext: '',
-    githubToken: undefined,
-    desktopOnly: undefined,
+  prepareWorkflowContext.mockReset().mockResolvedValue(baseCtx);
+});
+
+describe('runInvestigationWorkflow thread images', () => {
+  beforeEach(() => {
+    classifyInvestigationScope.mockResolvedValue({
+      scope: 'newton-web',
+      confidence: 0.9,
+      reasoning: 'ui',
+      method: 'llm',
+    });
+  });
+
+  it('hands downloaded thread screenshots to the investigator', async () => {
+    prepareWorkflowContext.mockResolvedValue({ ...baseCtx, imagePaths: ['/tmp/slack-files/F1-image.png'] });
+
+    await runInvestigationWorkflow({ task: makeTask('pls remove this section'), config, slack: slackStub() as any });
+
+    expect(runCodex.mock.calls[0][0].imagePaths).toEqual(['/tmp/slack-files/F1-image.png']);
+  });
+
+  it('passes no imagePaths when the thread has none', async () => {
+    await runInvestigationWorkflow({ task: makeTask('button is misaligned'), config, slack: slackStub() as any });
+
+    expect(runCodex.mock.calls[0][0].imagePaths).toBeUndefined();
   });
 });
 
