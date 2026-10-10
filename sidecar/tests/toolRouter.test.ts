@@ -70,8 +70,17 @@ describe('buildRouterPrompt', () => {
 
   it('says so when the message only tags the owner', () => {
     expect(buildRouterPrompt({ ...facts, addressing: 'owner_mention', hints: [] })).toContain(
-      'Addressed: to the owner, not to miniOG',
+      'Addressed: to the owner or the core-dev group, not to miniOG by name',
     );
+  });
+
+  it('carries the rules the replay of past mentions showed were missing', () => {
+    // A review ask that tags the owner is work for miniOG, not people talking.
+    expect(prompt).toContain('you act for the owner');
+    expect(prompt).toContain('"Review and merge" and "review, approve, merge" are review_pr');
+    expect(prompt).toContain('Metabase cannot be edited from here');
+    expect(prompt).toContain('A question is never unsupported');
+    expect(prompt).toContain("Pages on newtonschool.co are the team's own product");
   });
 
   it('includes thread context and the requester summary only when there is one', () => {

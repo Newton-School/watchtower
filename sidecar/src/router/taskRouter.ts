@@ -31,7 +31,7 @@ import { renderPromptTemplate } from '../workflows/renderer.js';
 import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
 import { highReasoningProfile } from '../codex/modelProfiles.js';
 import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
-import { classifyWorkflowIntent } from './classifyIntent.js';
+import { classifyWorkflowIntent, type IntentClassification } from './classifyIntent.js';
 import { startRouterShadow, type LegacyDecidedBy } from './routerShadow.js';
 import { looksLikeFixAffirmation } from './resumeIntentParser.js';
 
@@ -106,6 +106,43 @@ function runImplementation({ task, config, slack, store, jobId, logStep, signal 
 /** Intents routeTask can start a workflow for. */
 export const ROUTED_INTENTS = Object.keys(WORKFLOW_RUNNERS) as WorkflowIntent[];
 
+/** The intent classifier's call, as it ran before the tool-router could stand in for it. */
+async function classifyWithLegacyClassifier(params: {
+  task: NormalizedTask;
+  userMessage: string;
+  store: JobStore;
+  logStep?: WorkflowStepLogger;
+  signal?: AbortSignal;
+}): Promise<IntentClassification> {
+  const { task, userMessage, store, logStep, signal } = params;
+  // Pass mentionType so the classifier knows if this is a direct @miniOG mention
+  // or an indirect @theOG mention (owner-mention triggers should be filtered for relevance).
+  const hasPrUrl = Boolean(task.prContext);
+  let userDossierSummary: string | undefined;
+  try {
+    const dossier = store.dossierStore().getDossier(task.event.userId);
+    if (dossier.profile || dossier.affinity.length > 0) {
+      userDossierSummary = formatDossierForPrompt(dossier);
+    }
+  } catch (err) {
+    logStep?.({
+      stage: 'router.classify.dossier_lookup_failed',
+      level: 'WARN',
+      message: 'Failed to assemble dossier summary for classifier; continuing without it.',
+      data: { error: (err as Error).message },
+    });
+  }
+  return classifyWorkflowIntent({
+    userMessage,
+    threadContext: formatThreadContextForClassifier(task),
+    hasPrUrl,
+    mentionType: task.mentionType,
+    userDossierSummary,
+    logStep,
+    signal,
+  });
+}
+
 export async function routeTask(params: {
   task: NormalizedTask;
   config: AppConfig;
@@ -150,10 +187,12 @@ export async function routeTask(params: {
     .replace(/\s+/g, ' ')
     .trim();
 
-  // The tool-router runs beside everything below and only logs what it would
-  // have done (issue #456). Detached: nothing here waits for it.
+  // The tool-router's one call for this message (issue #456). In shadow mode it
+  // only logs what it would have done and nothing here waits for it. In `on`
+  // mode its decision is used below where the classifier's was, and nowhere else.
   const routerShadow = startRouterShadow({ task, userMessage, store, logStep, signal });
   let legacyDecidedBy: LegacyDecidedBy = 'gate';
+  let decider = 'AI classifier';
 
   // PR_REVIEW can only be seeded pre-classifier by the deterministic gate
   // (isPrReviewRequest in intentParser.ts) — nothing else produces it before
@@ -199,34 +238,18 @@ export async function routeTask(params: {
         data: { userMessage, threadTs: task.event.threadTs, resolvedIntent },
       });
     } else {
-      legacyDecidedBy = 'classifier';
-      // For all other intents, use AI to classify.
-      // Pass mentionType so the classifier knows if this is a direct @miniOG mention
-      // or an indirect @theOG mention (owner-mention triggers should be filtered for relevance).
-      const hasPrUrl = Boolean(task.prContext);
-      let userDossierSummary: string | undefined;
-      try {
-        const dossier = store.dossierStore().getDossier(task.event.userId);
-        if (dossier.profile || dossier.affinity.length > 0) {
-          userDossierSummary = formatDossierForPrompt(dossier);
-        }
-      } catch (err) {
-        logStep?.({
-          stage: 'router.classify.dossier_lookup_failed',
-          level: 'WARN',
-          message: 'Failed to assemble dossier summary for classifier; continuing without it.',
-          data: { error: (err as Error).message },
-        });
+      // For all other intents, use AI to decide: the tool-router when it is on,
+      // the intent classifier otherwise. Both return the same shape, and
+      // everything below this call treats them identically.
+      let classification: IntentClassification;
+      if (routerShadow?.decides) {
+        legacyDecidedBy = 'router';
+        decider = 'Router';
+        classification = await routerShadow.asClassification();
+      } else {
+        legacyDecidedBy = 'classifier';
+        classification = await classifyWithLegacyClassifier({ task, userMessage, store, logStep, signal });
       }
-      const classification = await classifyWorkflowIntent({
-        userMessage,
-        threadContext: formatThreadContextForClassifier(task),
-        hasPrUrl,
-        mentionType: task.mentionType,
-        userDossierSummary,
-        logStep,
-        signal,
-      });
       classificationReasoning = classification.reasoning;
 
       // Confidence floor on DANGEROUS classifier downgrades. RCA (Slack thread
@@ -265,7 +288,7 @@ export async function routeTask(params: {
           stage: 'router.classify.low_confidence_hold',
           level: 'WARN',
           message:
-            `AI classifier proposed ${task.intent} → ${classification.intent} at ` +
+            `${decider} proposed ${task.intent} → ${classification.intent} at ` +
             `confidence=${classification.confidence.toFixed(2)} (below ${CLASSIFIER_CONFIDENCE_FLOOR.toFixed(2)}); ` +
             `proposed workflow is ${proposedSideEffect} (can act on / imply completion of work) and drops access ` +
             `from ${originalRequiredLevel} to ${proposedRequiredLevel}. Holding original intent.`,
@@ -284,7 +307,7 @@ export async function routeTask(params: {
         if (classification.intent !== task.intent) {
           logStep?.({
             stage: 'router.classify.override',
-            message: `AI classifier resolved intent: ${task.intent} → ${classification.intent} (confidence=${classification.confidence.toFixed(2)}).`,
+            message: `${decider} resolved intent: ${task.intent} → ${classification.intent} (confidence=${classification.confidence.toFixed(2)}).`,
             data: {
               originalIntent: task.intent,
               classifiedIntent: classification.intent,
@@ -313,7 +336,7 @@ export async function routeTask(params: {
   if (resolvedIntent === 'NONE') {
     logStep?.({
       stage: 'router.silent',
-      message: 'Classifier returned NONE — staying silent for this human-to-human conversation.',
+      message: `${decider} returned NONE — staying silent for this human-to-human conversation.`,
       data: { reasoning: classificationReasoning },
     });
     return {

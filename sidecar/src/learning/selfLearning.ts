@@ -6,6 +6,7 @@ import type {
   WorkflowStepLogger,
 } from '../types/contracts.js';
 import type { JobStore } from '../state/jobStore.js';
+import { readToolRouterMode } from '../router/toolRouter.js';
 
 const REVIEW_KEYWORDS = [/review/i, /pr\b/i, /pull request/i, /code review/i];
 const CORRECTION_CUE = /\b(actually|instead|wrong|not this|no,|retry|again)\b/i;
@@ -29,6 +30,13 @@ export function applyLearning(input: {
   let intent = task.intent;
   let correctionApplied = false;
   const personalityMode: PersonalityMode = 'normal';
+
+  // With the tool-router deciding (issue #456), a remembered phrase must not
+  // pick the workflow: every correction on record turns a keyword-gated seed
+  // into a PR review, past the review gate and past the router.
+  if (readToolRouterMode(store) === 'on') {
+    return { intent, correctionApplied, personalityMode, notes: ['skipped: the tool-router decides'] };
+  }
 
   const phraseKey = normalizePhraseKey(task.event.text);
   const explicitIntent = detectExplicitIntent(task.event.text, task.event.channelId, config);

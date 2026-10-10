@@ -919,3 +919,199 @@ describe('routeTask runs the tool-router in shadow (issue #456)', () => {
     expect(decideTool).not.toHaveBeenCalled();
   });
 });
+
+describe('routeTask lets the tool-router decide when it is on (issue #456)', () => {
+  const settle = () => new Promise(resolve => setTimeout(resolve, 0));
+  const stageLog = (logStep: ReturnType<typeof vi.fn>, stage: string) =>
+    logStep.mock.calls.map(call => call[0]).find(entry => entry.stage === stage);
+  const routerSays = (tool: string, confidence = 0.9, extra: Record<string, unknown> = {}) =>
+    decideTool.mockResolvedValue({
+      ok: true,
+      decision: { tool, confidence, reason: `router picked ${tool}`, ...extra },
+      durationMs: 7,
+    });
+
+  function onStore(extra: Record<string, unknown> = {}) {
+    return { getState: (key: string) => (key === 'tool_router_mode' ? 'on' : undefined), ...extra };
+  }
+
+  async function route(
+    text: string,
+    task: Record<string, unknown> = {},
+    options: { store?: Record<string, unknown>; config?: AppConfig; log?: boolean } = {},
+  ) {
+    const logStep = vi.fn();
+    const { mentionType = 'bot', ...input } = task as { mentionType?: 'bot' | 'owner' };
+    const result = await routeTask({
+      task: { ...makeTask({ userId: 'UOWNER1', channelId: 'C-VIEW', text, ...input }), mentionType },
+      config: options.config ?? makeConfig('audit'),
+      slack: makeSlack() as never,
+      store: (options.store ?? onStore()) as never,
+      ...(options.log === false ? {} : { logStep }),
+    });
+    await settle();
+    return { result, logStep };
+  }
+
+  it('uses the router where the classifier was, with one call and no classifier call', async () => {
+    routerSays('answer', 0.93);
+
+    const { result, logStep } = await route('<@UBOT1> how does the login redirect work?');
+
+    expect(result.workflow).toBe('INFORMATIONAL');
+    expect(classifyWorkflowIntent).not.toHaveBeenCalled();
+    expect(decideTool).toHaveBeenCalledTimes(1);
+    // The deciding call is the job's own: costed as the router and logged like the classifier's was.
+    expect(decideTool.mock.calls[0][0]).toMatchObject({ role: 'router', logStep });
+    expect(stageLog(logStep, 'router.shadow')).toBeUndefined();
+    expect(stageLog(logStep, 'router.decision')).toMatchObject({
+      message: 'Router chose answer; running INFORMATIONAL.',
+      data: { mode: 'on', legacyDecidedBy: 'router', tool: 'answer', confidence: 0.93, agree: true },
+    });
+  });
+
+  it.each([
+    ['review_pr', 'PR_REVIEW', runAgenticPrReview],
+    ['change_code', 'IMPLEMENTATION', runImplementationWorkflow],
+    ['investigate', 'INVESTIGATION', runInvestigationWorkflow],
+    ['chat', 'CONVERSATIONAL', runAgenticEntry],
+  ] as const)('runs what the classifier could have returned for %s', async (tool, workflow, runner) => {
+    routerSays(tool);
+
+    const { result } = await route('<@UBOT1> the export job fails with a 500 on /api/export, fix it');
+
+    expect(result.workflow).toBe(workflow);
+    expect(runner).toHaveBeenCalledOnce();
+  });
+
+  it.each(['ask_user', 'unsupported', 'deploy', 'qa_webapp', 'stay_silent'])(
+    'cannot start anything new: %s on a direct mention is a lookup, as an invalid classification was',
+    async tool => {
+      routerSays(tool, 0.95, tool === 'ask_user' ? { question: 'Which page?' } : {});
+
+      const { result, logStep } = await route('<@UBOT1> ship it to production now');
+
+      expect(result.workflow).toBe('INFORMATIONAL');
+      expect(runDeployWorkflow).not.toHaveBeenCalled();
+      expect(runImplementationWorkflow).not.toHaveBeenCalled();
+      // The row says what the router wanted, so the difference stays visible.
+      expect(stageLog(logStep, 'router.decision').data).toMatchObject({ tool, agree: false });
+    },
+  );
+
+  it('falls back like the classifier when the router call fails: a lookup for a direct mention', async () => {
+    decideTool.mockResolvedValue({ ok: false, error: 'router call failed (exit 1)', durationMs: 3 });
+
+    const { result, logStep } = await route('<@UBOT1> fix the login redirect', { intent: 'IMPLEMENTATION' });
+
+    expect(result.workflow).toBe('INFORMATIONAL');
+    expect(runImplementationWorkflow).not.toHaveBeenCalled();
+    expect(stageLog(logStep, 'router.decision.fallback')).toMatchObject({
+      level: 'WARN',
+      data: { error: 'router call failed (exit 1)' },
+    });
+    expect(stageLog(logStep, 'router.decision').message).toBe(
+      'Router chose nothing (the call failed); running INFORMATIONAL.',
+    );
+  });
+
+  it('stays silent on an owner mention when the router fails, throws, or says stay_silent', async () => {
+    const ownerMention = { mentionType: 'owner' as const, userId: 'UVIEWER' };
+
+    decideTool.mockRejectedValue(new Error('spawn failed'));
+    const thrown = await route('<@UOWNER1> fyi the release went out', ownerMention);
+    expect(thrown.result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
+    expect(stageLog(thrown.logStep, 'router.silent').message).toContain('Router returned NONE');
+
+    routerSays('stay_silent');
+    const silent = await route('<@UOWNER1> fyi the release went out', ownerMention);
+    expect(silent.result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
+
+    // Nothing the classifier could not say reaches a workflow on an owner mention either.
+    routerSays('deploy');
+    const deploy = await route('<@UOWNER1> deploy went fine', ownerMention);
+    expect(deploy.result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
+    expect(runAgenticEntry).not.toHaveBeenCalled();
+    expect(runDeployWorkflow).not.toHaveBeenCalled();
+  });
+
+  it('keeps the confidence floor: a low-confidence chat verdict does not replace a change request', async () => {
+    routerSays('chat', 0.6);
+
+    const { result, logStep } = await route(
+      '<@UBOT1> yes',
+      { userId: 'UBUILDER', channelId: 'C-BUILD', intent: 'IMPLEMENTATION' },
+      { config: makeConfig('enforce') },
+    );
+
+    expect(result.workflow).toBe('IMPLEMENTATION');
+    expect(runAgenticEntry).not.toHaveBeenCalled();
+    expect(stageLog(logStep, 'router.classify.low_confidence_hold').message).toContain(
+      'Router proposed IMPLEMENTATION → CONVERSATIONAL',
+    );
+  });
+
+  it('leaves the keyword gates deciding: a gate-seeded review runs and the router is only shadowed', async () => {
+    routerSays('answer');
+
+    const { result, logStep } = await route('<@UBOT1> is this merged?', { intent: 'PR_REVIEW' });
+
+    expect(result.workflow).toBe('PR_REVIEW');
+    expect(runAgenticPrReview).toHaveBeenCalledOnce();
+    expect(stageLog(logStep, 'router.decision')).toBeUndefined();
+    expect(stageLog(logStep, 'router.shadow').data).toMatchObject({
+      mode: 'on',
+      legacyDecidedBy: 'gate',
+      routerWouldRun: 'INFORMATIONAL',
+      agree: false,
+    });
+  });
+
+  it('leaves a gate-seeded deploy with the deploy gate', async () => {
+    routerSays('answer');
+
+    const { result } = await route('<@UBOT1> deploy newton-web to production', { intent: 'DEPLOY' });
+
+    expect(result.workflow).toBe('DEPLOY');
+    expect(runDeployWorkflow).toHaveBeenCalledOnce();
+  });
+
+  it('leaves the "yes, fix it" resume gate ahead of the router', async () => {
+    routerSays('chat', 0.99);
+    const store = onStore({
+      investigationStore: () => ({ getForThread: () => ({ summary: 'prior RCA', repoName: 'newton-web' }) }),
+    });
+
+    const { result, logStep } = await route(
+      '<@UBOT1> yes, fix it',
+      { userId: 'UBUILDER', channelId: 'C-BUILD', intent: 'IMPLEMENTATION' },
+      { store, config: makeConfig('enforce') },
+    );
+
+    expect(result.workflow).toBe('IMPLEMENTATION');
+    expect(runImplementationWorkflow).toHaveBeenCalledOnce();
+    expect(stageLog(logStep, 'router.shadow').data).toMatchObject({ legacyDecidedBy: 'resume_gate' });
+  });
+
+  it('decides without a logger', async () => {
+    routerSays('investigate');
+
+    const { result } = await route('<@UBOT1> the dashboard looks off since morning', {}, { log: false });
+
+    expect(result.workflow).toBe('INVESTIGATION');
+    expect(classifyWorkflowIntent).not.toHaveBeenCalled();
+  });
+
+  it('applies the access tiers to what the router chose', async () => {
+    routerSays('change_code');
+
+    const { result } = await route(
+      '<@UBOT1> fix the login redirect in auth.ts',
+      { userId: 'UVIEWER', channelId: 'C-VIEW', intent: 'INFORMATIONAL' },
+      { config: makeConfig('enforce') },
+    );
+
+    expect(result.status).toBe('SKIPPED');
+    expect(runImplementationWorkflow).not.toHaveBeenCalled();
+  });
+});

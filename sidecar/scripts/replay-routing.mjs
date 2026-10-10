@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 
 const dist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../dist');
-const { decideTool } = await import(`${dist}/router/toolRouter.js`);
+const { decideTool, outcomeToLegacyIntent } = await import(`${dist}/router/toolRouter.js`);
 const { routerWouldRun } = await import(`${dist}/router/routerShadow.js`);
 const { setActiveBackend } = await import(`${dist}/codex/runCodex.js`);
 
@@ -60,6 +60,9 @@ const threadBefore = db.prepare(
    WHERE channel_id = ? AND thread_ts = ? AND deleted = 0 AND CAST(message_ts AS REAL) < CAST(? AS REAL)
    ORDER BY CAST(message_ts AS REAL) DESC LIMIT 6`,
 );
+const ranClassifier = db.prepare(
+  `SELECT 1 FROM job_logs WHERE job_id = ? AND stage = 'router.classify.start' LIMIT 1`,
+);
 
 const cases = [];
 for (const job of jobs) {
@@ -81,6 +84,10 @@ for (const job of jobs) {
     id: job.id.slice(0, 8),
     legacy: legacyName(job.executed_workflow ?? job.workflow),
     status: job.status,
+    // The router stands in for the classifier only. A keyword gate decided the
+    // rest, except where a learned phrase seeded the job: those are skipped
+    // once the router is on, so the router decides them too.
+    routerDecides: Boolean(ranClassifier.get(job.id)) || payload.correctionApplied === true,
     facts: {
       message,
       addressing: payload.mentionType === 'owner' ? 'owner_mention' : 'direct',
@@ -132,4 +139,26 @@ console.log(
     `${results.filter(r => !r.outcome.ok).length} router failures.`,
 );
 console.log(`Newly mutating (router would act where the legacy path only answered or stayed silent): ${newlyMutating.length}`);
+
+// What switching the router on changes today: only jobs the classifier decided,
+// and only to what the classifier could have returned. The confidence floor
+// that may still hold a seed is not modelled here.
+const decided = results.filter(r => r.routerDecides);
+const changed = decided
+  .map(r => ({ ...r, effective: legacyName(outcomeToLegacyIntent(r.outcome, r.facts.addressing)) }))
+  .filter(r => r.effective !== r.legacy);
+const changedMatrix = {};
+for (const r of changed) {
+  const key = `${r.legacy} → ${r.effective}`;
+  (changedMatrix[key] ??= []).push(r.id);
+}
+console.log(`\nWith the router on (${decided.length} of these jobs were decided by the classifier):`);
+for (const [key, ids] of Object.entries(changedMatrix).sort((a, b) => b[1].length - a[1].length)) {
+  console.log(`  ${String(ids.length).padStart(4)}  ${key}  [${ids.join(' ')}]`);
+}
+console.log(
+  `${changed.length} would run something different; ` +
+    `${changed.filter(r => MUTATING.has(r.effective) && !MUTATING.has(r.legacy)).length} newly reach a mutating tool, ` +
+    `${changed.filter(r => !MUTATING.has(r.effective) && MUTATING.has(r.legacy)).length} no longer do.`,
+);
 console.log('The route taken is not always the right one: read each difference before drawing a conclusion.');
