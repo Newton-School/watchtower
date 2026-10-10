@@ -32,7 +32,7 @@ import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
 import { highReasoningProfile } from '../codex/modelProfiles.js';
 import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
 import { classifyWorkflowIntent, type IntentClassification } from './classifyIntent.js';
-import { startRouterShadow, type LegacyDecidedBy, type RouterClassification } from './routerShadow.js';
+import { addressingOf, startRouterShadow, type LegacyDecidedBy, type RouterClassification } from './routerShadow.js';
 import { askRequester, decideClarify, giveUpOnClarify, type ClarifyAction } from './routeClarify.js';
 import { cancelledResult } from '../workflows/shared/cancelState.js';
 import { looksLikeFixAffirmation } from './resumeIntentParser.js';
@@ -304,7 +304,7 @@ export async function routeTask(params: {
           tool: routerDecision.tool,
           confidence: routerDecision.confidence,
           question: routerDecision.question,
-          addressing: task.mentionType === 'owner' ? 'owner_mention' : 'direct',
+          addressing: addressingOf(task),
           answering: Boolean(task.clarification),
           heldByFloor: holdOverride,
           confidenceFloor: CLASSIFIER_CONFIDENCE_FLOOR,

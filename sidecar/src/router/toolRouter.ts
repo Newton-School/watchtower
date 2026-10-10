@@ -33,8 +33,12 @@ export interface RouterDecision {
 export interface RouterFacts {
   /** The trigger message, mentions removed. */
   message: string;
-  /** `direct`: @miniOG or a DM. `owner_mention`: the message tags the owner, not the bot. */
-  addressing: 'direct' | 'owner_mention';
+  /**
+   * `direct`: @miniOG or a DM. `owner_mention`: the message tags the owner, not
+   * the bot. `reference`: the bot is tagged only in passing (a possessive, a cc,
+   * after someone else's name).
+   */
+  addressing: 'direct' | 'owner_mention' | 'reference';
   threadContext?: string;
   prUrlInTrigger: boolean;
   prUrlInThread: boolean;
@@ -82,7 +86,15 @@ const RULES = `Rules:
 - unsupported is only for an action in a system these tools do not reach (file a ticket, schedule a meeting, send an email). A question is never unsupported.
 - A message with nothing to act on ("no", "check now", "cc", a bare "yes" with no pending question) is ask_user, not a guess.
 - When a message is addressed to the owner instead of you, you act for the owner: a request in it that one of these tools can do is yours to route. A pull request posted for review is review_pr, and so is a request to merge one (the owner decides the merge; your review is what helps).
-- stay_silent is only for a message addressed to the owner that asks for nothing these tools can do: an FYI, a status update, scheduling, thanks, or a decision only a person can make. A message addressed to you directly is never stay_silent.`;
+- When you are tagged only in passing, route the message if it asks you for something. If it talks about you, or copies you in, without asking anything of you, choose stay_silent.
+- Otherwise stay_silent is only for a message addressed to the owner that asks for nothing these tools can do: an FYI, a status update, scheduling, thanks, or a decision only a person can make. A message addressed to you directly is never stay_silent.`;
+
+const ADDRESSED: Record<RouterFacts['addressing'], string> = {
+  direct: 'directly to miniOG',
+  owner_mention: 'to the owner or the core-dev group, not to miniOG by name',
+  reference:
+    "miniOG is tagged only in passing (a possessive, a cc, or after someone else's name); the message may be to another person",
+};
 
 export function buildRouterPrompt(facts: RouterFacts): string {
   const tools = PROMPT_TOOLS.map(tool => `- ${tool.id}: ${tool.description}`).join('\n');
@@ -103,7 +115,7 @@ export function buildRouterPrompt(facts: RouterFacts): string {
   }
   lines.push(
     '',
-    `Addressed: ${facts.addressing === 'direct' ? 'directly to miniOG' : 'to the owner or the core-dev group, not to miniOG by name'}`,
+    `Addressed: ${ADDRESSED[facts.addressing]}`,
     `Pull-request link in this message: ${facts.prUrlInTrigger ? 'yes' : 'no'}`,
     `Pull-request link earlier in the thread: ${facts.prUrlInThread ? 'yes' : 'no'}`,
   );
@@ -191,7 +203,8 @@ export async function decideTool(params: {
  * deploy, QA) fall back exactly as an invalid classification did.
  */
 export function outcomeToLegacyIntent(outcome: RouterOutcome, addressing: RouterFacts['addressing']): WorkflowIntent {
-  const fallback: WorkflowIntent = addressing === 'owner_mention' ? 'NONE' : 'INFORMATIONAL';
+  // Only someone who addressed miniOG is owed an answer when nothing else fits.
+  const fallback: WorkflowIntent = addressing === 'direct' ? 'INFORMATIONAL' : 'NONE';
   if (!outcome.ok) return fallback;
   switch (outcome.decision.tool) {
     case 'review_pr':
@@ -205,8 +218,8 @@ export function outcomeToLegacyIntent(outcome: RouterOutcome, addressing: Router
     case 'chat':
       return 'CONVERSATIONAL';
     case 'stay_silent':
-      // Only an owner mention may be met with silence.
-      return addressing === 'owner_mention' ? 'NONE' : fallback;
+      // A direct address may not be met with silence.
+      return addressing === 'direct' ? fallback : 'NONE';
     default:
       return fallback;
   }

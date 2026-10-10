@@ -340,6 +340,11 @@ export interface NormalizedTask {
   event: SlackEventEnvelope;
   mentionDetected: boolean;
   mentionType: 'bot' | 'owner' | 'none';
+  /**
+   * The bot is mentioned only in passing ("@miniOG's comments", "cc: @miniOG"):
+   * the message may be about it or addressed to someone else (issue #448).
+   */
+  mentionReference?: boolean;
   isOwnerAuthor: boolean;
   isCoreDevAuthor: boolean;
   intent: WorkflowIntent;
