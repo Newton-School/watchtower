@@ -38,6 +38,7 @@ export interface ToolSpec {
   /**
    * Whether the router's model may pick it. Tools reached only by exact
    * syntax (`wt …`, dossier subcommands) or by a dedicated gate stay false.
+   * Picking an irreversible tool is never enough to start it: see `mayDeploy`.
    */
   routerSelectable: boolean;
   /** One line for the router: when this is the right tool. */
@@ -113,7 +114,7 @@ export const TOOLS: readonly ToolSpec[] = [
     requiredLevel: 'admin',
     sideEffect: 'mutating',
     irreversible: true,
-    routerSelectable: false,
+    routerSelectable: true,
     description: 'Deploy an application to production.',
   },
   {

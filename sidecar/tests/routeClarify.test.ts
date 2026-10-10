@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   CLARIFY_GIVE_UP_REPLY,
   DEFAULT_CLARIFY_QUESTION,
+  DEPLOY_NEEDS_ONE_MESSAGE_REPLY,
   LOW_CONFIDENCE_CHANGE_QUESTION,
   ROUTE_CLARIFY_STAGE,
   ROUTE_CLARIFY_TTL_MS,
@@ -86,6 +87,21 @@ describe('decideClarify', () => {
 
   it('acts normally on a clear reply to the question', () => {
     expect(decide({ tool: 'change_code', confidence: 0.9, answering: true })).toEqual({ kind: 'run' });
+  });
+
+  it('says how to ask for a deploy, and waits for no reply, when code found no target (issue #428)', () => {
+    expect(decide({ tool: 'deploy', deployAllowed: false })).toEqual({
+      kind: 'ask',
+      question: DEPLOY_NEEDS_ONE_MESSAGE_REPLY,
+      reason: 'deploy_without_target',
+      park: false,
+    });
+    expect(decide({ tool: 'deploy', deployAllowed: true })).toEqual({ kind: 'run' });
+    // A deploy is never started from a reply to a question.
+    expect(decide({ tool: 'deploy', deployAllowed: false, answering: true })).toEqual({
+      kind: 'give_up',
+      reason: 'deploy_without_target',
+    });
   });
 
   it('never answers an owner mention with a question', () => {
@@ -204,6 +220,28 @@ describe('askRequester', () => {
     // Not PAUSED, and not the stage that marks a pending question: the next reply belongs to the other job.
     expect(result.status).toBe('SKIPPED');
     expect(logStep.mock.calls[0][0].stage).toBe('router.clarify.asked_unparked');
+  });
+});
+
+describe('askRequester without parking', () => {
+  it('posts the reply and leaves no pending question when asked not to park', async () => {
+    const slack = makeSlack();
+    const logStep = vi.fn();
+
+    const result = await askRequester({
+      slack: slack as never,
+      store: { pausedJobForThread: () => undefined },
+      task: makeTask(),
+      userMessage: 'ship it',
+      question: DEPLOY_NEEDS_ONE_MESSAGE_REPLY,
+      reason: 'deploy_without_target',
+      park: false,
+      logStep,
+    });
+
+    expect(slack.chat.postMessage.mock.calls[0][0].text).toBe(`<@UREQ> ${DEPLOY_NEEDS_ONE_MESSAGE_REPLY}`);
+    expect(result.status).toBe('SKIPPED');
+    expect(logStep.mock.calls[0][0].stage).not.toBe(ROUTE_CLARIFY_STAGE);
   });
 });
 

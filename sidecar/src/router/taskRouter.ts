@@ -308,6 +308,7 @@ export async function routeTask(params: {
           answering: Boolean(task.clarification),
           heldByFloor: holdOverride,
           confidenceFloor: CLASSIFIER_CONFIDENCE_FLOOR,
+          deployAllowed: routerDecision.deployAllowed,
         });
       }
 
@@ -518,7 +519,16 @@ export async function routeTask(params: {
   if (clarify.kind === 'ask' || clarify.kind === 'give_up') {
     if (signal?.aborted) return cancelledResult('UNKNOWN');
     return clarify.kind === 'ask'
-      ? askRequester({ slack, store, task, userMessage, question: clarify.question, reason: clarify.reason, logStep })
+      ? askRequester({
+          slack,
+          store,
+          task,
+          userMessage,
+          question: clarify.question,
+          reason: clarify.reason,
+          park: clarify.park,
+          logStep,
+        })
       : giveUpOnClarify({ slack, task, reason: clarify.reason, logStep });
   }
 

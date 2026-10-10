@@ -1,8 +1,10 @@
 import type { NormalizedTask, WorkflowIntent, WorkflowStepLogger } from '../types/contracts.js';
 import { formatThreadContextForClassifier, isPresencePing } from '../workflows/shared/workflowUtils.js';
 import type { IntentClassification } from './classifyIntent.js';
+import { classifyDeployTarget, leadingDeployTarget } from './intentParser.js';
 import {
   decideTool,
+  mayDeploy,
   outcomeToLegacyIntent,
   readToolRouterMode,
   type RouterFacts,
@@ -46,7 +48,12 @@ export function addressingOf(
 export function buildRouterFacts(task: NormalizedTask, userMessage: string): RouterFacts {
   const prs = task.prContexts ?? [];
   const inTrigger = prs.some(pr => pr.source === 'trigger');
-  const hint = GATE_HINTS[task.intent];
+  // With the router on the deploy keywords no longer seed DEPLOY, so the hint
+  // is read from the message, as the gate read it. The target that can allow
+  // a deploy is held to more: the message has to lead with the ask.
+  const text = task.event.text ?? '';
+  const deployTarget = leadingDeployTarget(text) ?? undefined;
+  const hint = GATE_HINTS[task.intent] ?? (classifyDeployTarget(text) ? GATE_HINTS.DEPLOY : undefined);
   return {
     message: userMessage,
     addressing: addressingOf(task),
@@ -55,6 +62,7 @@ export function buildRouterFacts(task: NormalizedTask, userMessage: string): Rou
     prUrlInThread: prs.some(pr => pr.source === 'thread') || (!inTrigger && Boolean(task.prContext)),
     hints: hint ? [hint] : [],
     ...(task.clarification ? { answering: task.clarification } : {}),
+    ...(deployTarget ? { deployTarget } : {}),
   };
 }
 
@@ -96,6 +104,8 @@ export interface RouterClassification extends IntentClassification {
   tool?: RouterTool;
   /** The question it wants put to the requester, for `ask_user`. */
   question?: string;
+  /** For `deploy`: whether code agrees a deploy may start (`mayDeploy`). */
+  deployAllowed?: boolean;
 }
 
 export interface RouterShadow {
@@ -158,7 +168,8 @@ export function startRouterShadow(params: {
     decides,
     async asClassification() {
       const outcome = await pending;
-      const intent = outcomeToLegacyIntent(outcome, facts.addressing);
+      const deployAllowed = mayDeploy(facts);
+      const intent = outcomeToLegacyIntent(outcome, facts.addressing, { allowDeploy: deployAllowed });
       if (!outcome.ok) {
         logStep?.({
           stage: 'router.decision.fallback',
@@ -181,6 +192,7 @@ export function startRouterShadow(params: {
         failed: false,
         tool: outcome.decision.tool,
         question: outcome.decision.question,
+        deployAllowed,
       };
     },
     compare(legacy) {
@@ -204,7 +216,7 @@ export function startRouterShadow(params: {
               legacyDecidedBy: legacy.decidedBy,
               routerWouldRun: wouldRun,
               // What the router would be allowed to run in place of the classifier today.
-              routerAsClassifier: outcomeToLegacyIntent(outcome, facts.addressing),
+              routerAsClassifier: outcomeToLegacyIntent(outcome, facts.addressing, { allowDeploy: mayDeploy(facts) }),
               ...(outcome.ok
                 ? {
                     tool: outcome.decision.tool,
