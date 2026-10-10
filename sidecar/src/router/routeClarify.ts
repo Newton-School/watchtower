@@ -24,6 +24,9 @@ export const ROUTE_CLARIFY_TTL_MS = 30 * 60_000;
 export const DEFAULT_CLARIFY_QUESTION = "I'm not sure what you'd like me to do here. What do you need?";
 export const LOW_CONFIDENCE_CHANGE_QUESTION =
   'Do you want me to change something here, or only look into it? Tell me what should change and where.';
+/** Not a question to answer in the thread: a deploy is never started from a reply. */
+export const DEPLOY_NEEDS_ONE_MESSAGE_REPLY =
+  'If you want a production deploy, say which app in one message to me, for example `deploy newton-web to production`. I can deploy newton-web or the marketing site.';
 export const CLARIFY_GIVE_UP_REPLY =
   "I still can't tell what you need. Mention me again with the full request and I'll pick it up.";
 
@@ -39,13 +42,23 @@ export interface PendingRouteQuestion {
 export type ClarifyAction =
   /** Act on the decision as given. */
   | { kind: 'run' }
-  | { kind: 'ask'; question: string; reason: ClarifyReason }
+  | {
+      kind: 'ask';
+      question: string;
+      reason: ClarifyReason;
+      /** false: say it, but wait for no reply. */ park?: boolean;
+    }
   /** Already asked once in this chain: say so and stop. */
   | { kind: 'give_up'; reason: ClarifyReason }
   /** A reply to the question that asks for nothing. */
   | { kind: 'silent' };
 
-export type ClarifyReason = 'router_asked' | 'silenced_direct_mention' | 'low_confidence_change' | 'floor_hold';
+export type ClarifyReason =
+  | 'router_asked'
+  | 'silenced_direct_mention'
+  | 'low_confidence_change'
+  | 'floor_hold'
+  | 'deploy_without_target';
 
 /**
  * What to do with a router decision that should not be acted on as given.
@@ -64,12 +77,18 @@ export function decideClarify(params: {
   /** The confidence floor would have kept the keyword seed over this decision. */
   heldByFloor: boolean;
   confidenceFloor: number;
+  /** For `deploy`: code agrees a deploy may start. */
+  deployAllowed?: boolean;
 }): ClarifyAction {
   const { tool, confidence, addressing, answering, heldByFloor, confidenceFloor } = params;
   if (addressing !== 'direct') return { kind: 'run' };
 
-  let ask: { question: string; reason: ClarifyReason } | undefined;
-  if (tool === 'ask_user') {
+  let ask: { question: string; reason: ClarifyReason; park?: boolean } | undefined;
+  if (tool === 'deploy' && !params.deployAllowed) {
+    // The model read a deploy ask where code found no target, or in a reply to
+    // a question. Neither may deploy; say how to ask, and wait for nothing.
+    ask = { question: DEPLOY_NEEDS_ONE_MESSAGE_REPLY, reason: 'deploy_without_target', park: false };
+  } else if (tool === 'ask_user') {
     ask = { question: params.question ?? DEFAULT_CLARIFY_QUESTION, reason: 'router_asked' };
   } else if (tool === 'stay_silent') {
     // The model may not silence someone who addressed miniOG, except to let a question drop.
@@ -127,6 +146,8 @@ export async function askRequester(params: {
   userMessage: string;
   question: string;
   reason: ClarifyReason;
+  /** false: post it, but do not treat the next reply as an answer. */
+  park?: boolean;
   logStep?: WorkflowStepLogger;
   nowMs?: number;
 }): Promise<WorkflowResult> {
@@ -135,9 +156,9 @@ export async function askRequester(params: {
 
   await slack.chat.postMessage({ channel: channelId, thread_ts: threadTs, text: `<@${userId}> ${question}` });
 
-  let otherParked = false;
+  let otherParked = params.park === false;
   try {
-    otherParked = Boolean(store.pausedJobForThread?.(channelId, threadTs));
+    otherParked ||= Boolean(store.pausedJobForThread?.(channelId, threadTs));
   } catch {
     // The lookup is advisory: when it fails, park as usual.
   }
@@ -150,7 +171,7 @@ export async function askRequester(params: {
   logStep?.({
     stage: otherParked ? 'router.clarify.asked_unparked' : ROUTE_CLARIFY_STAGE,
     message: otherParked
-      ? 'Asked the requester a question. Another job is parked in this thread, so the answer needs a mention.'
+      ? 'Replied to the requester without parking the job: a follow-up needs a mention.'
       : 'Asked the requester a question and parked the job until they reply.',
     data: { ...pending, reason },
   });

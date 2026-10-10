@@ -47,6 +47,11 @@ export interface RouterFacts {
   userDossierSummary?: string;
   /** Set when this message replies to a question miniOG asked about `askedText`. */
   answering?: { question: string; askedText: string };
+  /**
+   * The deploy target code found in the message itself, if any. Never shown
+   * to the model and never taken from it: see `mayDeploy`.
+   */
+  deployTarget?: string;
 }
 
 export type RouterOutcome =
@@ -202,11 +207,18 @@ export async function decideTool(params: {
  * runs. Decisions the classifier had no way to express (ask, unsupported,
  * deploy, QA) fall back exactly as an invalid classification did.
  */
-export function outcomeToLegacyIntent(outcome: RouterOutcome, addressing: RouterFacts['addressing']): WorkflowIntent {
+export function outcomeToLegacyIntent(
+  outcome: RouterOutcome,
+  addressing: RouterFacts['addressing'],
+  options: { allowDeploy?: boolean } = {},
+): WorkflowIntent {
   // Only someone who addressed miniOG is owed an answer when nothing else fits.
   const fallback: WorkflowIntent = addressing === 'direct' ? 'INFORMATIONAL' : 'NONE';
   if (!outcome.ok) return fallback;
   switch (outcome.decision.tool) {
+    case 'deploy':
+      // The model naming `deploy` is never enough by itself: see `mayDeploy`.
+      return options.allowDeploy ? 'DEPLOY' : fallback;
     case 'review_pr':
       return 'PR_REVIEW';
     case 'change_code':
@@ -223,6 +235,23 @@ export function outcomeToLegacyIntent(outcome: RouterOutcome, addressing: Router
     default:
       return fallback;
   }
+}
+
+/**
+ * Whether a `deploy` decision may start the deploy workflow (issue #428).
+ *
+ * A production deploy cannot be taken back, so the model's word is one
+ * condition of several, all checked here in code:
+ * - the message is addressed to miniOG: never an owner mention, a mention in
+ *   passing, or a reply to a question miniOG asked;
+ * - code found the deploy target in the message itself, links removed, and
+ *   the message leads with the deploy ask (`leadingDeployTarget`). The target
+ *   is never the model's.
+ * The admin tier and the `confirm deploy` reply are checked after this, by
+ * the access check and the deploy workflow.
+ */
+export function mayDeploy(facts: Pick<RouterFacts, 'addressing' | 'answering' | 'deployTarget'>): boolean {
+  return facts.addressing === 'direct' && !facts.answering && Boolean(facts.deployTarget);
 }
 
 export type ToolRouterMode = 'legacy' | 'shadow' | 'on';

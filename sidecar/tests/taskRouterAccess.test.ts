@@ -1002,7 +1002,7 @@ describe('routeTask lets the tool-router decide when it is on (issue #456)', () 
     expect(runner).toHaveBeenCalledOnce();
   });
 
-  it.each(['unsupported', 'deploy', 'qa_webapp'])(
+  it.each(['unsupported', 'qa_webapp'])(
     'cannot start anything new: %s on a direct mention is a lookup, as an invalid classification was',
     async tool => {
       routerSays(tool, 0.95);
@@ -1314,6 +1314,78 @@ describe('routeTask lets the tool-router decide when it is on (issue #456)', () 
       legacyDecidedBy: 'gate',
       routerWouldRun: 'INFORMATIONAL',
       agree: false,
+    });
+  });
+
+  describe('a production deploy (issue #428)', () => {
+    const DEPLOY_ASK = '<@UBOT1> deploy newton-web to production';
+    const NEAR_MISS =
+      '<@UBOT1> could you review these two please? • newton-web <https://github.com/Newton-School/newton-web/pull/9276|#9276> *Deploy order:* #9276 → web';
+
+    it('starts when the router says deploy, the message is addressed to miniOG and code finds the target', async () => {
+      routerSays('deploy', 0.95);
+
+      const { result } = await route(DEPLOY_ASK);
+
+      expect(result.workflow).toBe('DEPLOY');
+      expect(runDeployWorkflow).toHaveBeenCalledOnce();
+      expect(decideTool.mock.calls[0][0].facts).toMatchObject({ deployTarget: 'newton-web' });
+    });
+
+    it('is not started by keywords: the message that nearly deployed is reviewed', async () => {
+      routerSays('review_pr', 0.95);
+
+      const { result } = await route(NEAR_MISS);
+
+      expect(result.workflow).toBe('PR_REVIEW');
+      expect(runDeployWorkflow).not.toHaveBeenCalled();
+    });
+
+    it('is not started on the model alone: the message that nearly deployed gets a reply on how to ask', async () => {
+      // Even if the model misread it as a deploy, code finds no deploy ask leading the message.
+      routerSays('deploy', 0.95);
+
+      const { result, slack } = await route(NEAR_MISS);
+
+      expect(runDeployWorkflow).not.toHaveBeenCalled();
+      expect(result.status).toBe('SKIPPED');
+      expect(slack.chat.postMessage.mock.calls[0][0].text).toContain('say which app in one message');
+    });
+
+    it.each([
+      ['an owner mention', { mentionType: 'owner' as const, userId: 'UADMIN', channelId: 'C-ADMIN' }],
+      ['a mention in passing', { mentionReference: true, userId: 'UADMIN', channelId: 'C-ADMIN' }],
+    ])('is never started for %s, whatever the model says', async (_name, task) => {
+      routerSays('deploy', 0.99);
+
+      const { result, slack } = await route('<@UOWNER1> deploy newton-web to production cc <@UBOT1>', task);
+
+      expect(runDeployWorkflow).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
+      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+    });
+
+    it('is never started from a reply to a question miniOG asked', async () => {
+      routerSays('deploy', 0.99);
+      const clarification = { question: 'What do you need?', askedText: 'ship it' };
+
+      const { result } = await route('deploy newton-web to production', { clarification });
+
+      expect(runDeployWorkflow).not.toHaveBeenCalled();
+      expect(result.status).toBe('SKIPPED');
+    });
+
+    it('still needs the admin tier', async () => {
+      routerSays('deploy', 0.95);
+
+      const { result } = await route(
+        DEPLOY_ASK,
+        { userId: 'UBUILDER', channelId: 'C-BUILD', intent: 'IMPLEMENTATION' },
+        { config: makeConfig('enforce') },
+      );
+
+      expect(runDeployWorkflow).not.toHaveBeenCalled();
+      expect(result.status).toBe('SKIPPED');
     });
   });
 

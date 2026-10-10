@@ -4,6 +4,7 @@ import {
   detectMention,
   extractPrContext,
   isBarePrPaste,
+  leadingDeployTarget,
   isPrReviewRequest,
   isReferenceMention,
   normalizeTask,
@@ -655,11 +656,39 @@ describe('a mention made in passing (issue #448)', () => {
     expect(task({ routerDecides: false }).intent).toBe('PR_REVIEW');
   });
 
-  it('keeps the deploy gate for a direct address only', () => {
-    const seed = (text: string) =>
-      normalizeTask({ ...baseEvent, userId: 'U123', text }, config, [], { routerDecides: true }).intent;
+  it('never seeds a deploy from keywords while the tool-router decides (issue #428)', () => {
+    const seed = (text: string, routerDecides: boolean) =>
+      normalizeTask({ ...baseEvent, userId: 'U123', text }, config, [], { routerDecides }).intent;
 
-    expect(seed('<@UBOT1> deploy newton-web to production')).toBe('DEPLOY');
-    expect(seed('<@UOWNER1> can you deploy newton-web to production? cc <@UBOT1>')).not.toBe('DEPLOY');
+    // The router reads it first, and code checks its answer: the keywords are only a hint.
+    expect(seed('<@UBOT1> deploy newton-web to production', true)).toBe('IMPLEMENTATION');
+    expect(seed('<@UOWNER1> can you deploy newton-web to production? cc <@UBOT1>', true)).toBe('IMPLEMENTATION');
+    // Without the router deciding, the keyword gate is as it was.
+    expect(seed('<@UBOT1> deploy newton-web to production', false)).toBe('DEPLOY');
+  });
+});
+
+describe('leadingDeployTarget (issue #428)', () => {
+  it('finds the target when the message leads with the deploy ask', () => {
+    expect(leadingDeployTarget('<@UBOT1> deploy newton-web to production')).toBe('newton-web');
+    expect(leadingDeployTarget('<@UBOT1> can you please ship the marketing site to prod? thanks')).toBe(
+      'newton-marketing-web',
+    );
+    expect(leadingDeployTarget('<@UBOT1> deploy to prod')).toBe('newton-web');
+  });
+
+  it('finds none when the deploy words come after something else was asked', () => {
+    // The message that started the production deploy workflow on 2026-10-02.
+    expect(
+      leadingDeployTarget(
+        '<@UBOT1> could you review these two please? • newton-web <https://github.com/Newton-School/newton-web/pull/9276|#9276> *Deploy order:* #9276 → web',
+      ),
+    ).toBeNull();
+    expect(leadingDeployTarget('<@UBOT1> what changed in newton-web?\nwe deploy to prod on Friday')).toBeNull();
+  });
+
+  it('finds none where there is no deploy target at all', () => {
+    expect(leadingDeployTarget('<@UBOT1> ship it')).toBeNull();
+    expect(leadingDeployTarget('<@UBOT1> review https://github.com/Newton-School/newton-web/pull/1')).toBeNull();
   });
 });

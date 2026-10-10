@@ -99,6 +99,29 @@ export function classifyDeployTarget(text: string): DeployTarget | null {
 }
 
 /**
+ * The deploy target, but only when the message leads with the deploy ask:
+ * the verb has to be in its first sentence. Used where a deploy is about to
+ * be allowed (see `mayDeploy`), which is stricter than seeding a hint.
+ *
+ * `classifyDeployTarget` alone finds "newton-web" and "deploy" anywhere, so
+ * "could you review these two please? • newton-web <PR> *Deploy order:* …"
+ * has a target by its lights (issue #428). A request that leads with something
+ * else is not a deploy request, whatever its later lines mention.
+ */
+export function leadingDeployTarget(text: string): DeployTarget | null {
+  const firstSentence =
+    text
+      .replace(/<@[^>]+>/g, ' ')
+      .replace(/<https?:[^>|]*(?:\|([^>]*))?>/g, ' $1 ')
+      .replace(/https?:\/\/\S+/g, ' ')
+      .split(/[.?!\n•]+/)
+      .map(part => part.trim())
+      .find(part => part.length > 0) ?? '';
+  if (!DEPLOY_VERB_RE.test(firstSentence.toLowerCase())) return null;
+  return classifyDeployTarget(text);
+}
+
+/**
  * Deterministic check: does the message unambiguously ask to deploy
  * newton-web to production? Runs before the AI classifier so deploy requests
  * are never misrouted.
@@ -497,7 +520,10 @@ function inferIntent(
   // Direct address only (an @miniOG mention or a DM). A message that merely
   // tags the owner is a conversation between people; its wording must never
   // start a production deploy (issue #428).
-  if (directBotMention && classifyDeployTarget(event.text ?? '') !== null) {
+  // While the tool-router decides, the keywords are only a hint to it: "Deploy
+  // order: …" in a review request for a newton-web PR used to start the
+  // production deploy workflow from here (issue #428).
+  if (directBotMention && !options.routerDecides && classifyDeployTarget(event.text ?? '') !== null) {
     return { intent: 'DEPLOY' };
   }
 

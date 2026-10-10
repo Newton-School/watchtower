@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   buildRouterPrompt,
   decideTool,
+  mayDeploy,
   outcomeToLegacyIntent,
   parseRouterDecision,
   readToolRouterMode,
@@ -217,6 +218,13 @@ describe('outcomeToLegacyIntent', () => {
     },
   );
 
+  it('runs a deploy only where the caller says code allows it (issue #428)', () => {
+    expect(outcomeToLegacyIntent(decided('deploy'), 'direct', { allowDeploy: true })).toBe('DEPLOY');
+    expect(outcomeToLegacyIntent(decided('deploy'), 'direct', { allowDeploy: false })).toBe('INFORMATIONAL');
+    // allowDeploy lets `deploy` through and nothing else.
+    expect(outcomeToLegacyIntent(decided('answer'), 'direct', { allowDeploy: true })).toBe('INFORMATIONAL');
+  });
+
   it('falls back the same way when the router failed', () => {
     const failed: RouterOutcome = { ok: false, error: 'x', durationMs: 1 };
     expect(outcomeToLegacyIntent(failed, 'direct')).toBe('INFORMATIONAL');
@@ -298,5 +306,46 @@ describe('readToolRouterMode', () => {
         },
       }),
     ).toBe('shadow');
+  });
+});
+
+describe('mayDeploy (issue #428)', () => {
+  const ok = { addressing: 'direct' as const, deployTarget: 'newton-web' };
+
+  it('needs a direct address and a target found by code', () => {
+    expect(mayDeploy(ok)).toBe(true);
+    expect(mayDeploy({ addressing: 'direct' })).toBe(false);
+  });
+
+  it('never deploys for an owner mention, a mention in passing, or a reply to a question', () => {
+    expect(mayDeploy({ ...ok, addressing: 'owner_mention' })).toBe(false);
+    expect(mayDeploy({ ...ok, addressing: 'reference' })).toBe(false);
+    expect(mayDeploy({ ...ok, answering: { question: 'Which app?', askedText: 'ship it' } })).toBe(false);
+  });
+});
+
+describe('buildRouterFacts and the deploy keywords (issue #428)', () => {
+  const task = (text: string, intent = 'IMPLEMENTATION') =>
+    ({
+      event: { eventId: 'E', channelId: 'C', threadTs: '1.1', eventTs: '1.1', userId: 'U', text, rawEvent: {} },
+      mentionDetected: true,
+      mentionType: 'bot',
+      isOwnerAuthor: false,
+      isCoreDevAuthor: false,
+      intent,
+    }) as never;
+
+  it('finds the target in the message and passes the keyword match as a hint, with no DEPLOY seed', () => {
+    const facts = buildRouterFacts(task('<@UBOT1> deploy newton-web to production'), 'deploy newton-web to production');
+    expect(facts).toMatchObject({ deployTarget: 'newton-web', hints: ['deploy keywords matched'] });
+  });
+
+  it('finds no target in the message that nearly deployed, though its keywords still match', () => {
+    // "newton-web" and "Deploy order" are both in the text, which is all the old gate needed.
+    const text =
+      '<@UBOT1> could you review these two please? • newton-web <https://github.com/Newton-School/newton-web/pull/9276|#9276> *Deploy order:* #9276 → web';
+    const facts = buildRouterFacts(task(text), text);
+    expect(facts).not.toHaveProperty('deployTarget');
+    expect(facts.hints).toEqual(['deploy keywords matched']);
   });
 });

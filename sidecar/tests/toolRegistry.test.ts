@@ -53,10 +53,11 @@ describe('tool registry', () => {
     expect(TOOLS.filter(tool => tool.irreversible).map(tool => tool.id)).toEqual(['deploy']);
   });
 
-  it('never lets the model pick an irreversible tool, or one reached by exact syntax', () => {
+  it('never lets the model pick a tool reached by exact syntax or by its own gate', () => {
     const selectable = TOOLS.filter(tool => tool.routerSelectable).map(tool => tool.id);
-    expect(selectable).toEqual(['review_pr', 'change_code', 'investigate', 'answer', 'chat', 'stay_silent']);
-    expect(TOOLS.filter(tool => tool.irreversible && tool.routerSelectable)).toEqual([]);
+    expect(selectable).toEqual(['review_pr', 'change_code', 'investigate', 'answer', 'chat', 'deploy', 'stay_silent']);
+    // The model may name the deploy; whether it starts is decided in code (mayDeploy, issue #428).
+    expect(TOOLS.filter(tool => tool.irreversible && tool.routerSelectable).map(tool => tool.id)).toEqual(['deploy']);
   });
 
   it('lists the intents that have a workflow to run: all but NONE and UNKNOWN', () => {
