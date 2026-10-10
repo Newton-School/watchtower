@@ -124,6 +124,56 @@ async function fetchCiStatus(params: {
   }
 }
 
+export type PrLifecycleState = 'open' | 'merged' | 'closed';
+
+export interface PrState {
+  state: PrLifecycleState;
+  /** When it was merged or closed (ISO), if GitHub said. */
+  at?: string;
+}
+
+/**
+ * Whether a pull request is still open (issue #447). Returns undefined when
+ * GitHub cannot be asked, so callers fail open and review as before.
+ */
+export async function fetchPrState(params: {
+  prContext: PrContext;
+  githubToken?: string;
+  logStep?: WorkflowStepLogger;
+}): Promise<PrState | undefined> {
+  const { prContext, githubToken, logStep } = params;
+  const url = `https://api.github.com/repos/${prContext.owner}/${prContext.repo}/pulls/${prContext.number}`;
+  const headers: Record<string, string> = { Accept: 'application/vnd.github+json' };
+  if (githubToken) headers.Authorization = `Bearer ${githubToken}`;
+
+  try {
+    const response = await fetch(url, { headers, signal: AbortSignal.timeout(15_000) });
+    if (!response.ok) {
+      logStep?.({
+        stage: 'pr_review.state.fetch_failed',
+        message: 'Could not read the PR state from GitHub; treating it as open.',
+        level: 'WARN',
+        data: { status: response.status, prUrl: prContext.url },
+      });
+      return undefined;
+    }
+    const payload = (await response.json()) as Record<string, unknown>;
+    const text = (value: unknown) => (typeof value === 'string' ? value : undefined);
+    if (payload.merged === true || text(payload.merged_at)) return { state: 'merged', at: text(payload.merged_at) };
+    if (payload.state === 'closed') return { state: 'closed', at: text(payload.closed_at) };
+    if (payload.state === 'open') return { state: 'open' };
+    return undefined;
+  } catch (error) {
+    logStep?.({
+      stage: 'pr_review.state.fetch_failed',
+      message: 'Could not read the PR state from GitHub; treating it as open.',
+      level: 'WARN',
+      data: { error: String(error), prUrl: prContext.url },
+    });
+    return undefined;
+  }
+}
+
 export async function fetchPrMetadata(params: {
   prContext: PrContext;
   githubToken?: string;

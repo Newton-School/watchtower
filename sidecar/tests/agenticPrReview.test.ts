@@ -168,6 +168,7 @@ function makeDeps(overrides: Record<string, unknown> = {}) {
       reason: 'ok',
     }),
     resolveHeadSha: vi.fn().mockResolvedValue('feedface'),
+    fetchState: vi.fn().mockResolvedValue({ state: 'open' }),
     submitReview: vi.fn().mockResolvedValue(SUBMIT_OK),
     checkoutPr: vi.fn().mockResolvedValue(true),
     resolveWorkspaceFn: vi.fn((repoPath: string) => repoPath),
@@ -1264,5 +1265,91 @@ describe('agenticPrReview', () => {
 
     expect(result.status).toBe('CANCELLED');
     expect(slack.chat.postMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe('agenticPrReview — merged or closed PRs are not reviewed (issue #447)', () => {
+  const merged = { state: 'merged', at: '2026-10-06T09:12:00Z' };
+  const posted = (slack: any) => slack.chat.postMessage.mock.calls.map((c: any[]) => c[0].text as string);
+
+  async function review(text: string, deps: ReturnType<typeof makeDeps>, threadTexts: string[] = [text]) {
+    const slack = makeSlack(threadTexts);
+    const logStep = vi.fn();
+    const result = await runAgenticPrReview({
+      task: makeTask(text),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      logStep,
+      deps: deps as any,
+    });
+    return { result, slack, logStep };
+  }
+
+  it('does not review a merged PR, says when it merged, and offers a post-merge review', async () => {
+    const deps = makeDeps({ fetchState: vi.fn().mockResolvedValue(merged) });
+    const { result, slack, logStep } = await review(`<@UBOT1> review ${API_PR}`, deps);
+
+    expect(deps.runAgent).not.toHaveBeenCalled();
+    expect(deps.submitReview).not.toHaveBeenCalled();
+    expect(result.status).toBe('SKIPPED');
+    expect(result.slackPosted).toBe(true);
+    const reply = posted(slack)[0];
+    expect(reply).toContain('`newton-api#5781` is already merged (2026-10-06)');
+    expect(reply).toContain(`post-merge review ${API_PR}`);
+    expect(reply).toContain('@ me with the question');
+    expect(posted(slack).join(' ')).not.toContain('PR review in progress');
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'agentic.pr_review.guard.not_open' }));
+  });
+
+  it('does not review a question about a merged PR either (the issue #447 run)', async () => {
+    const deps = makeDeps({ fetchState: vi.fn().mockResolvedValue(merged) });
+    const { result } = await review(`<@UBOT1> is ${API_PR} merged and deployed to production?`, deps);
+
+    expect(deps.submitReview).not.toHaveBeenCalled();
+    expect(result.status).toBe('SKIPPED');
+  });
+
+  it('says a closed PR was closed without merging', async () => {
+    const deps = makeDeps({ fetchState: vi.fn().mockResolvedValue({ state: 'closed' }) });
+    const { slack } = await review(`<@UBOT1> review ${WEB_PR}`, deps);
+
+    expect(deps.submitReview).not.toHaveBeenCalled();
+    expect(posted(slack)[0]).toContain('`newton-web#8652` is closed without merging');
+  });
+
+  it('reviews a merged PR when a post-merge review is asked for, and drops "before merge"', async () => {
+    const runAgent = routedRunAgent({
+      orchestrator: agentOk([
+        { role: 'reviewer', severity: 'high', category: 'bug', message: 'null deref', file: 'src/a.ts', line: 2 },
+      ]),
+    });
+    const deps = makeDeps({ fetchState: vi.fn().mockResolvedValue(merged), runAgent });
+    const { result, slack } = await review(`<@UBOT1> post-merge review ${API_PR}`, deps);
+
+    expect(deps.submitReview).toHaveBeenCalledTimes(1);
+    expect(result.status).toBe('SUCCESS');
+    const all = posted(slack).join('\n');
+    expect(all).toContain('this PR is already merged, so they need a follow-up');
+    expect(all).not.toContain('please address before merge');
+  });
+
+  it('reviews as before when GitHub cannot say what state the PR is in', async () => {
+    const deps = makeDeps({ fetchState: vi.fn().mockRejectedValue(new Error('ETIMEDOUT')) });
+    const { result } = await review(`<@UBOT1> review ${API_PR}`, deps);
+
+    expect(deps.submitReview).toHaveBeenCalledTimes(1);
+    expect(result.status).toBe('SUCCESS');
+  });
+
+  it('in a batch, reviews the open PR and names the merged one', async () => {
+    const fetchState = vi.fn(async ({ prContext }: any) => (prContext.url === API_PR ? merged : { state: 'open' }));
+    const deps = makeDeps({ fetchState });
+    const { result, slack } = await review(`<@UBOT1> review ${API_PR} and ${WEB_PR}`, deps);
+
+    expect(deps.submitReview).toHaveBeenCalledTimes(1);
+    expect(deps.submitReview.mock.calls[0][0]).toMatchObject({ repo: 'newton-web', pullNumber: 8652 });
+    expect(posted(slack)[0]).toContain('`newton-api#5781` is already merged');
+    expect(result.status).toBe('SUCCESS');
   });
 });
