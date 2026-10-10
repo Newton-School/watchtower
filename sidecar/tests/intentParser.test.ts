@@ -548,6 +548,19 @@ describe('the review gate while the tool-router decides (issue #447)', () => {
     expect(seed(`<@UBOT1> please re-review ${slackPr}`)).toBe('PR_REVIEW');
   });
 
+  it('fires on a review verb before a link in the form Slack delivers it', () => {
+    // Slack wraps every link: <url> or <url|label>. This is what a real "review <PR>" looks like.
+    expect(seed(`<@UBOT1> review <${PR}>`)).toBe('PR_REVIEW');
+    expect(seed(`<@UBOT1> please review ${slackPr}`)).toBe('PR_REVIEW');
+    expect(seed(`<@UBOT1> can you review <${PR}/changes> when you get a minute`)).toBe('PR_REVIEW');
+    expect(seed(`<@UBOT1> review <${PR}> *Sent using* <@UCLAUDE>`)).toBe('PR_REVIEW');
+    expect(seed(`<@UBOT1> review <${PR}>`, 'UOWNER1')).toBe('PR_REVIEW');
+  });
+
+  it('does not take a noun "review" beside a Slack link for a request', () => {
+    expect(seed(`<@UBOT1> thanks for the review on ${slackPr}, is it live?`)).toBe('IMPLEMENTATION');
+  });
+
   it('still fires on a bare paste: nothing but mentions and PR links', () => {
     expect(seed(`<@UBOT1> ${PR}`)).toBe('PR_REVIEW');
     expect(seed(`<@UBOT1> <@U999> ${slackPr}, ${PR}/changes`)).toBe('PR_REVIEW');
