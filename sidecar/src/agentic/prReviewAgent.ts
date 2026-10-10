@@ -27,6 +27,8 @@ import {
   fetchPrDiff,
   fetchPrHeadSha,
   fetchPrMetadata,
+  fetchPrState,
+  type PrLifecycleState,
   formatSlackReviewSummary,
   normalizePrReviewAgentOutput,
   splitAgenticOutputByRole,
@@ -77,6 +79,7 @@ export interface PrReviewDeps {
   fetchMetadata: typeof fetchPrMetadata;
   fetchDiff: typeof fetchPrDiff;
   resolveHeadSha: typeof fetchPrHeadSha;
+  fetchState: typeof fetchPrState;
   submitReview: typeof submitPrReview;
   checkoutPr: typeof checkoutPrBranch;
   resolveWorkspaceFn: typeof resolveWorkspace;
@@ -89,6 +92,7 @@ export const defaultPrReviewDeps: PrReviewDeps = {
   fetchMetadata: fetchPrMetadata,
   fetchDiff: fetchPrDiff,
   resolveHeadSha: fetchPrHeadSha,
+  fetchState: fetchPrState,
   submitReview: submitPrReview,
   checkoutPr: checkoutPrBranch,
   resolveWorkspaceFn: resolveWorkspace,
@@ -1182,6 +1186,8 @@ export async function reviewSinglePr(params: {
   threadContext: string;
   userFocusBlock?: string;
   githubToken?: string;
+  /** Set when this is a requested post-merge review; changes what the summary asks for. */
+  prState?: PrLifecycleState;
   previousReview?: { jobId: string; prHeadSha: string; updatedAt: string };
   /** Findings persisted by the previous review of this PR, for re-review context. */
   priorFindings?: PriorReviewFinding[];
@@ -1207,6 +1213,7 @@ export async function reviewSinglePr(params: {
     threadContext,
     userFocusBlock,
     githubToken,
+    prState,
     previousReview,
     priorFindings,
     persistFindings,
@@ -1547,7 +1554,12 @@ export async function reviewSinglePr(params: {
   const baseSummary = formatSlackReviewSummary(normalizedOutputs, prContext.url, reviewResult, appliedSkills);
   const summaryParts = [baseSummary];
   if (hasBlockingFindings) {
-    summaryParts.push(`⚠️ ${blockingFindings.length} blocking-severity finding(s) — please address before merge.`);
+    // "Before merge" is meaningless on a PR that has already shipped (issue #447).
+    summaryParts.push(
+      prState && prState !== 'open'
+        ? `⚠️ ${blockingFindings.length} blocking-severity finding(s) — this PR is already ${prState}, so they need a follow-up.`
+        : `⚠️ ${blockingFindings.length} blocking-severity finding(s) — please address before merge.`,
+    );
     const preview = blockingFindings
       .slice(0, 3)
       .map(
