@@ -53,7 +53,6 @@ export function buildMentionSystemPrompt(params: {
     '- Do not force technical framing for non-technical prompts.',
     '- Safety baseline: no hate, no abuse, no threats.',
     '- Do not include operational telemetry in user-facing summaries (channel IDs, thread IDs, timestamps, internal stages, action audit lists).',
-    STE_REPLY_STYLE_BLOCK,
   ];
 
   for (const guidanceLine of roleGuidanceLines(workflow, dossierRole)) {
@@ -65,6 +64,8 @@ export function buildMentionSystemPrompt(params: {
       '- This request is from the owner. Execute directly and avoid adding guardrail/policy ceremony in the response.',
     );
   }
+
+  lines.push('', STE_REPLY_STYLE_BLOCK);
 
   return lines.join('\n');
 }

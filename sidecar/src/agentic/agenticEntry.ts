@@ -215,7 +215,7 @@ ${FILES_MARKER}
 [{"path": "/tmp/company_playbooks.csv", "caption": "company_id, name, question count"}]`;
 }
 
-function informationalSystemPrompt(config: AppConfig): string {
+export function informationalSystemPrompt(config: AppConfig): string {
   return `You are miniOG, a Slack assistant. The user has asked an informational question — code lookup, "where is X", "how does Y work", documentation, table schemas, data sources.
 
 Your job:
@@ -236,7 +236,7 @@ ${STE_REPLY_STYLE_BLOCK}
 ${fileAttachmentPromptBlock()}`;
 }
 
-const CONVERSATIONAL_SYSTEM_PROMPT = `You are miniOG, a Slack assistant. The user is making a conversational request — greeting, status check, casual chat, or a question about miniOG itself.
+export const CONVERSATIONAL_SYSTEM_PROMPT = `You are miniOG, a Slack assistant. The user is making a conversational request — greeting, status check, casual chat, or a question about miniOG itself.
 
 Your job:
 1. Produce a short, human reply.

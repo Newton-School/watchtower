@@ -193,7 +193,6 @@ Rules:
   Real observations that cannot be mapped to an exact diff location go in "summaryNotes" — never invent a location.
 ${SEVERITY_RUBRIC}
 ${NEVER_POST_RULE}
-${STE_REVIEW_TEXT_RULE}
 - Your final message must be ONLY this JSON object (no prose, no code fences):
 
 {
@@ -204,6 +203,8 @@ ${STE_REVIEW_TEXT_RULE}
   "reviewApproach": string,
   "skillsApplied": string[]
 }
+
+${STE_REVIEW_TEXT_RULE}
 
 PR Diff:
 \`\`\`diff

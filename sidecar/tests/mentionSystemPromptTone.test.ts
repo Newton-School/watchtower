@@ -56,4 +56,10 @@ describe('mentionSystemPrompt STE writing style', () => {
       expect(prompt).toContain(STE_REPLY_STYLE_BLOCK);
     }
   });
+
+  it('puts the STE block after the role guidance, at the end of the prompt', () => {
+    const prompt = buildMentionSystemPrompt({ task: makeTask(), workflow: 'INVESTIGATION', dossierRole: 'pm' });
+    expect(prompt.endsWith(STE_REPLY_STYLE_BLOCK)).toBe(true);
+    expect(prompt.indexOf('The asker is a pm')).toBeLessThan(prompt.indexOf(STE_REPLY_STYLE_BLOCK));
+  });
 });
