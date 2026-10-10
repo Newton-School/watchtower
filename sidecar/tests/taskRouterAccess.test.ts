@@ -10,6 +10,7 @@ const runDeployWorkflow = vi.fn();
 const runAgenticEntry = vi.fn();
 const runUnknownTaskWorkflow = vi.fn();
 const classifyWorkflowIntent = vi.fn();
+const decideTool = vi.fn();
 
 vi.mock('../src/agentic/agenticPrReview.js', () => ({
   runAgenticPrReview: runAgenticPrReview,
@@ -37,6 +38,13 @@ vi.mock('../src/agentic/agenticEntry.js', () => ({
 
 vi.mock('../src/workflows/unknownTaskWorkflow.js', () => ({
   runUnknownTaskWorkflow,
+}));
+
+// The tool-router runs in shadow beside every routed mention (issue #456).
+// Stub its model call so no test can spawn the real CLI; keep the rest real.
+vi.mock('../src/router/toolRouter.js', async importOriginal => ({
+  ...(await importOriginal<typeof import('../src/router/toolRouter.js')>()),
+  decideTool,
 }));
 
 vi.mock('../src/router/classifyIntent.js', () => ({
@@ -167,6 +175,8 @@ function makeSlack() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Shadow router: by default it "fails", which must never matter to a job.
+  decideTool.mockResolvedValue({ ok: false, error: 'stubbed', durationMs: 0 });
   classifyWorkflowIntent.mockResolvedValue({
     intent: 'PR_REVIEW',
     confidence: 0.91,
@@ -796,5 +806,116 @@ describe('routeTask and the tool registry (issue #456)', () => {
     const { ROUTED_INTENTS } = await import('../src/router/taskRouter.js');
     const { RUNNABLE_INTENTS } = await import('../src/router/toolRegistry.js');
     expect([...ROUTED_INTENTS].sort()).toEqual([...RUNNABLE_INTENTS].sort());
+  });
+});
+
+describe('routeTask runs the tool-router in shadow (issue #456)', () => {
+  const settle = () => new Promise(resolve => setTimeout(resolve, 0));
+  const shadowLog = (logStep: ReturnType<typeof vi.fn>) =>
+    logStep.mock.calls.map(call => call[0]).find(entry => entry.stage === 'router.shadow');
+
+  async function route(text: string, store: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) {
+    const logStep = vi.fn();
+    const result = await routeTask({
+      task: makeTask({ userId: 'UOWNER1', channelId: 'C-VIEW', text, ...extra }),
+      config: makeConfig('audit'),
+      slack: makeSlack() as never,
+      store: store as never,
+      logStep,
+    });
+    await settle();
+    return { result, logStep };
+  }
+
+  it('asks the router beside the classifier and logs whether they agree, without changing what runs', async () => {
+    classifyWorkflowIntent.mockResolvedValue({ intent: 'INFORMATIONAL', confidence: 0.9, reasoning: 'a question' });
+    decideTool.mockResolvedValue({
+      ok: true,
+      decision: { tool: 'answer', confidence: 0.93, reason: 'a question about the code' },
+      durationMs: 812,
+    });
+
+    const { result, logStep } = await route('<@UBOT1> how does the login redirect work?');
+
+    expect(result.workflow).toBe('INFORMATIONAL');
+    expect(decideTool).toHaveBeenCalledTimes(1);
+    expect(decideTool.mock.calls[0][0]).toMatchObject({
+      role: 'router_shadow',
+      facts: { message: 'how does the login redirect work?', addressing: 'direct', hints: [] },
+    });
+    // No onLog: the shadow call must not move the Slack status line.
+    expect(decideTool.mock.calls[0][0].logStep).toBeUndefined();
+    expect(shadowLog(logStep).data).toMatchObject({
+      agree: true,
+      legacyIntent: 'INFORMATIONAL',
+      legacyDecidedBy: 'classifier',
+      routerWouldRun: 'INFORMATIONAL',
+      tool: 'answer',
+      confidence: 0.93,
+      durationMs: 812,
+    });
+  });
+
+  it('records a disagreement and still runs what the legacy path chose', async () => {
+    classifyWorkflowIntent.mockResolvedValue({ intent: 'INFORMATIONAL', confidence: 0.9, reasoning: 'q' });
+    decideTool.mockResolvedValue({
+      ok: true,
+      decision: { tool: 'ask_user', confidence: 0.8, reason: 'nothing to act on', question: 'What should I look at?' },
+      durationMs: 5,
+    });
+
+    const { result, logStep } = await route('<@UBOT1> check now');
+
+    expect(result.workflow).toBe('INFORMATIONAL');
+    expect(runAgenticEntry).toHaveBeenCalledTimes(1);
+    expect(shadowLog(logStep).data).toMatchObject({
+      agree: false,
+      routerWouldRun: 'ASK_USER',
+      routerAsClassifier: 'INFORMATIONAL',
+      question: 'What should I look at?',
+    });
+  });
+
+  it('shadows a message the keyword gate decided, and says a gate decided it', async () => {
+    decideTool.mockResolvedValue({
+      ok: true,
+      decision: { tool: 'answer', confidence: 0.9, reason: 'a question about a merged PR' },
+      durationMs: 5,
+    });
+
+    const { result, logStep } = await route('<@UBOT1> is this merged?', {}, { intent: 'PR_REVIEW' });
+
+    expect(result.workflow).toBe('PR_REVIEW');
+    expect(classifyWorkflowIntent).not.toHaveBeenCalled();
+    expect(decideTool.mock.calls[0][0].facts.hints).toEqual(['review gate matched']);
+    expect(shadowLog(logStep).data).toMatchObject({
+      agree: false,
+      legacyIntent: 'PR_REVIEW',
+      legacyDecidedBy: 'gate',
+      routerWouldRun: 'INFORMATIONAL',
+    });
+  });
+
+  it('is unaffected when the router fails or throws', async () => {
+    classifyWorkflowIntent.mockResolvedValue({ intent: 'INFORMATIONAL', confidence: 0.9, reasoning: 'q' });
+    decideTool.mockRejectedValue(new Error('spawn failed'));
+
+    const { result, logStep } = await route('<@UBOT1> how does the login redirect work?');
+
+    expect(result.status).toBe('SUCCESS');
+    expect(shadowLog(logStep).data).toMatchObject({ agree: false, routerWouldRun: 'FAILED' });
+  });
+
+  it('does not run in legacy mode', async () => {
+    const store = { getState: (key: string) => (key === 'tool_router_mode' ? 'legacy' : undefined) };
+    const { logStep } = await route('<@UBOT1> how does the login redirect work?', store);
+
+    expect(decideTool).not.toHaveBeenCalled();
+    expect(shadowLog(logStep)).toBeUndefined();
+  });
+
+  it('skips exact-syntax commands, which leave nothing to decide', async () => {
+    await route('<@UBOT1> wt status', {}, { intent: 'DEV_ASSIST' });
+    expect(decideTool).not.toHaveBeenCalled();
   });
 });
