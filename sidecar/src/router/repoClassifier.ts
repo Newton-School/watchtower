@@ -313,6 +313,7 @@ export async function classifyRepo(params: ClassifyRepoParams): Promise<RepoClas
     const profile = lightweightProfile(getActiveBackendId());
     const result = await runCodex({
       cwd: os.tmpdir(),
+      noTools: true,
       prompt,
       model: profile.model,
       reasoningEffort: profile.reasoningEffort,

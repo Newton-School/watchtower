@@ -413,6 +413,15 @@ export interface CodexRunRequest {
    * deployed default. `runCodex` resolves `backendOverride ?? activeBackendId`.
    */
   backendOverride?: AgentBackendId;
+  /**
+   * The call only has to turn text into text: a classification, a summary.
+   * On the claude-code backend it then gets no built-in tools, no MCP
+   * servers, no skills, no hooks and no bypassed permissions (issue #443).
+   * Such calls read arbitrary Slack text, and used to run with every tool and
+   * every connector the host user has. The Codex backend ignores this; it
+   * runs sandboxed.
+   */
+  noTools?: boolean;
 }
 
 export interface McpServerConfig {

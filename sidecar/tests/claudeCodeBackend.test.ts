@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { claudeCodeBackend, stripPlanHarnessMeta } from '../src/backends/claudeCodeBackend.js';
+import { claudeCodeBackend, NO_TOOLS_ARGS, stripPlanHarnessMeta } from '../src/backends/claudeCodeBackend.js';
 
 describe('claudeCodeBackend.parseOutput', () => {
   it('unwraps Claude Code wrapper and extracts inner structured JSON', () => {
@@ -443,6 +443,61 @@ describe('claudeCodeBackend.buildArgs', () => {
     expect(addDir).toBeGreaterThan(args.indexOf('-p') + 1);
     expect(args.slice(addDir + 1, addDir + 3)).toEqual(['/tmp/slack-a', '/tmp/slack-b']);
     expect(args.filter(a => a === '--add-dir')).toHaveLength(1);
+  });
+
+  // Issue #443: text-only calls ran with 441 tools, 18 MCP servers and 76 skills.
+  describe('noTools', () => {
+    const args = () => claudeCodeBackend.buildArgs({ ...baseRequest, noTools: true }, '/tmp/out.json');
+
+    it('removes built-in tools, every MCP server, skills, hooks and plugins', () => {
+      const built = args();
+      expect(built).toEqual(expect.arrayContaining(NO_TOOLS_ARGS));
+      expect(built[built.indexOf('--tools') + 1]).toBe('');
+      expect(built).toContain('--strict-mcp-config');
+      expect(built[built.indexOf('--mcp-config') + 1]).toBe('{"mcpServers":{}}');
+      expect(built).toContain('--disable-slash-commands');
+      expect(built).toContain('--safe-mode');
+    });
+
+    it('does not bypass permissions: there is nothing left to permit', () => {
+      const built = args();
+      expect(built).not.toContain('--dangerously-skip-permissions');
+      expect(built).not.toContain('--permission-mode');
+    });
+
+    it('keeps the variadic flags from swallowing what follows them', () => {
+      const built = claudeCodeBackend.buildArgs(
+        { ...baseRequest, noTools: true, model: 'claude-haiku-5-5', reasoningEffort: 'low' },
+        '/tmp/out.json',
+      );
+      // `--tools <tools...>` and `--mcp-config <configs...>` take every following non-flag argument.
+      expect(built[built.indexOf('--tools') + 2].startsWith('--')).toBe(true);
+      expect(built[built.indexOf('--mcp-config') + 2].startsWith('--')).toBe(true);
+      // The prompt is still the first positional, and the model is still passed.
+      expect(built.slice(0, 2)).toEqual(['-p', 'hello']);
+      expect(built[built.indexOf('--model') + 1]).toBe('claude-haiku-5-5');
+    });
+
+    it('ignores MCP servers on the request: no tools means none', () => {
+      const built = claudeCodeBackend.buildArgs(
+        {
+          ...baseRequest,
+          noTools: true,
+          mcpServers: { metabase: { type: 'http', url: 'https://metabase.example/mcp' } },
+        },
+        '/tmp/out.json',
+      );
+      expect(built.filter(arg => arg === '--mcp-config')).toHaveLength(1);
+      expect(built.join(' ')).not.toContain('metabase.example');
+    });
+
+    it('leaves every other run exactly as it was', () => {
+      const built = claudeCodeBackend.buildArgs(baseRequest, '/tmp/out.json');
+      expect(built).toContain('--dangerously-skip-permissions');
+      expect(built).not.toContain('--tools');
+      expect(built).not.toContain('--safe-mode');
+      expect(built).not.toContain('--strict-mcp-config');
+    });
   });
 
   it('leaves the prompt and args alone when there are no images', () => {

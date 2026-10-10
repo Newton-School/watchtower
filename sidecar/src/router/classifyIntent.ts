@@ -120,6 +120,7 @@ export async function classifyWorkflowIntent(params: {
 
     const result = await runCodex({
       cwd: os.tmpdir(),
+      noTools: true,
       prompt: fullPrompt,
       model: profile.model,
       reasoningEffort: profile.reasoningEffort,

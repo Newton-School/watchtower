@@ -174,6 +174,20 @@ function resolveClaudeCodeBinary(): string {
   return 'claude';
 }
 
+/**
+ * Flags for a text-in, text-out call (`noTools`). `--tools` and `--mcp-config`
+ * are variadic, so each must be followed by another flag, never a positional.
+ */
+export const NO_TOOLS_ARGS = [
+  '--safe-mode',
+  '--tools',
+  '',
+  '--strict-mcp-config',
+  '--mcp-config',
+  JSON.stringify({ mcpServers: {} }),
+  '--disable-slash-commands',
+];
+
 /** Name downloaded thread images in the prompt so the agent opens them with Read. */
 export function withImageReadInstructions(prompt: string, imagePaths: string[] | undefined): string {
   if (!imagePaths || imagePaths.length === 0) return prompt;
@@ -220,7 +234,16 @@ export const claudeCodeBackend: AgentBackend = {
     // `--dangerously-skip-permissions` is equivalent to `--permission-mode bypassPermissions`
     // and silently wins over `--permission-mode plan`, so passing both leaves the model
     // without the ExitPlanMode tool. Choose one or the other.
-    if (request.planMode) {
+    if (request.noTools) {
+      // A call that only returns text gets nothing to act with (issue #443).
+      // Each flag removes what the others leave in: `--tools ""` the built-in
+      // tools; strict MCP with an empty config every MCP server, the account's
+      // connectors included; `--disable-slash-commands` the skills;
+      // `--safe-mode` hooks, plugins and CLAUDE.md. No bypass flag: there is
+      // nothing left to permit. Measured on CLI 2.1.296: 441 tools, 18 MCP
+      // servers and 76 skills become 0, 0 and 0.
+      args.push(...NO_TOOLS_ARGS);
+    } else if (request.planMode) {
       args.push('--permission-mode', 'plan');
     } else {
       args.push('--dangerously-skip-permissions');
@@ -250,7 +273,7 @@ export const claudeCodeBackend: AgentBackend = {
     // avoids a temp file. `--dangerously-skip-permissions` (set above in
     // non-plan mode) auto-allows the MCP tools; OAuth HTTP servers reuse the
     // CLI's Keychain-cached token, which requires HOME in buildEnv.
-    if (request.mcpServers && Object.keys(request.mcpServers).length > 0) {
+    if (!request.noTools && request.mcpServers && Object.keys(request.mcpServers).length > 0) {
       args.push('--mcp-config', JSON.stringify({ mcpServers: request.mcpServers }), '--strict-mcp-config');
     }
     // Claude Code writes JSON to stdout when --output-format json is set.
