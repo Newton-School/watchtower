@@ -32,6 +32,7 @@ import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
 import { highReasoningProfile } from '../codex/modelProfiles.js';
 import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
 import { classifyWorkflowIntent } from './classifyIntent.js';
+import { startRouterShadow, type LegacyDecidedBy } from './routerShadow.js';
 import { looksLikeFixAffirmation } from './resumeIntentParser.js';
 
 // Confidence threshold below which the router refuses to honor a classifier
@@ -149,6 +150,11 @@ export async function routeTask(params: {
     .replace(/\s+/g, ' ')
     .trim();
 
+  // The tool-router runs beside everything below and only logs what it would
+  // have done (issue #456). Detached: nothing here waits for it.
+  const routerShadow = startRouterShadow({ task, userMessage, store, logStep, signal });
+  let legacyDecidedBy: LegacyDecidedBy = 'gate';
+
   // PR_REVIEW can only be seeded pre-classifier by the deterministic gate
   // (isPrReviewRequest in intentParser.ts) — nothing else produces it before
   // this point. Skip the AI classifier entirely so a "review <PR URL>"
@@ -185,6 +191,7 @@ export async function routeTask(params: {
       // classifier. implementationWorkflow.ts already consumes those findings
       // via investigationStore.getForThread.
       resolvedIntent = task.isOwnerAuthor ? 'OWNER_AUTOPILOT' : 'IMPLEMENTATION';
+      legacyDecidedBy = 'resume_gate';
       logStep?.({
         stage: 'router.investigation.resume_gate',
         message:
@@ -192,6 +199,7 @@ export async function routeTask(params: {
         data: { userMessage, threadTs: task.event.threadTs, resolvedIntent },
       });
     } else {
+      legacyDecidedBy = 'classifier';
       // For all other intents, use AI to classify.
       // Pass mentionType so the classifier knows if this is a direct @miniOG mention
       // or an indirect @theOG mention (owner-mention triggers should be filtered for relevance).
@@ -298,6 +306,8 @@ export async function routeTask(params: {
     resolvedIntent !== task.intent || toneMode !== task.toneMode || dossierRole !== task.dossierRole
       ? { ...task, intent: resolvedIntent, toneMode, dossierRole }
       : task;
+
+  routerShadow?.compare({ intent: resolvedIntent, decidedBy: legacyDecidedBy });
 
   // NONE = classifier determined this is human-to-human conversation, miniOG should stay silent
   if (resolvedIntent === 'NONE') {
