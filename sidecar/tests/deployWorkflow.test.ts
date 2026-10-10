@@ -3,7 +3,13 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { classifyDeployTarget, isDeployRequest, isMarketingDeployRequest } from '../src/router/intentParser.js';
 import { normalizeTask } from '../src/router/intentParser.js';
 import type { AppConfig, NormalizedTask, SlackEventEnvelope } from '../src/types/contracts.js';
-import { runDeployWorkflow, __ghCli, __deployTiming } from '../src/workflows/deployWorkflow.js';
+import {
+  runDeployWorkflow,
+  __ghCli,
+  __deployTiming,
+  __deployConfirm,
+  DEPLOY_DRY_RUN_STATE_KEY,
+} from '../src/workflows/deployWorkflow.js';
 import { runCodex } from '../src/codex/runCodex.js';
 
 vi.mock('../src/codex/runCodex.js', () => ({
@@ -42,6 +48,13 @@ const config: AppConfig = {
   bugFixTimeoutMs: 120_000,
   pmTaskTimeoutMs: 120_000,
 };
+
+// Every deploy now waits for an explicit confirmation (issue #428). Default
+// to "the requester confirmed" so the existing suites exercise what happens
+// after it; the confirmation suite below overrides this.
+beforeEach(() => {
+  __deployConfirm.wait = vi.fn().mockResolvedValue({ outcome: 'confirmed', userId: 'UOWNER1', replyTs: '1.5' });
+});
 
 const baseEvent: SlackEventEnvelope = {
   eventId: 'Ev1',
@@ -118,6 +131,36 @@ describe('normalizeTask routes DEPLOY deterministically', () => {
   it('does not route "fix the deploy script" as DEPLOY', () => {
     const task = normalizeTask({ ...baseEvent, text: '<@UBOT1> fix the deploy script' }, config, []);
     expect(task.intent).not.toBe('DEPLOY');
+  });
+
+  it('does not route an owner mention as DEPLOY, whatever it says (issue #428)', () => {
+    const text =
+      '<@UOWNER1> could you review these two please? newton-web <https://github.com/Newton-School/newton-web/pull/9277> Deploy order: api then web, release to production after';
+    const task = normalizeTask({ ...baseEvent, userId: 'UDEV2', text }, config, []);
+    expect(task.mentionType).toBe('owner');
+    expect(task.intent).not.toBe('DEPLOY');
+  });
+
+  it('still routes a direct message as DEPLOY', () => {
+    const task = normalizeTask({ ...baseEvent, text: 'deploy newton-web to prod', channelType: 'im' }, config, []);
+    expect(task.intent).toBe('DEPLOY');
+  });
+
+  it('does not let a newton-web PR link name the deploy target (issue #428)', () => {
+    const link = '<https://github.com/Newton-School/newton-web/pull/9277>';
+    expect(classifyDeployTarget(`<@UBOT1> review ${link} before we ship`)).toBeNull();
+    expect(classifyDeployTarget(`<@UBOT1> can you deploy ${link}`)).toBeNull();
+    expect(
+      classifyDeployTarget('<@UBOT1> release notes: https://github.com/Newton-School/newton-web/pull/1'),
+    ).toBeNull();
+    const task = normalizeTask({ ...baseEvent, text: `<@UBOT1> review ${link} before we ship` }, config, []);
+    expect(task.intent).not.toBe('DEPLOY');
+  });
+
+  it('keeps a target named in words, or in a link label, next to a link', () => {
+    const link = '<https://github.com/Newton-School/newton-web/pull/9277>';
+    expect(classifyDeployTarget(`<@UBOT1> deploy newton-web to prod ${link}`)).toBe('newton-web');
+    expect(classifyDeployTarget('<@UBOT1> deploy <https://example.com/x|newton-web> to prod')).toBe('newton-web');
   });
 
   it('prioritizes DEV_ASSIST prefix over DEPLOY', () => {
@@ -501,6 +544,7 @@ describe('runDeployWorkflow idempotency on Slack post failure', () => {
 
     const postMessage = vi
       .fn()
+      .mockResolvedValueOnce({ ok: true, ts: '0.5' }) // confirmation prompt
       .mockResolvedValueOnce({ ok: true, ts: '1.0' }) // ack post ("Deploying newton-web to production...")
       .mockRejectedValueOnce(new Error('ETIMEDOUT'))
       .mockRejectedValueOnce(new Error('ETIMEDOUT'))
@@ -514,8 +558,8 @@ describe('runDeployWorkflow idempotency on Slack post failure', () => {
     // The workflow must NOT throw — that's what would trigger the index.ts retry loop.
     expect(result.status).toBe('SUCCESS');
     expect(result.slackPosted).toBe(false);
-    // The ack + 3 final-reply attempts = 4 calls total.
-    expect(postMessage).toHaveBeenCalledTimes(4);
+    // The confirmation prompt + the ack + 3 final-reply attempts = 5 calls total.
+    expect(postMessage).toHaveBeenCalledTimes(5);
   });
 
   it('returns SUCCESS and slackPosted=true when the final reply lands on a later retry', async () => {
@@ -532,6 +576,7 @@ describe('runDeployWorkflow idempotency on Slack post failure', () => {
 
     const postMessage = vi
       .fn()
+      .mockResolvedValueOnce({ ok: true, ts: '0.5' }) // confirmation prompt
       .mockResolvedValueOnce({ ok: true, ts: '1.0' }) // ack post
       .mockRejectedValueOnce(new Error('ECONNRESET')) // first reply attempt
       .mockResolvedValueOnce({ ok: true, ts: '2.0' }); // second attempt succeeds
@@ -542,6 +587,169 @@ describe('runDeployWorkflow idempotency on Slack post failure', () => {
     expect(runCodex).toHaveBeenCalledTimes(1);
     expect(result.status).toBe('SUCCESS');
     expect(result.slackPosted).toBe(true);
-    expect(postMessage).toHaveBeenCalledTimes(3);
+    expect(postMessage).toHaveBeenCalledTimes(4);
+  });
+});
+
+describe('runDeployWorkflow confirmation (issue #428)', () => {
+  function deployTask(text = '<@UBOT1> deploy newton-web to prod', userId = 'UOWNER1'): NormalizedTask {
+    return {
+      event: {
+        eventId: 'Ev-confirm',
+        channelId: 'C-DEPLOY',
+        threadTs: '777.66',
+        eventTs: '777.66',
+        userId,
+        text,
+        rawEvent: {},
+      },
+      mentionDetected: true,
+      mentionType: 'bot',
+      isOwnerAuthor: userId === 'UOWNER1',
+      isCoreDevAuthor: true,
+      intent: 'DEPLOY',
+    };
+  }
+
+  const marketingConfig: AppConfig = {
+    ...config,
+    repoPaths: { ...config.repoPaths, newtonMarketingWeb: '/Users/dipesh/code/mini-og/newton-marketing-web' },
+  };
+
+  const deployed = {
+    ok: true,
+    exitCode: 0,
+    timedOut: false,
+    stdout: '',
+    stderr: '',
+    lastMessage: 'Deploy succeeded.',
+    parsedJson: undefined,
+  } as any;
+
+  let postMessage: ReturnType<typeof vi.fn>;
+  let slack: any;
+  let ghExec: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.mocked(runCodex).mockReset().mockResolvedValue(deployed);
+    ghExec = vi.fn().mockResolvedValue('');
+    __ghCli.exec = ghExec;
+    postMessage = vi.fn().mockResolvedValue({ ok: true, ts: '50.1' });
+    slack = { chat: { postMessage } };
+  });
+
+  const outcome = (value: string) => {
+    __deployConfirm.wait = vi.fn().mockResolvedValue({ outcome: value });
+  };
+
+  it('asks the requester for the exact phrase before deploying, and names the target', async () => {
+    await runDeployWorkflow({ task: deployTask(), config, slack });
+
+    const prompt = postMessage.mock.calls[0][0];
+    expect(prompt.thread_ts).toBe('777.66');
+    expect(prompt.text).toContain('Deploy *newton-web* to production?');
+    expect(prompt.text).toContain('<@UOWNER1>');
+    expect(prompt.text).toContain('`confirm deploy`');
+    expect(__deployConfirm.wait).toHaveBeenCalledWith(
+      expect.objectContaining({
+        promptTs: '50.1',
+        phrase: 'confirm deploy',
+        allowedUserIds: ['UOWNER1'],
+        botUserId: 'UBOT1',
+        stagePrefix: 'deploy.confirm',
+      }),
+    );
+    expect(runCodex).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not deploy newton-web when the confirmation expires', async () => {
+    outcome('expired');
+    const result = await runDeployWorkflow({ task: deployTask(), config, slack });
+
+    expect(runCodex).not.toHaveBeenCalled();
+    expect(result.status).toBe('SKIPPED');
+    expect(result.message).toContain('nothing was deployed');
+    expect(postMessage.mock.calls.map(c => c[0].text)).not.toContain('Deploying newton-web to production...');
+  });
+
+  it('does not deploy when the requester declines', async () => {
+    outcome('declined');
+    const result = await runDeployWorkflow({ task: deployTask(), config, slack });
+
+    expect(runCodex).not.toHaveBeenCalled();
+    expect(result.status).toBe('SKIPPED');
+    expect(result.message).toBe('Okay, not deploying.');
+  });
+
+  it('reports CANCELLED, not a failure, when the job is stopped while waiting', async () => {
+    outcome('cancelled');
+    const result = await runDeployWorkflow({ task: deployTask(), config, slack });
+
+    expect(runCodex).not.toHaveBeenCalled();
+    expect(result.status).toBe('CANCELLED');
+  });
+
+  it('does not deploy when the confirmation prompt cannot be posted', async () => {
+    postMessage.mockRejectedValue(new Error('ETIMEDOUT'));
+    const result = await runDeployWorkflow({ task: deployTask(), config, slack });
+
+    expect(__deployConfirm.wait).not.toHaveBeenCalled();
+    expect(runCodex).not.toHaveBeenCalled();
+    expect(result.status).toBe('FAILED');
+  });
+
+  it('does not dispatch the marketing deploy without confirmation', async () => {
+    outcome('expired');
+    const result = await runDeployWorkflow({
+      task: deployTask('<@UBOT1> deploy the marketing site to prod'),
+      config: marketingConfig,
+      slack,
+    });
+
+    expect(postMessage.mock.calls[0][0].text).toContain('Deploy *newton-marketing-web* to production?');
+    expect(ghExec).not.toHaveBeenCalled();
+    expect(runCodex).not.toHaveBeenCalled();
+    expect(result.status).toBe('SKIPPED');
+  });
+
+  it('asks only the person who made the request, even when someone else is an admin', async () => {
+    await runDeployWorkflow({ task: deployTask('<@UBOT1> deploy newton-web to prod', 'UOWNER1'), config, slack });
+    expect(vi.mocked(__deployConfirm.wait).mock.calls[0][0].allowedUserIds).toEqual(['UOWNER1']);
+  });
+
+  it('never assumes newton-web when the message names no deploy target', async () => {
+    const result = await runDeployWorkflow({ task: deployTask('<@UBOT1> confirm deploy'), config, slack });
+
+    expect(__deployConfirm.wait).not.toHaveBeenCalled();
+    expect(runCodex).not.toHaveBeenCalled();
+    expect(ghExec).not.toHaveBeenCalled();
+    expect(result.status).toBe('SKIPPED');
+    expect(result.message).toContain("couldn't tell what to deploy");
+  });
+
+  it('in dry-run mode confirms, then reports instead of deploying', async () => {
+    const store = { getState: vi.fn((key: string) => (key === DEPLOY_DRY_RUN_STATE_KEY ? '1' : undefined)) };
+
+    const web = await runDeployWorkflow({ task: deployTask(), config, slack, store });
+    const marketing = await runDeployWorkflow({
+      task: deployTask('<@UBOT1> deploy the marketing site to prod'),
+      config: marketingConfig,
+      slack,
+      store,
+    });
+
+    expect(__deployConfirm.wait).toHaveBeenCalledTimes(2);
+    expect(runCodex).not.toHaveBeenCalled();
+    expect(ghExec).not.toHaveBeenCalled();
+    expect(web.status).toBe('SUCCESS');
+    expect(web.message).toContain('Dry run');
+    expect(web.message).toContain('newton-web');
+    expect(marketing.message).toContain('newton-marketing-web');
+  });
+
+  it('deploys for real when the dry-run key is unset', async () => {
+    const store = { getState: vi.fn(() => undefined) };
+    await runDeployWorkflow({ task: deployTask(), config, slack, store });
+    expect(runCodex).toHaveBeenCalledTimes(1);
   });
 });

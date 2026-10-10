@@ -385,7 +385,7 @@ export async function routeTask(params: {
   }
 
   if (resolvedIntent === 'DEPLOY') {
-    return runDeployWorkflow({ task: routedTask, config, slack, logStep, signal });
+    return runDeployWorkflow({ task: routedTask, config, slack, store, logStep, signal });
   }
 
   // Check file-based workflow templates before falling through to unknown

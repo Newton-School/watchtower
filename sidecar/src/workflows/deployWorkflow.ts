@@ -11,6 +11,7 @@ import { highReasoningProfile } from '../codex/modelProfiles.js';
 import { buildMentionSystemPrompt } from '../codex/mentionSystemPrompt.js';
 import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
 import { extractReplyFromCodexResult } from './shared/workflowUtils.js';
+import { waitForExactConfirmation } from './shared/confirmationGate.js';
 import { classifyDeployTarget } from '../router/intentParser.js';
 import { getRepo, isRepoEnabled, repoPathOrNull } from '../repos/registry.js';
 
@@ -23,6 +24,115 @@ export const __ghCli = {
     return stdout;
   },
 };
+
+/** Internal seam — tests stub the wait instead of scripting Slack replies. */
+export const __deployConfirm = { wait: waitForExactConfirmation };
+
+export const DEPLOY_CONFIRM_PHRASE = 'confirm deploy';
+
+/**
+ * sidecar_state key. When '1', a confirmed deploy is reported but not run, so
+ * the deploy path can be exercised live without shipping anything.
+ */
+export const DEPLOY_DRY_RUN_STATE_KEY = 'deploy_dry_run';
+
+type DeployStateReader = { getState(key: string): string | undefined };
+
+function isDeployDryRun(store: DeployStateReader | undefined): boolean {
+  try {
+    return store?.getState(DEPLOY_DRY_RUN_STATE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Last gate before anything irreversible (issue #428). Returns undefined once
+ * the requester has confirmed; otherwise the result to return, with nothing
+ * deployed. The DEPLOY intent is seeded by keywords, so the requester — not
+ * the match — decides whether production changes.
+ */
+async function confirmDeploy(params: {
+  task: NormalizedTask;
+  config: AppConfig;
+  slack: WebClient;
+  targetLabel: string;
+  logStep?: WorkflowStepLogger;
+  signal?: AbortSignal;
+}): Promise<WorkflowResult | undefined> {
+  const { task, config, slack, targetLabel, logStep, signal } = params;
+  const { channelId, threadTs, userId } = task.event;
+  const stop = (status: WorkflowResult['status'], message: string, slackPosted: boolean): WorkflowResult => ({
+    workflow: 'DEPLOY',
+    status,
+    message,
+    notifyDesktop: status === 'FAILED',
+    slackPosted,
+  });
+
+  let promptTs: string | undefined;
+  try {
+    const prompt = await slack.chat.postMessage({
+      channel: channelId,
+      thread_ts: threadTs,
+      text: `Deploy *${targetLabel}* to production? <@${userId}>, reply \`${DEPLOY_CONFIRM_PHRASE}\` within 10 minutes and I'll start. Without that, nothing is deployed.`,
+    });
+    promptTs = typeof prompt.ts === 'string' ? prompt.ts : undefined;
+  } catch {
+    // Handled below: without an anchored prompt there is nothing safe to wait on.
+  }
+  if (!promptTs) {
+    const msg = "Couldn't post the deploy confirmation, so nothing was deployed.";
+    logStep?.({ stage: 'deploy.confirm.prompt_failed', message: msg, level: 'ERROR' });
+    return stop('FAILED', msg, false);
+  }
+  logStep?.({
+    stage: 'deploy.confirm.asked',
+    message: `Asked <@${userId}> to confirm the ${targetLabel} production deploy.`,
+    data: { targetLabel, promptTs },
+  });
+
+  const confirmation = await __deployConfirm.wait({
+    slack,
+    channelId,
+    threadTs,
+    promptTs,
+    phrase: DEPLOY_CONFIRM_PHRASE,
+    allowedUserIds: [userId],
+    botUserId: config.botUserId,
+    stagePrefix: 'deploy.confirm',
+    logStep,
+    signal,
+  });
+  if (confirmation.outcome === 'confirmed') return undefined;
+  if (confirmation.outcome === 'cancelled') return stop('CANCELLED', 'Deploy cancelled before confirmation.', false);
+
+  const msg =
+    confirmation.outcome === 'declined'
+      ? 'Okay, not deploying.'
+      : `No \`${DEPLOY_CONFIRM_PHRASE}\` in 10 minutes, so nothing was deployed. Ask again when you're ready.`;
+  const slackPosted = await slack.chat
+    .postMessage({ channel: channelId, thread_ts: threadTs, text: msg })
+    .then(() => true)
+    .catch(() => false);
+  return stop('SKIPPED', msg, slackPosted);
+}
+
+async function reportDryRun(params: {
+  task: NormalizedTask;
+  slack: WebClient;
+  targetLabel: string;
+  logStep?: WorkflowStepLogger;
+}): Promise<WorkflowResult> {
+  const { task, slack, targetLabel, logStep } = params;
+  const msg = `Dry run: this is where I would deploy *${targetLabel}* to production. Nothing was deployed.`;
+  logStep?.({ stage: 'deploy.dry_run', message: msg, level: 'WARN', data: { targetLabel } });
+  const slackPosted = await slack.chat
+    .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: msg })
+    .then(() => true)
+    .catch(() => false);
+  return { workflow: 'DEPLOY', status: 'SUCCESS', message: msg, notifyDesktop: false, slackPosted };
+}
 
 /**
  * Resolves the deploy-prod skill instructions.
@@ -65,16 +175,28 @@ export async function runDeployWorkflow(params: {
   task: NormalizedTask;
   config: AppConfig;
   slack: WebClient;
+  store?: DeployStateReader;
   logStep?: WorkflowStepLogger;
   signal?: AbortSignal;
 }): Promise<WorkflowResult> {
-  const { task, config, slack, logStep, signal } = params;
+  const { task, config, slack, store, logStep, signal } = params;
 
   // Same deterministic classification the intent gate used: a deploy ask
   // naming the marketing site routes to the GitHub Actions flow; everything
   // else is the classic newton-web prod deploy. Never let one mechanism run
   // the other, and never GUESS between them on conflicting signals.
-  const target = classifyDeployTarget(task.event.text ?? '') ?? 'newton-web';
+  const target = classifyDeployTarget(task.event.text ?? '');
+  if (target === null) {
+    // Reached without a deploy target in the message. Assuming newton-web here
+    // is how a confirmed marketing deploy could ship the wrong site (#428).
+    const msg =
+      'I couldn\'t tell what to deploy. Re-ask with the target in the message — e.g. "deploy newton-web to prod" or "deploy marketing to prod".';
+    await slack.chat
+      .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: msg })
+      .catch(() => {});
+    logStep?.({ stage: 'deploy.no_target', message: msg, level: 'WARN' });
+    return { workflow: 'DEPLOY', status: 'SKIPPED', message: msg, notifyDesktop: false, slackPosted: true };
+  }
   if (target === 'newton-marketing-web') {
     return runMarketingDeploy(params);
   }
@@ -154,6 +276,10 @@ export async function runDeployWorkflow(params: {
     };
   }
 
+  const notConfirmed = await confirmDeploy({ task, config, slack, targetLabel: 'newton-web', logStep, signal });
+  if (notConfirmed) return notConfirmed;
+  if (isDeployDryRun(store)) return reportDryRun({ task, slack, targetLabel: 'newton-web', logStep });
+
   // Post a progress message
   await slack.chat
     .postMessage({
@@ -225,10 +351,11 @@ async function runMarketingDeploy(params: {
   task: NormalizedTask;
   config: AppConfig;
   slack: WebClient;
+  store?: DeployStateReader;
   logStep?: WorkflowStepLogger;
   signal?: AbortSignal;
 }): Promise<WorkflowResult> {
-  const { task, config, slack, logStep, signal } = params;
+  const { task, config, slack, store, logStep, signal } = params;
 
   logStep?.({
     stage: 'deploy.marketing.start',
@@ -281,6 +408,17 @@ async function runMarketingDeploy(params: {
     await slack.chat.postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: msg });
     return skipped(msg);
   }
+
+  const notConfirmed = await confirmDeploy({
+    task,
+    config,
+    slack,
+    targetLabel: 'newton-marketing-web',
+    logStep,
+    signal,
+  });
+  if (notConfirmed) return notConfirmed;
+  if (isDeployDryRun(store)) return reportDryRun({ task, slack, targetLabel: 'newton-marketing-web', logStep });
 
   await slack.chat
     .postMessage({
