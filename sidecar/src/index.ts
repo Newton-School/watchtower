@@ -43,6 +43,8 @@ import { narrateStep } from './slack/statusNarrator.js';
 import { fetchThreadContext } from './slack/threadContext.js';
 import { createThreadStatus, type ThreadStatus } from './slack/threadStatus.js';
 import { resolveUserGroup } from './slack/userGroupResolver.js';
+import { isOlderVersion, readSidecarBuild } from './runtime/buildInfo.js';
+import { acquireInstanceLock, instanceLockPath, releaseInstanceLock } from './runtime/instanceLock.js';
 import { registerActiveJob, unregisterActiveJob, cancelJob } from './state/activeJobs.js';
 import { JobStore } from './state/jobStore.js';
 import type { AccessGroupKey, SlackEventEnvelope, SlackReactionEvent, WorkflowStepLog } from './types/contracts.js';
@@ -52,6 +54,37 @@ loadPolicies();
 loadWorkflowTemplates();
 
 const dbPath = process.env.WATCHTOWER_DB_PATH ?? path.resolve(process.cwd(), 'watchtower.db');
+
+// Stamped on every job so a run can be traced to the bundle that handled it
+// (issue #450).
+const sidecarBuild = readSidecarBuild({ pid: process.pid, argv: process.argv, env: process.env });
+
+// One sidecar per database. Take the instance lock before touching the DB or
+// Slack; a second sidecar waits here until the first one exits.
+const lockPath = instanceLockPath(dbPath);
+let standbyPolls = 0;
+const { replaced: staleLock } = await acquireInstanceLock({
+  lockPath,
+  self: {
+    pid: sidecarBuild.sidecarPid,
+    entry: sidecarBuild.sidecarEntry,
+    version: sidecarBuild.appVersion,
+    startedAt: new Date().toISOString(),
+  },
+  onStandby: holder => {
+    // First poll, then every 5 minutes at the default 5s interval.
+    if (standbyPolls++ % 60 === 0) {
+      logger.warn(
+        { lockPath, holder, ...sidecarBuild },
+        'another watchtower sidecar holds the instance lock — standing by until it exits',
+      );
+    }
+  },
+});
+process.on('exit', () => releaseInstanceLock(lockPath));
+if (staleLock) {
+  logger.info({ lockPath, staleLock }, 'took over a stale sidecar instance lock');
+}
 
 let config: ReturnType<typeof loadConfigFromDb>;
 try {
@@ -1070,6 +1103,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
       threadMessages: threadMessages.length,
       ingestSource: event.ingestSource ?? 'socket',
       launchpadRequestId: event.launchpadRequestId ?? null,
+      ...sidecarBuild,
     },
   });
 
@@ -1482,8 +1516,22 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
 }
 
 async function main(): Promise<void> {
-  logger.info({ dbPath, maxConcurrentJobs: config.maxConcurrentJobs }, 'watchtower sidecar starting');
+  logger.info({ dbPath, maxConcurrentJobs: config.maxConcurrentJobs, ...sidecarBuild }, 'watchtower sidecar starting');
   await cleanupStaleWorkspaces();
+
+  // An older bundle starting after a newer one is how two builds ended up
+  // serving the same Slack app (issue #450). The lock stops them overlapping;
+  // this makes a rollback-by-accident visible.
+  const lastAppVersion = store.getState('last_app_version');
+  if (lastAppVersion && isOlderVersion(sidecarBuild.appVersion, lastAppVersion)) {
+    logger.warn({ lastAppVersion, ...sidecarBuild }, 'this build is older than the one that last used this database');
+    notifyDesktop(
+      'Older Watchtower build started',
+      `Running ${sidecarBuild.appVersion}, but ${lastAppVersion} last used this database. Quit this copy unless that is intended.`,
+    );
+  } else if (sidecarBuild.appVersion !== 'dev') {
+    store.setState('last_app_version', sidecarBuild.appVersion);
+  }
 
   // Boot the optional Obsidian-compatible vault writer. When disabled (or no
   // path configured), scheduleVaultRender calls become no-ops; the dossier
