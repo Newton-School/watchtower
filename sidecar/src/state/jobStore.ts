@@ -25,6 +25,7 @@ import { createInvestigationStore, type InvestigationStore } from './investigati
 import { createDossierStore, type DossierStore } from './dossierStore.js';
 import { createConversationStore, type ConversationStore } from './conversationStore.js';
 import { createExportLog, type ExportLog } from '../egress/exportLog.js';
+import { ROUTE_CLARIFY_STAGE, parsePendingRouteQuestion, type PendingRouteQuestion } from '../router/routeClarify.js';
 
 function normalizeStoredPersonalityMode(mode: unknown): PersonalityMode {
   return mode === 'terse' || mode === 'technical' || mode === 'casual' ? mode : 'normal';
@@ -1526,6 +1527,51 @@ export class JobStore {
       )
       .get(jobId) as { hit?: number } | undefined;
     return Boolean(row?.hit);
+  }
+
+  /**
+   * The question a job parked itself on (issue #431): the requester's next
+   * reply in the thread is its answer. Read from the stage the router logged
+   * before pausing, like the other pause causes above.
+   */
+  pausedRouteQuestion(jobId: string): PendingRouteQuestion | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT data_json
+         FROM job_logs
+         WHERE job_id = ? AND stage = '${ROUTE_CLARIFY_STAGE}'
+         ORDER BY id DESC
+         LIMIT 1`,
+      )
+      .get(jobId) as { data_json?: string | null } | undefined;
+    if (!row?.data_json) return undefined;
+    try {
+      return parsePendingRouteQuestion(JSON.parse(row.data_json));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Every job still parked on a question, for the sweeper that expires them. */
+  pausedRouteQuestions(): Array<{ id: string; pending: PendingRouteQuestion }> {
+    const rows = this.db
+      .prepare(
+        `SELECT j.id AS id, l.data_json AS data_json
+         FROM jobs j
+         JOIN job_logs l ON l.job_id = j.id AND l.stage = '${ROUTE_CLARIFY_STAGE}'
+         WHERE j.status = 'PAUSED'`,
+      )
+      .all() as Array<{ id: string; data_json?: string | null }>;
+    const parked: Array<{ id: string; pending: PendingRouteQuestion }> = [];
+    for (const row of rows) {
+      try {
+        const pending = parsePendingRouteQuestion(JSON.parse(row.data_json ?? 'null'));
+        if (pending) parked.push({ id: row.id, pending });
+      } catch {
+        // an unreadable row is not a pending question
+      }
+    }
+    return parked;
   }
 
   /**

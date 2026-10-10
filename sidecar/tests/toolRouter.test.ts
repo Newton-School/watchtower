@@ -83,6 +83,19 @@ describe('buildRouterPrompt', () => {
     expect(prompt).toContain("Pages on newtonschool.co are the team's own product");
   });
 
+  it('tells the model when the message replies to its own question, and that it may then drop it', () => {
+    expect(prompt).not.toContain('You asked the requester a question');
+    const answering = buildRouterPrompt({
+      ...facts,
+      message: 'the login redirect',
+      answering: { question: 'What should I check?', askedText: 'check now' },
+    });
+    expect(answering).toContain('Their earlier message: "check now"');
+    expect(answering).toContain('Your question: "What should I check?"');
+    expect(answering).toContain('choose stay_silent: here that is allowed');
+    expect(answering.endsWith('Message: "the login redirect"')).toBe(true);
+  });
+
   it('includes thread context and the requester summary only when there is one', () => {
     expect(prompt).not.toContain('Thread so far:');
     const withContext = buildRouterPrompt({
@@ -231,6 +244,12 @@ describe('buildRouterFacts', () => {
       addressing: 'owner_mention',
       hints: [],
     });
+  });
+
+  it('carries the question a reply answers, and only then (issue #431)', () => {
+    const clarification = { question: 'What should I check?', askedText: 'check now' };
+    expect(buildRouterFacts(task({ clarification }), 'the login redirect').answering).toEqual(clarification);
+    expect(buildRouterFacts(task(), 'm')).not.toHaveProperty('answering');
   });
 });
 

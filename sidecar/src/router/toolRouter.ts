@@ -41,6 +41,8 @@ export interface RouterFacts {
   /** Keyword matches from the legacy gates, as hints. Never decisions. */
   hints: string[];
   userDossierSummary?: string;
+  /** Set when this message replies to a question miniOG asked about `askedText`. */
+  answering?: { question: string; askedText: string };
 }
 
 export type RouterOutcome =
@@ -110,6 +112,15 @@ export function buildRouterPrompt(facts: RouterFacts): string {
   }
   if (facts.threadContext) {
     lines.push('', 'Thread so far:', facts.threadContext);
+  }
+  if (facts.answering) {
+    lines.push(
+      '',
+      'You asked the requester a question about an earlier message, and the message below is their reply.',
+      `Their earlier message: "${facts.answering.askedText}"`,
+      `Your question: "${facts.answering.question}"`,
+      'Route what the two messages ask for together. If the reply still gives nothing to act on, or tells you to drop it, choose stay_silent: here that is allowed.',
+    );
   }
   lines.push('', `Message: "${facts.message}"`);
   return lines.join('\n');

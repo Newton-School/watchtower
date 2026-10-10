@@ -166,3 +166,43 @@ describe('decidePausedResume', () => {
     });
   });
 });
+
+describe('decidePausedResume for a parked question (issue #431)', () => {
+  const paused = { id: 'job-q', workflow: 'IMPLEMENTATION' as const };
+  const routeQuestion = {
+    question: 'What should I check?',
+    requesterId: 'UREQ',
+    askedAtMs: 1_000_000,
+    askedText: 'check now',
+  };
+  const decide = (senderId: string | undefined, nowMs: number, eventText = 'the login redirect') =>
+    decidePausedResume({ pausedJob: paused, pauseSignal: 'route_clarify', eventText, routeQuestion, senderId, nowMs });
+
+  it("resumes on the requester's next reply, whatever it says and with no mention", () => {
+    expect(decide('UREQ', 1_060_000)).toEqual({ resume: true, reason: 'route_clarify_answer', paused });
+    expect(decide('UREQ', 1_060_000, 'never mind').resume).toBe(true);
+  });
+
+  it("does not resume on someone else's reply", () => {
+    expect(decide('UOTHER', 1_060_000)).toEqual({ resume: false, reason: 'route_clarify_not_the_answer' });
+    expect(decide(undefined, 1_060_000).resume).toBe(false);
+  });
+
+  it('does not resume after 30 minutes', () => {
+    expect(decide('UREQ', 1_000_000 + 30 * 60_000 + 1).resume).toBe(false);
+  });
+
+  it('does not resume without the question on record', () => {
+    const decision = decidePausedResume({
+      pausedJob: paused,
+      pauseSignal: 'route_clarify',
+      eventText: 'x',
+      senderId: 'UREQ',
+    });
+    expect(decision.resume).toBe(false);
+  });
+
+  it('never forces an intent: the router reads the reply with the question', () => {
+    expect(decide('UREQ', 1_060_000).forceIntent).toBeUndefined();
+  });
+});
