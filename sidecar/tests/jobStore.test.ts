@@ -261,6 +261,77 @@ describe('thread job lookups', () => {
   });
 });
 
+describe('listRunningJobsWithLastStage (issue #436)', () => {
+  function makeJob(store: JobStore, id: string, threadTs: string, requestUserId?: string): void {
+    store.createJob({
+      id,
+      eventId: `e-${id}`,
+      dedupeKey: `C1:${threadTs}:e-${id}:IMPLEMENTATION`,
+      workflow: 'IMPLEMENTATION',
+      channelId: 'C1',
+      threadTs,
+      payload: requestUserId ? { requestUserId } : {},
+    });
+  }
+
+  it('returns each RUNNING job with the stage of its newest log entry and who asked for it', () => {
+    const store = new JobStore(tempDbPath());
+    makeJob(store, 'job-waiting', 'T-wait', 'UREQ');
+    store.appendJobLog({ jobId: 'job-waiting', stage: 'pipeline.agent.planner.start', level: 'INFO', message: 'plan' });
+    store.appendJobLog({
+      jobId: 'job-waiting',
+      stage: 'implementation.approval.waiting',
+      level: 'INFO',
+      message: 'wait',
+    });
+    makeJob(store, 'job-coding', 'T-code');
+    store.appendJobLog({ jobId: 'job-coding', stage: 'pipeline.agent.coder.start', level: 'INFO', message: 'code' });
+
+    const jobs = store.listRunningJobsWithLastStage().sort((a, b) => a.id.localeCompare(b.id));
+
+    expect(jobs).toEqual([
+      {
+        id: 'job-coding',
+        channelId: 'C1',
+        threadTs: 'T-code',
+        requestedBy: undefined,
+        lastStage: 'pipeline.agent.coder.start',
+      },
+      {
+        id: 'job-waiting',
+        channelId: 'C1',
+        threadTs: 'T-wait',
+        requestedBy: 'UREQ',
+        lastStage: 'implementation.approval.waiting',
+      },
+    ]);
+    store.close();
+  });
+
+  it('leaves out jobs that are not RUNNING, and copes with a job that has no logs', () => {
+    const store = new JobStore(tempDbPath());
+    makeJob(store, 'job-done', 'T-done');
+    store.markJob('job-done', 'SUCCESS');
+    makeJob(store, 'job-paused', 'T-paused');
+    store.markJob('job-paused', 'PAUSED');
+    makeJob(store, 'job-new', 'T-new');
+
+    expect(store.listRunningJobsWithLastStage()).toEqual([
+      { id: 'job-new', channelId: 'C1', threadTs: 'T-new', requestedBy: undefined, lastStage: undefined },
+    ]);
+    store.close();
+  });
+
+  it('is read before the orphan cleanup, which then fails those jobs', () => {
+    const store = new JobStore(tempDbPath());
+    makeJob(store, 'job-orphan', 'T-orphan');
+    expect(store.listRunningJobsWithLastStage()).toHaveLength(1);
+    expect(store.cleanupOrphanedRunningJobs()).toBe(1);
+    expect(store.listRunningJobsWithLastStage()).toEqual([]);
+    store.close();
+  });
+});
+
 describe('pause / resume lifecycle', () => {
   function makePausedJob(store: JobStore, id: string, threadTs: string): void {
     store.createJob({

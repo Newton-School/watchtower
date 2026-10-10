@@ -9,7 +9,7 @@ import type {
   WorkflowResult,
   WorkflowStepLogger,
 } from '../types/contracts.js';
-import { getAdminUserIds } from '../access/control.js';
+import { formatAdminMention, getAdminUserIds } from '../access/control.js';
 import { runCodex, getActiveBackendId, selectBackendForUser } from '../codex/runCodex.js';
 import { assembleRecall } from '../codex/recallAssembler.js';
 import { highReasoningProfile } from '../codex/modelProfiles.js';
@@ -187,6 +187,8 @@ Return strict JSON with:
 }
 
 const MAX_FEEDBACK_ITERATIONS = 5;
+/** A plan waiting for approval re-pings the approvers after 15 minutes and again after 2 hours (issue #436). */
+export const PLAN_APPROVAL_REMINDERS_MS = [15 * 60 * 1000, 2 * 60 * 60 * 1000];
 
 /** Deploy semantics in a no-code ask. Wider than the deploy gate on purpose: here a match only withholds an action. */
 export const QUICK_ACTION_DEPLOY_RE =
@@ -452,6 +454,7 @@ async function runApprovalLoop(input: {
       message: `Waiting for admin approval of plan (iteration ${iteration + 1}).`,
     });
 
+    const approverMention = formatAdminMention(config);
     let approval = await waitForApproval({
       slack,
       channelId: task.event.channelId,
@@ -462,6 +465,11 @@ async function runApprovalLoop(input: {
       logStep: logStep ?? (() => {}),
       botUserId: config.botUserId,
       signal,
+      reminders: {
+        afterMs: PLAN_APPROVAL_REMINDERS_MS,
+        text: `${approverMention} <@${task.event.userId}>'s plan above still needs a yes or no.`,
+      },
+      approverMention,
     });
 
     if (approval.outcome === 'cancelled') {
