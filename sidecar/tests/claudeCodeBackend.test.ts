@@ -1,8 +1,20 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { claudeCodeBackend, NO_TOOLS_ARGS, stripPlanHarnessMeta } from '../src/backends/claudeCodeBackend.js';
+import { __personalSkills } from '../src/backends/personalSkills.js';
+
+// buildArgs denies the host user's personal skills (personalSkills.test.ts).
+// Point it at an empty home here so these tests see the same arguments on
+// every machine.
+const realPersonalHome = __personalSkills.home;
+beforeAll(() => {
+  __personalSkills.home = () => '/nonexistent-watchtower-test-home';
+});
+afterAll(() => {
+  __personalSkills.home = realPersonalHome;
+});
 
 describe('claudeCodeBackend.parseOutput', () => {
   it('unwraps Claude Code wrapper and extracts inner structured JSON', () => {
