@@ -4,6 +4,7 @@ import path, { delimiter as pathDelimiter } from 'node:path';
 import type { AgentBackend, AgentRunRequest, ParseOutputOptions, ParsedBackendOutput } from './types.js';
 import type { TokenUsage } from '../types/contracts.js';
 import { buildCodexPath, parseStructuredOutput } from './codexBackend.js';
+import { personalSkillDenyRules } from './personalSkills.js';
 
 function asFiniteNumber(value: unknown): number | undefined {
   if (typeof value !== 'number') return undefined;
@@ -247,6 +248,15 @@ export const claudeCodeBackend: AgentBackend = {
       args.push('--permission-mode', 'plan');
     } else {
       args.push('--dangerously-skip-permissions');
+    }
+    // An agent that does work keeps its tools, but not the host user's
+    // personal skills and commands (issue #443). `--disallowedTools` is
+    // variadic, so it stays ahead of the flags below.
+    if (!request.noTools) {
+      const denied = personalSkillDenyRules(request.cwd);
+      if (denied.length > 0) {
+        args.push('--disallowedTools', ...denied);
+      }
     }
     if (request.sessionId) {
       args.push('--session-id', request.sessionId);
