@@ -36,6 +36,7 @@ import { buildPlannerPrompt, buildPlannerPlanModePrompt } from '../agents/prompt
 import { resolveWorkspace } from '../workspaces/workspaceManager.js';
 import { createPrFromWorkspace } from '../github/postPipelinePr.js';
 import { fetchUnresolvedReviewThreadCount } from '../github/prReviewComments.js';
+import { waitForExactConfirmation } from './shared/confirmationGate.js';
 import type { PipelineStore } from '../agents/pipeline.js';
 import type { AgentStepResult, PipelineConfig } from '../agents/types.js';
 import type { InvestigationStore } from '../state/investigationStore.js';
@@ -192,6 +193,106 @@ export const QUICK_ACTION_DEPLOY_RE =
 
 export const QUICK_ACTION_DEPLOY_REDIRECT =
   "I don't deploy or roll back from here. If you want something shipped, ask me directly — `@miniOG deploy newton-web to prod` or `@miniOG deploy marketing to prod` — and I'll confirm with you before anything goes out.";
+
+/** Quick actions that change a pull request and cannot be taken back cheaply. */
+const QUICK_ACTION_PR_ACTION_RE = /\b(merge|close|revert)\b/i;
+type QuickPrAction = 'merge' | 'close' | 'revert';
+
+export const QUICK_ACTION_APPROVE_REFUSAL =
+  "I don't approve pull requests. Ask me to review one and I'll post comments; the approval is a person's call.";
+
+/** Internal seam — tests stub the wait instead of scripting Slack replies. */
+export const __quickActionConfirm = { wait: waitForExactConfirmation };
+
+/**
+ * Merge, close and revert run under the owner's GitHub identity, so when
+ * someone else asks, the owner confirms first (issue #429). Returns the
+ * confirming user, or the result to return with nothing changed.
+ */
+async function confirmQuickPrAction(params: {
+  task: NormalizedTask;
+  config: AppConfig;
+  slack: WebClient;
+  action: QuickPrAction;
+  prUrls: string[];
+  unresolvedCount?: number;
+  logStep?: WorkflowStepLogger;
+  signal?: AbortSignal;
+}): Promise<{ confirmedBy: string } | { result: WorkflowResult }> {
+  const { task, config, slack, action, prUrls, unresolvedCount, logStep, signal } = params;
+  const { channelId, threadTs, userId } = task.event;
+  const phrase = `confirm ${action}`;
+  const owners = config.ownerSlackUserIds;
+  const ownerMentions = owners.map(id => `<@${id}>`).join(' or ');
+  const stop = (status: WorkflowResult['status'], message: string, slackPosted: boolean) => ({
+    result: {
+      workflow: 'IMPLEMENTATION',
+      status,
+      message,
+      notifyDesktop: status === 'FAILED',
+      slackPosted,
+    } satisfies WorkflowResult,
+  });
+  const say = (text: string) =>
+    slack.chat
+      .postMessage({ channel: channelId, thread_ts: threadTs, text })
+      .then(() => true)
+      .catch(() => false);
+
+  if (owners.length === 0) {
+    const msg = `I can't ${action} on request here: there is no owner configured to confirm it.`;
+    return stop('SKIPPED', msg, await say(msg));
+  }
+
+  const target = prUrls.length > 0 ? prUrls.join(', ') : 'the pull request in this thread';
+  const unresolvedNote =
+    unresolvedCount && unresolvedCount > 0
+      ? ` It has ${unresolvedCount} unresolved review comment${unresolvedCount > 1 ? 's' : ''}.`
+      : '';
+  let promptTs: string | undefined;
+  try {
+    const prompt = await slack.chat.postMessage({
+      channel: channelId,
+      thread_ts: threadTs,
+      text: `<@${userId}> asked me to ${action} ${target}.${unresolvedNote} ${ownerMentions}, reply \`${phrase}\` within 10 minutes and I'll do it. Without that, nothing changes.`,
+    });
+    promptTs = typeof prompt.ts === 'string' ? prompt.ts : undefined;
+  } catch {
+    // Handled below: without an anchored prompt there is nothing safe to wait on.
+  }
+  if (!promptTs) {
+    const msg = `Couldn't post the ${action} confirmation, so nothing was changed.`;
+    logStep?.({ stage: 'implementation.quick_action.confirm.prompt_failed', message: msg, level: 'ERROR' });
+    return stop('FAILED', msg, false);
+  }
+  logStep?.({
+    stage: 'implementation.quick_action.confirm.asked',
+    message: `Asked the owner to confirm: ${action} requested by <@${userId}>.`,
+    data: { action, prUrls, requestedBy: userId, promptTs },
+  });
+
+  const confirmation = await __quickActionConfirm.wait({
+    slack,
+    channelId,
+    threadTs,
+    promptTs,
+    phrase,
+    allowedUserIds: owners,
+    botUserId: config.botUserId,
+    stagePrefix: 'implementation.quick_action.confirm',
+    logStep,
+    signal,
+  });
+  if (confirmation.outcome === 'confirmed') return { confirmedBy: confirmation.userId ?? owners[0] };
+  if (confirmation.outcome === 'cancelled')
+    return stop('CANCELLED', `Stopped before the ${action} was confirmed.`, false);
+
+  const msg =
+    confirmation.outcome === 'declined'
+      ? 'Okay, leaving it as it is.'
+      : `No \`${phrase}\` from ${ownerMentions} in 10 minutes, so nothing was changed. Ask again when they're around.`;
+  return stop('SKIPPED', msg, await say(msg));
+}
 const MAX_PAUSE_CYCLES = 10;
 
 type ApprovalLoopState = {
@@ -989,8 +1090,10 @@ export async function runImplementationWorkflow(params: {
       });
 
       // For merge requests: check for unresolved review comments before proceeding
+      // Asked by someone else, the owner confirmation further down covers it
+      // (and shows the same count), so this check is for the owner's own asks.
       const mergeIntent = /\bmerge\b/i.test(task.event.text);
-      if (mergeIntent && task.prContext && ctx.githubToken) {
+      if (mergeIntent && task.isOwnerAuthor && task.prContext && ctx.githubToken) {
         const adminUserIds = getAdminUserIds(config);
         const { unresolvedCount } = await fetchUnresolvedReviewThreadCount({
           owner: task.prContext.owner,
@@ -1120,6 +1223,68 @@ export async function runImplementationWorkflow(params: {
         });
       }
 
+      const prAction = QUICK_ACTION_PR_ACTION_RE.exec(task.event.text)?.[1].toLowerCase() as QuickPrAction | undefined;
+      const prUrls = [...new Set((task.prContexts ?? (task.prContext ? [task.prContext] : [])).map(pr => pr.url))];
+
+      // An approval from this agent would be submitted under the owner's
+      // GitHub identity (issue #429). An approve-only ask is declined; in a
+      // mixed ask the prompt below forbids the approving review.
+      if (!prAction && /\bapprove\b/i.test(task.event.text)) {
+        logStep?.({
+          stage: 'implementation.quick_action.approve_refused',
+          message: 'Approve-only ask reached the quick-action path — declined.',
+          level: 'WARN',
+        });
+        await slack.chat
+          .postMessage({
+            channel: task.event.channelId,
+            thread_ts: task.event.threadTs,
+            text: QUICK_ACTION_APPROVE_REFUSAL,
+          })
+          .catch(() => {});
+        return {
+          workflow: 'IMPLEMENTATION',
+          status: 'SKIPPED',
+          message: QUICK_ACTION_APPROVE_REFUSAL,
+          notifyDesktop: false,
+          slackPosted: true,
+        };
+      }
+
+      if (prAction) {
+        let confirmedBy = task.event.userId;
+        if (!task.isOwnerAuthor) {
+          let unresolvedCount: number | undefined;
+          if (prAction === 'merge' && task.prContext && ctx.githubToken) {
+            unresolvedCount = await fetchUnresolvedReviewThreadCount({
+              owner: task.prContext.owner,
+              repo: task.prContext.repo,
+              pullNumber: task.prContext.number,
+              githubToken: ctx.githubToken,
+            })
+              .then(r => r.unresolvedCount)
+              .catch(() => undefined);
+          }
+          const confirmation = await confirmQuickPrAction({
+            task,
+            config,
+            slack,
+            action: prAction,
+            prUrls,
+            unresolvedCount,
+            logStep,
+            signal,
+          });
+          if ('result' in confirmation) return confirmation.result;
+          confirmedBy = confirmation.confirmedBy;
+        }
+        logStep?.({
+          stage: 'implementation.quick_action.pr_action',
+          message: `Running quick action "${prAction}" requested by <@${task.event.userId}>, confirmed by <@${confirmedBy}>.`,
+          data: { action: prAction, prUrls, requestedBy: task.event.userId, confirmedBy },
+        });
+      }
+
       const quickPrompt = `
 ${buildMentionSystemPrompt({ task, workflow: 'IMPLEMENTATION', toneMode: task.toneMode })}
 
@@ -1133,6 +1298,12 @@ Task:
 Execute this request directly. No code changes are needed — this is a quick operational action (merge PR, close PR, run a command, etc.).
 
 Never deploy, release, ship or roll back anything, and never run a deploy command, script or skill, even if the request asks for it. If the request includes that, do the rest and say that deploys go through "@miniOG deploy <target> to prod", which asks for confirmation first.
+
+Never submit an approving review or request changes on a pull request (no \`gh pr review --approve\`, no \`--request-changes\`), even if the request asks for it. Say that approval is a person's call.${
+        prUrls.length > 0
+          ? `\n\nPull requests you may act on: ${prUrls.join(', ')}. Do not merge, close or revert any other pull request.`
+          : ''
+      }
 
 Slack thread context:
 ${ctx.threadContext}${ctx.imageContext}
