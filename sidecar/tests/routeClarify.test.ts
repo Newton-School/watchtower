@@ -7,6 +7,7 @@ import {
   DEFAULT_CLARIFY_QUESTION,
   DEPLOY_NEEDS_ONE_MESSAGE_REPLY,
   LOW_CONFIDENCE_CHANGE_QUESTION,
+  OWNER_MENTION_CHANGE_QUESTION,
   ROUTE_CLARIFY_STAGE,
   ROUTE_CLARIFY_TTL_MS,
   askRequester,
@@ -104,11 +105,27 @@ describe('decideClarify', () => {
     });
   });
 
-  it('never answers an owner mention with a question', () => {
-    for (const tool of ['ask_user', 'stay_silent', 'change_code'] as const) {
+  it('does not answer an owner mention with a question when the router cannot tell or wants silence', () => {
+    for (const tool of ['ask_user', 'stay_silent', 'chat'] as const) {
       expect(decide({ tool, confidence: 0.3, heldByFloor: true, addressing: 'owner_mention' })).toEqual({
         kind: 'run',
       });
+    }
+  });
+
+  it('asks before starting a change for someone who tagged the owner, however sure the router is (issue #430)', () => {
+    for (const confidence of [0.6, 0.95]) {
+      expect(decide({ tool: 'change_code', confidence, addressing: 'owner_mention' })).toEqual({
+        kind: 'ask',
+        question: OWNER_MENTION_CHANGE_QUESTION,
+        reason: 'owner_mention_change',
+      });
+    }
+  });
+
+  it('runs what else an owner mention asks for without a question', () => {
+    for (const tool of ['review_pr', 'investigate', 'answer'] as const) {
+      expect(decide({ tool, addressing: 'owner_mention' })).toEqual({ kind: 'run' });
     }
   });
 });

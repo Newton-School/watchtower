@@ -331,7 +331,14 @@ export async function routeTask(params: {
           },
         });
         // Nothing runs, so the access check below is made at the lowest tier.
-        resolvedIntent = clarify.kind === 'silent' ? 'NONE' : 'INFORMATIONAL';
+        // The exception offers to start the change pipeline, so it is checked
+        // at that tier: no point asking someone who could not say yes.
+        resolvedIntent =
+          clarify.kind === 'silent'
+            ? 'NONE'
+            : clarify.kind === 'ask' && clarify.reason === 'owner_mention_change'
+              ? classification.intent
+              : 'INFORMATIONAL';
       } else if (holdOverride) {
         logStep?.({
           stage: 'router.classify.low_confidence_hold',

@@ -705,3 +705,41 @@ describe('leadingDeployTarget (issue #428)', () => {
     expect(leadingDeployTarget('<@UBOT1> review https://github.com/Newton-School/newton-web/pull/1')).toBeNull();
   });
 });
+
+describe('review asks that tag the owner, while the tool-router decides (issue #430)', () => {
+  const PR = 'https://github.com/Newton-School/newton-web/pull/9210';
+  const link = `<${PR}|github.com/Newton-School/newton-web/pull/9210>`;
+  const CORE_DEV = '<!subteam^S02HXP05ZNJ>';
+  const seed = (text: string, routerDecides = true, threadTexts: string[] = []) =>
+    normalizeTask({ ...baseEvent, userId: 'U123', text }, config, threadTexts, { routerDecides }).intent;
+
+  it('seeds a review for the sentences that were reviewed, sent to the change pipeline or ignored at random', () => {
+    expect(seed(`${CORE_DEV} <@UOWNER1> Please review, approve, merge. ${link}`)).toBe('PR_REVIEW');
+    expect(seed(`${CORE_DEV} <@UOWNER1> Please review and merge ${link}`)).toBe('PR_REVIEW');
+    expect(seed(`${CORE_DEV} <@UOWNER1> please review ${link}`)).toBe('PR_REVIEW');
+    expect(seed(`<@UOWNER1> could you please review and merge this PR ? ${link}`)).toBe('PR_REVIEW');
+  });
+
+  it('seeds a review for a bare PR post: nothing but tags and links', () => {
+    expect(seed(`${CORE_DEV} <@UOWNER1> ${link}`)).toBe('PR_REVIEW');
+  });
+
+  it('leaves everything else that tags the owner to the router', () => {
+    // A link with its ticket title, a question about a PR, a merge ask with no review in it.
+    expect(seed(`${CORE_DEV} <@UOWNER1> NS-14362: Map playlists to company ${link}`)).toBe('UNKNOWN');
+    expect(seed(`<@UOWNER1> is ${link} live yet?`)).toBe('UNKNOWN');
+    expect(seed(`<@UOWNER1> please merge on priority ${link}`)).toBe('UNKNOWN');
+    // The link has to be in the message itself: no thread tier for a message written to a person.
+    expect(seed('<@UOWNER1> please review', true, [PR])).toBe('UNKNOWN');
+  });
+
+  it('counts "review and merge" as a review ask for a direct mention too', () => {
+    expect(seed(`<@UBOT1> review and merge ${link}`)).toBe('PR_REVIEW');
+    expect(seed(`<@UBOT1> please review & approve <${PR}>`)).toBe('PR_REVIEW');
+  });
+
+  it('changes nothing unless the router decides', () => {
+    expect(seed(`${CORE_DEV} <@UOWNER1> please review ${link}`, false)).toBe('UNKNOWN');
+    expect(seed(`<@UBOT1> review and merge ${link}`, false)).toBe('IMPLEMENTATION');
+  });
+});
