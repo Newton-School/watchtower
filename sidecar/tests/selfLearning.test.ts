@@ -117,3 +117,33 @@ describe('selfLearning', () => {
     store.close();
   });
 });
+
+describe('selfLearning with the tool-router on (issue #456)', () => {
+  it('neither applies nor records a phrase correction: the router decides', () => {
+    const store = new JobStore(tempDbPath());
+    store.createJob({
+      id: 'job-prev',
+      eventId: 'event-prev',
+      dedupeKey: 'dedupe-prev',
+      workflow: 'UNKNOWN',
+      channelId: 'C01H25RNLJH',
+      threadTs: '111.22',
+      payload: {},
+    });
+    store.markJob('job-prev', 'SKIPPED');
+    const task = () => buildTask({ text: '<@UBOT1> actually review this PR again', intent: 'UNKNOWN' });
+
+    store.setState('tool_router_mode', 'on');
+    const skipped = applyLearning({ task: task(), config, store });
+    expect(skipped).toMatchObject({ intent: 'UNKNOWN', correctionApplied: false });
+
+    // Nothing was learned while it was on: turning it off starts from a clean slate.
+    store.setState('tool_router_mode', 'legacy');
+    expect(
+      store.findIntentCorrection({ channelId: 'C01H25RNLJH', userId: 'U123', phraseKey: 'actually review this again' }),
+    ).toBeUndefined();
+    expect(applyLearning({ task: task(), config, store }).intent).toBe('PR_REVIEW');
+
+    store.close();
+  });
+});

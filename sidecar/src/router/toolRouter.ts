@@ -68,15 +68,19 @@ const VALID_TOOLS = new Set<string>(PROMPT_TOOLS.map(tool => tool.id));
 
 const RULES = `Rules:
 - Decide from what this message asks for. Thread context explains it; it is not the request.
-- A link is not a request. A pull-request link with a question about it ("is this merged?", "what does this change?") is answer. review_pr needs the person to ask for a review, or to post the link with nothing else.
-- change_code needs both an instruction to build, change, fix, add or remove something and something to act on: an error, a file, a function, a failing request, or a specific change.
+- A link is not a request. A pull-request link with a question about it ("is this merged?", "what does this change?") is answer.
+- review_pr: the person asks for a review of a pull request, or posts the link with nothing else or with only a description of the change. "Review and merge" and "review, approve, merge" are review_pr: you review, a person merges.
+- change_code needs both an instruction to build, change, fix, add or remove something and something to act on: an error, a file, a function, a failing request, a page, or a specific change ("change X to Y").
 - A problem report with no instruction and nothing to act on, or a vague "fix it", is investigate. Between change_code and investigate, prefer investigate.
-- A question about how something works, where something is, or what happened is answer. A question about a dashboard or query (a Metabase link) is answer.
-- A request to merge, close or create a pull request is change_code.
+- A question is answer: how something works, where something is, what happened, how to do something in the product, or about miniOG itself. Pages on newtonschool.co are the team's own product: a question about one is answer, a change to one is change_code. Asking for the answer as a document or PDF does not change that.
+- Metabase cannot be edited from here. A question about a dashboard or query (a Metabase link) is answer; a request to fix or change one is investigate.
+- A request to merge, close or create a pull request, with no review asked for, is change_code when it is addressed to you directly.
 - deploy only when this message itself tells you to deploy to production now. Words like "deploy", "release" or "ship" in a description, a plan, a question or a link are not that.
 - qa_webapp only when the person asks you to test or QA a running app or a pull request in a browser.
+- unsupported is only for an action in a system these tools do not reach (file a ticket, schedule a meeting, send an email). A question is never unsupported.
 - A message with nothing to act on ("no", "check now", "cc", a bare "yes" with no pending question) is ask_user, not a guess.
-- stay_silent is only for a message that tags the owner while people talk to each other. A message addressed to you directly is never stay_silent.`;
+- When a message is addressed to the owner instead of you, you act for the owner: a request in it that one of these tools can do is yours to route. A pull request posted for review is review_pr, and so is a request to merge one (the owner decides the merge; your review is what helps).
+- stay_silent is only for a message addressed to the owner that asks for nothing these tools can do: an FYI, a status update, scheduling, thanks, or a decision only a person can make. A message addressed to you directly is never stay_silent.`;
 
 export function buildRouterPrompt(facts: RouterFacts): string {
   const tools = PROMPT_TOOLS.map(tool => `- ${tool.id}: ${tool.description}`).join('\n');
@@ -97,7 +101,7 @@ export function buildRouterPrompt(facts: RouterFacts): string {
   }
   lines.push(
     '',
-    `Addressed: ${facts.addressing === 'direct' ? 'directly to miniOG' : 'to the owner, not to miniOG (people may be talking to each other)'}`,
+    `Addressed: ${facts.addressing === 'direct' ? 'directly to miniOG' : 'to the owner or the core-dev group, not to miniOG by name'}`,
     `Pull-request link in this message: ${facts.prUrlInTrigger ? 'yes' : 'no'}`,
     `Pull-request link earlier in the thread: ${facts.prUrlInThread ? 'yes' : 'no'}`,
   );
@@ -204,8 +208,8 @@ export const TOOL_ROUTER_MODE_KEY = 'tool_router_mode';
 
 /**
  * How the router takes part. `shadow` (the default) runs it beside the legacy
- * path and logs what it would have done; `legacy` turns it off. `on` is
- * reserved for the change that lets it decide, and behaves as `shadow` until then.
+ * path and logs what it would have done; `legacy` turns it off; `on` lets it
+ * decide where the intent classifier did.
  */
 export function readToolRouterMode(
   store: { getState?: (key: string) => string | undefined } | undefined,
