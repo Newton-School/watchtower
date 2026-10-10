@@ -6,6 +6,7 @@ import {
   getActiveJobIds,
   takeCancelReason,
   activeJobIdForThread,
+  activeJobForThread,
 } from '../src/state/activeJobs.js';
 
 describe('activeJobs', () => {
@@ -128,5 +129,31 @@ describe('activeJobIdForThread — the same-thread lock', () => {
     registerActiveJob('job-no-thread', new AbortController());
     expect(activeJobIdForThread('C1', '1791000000.000100')).toBeUndefined();
     unregisterActiveJob('job-no-thread');
+  });
+});
+
+describe('activeJobForThread — who may stop the job (issue #435)', () => {
+  it('returns the job and who asked for it', () => {
+    registerActiveJob('job-req', new AbortController(), { channelId: 'C1', threadTs: '5.5', requestedBy: 'UREQ' });
+    expect(activeJobForThread('C1', '5.5')).toEqual({ jobId: 'job-req', requestedBy: 'UREQ' });
+    unregisterActiveJob('job-req');
+  });
+
+  it('still names the job while it is stopping, so a second stop is recognised', () => {
+    registerActiveJob('job-stopping', new AbortController(), { channelId: 'C1', threadTs: '6.6', requestedBy: 'UREQ' });
+    expect(cancelJob('job-stopping', { source: 'slack_stop', message: 'Stopped from Slack by <@UREQ>.' })).toBe(true);
+
+    expect(activeJobForThread('C1', '6.6')?.jobId).toBe('job-stopping');
+    // The controller is gone, which is how the handler knows not to reply twice.
+    expect(cancelJob('job-stopping', { source: 'slack_stop', message: 'again' })).toBe(false);
+    expect(takeCancelReason('job-stopping')).toEqual({
+      source: 'slack_stop',
+      message: 'Stopped from Slack by <@UREQ>.',
+    });
+    unregisterActiveJob('job-stopping');
+  });
+
+  it('is undefined for a thread with no job', () => {
+    expect(activeJobForThread('C1', '7.7')).toBeUndefined();
   });
 });

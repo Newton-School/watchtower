@@ -23,7 +23,7 @@ import { notifyDesktop } from './notify/desktopNotifier.js';
 import { assertMacOS } from './platform.js';
 import { evaluatePolicy, loadPolicies } from './policies/evaluator.js';
 import { agentCallContext } from './state/runContext.js';
-import { normalizeTask } from './router/intentParser.js';
+import { detectMention, normalizeTask } from './router/intentParser.js';
 import { decidePausedResume } from './router/pausedResume.js';
 import { classifyProduct } from './router/productClassifier.js';
 import { routeTask } from './router/taskRouter.js';
@@ -51,7 +51,9 @@ import {
   cancelJob,
   takeCancelReason,
   activeJobIdForThread,
+  activeJobForThread,
 } from './state/activeJobs.js';
+import { decideStop } from './router/stopIntent.js';
 import { JobStore } from './state/jobStore.js';
 import { settleAbortedResult } from './workflows/shared/cancelState.js';
 import type { AccessGroupKey, SlackEventEnvelope, SlackReactionEvent, WorkflowStepLog } from './types/contracts.js';
@@ -733,9 +735,64 @@ async function enqueueSlackEvent(
   client: WebClient,
   source: 'socket' | 'catchup' | 'launchpad',
 ): Promise<void> {
+  // A stop must not wait in the queue behind the job it is meant to stop.
+  if (source !== 'launchpad' && (await tryHandleStopControl(event, client))) {
+    return;
+  }
   queue.push({ event, client });
   logger.info({ queueDepth: queue.length, eventId: event.eventId, source }, 'event queued for processing');
   await processNext();
+}
+
+/** Stop messages already acted on. Slack delivers one message as both `app_mention` and `message`. */
+const handledStopMessages = new Set<string>();
+
+/**
+ * "@miniOG stop" in a thread with a running job cancels that job at once
+ * (issue #435). It used to be dropped by the same-thread lock, or queued
+ * behind the job and answered "nothing's running" once it had finished.
+ * Returns true when the event was a stop and must not be queued.
+ */
+async function tryHandleStopControl(event: SlackEventEnvelope, client: WebClient): Promise<boolean> {
+  if (event.messageSubtype) return false;
+  const messageKey = `${event.channelId}:${event.eventTs}`;
+  if (handledStopMessages.has(messageKey)) return true;
+
+  const active = activeJobForThread(event.channelId, event.threadTs);
+  const decision = decideStop({
+    isBotMention: detectMention(event.text, config, event.channelType).type === 'bot',
+    text: event.text,
+    senderId: event.userId,
+    activeJob: active,
+    adminUserIds: getAdminUserIds(config),
+    ownerUserIds: config.ownerSlackUserIds,
+  });
+  if (!decision.stop || !active) return false;
+
+  handledStopMessages.add(messageKey);
+  if (handledStopMessages.size > 500) {
+    handledStopMessages.delete(handledStopMessages.values().next().value as string);
+  }
+  store.recordEvent(event.eventId, event.channelId, event.threadTs);
+
+  const reason = { source: 'slack_stop' as const, message: `Stopped from Slack by <@${event.userId}>.` };
+  if (!cancelJob(active.jobId, reason)) {
+    // Already stopping: a second "stop" needs no second reply.
+    return true;
+  }
+  store.markJob(active.jobId, 'CANCELLED', { errorMessage: reason.message });
+  store.appendJobLog({
+    jobId: active.jobId,
+    stage: 'job.stopped_from_slack',
+    level: 'WARN',
+    message: `Stopped from Slack by <@${event.userId}>.`,
+    data: { stoppedBy: event.userId, requestedBy: active.requestedBy ?? null, eventTs: event.eventTs },
+  });
+  logger.info({ jobId: active.jobId, stoppedBy: event.userId, eventId: event.eventId }, 'job stopped from Slack');
+  await client.chat
+    .postMessage({ channel: event.channelId, thread_ts: event.threadTs, text: 'Stopped.' })
+    .catch(() => {});
+  return true;
 }
 
 async function processNext(): Promise<void> {
@@ -1020,7 +1077,11 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
   });
 
   const abortController = new AbortController();
-  registerActiveJob(jobId, abortController, { channelId: event.channelId, threadTs: event.threadTs });
+  registerActiveJob(jobId, abortController, {
+    channelId: event.channelId,
+    threadTs: event.threadTs,
+    requestedBy: event.userId,
+  });
 
   const stepLogs: WorkflowStepLog[] = [];
 
