@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { containsMetabaseUrl, detectMention, extractPrContext, normalizeTask } from '../src/router/intentParser.js';
+import {
+  containsMetabaseUrl,
+  detectMention,
+  extractPrContext,
+  isBarePrPaste,
+  isPrReviewRequest,
+  normalizeTask,
+} from '../src/router/intentParser.js';
 import type { AppConfig, SlackEventEnvelope } from '../src/types/contracts.js';
 
 const config: AppConfig = {
@@ -525,5 +532,74 @@ describe('intentParser', () => {
       );
       expect(task.intent).toBe('IMPLEMENTATION');
     });
+  });
+});
+
+describe('the review gate while the tool-router decides (issue #447)', () => {
+  const PR = 'https://github.com/Newton-School/newton-api/pull/6436';
+  const slackPr = `<${PR}|github.com/Newton-School/newton-api/pull/6436>`;
+  const seed = (text: string, userId = 'U123') =>
+    normalizeTask({ ...baseEvent, userId, text }, config, [], { explicitReviewGate: true }).intent;
+
+  it('still fires on a review verb with the PR link', () => {
+    expect(seed(`<@UBOT1> review ${PR}`)).toBe('PR_REVIEW');
+    expect(seed(`<@UBOT1> please re-review ${slackPr}`)).toBe('PR_REVIEW');
+  });
+
+  it('still fires on a bare paste: nothing but mentions and PR links', () => {
+    expect(seed(`<@UBOT1> ${PR}`)).toBe('PR_REVIEW');
+    expect(seed(`<@UBOT1> <@U999> ${slackPr}, ${PR}/changes`)).toBe('PR_REVIEW');
+    // The footer Slack adds when a person sends through the Claude app is not words about the PR.
+    expect(seed(`<@UBOT1> ${slackPr} *Sent using* <@UCLAUDE>`)).toBe('PR_REVIEW');
+  });
+
+  it('leaves a question that merely contains a PR link to the router', () => {
+    // The incident: four questions about a merged PR got a 13-comment review.
+    expect(
+      seed(`<@UBOT1> Follow-up on the reminders. The devs implemented it in PR #6436 (${PR}). Is it deployed?`),
+    ).toBe('IMPLEMENTATION');
+    expect(seed(`<@UBOT1> is ${slackPr} live yet?`)).toBe('IMPLEMENTATION');
+    expect(seed(`<@UBOT1> what does ${PR} change`, 'UOWNER1')).toBe('OWNER_AUTOPILOT');
+  });
+
+  it('leaves a PR link with a description and no review ask to the router', () => {
+    expect(seed(`<@UBOT1> NS-14362: keep company playlists usable ${slackPr}`)).toBe('IMPLEMENTATION');
+  });
+
+  it('leaves the thread-URL tier as it was', () => {
+    const intent = normalizeTask(
+      { ...baseEvent, userId: 'U123', text: '<@UBOT1> review the frontend PR' },
+      config,
+      [PR],
+      {
+        explicitReviewGate: true,
+      },
+    ).intent;
+    expect(intent).toBe('PR_REVIEW');
+  });
+
+  it('changes nothing unless asked: without the option a question with a PR link is still a review', () => {
+    expect(normalizeTask({ ...baseEvent, userId: 'U123', text: `<@UBOT1> is ${PR} live yet?` }, config).intent).toBe(
+      'PR_REVIEW',
+    );
+    expect(isPrReviewRequest(`is ${PR} live yet?`)).toBe(true);
+    expect(isPrReviewRequest(`is ${PR} live yet?`, [], { explicitOnly: true })).toBe(false);
+  });
+});
+
+describe('isBarePrPaste', () => {
+  const PR = 'https://github.com/Newton-School/newton-web/pull/9';
+
+  it('accepts mentions, PR links in either Slack form, and punctuation between them', () => {
+    expect(isBarePrPaste(`<@UBOT1> ${PR}`)).toBe(true);
+    expect(isBarePrPaste(`<@UBOT1> <!subteam^S02|@core-dev> <${PR}|newton-web#9> • <${PR}/files>`)).toBe(true);
+    expect(isBarePrPaste(`${PR}?diff=split#discussion_r1`)).toBe(true);
+  });
+
+  it('rejects any words around the link, and a message with no PR link', () => {
+    expect(isBarePrPaste(`<@UBOT1> ${PR} thoughts?`)).toBe(false);
+    expect(isBarePrPaste(`<@UBOT1> pls ${PR}`)).toBe(false);
+    expect(isBarePrPaste('<@UBOT1>')).toBe(false);
+    expect(isBarePrPaste('<@UBOT1> https://github.com/Newton-School/newton-web/issues/9')).toBe(false);
   });
 });

@@ -193,6 +193,26 @@ function isReviewRequestVerb(normalized: string): boolean {
 const CONFLICTING_CHANGE_VERB_RE =
   /\b(create|open|raise|fix|implement|merge|close|revert|rebase|update|address|resolve)\b/;
 
+/** The footer Slack adds to a message a person sends through the Claude app. */
+const SENT_USING_FOOTER_RE = /\*sent using\*\s*<@[^>]+>\s*$/i;
+
+/**
+ * True when a message is nothing but mentions and pull-request links: a PR
+ * pasted at miniOG with no words around it, which has only one reading.
+ */
+export function isBarePrPaste(triggerText: string): boolean {
+  if (!GITHUB_PR_URL_TEST_RE.test(triggerText)) return false;
+  const rest = triggerText
+    .replace(SENT_USING_FOOTER_RE, ' ')
+    // Slack's link form, with or without a label: <https://github.com/o/r/pull/1|label>
+    .replace(/<https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+[^>]*>/g, ' ')
+    .replace(/https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+[^\s<>|]*/g, ' ')
+    // user, user-group and special mentions
+    .replace(/<[@!][^>]+>/g, ' ')
+    .replace(/[\s\p{P}\p{S}]+/gu, '');
+  return rest.length === 0;
+}
+
 /**
  * Deterministic check: is the message asking for a PR review? Runs before
  * the AI classifier (pattern: isDeployRequest) so a message that carries
@@ -207,8 +227,19 @@ const CONFLICTING_CHANGE_VERB_RE =
  * Tier 2 — review verb in the trigger, PR URL(s) elsewhere in the thread:
  * fires only when no conflicting change verb muddies the ask ("review and
  * fix X" is mixed intent — let the classifier decide).
+ *
+ * `explicitOnly` narrows Tier 1 to its two unambiguous forms: a review verb
+ * with the URL, or a message that is nothing but mentions and PR links. A PR
+ * link with anything else around it (a question about the PR, a status
+ * update) is then left to the tool-router: "no change verb" used to make it
+ * a review, and a PM's four questions about a merged PR got 13 inline review
+ * comments instead of answers (issue #447).
  */
-export function isPrReviewRequest(triggerText: string, threadTexts: string[] = []): boolean {
+export function isPrReviewRequest(
+  triggerText: string,
+  threadTexts: string[] = [],
+  options: { explicitOnly?: boolean } = {},
+): boolean {
   if (!triggerText) return false;
   const normalized = triggerText
     .replace(/<@[^>]+>/g, ' ')
@@ -219,6 +250,7 @@ export function isPrReviewRequest(triggerText: string, threadTexts: string[] = [
   const hasConflictingVerb = CONFLICTING_CHANGE_VERB_RE.test(normalized);
 
   if (GITHUB_PR_URL_TEST_RE.test(triggerText)) {
+    if (options.explicitOnly) return hasReviewVerb || isBarePrPaste(triggerText);
     return hasReviewVerb || !hasConflictingVerb;
   }
 
@@ -392,6 +424,7 @@ function inferIntent(
   config: AppConfig,
   mention: { detected: boolean; type: 'bot' | 'owner' | 'none' },
   threadTexts: string[] = [],
+  options: NormalizeTaskOptions = {},
 ): { intent: WorkflowIntent; miniogSubcommand?: MiniogSubcommand } {
   // Dossier subcommands (whoami / set-role / forget) take precedence over every other route
   // when the bot is mentioned. They are read-only or operator-self-edit commands and
@@ -440,7 +473,11 @@ function inferIntent(
     return { intent: 'WEBAPP_QA' };
   }
 
-  if (mention.detected && mention.type === 'bot' && isPrReviewRequest(event.text ?? '', threadTexts)) {
+  if (
+    mention.detected &&
+    mention.type === 'bot' &&
+    isPrReviewRequest(event.text ?? '', threadTexts, { explicitOnly: options.explicitReviewGate })
+  ) {
     return { intent: 'PR_REVIEW' };
   }
 
@@ -482,10 +519,20 @@ function inferIntent(
   return { intent: 'UNKNOWN' };
 }
 
+export interface NormalizeTaskOptions {
+  /**
+   * Set while the tool-router decides: the review gate then fires only on an
+   * explicit review ask or a bare PR paste, and every other message with a PR
+   * link reaches the router (issue #447).
+   */
+  explicitReviewGate?: boolean;
+}
+
 export function normalizeTask(
   event: SlackEventEnvelope,
   config: AppConfig,
   threadTexts: string[] = [],
+  options: NormalizeTaskOptions = {},
 ): NormalizedTask {
   const mention = detectMention(event.text, config, event.channelType);
   const isOwnerAuthor = config.ownerSlackUserIds.includes(event.userId);
@@ -493,7 +540,7 @@ export function normalizeTask(
   const prContexts = extractAllPrContexts({ triggerText: event.text, threadTexts });
   const first = prContexts[0];
   const prContext = first ? { url: first.url, owner: first.owner, repo: first.repo, number: first.number } : undefined;
-  const inferred = inferIntent(event, config, mention, threadTexts);
+  const inferred = inferIntent(event, config, mention, threadTexts, options);
 
   return {
     event,
