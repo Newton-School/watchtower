@@ -1147,6 +1147,43 @@ describe('waitForApproval', () => {
     });
   }
 
+  // Issue #264: a cancelled job used to wait here until an admin replied.
+  it('returns cancelled as soon as the job is aborted, without waiting out the poll', async () => {
+    vi.mocked(fetchThreadContext).mockResolvedValue([]);
+    const controller = new AbortController();
+    const stages: string[] = [];
+
+    const promise = runApproval({ signal: controller.signal, logStep: (entry: any) => stages.push(entry.stage) });
+    await vi.advanceTimersByTimeAsync(1000); // mid-poll: the 5s tick has not fired
+    controller.abort();
+    const result = await promise;
+
+    expect(result).toEqual({ outcome: 'cancelled', userReply: '', approverId: '', replyTs: '' });
+    expect(fetchThreadContext).not.toHaveBeenCalled();
+    expect(stages).toContain('pipeline.approval.cancelled');
+  });
+
+  it('returns cancelled without polling when the job was aborted before the wait began', async () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await runApproval({ signal: controller.signal });
+
+    expect(result.outcome).toBe('cancelled');
+    expect(fetchThreadContext).not.toHaveBeenCalled();
+  });
+
+  it('does not read an approval that arrives in the same tick as the cancel', async () => {
+    vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'yes', user: 'UCOREDEV', ts: '200.00' }]);
+    const controller = new AbortController();
+
+    const promise = runApproval({ signal: controller.signal });
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(6000);
+
+    expect((await promise).outcome).toBe('cancelled');
+  });
+
   it('rejects when message starts with "stop" followed by a reason', async () => {
     vi.mocked(fetchThreadContext).mockResolvedValue([
       { text: 'stop - as this is huge change', user: 'UCOREDEV', ts: '200.00' },

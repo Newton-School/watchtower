@@ -274,3 +274,48 @@ describe('runInvestigationWorkflow cancelled mid-run (issue #438)', () => {
     expect(posted.some(text => text.includes("couldn't complete the investigation"))).toBe(true);
   });
 });
+
+describe('runInvestigationWorkflow cancelled while asking which repo (issue #264)', () => {
+  beforeEach(() => {
+    classifyInvestigationScope.mockResolvedValue({
+      scope: 'newton-web',
+      confidence: 0.9,
+      reasoning: 'ui',
+      method: 'llm',
+    });
+  });
+
+  it("hands the job's signal to the context step that asks which repo", async () => {
+    const controller = new AbortController();
+
+    await runInvestigationWorkflow({
+      task: makeTask('checkout page is broken'),
+      config,
+      slack: slackStub() as any,
+      signal: controller.signal,
+    });
+
+    expect(prepareWorkflowContext.mock.calls[0][0].signal).toBe(controller.signal);
+  });
+
+  it('returns CANCELLED, with no "desktop queue" copy and no agent run, when cancelled during that step', async () => {
+    const controller = new AbortController();
+    // What the repo-choice wait leaves behind once the abort ends it.
+    prepareWorkflowContext.mockImplementation(async () => {
+      controller.abort();
+      return { ...baseCtx, desktopOnly: { reason: 'admin cancelled', cancelled: true } };
+    });
+    const slack = slackStub();
+
+    const result = await runInvestigationWorkflow({
+      task: makeTask('checkout page is broken'),
+      config,
+      slack: slack as any,
+      signal: controller.signal,
+    });
+
+    expect(result.status).toBe('CANCELLED');
+    expect(slack.chat.postMessage).not.toHaveBeenCalled();
+    expect(runCodex).not.toHaveBeenCalled();
+  });
+});

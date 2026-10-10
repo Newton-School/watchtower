@@ -264,6 +264,8 @@ export async function prepareWorkflowContext(params: {
   logStep?: WorkflowStepLogger;
   resolveRepo?: boolean;
   store?: DossierAware;
+  /** The job's abort signal, so a cancel ends the "which repo?" wait (issue #264). */
+  signal?: AbortSignal;
   /**
    * Bypass repo classification and pin the workspace directly (issue: scoped
    * investigation). A repo key → that repo's worktree; 'broad' → the combined
@@ -372,6 +374,7 @@ export async function prepareWorkflowContext(params: {
       logStep,
       threadMessages,
       repoAffinity,
+      signal: params.signal,
     });
     if (resolution.outcome === 'resolved') {
       repoName = resolution.name;
