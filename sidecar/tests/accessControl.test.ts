@@ -410,6 +410,52 @@ describe('access control evaluator', () => {
     });
   });
 
+  describe('owner-mention grant (#owner-mention-readonly)', () => {
+    it('grants a non-allowlisted author read-only access when the owner is mentioned', () => {
+      const config = makeConfig();
+      const decision = evaluateAccess({
+        config,
+        userId: 'UNKNOWN', // not on any access list
+        channelId: 'C-UNLISTED',
+        requiredLevel: 'viewer',
+        ownerMentioned: true,
+      });
+
+      expect(decision.allowed).toBe(true);
+      expect(decision.ownerMentionGrant).toBe(true);
+      expect(decision.ownerBypass).toBe(false);
+      expect(decision.denyReason).toBeUndefined();
+    });
+
+    it('does NOT extend the owner-mention grant to write/elevated workflows', () => {
+      const config = makeConfig();
+      const decision = evaluateAccess({
+        config,
+        userId: 'UNKNOWN',
+        channelId: 'C-UNLISTED',
+        requiredLevel: 'builder', // IMPLEMENTATION-tier
+        ownerMentioned: true,
+      });
+
+      expect(decision.allowed).toBe(false);
+      expect(decision.denyReason).toBe('NOT_ON_ACCESS_LIST');
+    });
+
+    it('still denies a read-only request when the owner is NOT mentioned (unchanged)', () => {
+      const config = makeConfig();
+      const decision = evaluateAccess({
+        config,
+        userId: 'UNKNOWN',
+        channelId: 'C-UNLISTED',
+        requiredLevel: 'viewer',
+        ownerMentioned: false,
+      });
+
+      expect(decision.allowed).toBe(false);
+      expect(decision.denyReason).toBe('NOT_ON_ACCESS_LIST');
+    });
+  });
+
   it('seeds legacy builder and admin permissions from previous config', () => {
     const accessControl = buildLegacyAccessControlConfig({
       ownerSlackUserIds: ['UOWNER1'],
