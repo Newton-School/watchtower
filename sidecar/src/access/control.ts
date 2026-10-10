@@ -1,3 +1,4 @@
+import { toolForIntent } from '../router/toolRegistry.js';
 import type {
   AccessControlConfig,
   AccessControlSettings,
@@ -256,33 +257,8 @@ export function deriveBundlesFromLegacy(accessControl: AccessControlConfig): Bun
  * should call this and then `evaluateCapability` directly (D4).
  */
 export function intentToCapability(intent: WorkflowIntent): Capability {
-  switch (intent) {
-    case 'PR_REVIEW':
-      return 'submit_pr_review';
-    case 'IMPLEMENTATION':
-    case 'OWNER_AUTOPILOT':
-      return 'start_implementation';
-    // Webapp-QA drives a live app but ships no code — builder-tier, reusing
-    // the implementation capability rather than minting a new one for the MVP.
-    case 'WEBAPP_QA':
-      return 'start_implementation';
-    case 'INVESTIGATION':
-      return 'investigate';
-    case 'DEPLOY':
-      return 'deploy_prod';
-    case 'DEV_ASSIST':
-      return 'dev_assist';
-    case 'INFORMATIONAL':
-      return 'query_codebase';
-    case 'CONVERSATIONAL':
-      return 'chat';
-    case 'MINIOG_DOSSIER':
-      return 'miniog_dossier_self';
-    case 'UNKNOWN':
-    case 'NONE':
-    default:
-      return 'query_codebase';
-  }
+  // An intent that names no tool (UNKNOWN) is read-only by default.
+  return toolForIntent(intent)?.capability ?? 'query_codebase';
 }
 
 /**
@@ -309,25 +285,7 @@ export function intentToCapability(intent: WorkflowIntent): Capability {
 export type WorkflowSideEffect = 'mutating' | 'answer' | 'chat' | 'none';
 
 export function workflowSideEffect(intent: WorkflowIntent): WorkflowSideEffect {
-  switch (intent) {
-    case 'IMPLEMENTATION':
-    case 'OWNER_AUTOPILOT':
-    case 'PR_REVIEW':
-    case 'DEPLOY':
-      return 'mutating';
-    case 'CONVERSATIONAL':
-      return 'chat';
-    case 'NONE':
-      return 'none';
-    case 'INFORMATIONAL':
-    case 'INVESTIGATION':
-    case 'DEV_ASSIST':
-    case 'MINIOG_DOSSIER':
-    case 'WEBAPP_QA': // QA reports findings against a running app; it cannot imply code shipped.
-    case 'UNKNOWN':
-    default:
-      return 'answer';
-  }
+  return toolForIntent(intent)?.sideEffect ?? 'answer';
 }
 
 /**
@@ -337,24 +295,7 @@ export function workflowSideEffect(intent: WorkflowIntent): WorkflowSideEffect {
  * compiling unchanged during the migration.
  */
 export function resolveRequiredAccessLevel(intent: WorkflowIntent): AccessLevel {
-  switch (intent) {
-    case 'PR_REVIEW':
-      return 'reviewer';
-    case 'IMPLEMENTATION':
-    case 'OWNER_AUTOPILOT':
-    case 'WEBAPP_QA':
-      return 'builder';
-    case 'DEPLOY':
-    case 'DEV_ASSIST':
-      return 'admin';
-    case 'INFORMATIONAL':
-    case 'CONVERSATIONAL':
-    case 'MINIOG_DOSSIER':
-    case 'UNKNOWN':
-    case 'NONE':
-    default:
-      return 'viewer';
-  }
+  return toolForIntent(intent)?.requiredLevel ?? 'viewer';
 }
 
 export function getAdminUserIds(config: AppConfig): string[] {
