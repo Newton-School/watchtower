@@ -1118,9 +1118,10 @@ export class JobStore {
   /**
    * Find the job (if any) currently RUNNING or PAUSED for a given Slack
    * message ts. Used by the `message_deleted` handler to cancel jobs whose
-   * source message the author just removed. Unlike `activeJobForThread`,
-   * this matches the underlying message identity (`payload_json.eventTs`)
-   * rather than the thread root — so it catches the case where the deleted
+   * source message the author just removed. Unlike the same-thread lock
+   * (`activeJobIdForThread` in state/activeJobs.ts), this matches the
+   * underlying message identity (`payload_json.eventTs`) rather than the
+   * thread root — so it catches the case where the deleted
    * message was a top-level mention that owns its own thread.
    */
   activeJobForEventTs(
@@ -1415,8 +1416,8 @@ export class JobStore {
 
   /**
    * Find a PAUSED job in this thread that should be resumed by the next
-   * @miniOG mention. Uses a wider stale window than activeJobForThread
-   * (24h vs 45min) since paused jobs can sit overnight waiting for the user.
+   * @miniOG mention. The stale window is 24h since paused jobs can sit
+   * overnight waiting for the user.
    */
   pausedJobForThread(
     channelId: string,
@@ -1560,46 +1561,6 @@ export class JobStore {
          WHERE id = ? AND status = 'PAUSED'`,
       )
       .run(new Date().toISOString(), jobId);
-  }
-
-  /**
-   * Find the currently-RUNNING job in a thread (if any) — the one that's
-   * actively holding a worker slot. PAUSED jobs are intentionally NOT
-   * considered active here: they've released their slot and a new @miniOG
-   * mention should start a fresh job (a later PR can wire up "resume the
-   * paused job in place" using the persisted resumeContext; today the
-   * resumeContext is forward-compat groundwork + the sweeper's input).
-   */
-  activeJobForThread(
-    channelId: string,
-    threadTs: string,
-    staleMinutes = 45,
-  ): { id: string; workflow: WorkflowIntent; status: JobRecord['status']; updatedAt: string } | undefined {
-    const row = this.db
-      .prepare(
-        `SELECT id, workflow, status, updated_at
-         FROM jobs
-         WHERE channel_id = ?
-           AND thread_ts = ?
-           AND status = 'RUNNING'
-           AND updated_at > datetime('now', '-' || ? || ' minutes')
-         ORDER BY updated_at DESC
-         LIMIT 1`,
-      )
-      .get(channelId, threadTs, staleMinutes) as
-      | { id?: string; workflow?: WorkflowIntent; status?: JobRecord['status']; updated_at?: string }
-      | undefined;
-
-    if (!row?.id || !row?.workflow || !row?.status || !row?.updated_at) {
-      return undefined;
-    }
-
-    return {
-      id: row.id,
-      workflow: row.workflow,
-      status: row.status,
-      updatedAt: row.updated_at,
-    };
   }
 
   hasDedupeKey(dedupeKey: string): boolean {

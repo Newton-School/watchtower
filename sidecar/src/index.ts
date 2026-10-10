@@ -45,7 +45,13 @@ import { createThreadStatus, type ThreadStatus } from './slack/threadStatus.js';
 import { resolveUserGroup } from './slack/userGroupResolver.js';
 import { isOlderVersion, readSidecarBuild } from './runtime/buildInfo.js';
 import { acquireInstanceLock, instanceLockPath, releaseInstanceLock } from './runtime/instanceLock.js';
-import { registerActiveJob, unregisterActiveJob, cancelJob, takeCancelReason } from './state/activeJobs.js';
+import {
+  registerActiveJob,
+  unregisterActiveJob,
+  cancelJob,
+  takeCancelReason,
+  activeJobIdForThread,
+} from './state/activeJobs.js';
 import { JobStore } from './state/jobStore.js';
 import { settleAbortedResult } from './workflows/shared/cancelState.js';
 import type { AccessGroupKey, SlackEventEnvelope, SlackReactionEvent, WorkflowStepLog } from './types/contracts.js';
@@ -824,18 +830,18 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     return;
   }
 
-  // Thread-level dedup: skip if this thread already has a running/paused job
-  const activeThreadJob = store.activeJobForThread(event.channelId, event.threadTs);
-  if (activeThreadJob) {
+  // Thread-level dedup: one in-flight job per thread. Asked of the in-process
+  // registry, not the jobs table — a time window on jobs.updated_at let the
+  // lock lapse under a long job (issue #261).
+  const activeThreadJobId = activeJobIdForThread(event.channelId, event.threadTs);
+  if (activeThreadJobId) {
     store.recordEvent(event.eventId, event.channelId, event.threadTs);
     logger.info(
       {
         eventId: event.eventId,
         channelId: event.channelId,
         threadTs: event.threadTs,
-        activeJobId: activeThreadJob.id,
-        activeJobStatus: activeThreadJob.status,
-        activeJobWorkflow: activeThreadJob.workflow,
+        activeJobId: activeThreadJobId,
       },
       'skipped: thread already has an active job',
     );
@@ -1014,7 +1020,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
   });
 
   const abortController = new AbortController();
-  registerActiveJob(jobId, abortController);
+  registerActiveJob(jobId, abortController, { channelId: event.channelId, threadTs: event.threadTs });
 
   const stepLogs: WorkflowStepLog[] = [];
 
@@ -1574,6 +1580,11 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
       // ignore persistence failures in terminal error path
     }
   } finally {
+    // The same-thread lock lives in this process (issue #261), so it must be
+    // released on every way out, including a throw inside the handlers above.
+    // Idempotent: the normal paths have already unregistered.
+    unregisterActiveJob(jobId);
+
     // Slack clears the status automatically whenever miniOG posts a message,
     // but SKIPPED jobs can end without ever posting — clear explicitly so the
     // thread does not keep showing "miniOG is …" after the job is done.
