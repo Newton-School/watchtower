@@ -9,7 +9,7 @@ import {
   resolveRepoPath,
   type RepoKey,
 } from '../../repos/registry.js';
-import { formatAdminMention, getAdminUserIds } from '../../access/control.js';
+import { getAdminUserIds } from '../../access/control.js';
 import { waitForRepoChoice } from '../../agents/pipeline.js';
 
 /** Canonical repo union — re-exported so the ~6 importers keep compiling. */
@@ -161,17 +161,18 @@ export async function resolveRepoOrAsk(params: {
 
   logStep?.({
     stage: 'workflow.repo.clarify',
-    message: 'Target repo is ambiguous — asking admins to clarify.',
+    message: 'Target repo is ambiguous — asking the requester to clarify.',
     level: 'WARN',
   });
 
-  // Use the core-dev subteam handle when available so we ping the group once
-  // instead of unrolling every admin into a wall of individual `<@U…>` tags.
-  const mentionStr = formatAdminMention(config);
+  // Ask the person who made the request: they know which product they mean,
+  // and the admin group was being paged for what was often not a task at all
+  // (issue #431). An admin's answer still counts.
+  const requesterId = task.event.userId;
   const enabled = enabledRepoKeys(config);
   const repoListInline = enabled.map(key => `*${key}*`).join(' / ');
   const replyOptions = enabled.map(key => `"${REPO_SHORT_REPLY[key]}"`).join(' or ');
-  const promptText = `I can't tell which repo this task targets — ${repoListInline}.${mentionStr ? ` ${mentionStr}` : ''} Reply with ${replyOptions} (or "cancel" to abandon).`;
+  const promptText = `${requesterId ? `<@${requesterId}> ` : ''}I can't tell which repo this is for — ${repoListInline}. Reply with ${replyOptions} (or "cancel" to drop it).`;
 
   let promptTs: string | undefined;
   try {
@@ -198,13 +199,13 @@ export async function resolveRepoOrAsk(params: {
     slack,
     channelId: task.event.channelId,
     threadTs: task.event.threadTs,
-    approverUserIds: adminUserIds,
+    approverUserIds: requesterId ? [...new Set([requesterId, ...adminUserIds])] : adminUserIds,
     promptTs,
     logStep: logStep ?? (() => {}),
     botUserId: config.botUserId,
     signal,
     allowedRepos: enabled,
-    nudgeText: `Still waiting on an admin to pick ${repoListInline} for this task. Reply here or say 'cancel' to stop.`,
+    nudgeText: `Still waiting to hear which repo this is for (${repoListInline}). Reply here or say 'cancel' to stop.`,
   });
 
   if (choice.outcome === 'cancelled') {

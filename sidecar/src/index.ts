@@ -24,6 +24,7 @@ import { assertMacOS } from './platform.js';
 import { evaluatePolicy, loadPolicies } from './policies/evaluator.js';
 import { agentCallContext } from './state/runContext.js';
 import { detectMention, normalizeTask } from './router/intentParser.js';
+import { isRouteQuestionExpired } from './router/routeClarify.js';
 import { decidePausedResume } from './router/pausedResume.js';
 import { classifyProduct } from './router/productClassifier.js';
 import { routeTask } from './router/taskRouter.js';
@@ -916,6 +917,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
   // that column as OWNER_AUTOPILOT even when the classifier later routed
   // them to PR_REVIEW. Read the actual pause cause from job_logs instead.
   const pausedJob = store.pausedJobForThread(event.channelId, event.threadTs);
+  const routeQuestion = pausedJob ? store.pausedRouteQuestion(pausedJob.id) : undefined;
   const pauseSignal = pausedJob
     ? store.isPausedAwaitingPrUrl(pausedJob.id)
       ? 'pr_review_awaiting_url'
@@ -923,12 +925,16 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
         ? 'pr_review_target_choice'
         : store.isPausedAwaitingUsageLimitRetry(pausedJob.id)
           ? 'usage_limit_retry'
-          : undefined
+          : routeQuestion
+            ? 'route_clarify'
+            : undefined
     : undefined;
   const resumeDecision = decidePausedResume({
     pausedJob: pausedJob ? { id: pausedJob.id, workflow: pausedJob.workflow } : undefined,
     pauseSignal,
     eventText: event.text ?? '',
+    routeQuestion,
+    senderId: event.userId,
   });
 
   const eventClient = buildEventAwareClient(client, event);
@@ -954,6 +960,10 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
       mentionDetected: true,
       mentionType: 'bot',
       ...(resumeDecision.forceIntent ? { intent: resumeDecision.forceIntent } : {}),
+      // The reply to a question miniOG asked: the router reads the two together (issue #431).
+      ...(resumeDecision.reason === 'route_clarify_answer' && routeQuestion
+        ? { clarification: { question: routeQuestion.question, askedText: routeQuestion.askedText } }
+        : {}),
     };
     store.markJob(resumeDecision.paused.id, 'SKIPPED', {
       result: {
@@ -1905,6 +1915,19 @@ async function main(): Promise<void> {
   const PAUSED_MAX_AGE_MIN = 24 * 60;
   setInterval(
     () => {
+      // A question nobody answered is not a failure, and it is not worth a
+      // day: after 30 minutes the next reply is no longer "the answer" (#431).
+      try {
+        for (const parked of store.pausedRouteQuestions()) {
+          if (!isRouteQuestionExpired(parked.pending, Date.now())) continue;
+          store.markJob(parked.id, 'SKIPPED', { result: { reason: 'clarify_unanswered' } });
+          const anchor = store.eventAnchorFor(parked.id);
+          if (anchor) void removeReaction(client.webClient, anchor.channelId, anchor.eventTs, 'zzz');
+          logger.info({ jobId: parked.id }, 'unanswered clarify question expired');
+        }
+      } catch (err) {
+        logger.warn({ err: String(err) }, 'clarify-question sweeper tick failed');
+      }
       try {
         const stale = store.stalePausedJobs(PAUSED_MAX_AGE_MIN);
         for (const job of stale) {

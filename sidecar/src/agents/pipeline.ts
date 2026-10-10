@@ -694,7 +694,7 @@ export async function waitForRepoChoice(params: {
   // post-message clear.
   logStep({
     stage: 'pipeline.repo_choice.waiting',
-    message: 'Waiting for an admin to pick the target repo.',
+    message: 'Waiting to hear which repo this is for.',
   });
   const pollIntervalMs = 5_000;
   const notifiedUsers = new Set<string>();

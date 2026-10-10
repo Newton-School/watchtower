@@ -230,6 +230,33 @@ describe('resolveRepoOrAsk', () => {
     expect(slack.chat.postMessage).toHaveBeenCalled();
   });
 
+  it('asks the requester which repo, not the admin group, and lets either answer (issue #431)', async () => {
+    vi.mocked(classifyRepo).mockResolvedValueOnce({
+      selectedRepo: null,
+      confidence: 0,
+      reasoning: 'no signal',
+      uncertain: true,
+    });
+    vi.mocked(waitForRepoChoice).mockResolvedValueOnce({
+      outcome: 'newton-api',
+      userReply: 'api',
+      approverId: 'UREQUESTER',
+    });
+    const config = baseConfig();
+    config.accessControl = adminAccessControl();
+    config.coreDevSlackUserGroup = 'S0CORE';
+    const task = baseTask('update the copy');
+    task.event.userId = 'UREQUESTER';
+
+    await resolveRepoOrAsk({ task, config, slack, threadMessages: [] });
+
+    const prompt = slack.chat.postMessage.mock.lastCall?.[0].text as string;
+    expect(prompt.startsWith('<@UREQUESTER> ')).toBe(true);
+    expect(prompt).not.toContain('subteam');
+    expect(prompt).not.toContain('<@UADMIN>');
+    expect(vi.mocked(waitForRepoChoice).mock.lastCall?.[0].approverUserIds).toEqual(['UREQUESTER', 'UOWNER', 'UADMIN']);
+  });
+
   it('returns desktop_only when classifier uncertain and no admin reply', async () => {
     vi.mocked(classifyRepo).mockResolvedValueOnce({
       selectedRepo: null,

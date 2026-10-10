@@ -367,6 +367,11 @@ export interface NormalizedTask {
    * (non-dev roles get plain-language, low-code answers).
    */
   dossierRole?: DossierRole;
+  /**
+   * Set when this message is the requester's reply to a question miniOG asked
+   * about an earlier message it could not act on (issue #431).
+   */
+  clarification?: { question: string; askedText: string };
 }
 
 export interface RepoClassificationResult {

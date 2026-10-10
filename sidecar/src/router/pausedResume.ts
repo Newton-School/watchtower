@@ -1,5 +1,6 @@
 import type { WorkflowIntent } from '../types/contracts.js';
 import { extractPrContext } from './intentParser.js';
+import { isRouteAnswer, type PendingRouteQuestion } from './routeClarify.js';
 
 export interface PausedJobSummary {
   id: string;
@@ -13,7 +14,12 @@ export interface PausedJobSummary {
  * PR_REVIEW, so the column alone can't tell us what kind of follow-up to
  * accept as a resume signal.
  */
-export type PauseSignal = 'pr_review_awaiting_url' | 'pr_review_target_choice' | 'usage_limit_retry' | undefined;
+export type PauseSignal =
+  | 'pr_review_awaiting_url'
+  | 'pr_review_target_choice'
+  | 'usage_limit_retry'
+  | 'route_clarify'
+  | undefined;
 
 /** Replies that resume a job paused on a Claude usage limit (issue #342). */
 const USAGE_LIMIT_RESUME_RE = /\b(resume|retry|continue|go|try again)\b/i;
@@ -58,6 +64,10 @@ export function decidePausedResume(params: {
   pausedJob: PausedJobSummary | undefined;
   pauseSignal: PauseSignal;
   eventText: string;
+  /** For `route_clarify`: the parked question, who is replying, and when. */
+  routeQuestion?: PendingRouteQuestion;
+  senderId?: string;
+  nowMs?: number;
 }): PausedResumeDecision {
   const { pausedJob, pauseSignal, eventText } = params;
 
@@ -89,6 +99,20 @@ export function decidePausedResume(params: {
       };
     }
     return { resume: false, reason: 'pr_review_no_target_in_reply' };
+  }
+
+  if (pauseSignal === 'route_clarify') {
+    // Whatever the requester says next is the answer: the router reads it
+    // together with the question. Anyone else's reply, or a late one, is not.
+    const { routeQuestion, senderId } = params;
+    if (
+      routeQuestion &&
+      senderId &&
+      isRouteAnswer({ pending: routeQuestion, senderId, nowMs: params.nowMs ?? Date.now() })
+    ) {
+      return { resume: true, reason: 'route_clarify_answer', paused: pausedJob };
+    }
+    return { resume: false, reason: 'route_clarify_not_the_answer' };
   }
 
   return { resume: false, reason: `unhandled_pause_signal:${pauseSignal ?? 'unknown'}` };

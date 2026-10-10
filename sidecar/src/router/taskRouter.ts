@@ -32,7 +32,9 @@ import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
 import { highReasoningProfile } from '../codex/modelProfiles.js';
 import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
 import { classifyWorkflowIntent, type IntentClassification } from './classifyIntent.js';
-import { startRouterShadow, type LegacyDecidedBy } from './routerShadow.js';
+import { startRouterShadow, type LegacyDecidedBy, type RouterClassification } from './routerShadow.js';
+import { askRequester, decideClarify, giveUpOnClarify, type ClarifyAction } from './routeClarify.js';
+import { cancelledResult } from '../workflows/shared/cancelState.js';
 import { looksLikeFixAffirmation } from './resumeIntentParser.js';
 
 // Confidence threshold below which the router refuses to honor a classifier
@@ -198,6 +200,8 @@ export async function routeTask(params: {
   let legacyDecidedBy: LegacyDecidedBy = 'gate';
   let decider = 'AI classifier';
   let routerCouldNotDecide = false;
+  let routerDecision: RouterClassification | undefined;
+  let clarify: ClarifyAction = { kind: 'run' };
 
   // PR_REVIEW can only be seeded pre-classifier by the deterministic gate
   // (isPrReviewRequest in intentParser.ts) — nothing else produces it before
@@ -253,6 +257,7 @@ export async function routeTask(params: {
         const decided = await routerShadow.asClassification();
         // An owner mention the router could not read stays unanswered, as before.
         routerCouldNotDecide = decided.failed && decided.intent !== 'NONE';
+        routerDecision = decided;
         classification = decided;
       } else {
         legacyDecidedBy = 'classifier';
@@ -291,7 +296,42 @@ export async function routeTask(params: {
       const holdOverride =
         classification.intent !== task.intent && accessDropping && proposedCanClaimCompletion && lowConfidence;
 
-      if (holdOverride) {
+      // Where the router decided, a decision that should not be acted on as
+      // given becomes one question to the requester, instead of the keyword
+      // seed (the floor hold below) or a guess (issue #431).
+      if (routerDecision?.tool && !routerDecision.failed) {
+        clarify = decideClarify({
+          tool: routerDecision.tool,
+          confidence: routerDecision.confidence,
+          question: routerDecision.question,
+          addressing: task.mentionType === 'owner' ? 'owner_mention' : 'direct',
+          answering: Boolean(task.clarification),
+          heldByFloor: holdOverride,
+          confidenceFloor: CLASSIFIER_CONFIDENCE_FLOOR,
+        });
+      }
+
+      if (clarify.kind !== 'run') {
+        logStep?.({
+          stage: 'router.clarify.decided',
+          message:
+            clarify.kind === 'ask'
+              ? `Not acting on the router's ${routerDecision?.tool} (${clarify.reason}) — asking the requester instead.`
+              : clarify.kind === 'give_up'
+                ? `The reply to the question is still unclear (${clarify.reason}) — not asking twice.`
+                : 'The reply to the question asks for nothing — staying silent.',
+          data: {
+            action: clarify.kind,
+            tool: routerDecision?.tool,
+            confidence: routerDecision?.confidence,
+            seedIntent: task.intent,
+            answering: Boolean(task.clarification),
+            reasoning: routerDecision?.reasoning,
+          },
+        });
+        // Nothing runs, so the access check below is made at the lowest tier.
+        resolvedIntent = clarify.kind === 'silent' ? 'NONE' : 'INFORMATIONAL';
+      } else if (holdOverride) {
         logStep?.({
           stage: 'router.classify.low_confidence_hold',
           level: 'WARN',
@@ -338,13 +378,24 @@ export async function routeTask(params: {
       ? { ...task, intent: resolvedIntent, toneMode, dossierRole }
       : task;
 
-  routerShadow?.compare({ intent: resolvedIntent, decidedBy: legacyDecidedBy });
+  routerShadow?.compare({
+    intent: resolvedIntent,
+    decidedBy: legacyDecidedBy,
+    ...(clarify.kind === 'ask'
+      ? { did: 'asking the requester', ran: 'ASK_USER' }
+      : clarify.kind === 'give_up'
+        ? { did: 'not asking a second time', ran: 'GAVE_UP' }
+        : {}),
+  });
 
   // NONE = classifier determined this is human-to-human conversation, miniOG should stay silent
   if (resolvedIntent === 'NONE') {
     logStep?.({
       stage: 'router.silent',
-      message: `${decider} returned NONE — staying silent for this human-to-human conversation.`,
+      message:
+        clarify.kind === 'silent'
+          ? 'The reply to the question asked for nothing — staying silent.'
+          : `${decider} returned NONE — staying silent for this human-to-human conversation.`,
       data: { reasoning: classificationReasoning },
     });
     return {
@@ -460,6 +511,15 @@ export async function routeTask(params: {
       notifyDesktop: false,
       slackPosted: true,
     };
+  }
+
+  // One question to the requester, or (if this message already was the answer
+  // to one) a line saying so. After the access check, like the reply above.
+  if (clarify.kind === 'ask' || clarify.kind === 'give_up') {
+    if (signal?.aborted) return cancelledResult('UNKNOWN');
+    return clarify.kind === 'ask'
+      ? askRequester({ slack, store, task, userMessage, question: clarify.question, reason: clarify.reason, logStep })
+      : giveUpOnClarify({ slack, task, reason: clarify.reason, logStep });
   }
 
   const runWorkflow = WORKFLOW_RUNNERS[resolvedIntent];

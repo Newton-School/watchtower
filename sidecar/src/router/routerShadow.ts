@@ -7,6 +7,7 @@ import {
   readToolRouterMode,
   type RouterFacts,
   type RouterOutcome,
+  type RouterTool,
 } from './toolRouter.js';
 
 /**
@@ -45,6 +46,7 @@ export function buildRouterFacts(task: NormalizedTask, userMessage: string): Rou
     prUrlInTrigger: inTrigger,
     prUrlInThread: prs.some(pr => pr.source === 'thread') || (!inTrigger && Boolean(task.prContext)),
     hints: hint ? [hint] : [],
+    ...(task.clarification ? { answering: task.clarification } : {}),
   };
 }
 
@@ -82,6 +84,10 @@ const sameWorkflow = (legacy: WorkflowIntent, router: string): boolean =>
 export interface RouterClassification extends IntentClassification {
   /** The router could not decide, even on a second try. `intent` is then the low-risk fallback. */
   failed: boolean;
+  /** What the router named, before it was mapped to an intent. Absent when it failed. */
+  tool?: RouterTool;
+  /** The question it wants put to the requester, for `ask_user`. */
+  question?: string;
 }
 
 export interface RouterShadow {
@@ -92,8 +98,12 @@ export interface RouterShadow {
    * that consumed a classification. Waits for the call; never rejects.
    */
   asClassification(): Promise<RouterClassification>;
-  /** Call once a workflow is settled on. Logs what the router said; returns at once. */
-  compare(legacy: { intent: WorkflowIntent; decidedBy: LegacyDecidedBy }): void;
+  /**
+   * Call once a workflow is settled on. Logs what the router said; returns at once.
+   * When what happened was not a workflow run, `did` says it in words and
+   * `ran` names it in the router's vocabulary ("ASK_USER").
+   */
+  compare(legacy: { intent: WorkflowIntent; decidedBy: LegacyDecidedBy; did?: string; ran?: string }): void;
 }
 
 export function startRouterShadow(params: {
@@ -161,6 +171,8 @@ export function startRouterShadow(params: {
         confidence: outcome.decision.confidence,
         reasoning: outcome.decision.reason,
         failed: false,
+        tool: outcome.decision.tool,
+        question: outcome.decision.question,
       };
     },
     compare(legacy) {
@@ -168,12 +180,12 @@ export function startRouterShadow(params: {
       void pending
         .then(outcome => {
           const wouldRun = routerWouldRun(outcome);
-          const agree = sameWorkflow(legacy.intent, wouldRun);
+          const agree = legacy.ran ? legacy.ran === wouldRun : sameWorkflow(legacy.intent, wouldRun);
           const routerDecided = legacy.decidedBy === 'router';
           logStep({
             stage: routerDecided ? 'router.decision' : 'router.shadow',
             message: routerDecided
-              ? `Router chose ${outcome.ok ? outcome.decision.tool : 'nothing (the call failed)'}; running ${legacy.intent}.`
+              ? `Router chose ${outcome.ok ? outcome.decision.tool : 'nothing (the call failed)'}; ${legacy.did ?? `running ${legacy.intent}`}.`
               : `Router (shadow) would run ${wouldRun}; the legacy path ran ${legacy.intent} — ${agree ? 'agree' : 'differ'}.`,
             level: 'INFO',
             data: {
