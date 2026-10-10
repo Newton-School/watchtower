@@ -35,13 +35,21 @@ const GATE_HINTS: Partial<Record<WorkflowIntent, string>> = {
   WEBAPP_QA: 'QA gate matched',
 };
 
+/** How a message reached miniOG, in the router's terms. */
+export function addressingOf(
+  task: Pick<NormalizedTask, 'mentionType' | 'mentionReference'>,
+): RouterFacts['addressing'] {
+  if (task.mentionType === 'owner') return 'owner_mention';
+  return task.mentionReference ? 'reference' : 'direct';
+}
+
 export function buildRouterFacts(task: NormalizedTask, userMessage: string): RouterFacts {
   const prs = task.prContexts ?? [];
   const inTrigger = prs.some(pr => pr.source === 'trigger');
   const hint = GATE_HINTS[task.intent];
   return {
     message: userMessage,
-    addressing: task.mentionType === 'owner' ? 'owner_mention' : 'direct',
+    addressing: addressingOf(task),
     threadContext: formatThreadContextForClassifier(task),
     prUrlInTrigger: inTrigger,
     prUrlInThread: prs.some(pr => pr.source === 'thread') || (!inTrigger && Boolean(task.prContext)),

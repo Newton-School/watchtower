@@ -74,6 +74,13 @@ describe('buildRouterPrompt', () => {
     );
   });
 
+  it('says so when miniOG is only tagged in passing, and allows silence there (issue #448)', () => {
+    const reference = buildRouterPrompt({ ...facts, addressing: 'reference', hints: [] });
+    expect(reference).toContain('Addressed: miniOG is tagged only in passing');
+    expect(reference).toContain('route the message if it asks you for something');
+    expect(reference).toContain('without asking anything of you, choose stay_silent');
+  });
+
   it('carries the rules the replay of past mentions showed were missing', () => {
     // A review ask that tags the owner is work for miniOG, not people talking.
     expect(prompt).toContain('you act for the owner');
@@ -184,9 +191,22 @@ describe('outcomeToLegacyIntent', () => {
     expect(outcomeToLegacyIntent(decided(tool), 'owner_mention')).toBe(intent);
   });
 
-  it('lets only an owner mention be met with silence', () => {
+  it('lets an owner mention and a mention in passing be met with silence, never a direct address', () => {
     expect(outcomeToLegacyIntent(decided('stay_silent'), 'owner_mention')).toBe('NONE');
+    expect(outcomeToLegacyIntent(decided('stay_silent'), 'reference')).toBe('NONE');
     expect(outcomeToLegacyIntent(decided('stay_silent'), 'direct')).toBe('INFORMATIONAL');
+  });
+
+  it('still runs what a mention in passing asks for (issue #448)', () => {
+    expect(outcomeToLegacyIntent(decided('review_pr'), 'reference')).toBe('PR_REVIEW');
+    expect(outcomeToLegacyIntent(decided('answer'), 'reference')).toBe('INFORMATIONAL');
+  });
+
+  it('owes a mention in passing no answer when nothing fits or the router failed', () => {
+    for (const tool of ['ask_user', 'unsupported', 'deploy', 'qa_webapp']) {
+      expect(outcomeToLegacyIntent(decided(tool), 'reference')).toBe('NONE');
+    }
+    expect(outcomeToLegacyIntent({ ok: false, error: 'x', durationMs: 1 }, 'reference')).toBe('NONE');
   });
 
   it.each(['ask_user', 'unsupported', 'deploy', 'qa_webapp'])(
@@ -236,6 +256,14 @@ describe('buildRouterFacts', () => {
       prUrlInTrigger: false,
       prUrlInThread: true,
     });
+  });
+
+  it('marks a mention made in passing as a reference', () => {
+    expect(buildRouterFacts(task({ mentionReference: true }), 'm').addressing).toBe('reference');
+    // An owner mention stays an owner mention whatever else the message tags.
+    expect(buildRouterFacts(task({ mentionType: 'owner', mentionReference: true }), 'm').addressing).toBe(
+      'owner_mention',
+    );
   });
 
   it('passes a gate match as a hint and marks an owner mention', () => {

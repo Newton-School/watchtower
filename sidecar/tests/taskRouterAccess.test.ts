@@ -946,13 +946,19 @@ describe('routeTask lets the tool-router decide when it is on (issue #456)', () 
     const slack = makeSlack();
     const {
       mentionType = 'bot',
+      mentionReference,
       clarification,
       ...input
-    } = task as { mentionType?: 'bot' | 'owner'; clarification?: NormalizedTask['clarification'] };
+    } = task as {
+      mentionType?: 'bot' | 'owner';
+      mentionReference?: boolean;
+      clarification?: NormalizedTask['clarification'];
+    };
     const result = await routeTask({
       task: {
         ...makeTask({ userId: 'UOWNER1', channelId: 'C-VIEW', text, ...input }),
         mentionType,
+        ...(mentionReference ? { mentionReference } : {}),
         ...(clarification ? { clarification } : {}),
       },
       config: options.config ?? makeConfig('audit'),
@@ -1249,6 +1255,49 @@ describe('routeTask lets the tool-router decide when it is on (issue #456)', () 
       const { result } = await route('<@UBOT1> no', builder, { ...enforce(), store });
 
       expect(result.status).toBe('SKIPPED');
+    });
+  });
+
+  describe('a mention made in passing (issue #448)', () => {
+    const inPassing = {
+      mentionReference: true,
+      userId: 'UBUILDER',
+      channelId: 'C-BUILD',
+      intent: 'IMPLEMENTATION' as const,
+    };
+    const text = "<@UOWNER1> - I've resolved <@UBOT1>'s comments can u pls take a look on priority?";
+
+    it('may be met with silence: nothing runs and nothing is posted', async () => {
+      routerSays('stay_silent', 0.9);
+
+      const { result, slack } = await route(text, inPassing, { config: makeConfig('enforce') });
+
+      expect(result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
+      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+      expect(runAgenticPrReview).not.toHaveBeenCalled();
+      expect(decideTool.mock.calls[0][0].facts.addressing).toBe('reference');
+    });
+
+    it('still gets what it asks for when it does ask miniOG for something', async () => {
+      routerSays('answer', 0.9);
+
+      const { result } = await route('<@U999> not sure — <@UBOT1> which service sends this email?', inPassing, {
+        config: makeConfig('enforce'),
+      });
+
+      expect(result.workflow).toBe('INFORMATIONAL');
+    });
+
+    it('is not asked a question, and not told the router failed', async () => {
+      routerSays('ask_user', 0.8, { question: 'What do you need?' });
+      const asked = await route('cc: <@UBOT1>', inPassing, { config: makeConfig('enforce') });
+      expect(asked.result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
+      expect(asked.slack.chat.postMessage).not.toHaveBeenCalled();
+
+      decideTool.mockResolvedValue({ ok: false, error: 'router call failed (exit 1)', durationMs: 3 });
+      const failed = await route('cc: <@UBOT1>', inPassing, { config: makeConfig('enforce') });
+      expect(failed.result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
+      expect(failed.slack.chat.postMessage).not.toHaveBeenCalled();
     });
   });
 

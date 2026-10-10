@@ -5,6 +5,7 @@ import {
   extractPrContext,
   isBarePrPaste,
   isPrReviewRequest,
+  isReferenceMention,
   normalizeTask,
 } from '../src/router/intentParser.js';
 import type { AppConfig, SlackEventEnvelope } from '../src/types/contracts.js';
@@ -539,7 +540,7 @@ describe('the review gate while the tool-router decides (issue #447)', () => {
   const PR = 'https://github.com/Newton-School/newton-api/pull/6436';
   const slackPr = `<${PR}|github.com/Newton-School/newton-api/pull/6436>`;
   const seed = (text: string, userId = 'U123') =>
-    normalizeTask({ ...baseEvent, userId, text }, config, [], { explicitReviewGate: true }).intent;
+    normalizeTask({ ...baseEvent, userId, text }, config, [], { routerDecides: true }).intent;
 
   it('still fires on a review verb with the PR link', () => {
     expect(seed(`<@UBOT1> review ${PR}`)).toBe('PR_REVIEW');
@@ -572,7 +573,7 @@ describe('the review gate while the tool-router decides (issue #447)', () => {
       config,
       [PR],
       {
-        explicitReviewGate: true,
+        routerDecides: true,
       },
     ).intent;
     expect(intent).toBe('PR_REVIEW');
@@ -601,5 +602,64 @@ describe('isBarePrPaste', () => {
     expect(isBarePrPaste(`<@UBOT1> pls ${PR}`)).toBe(false);
     expect(isBarePrPaste('<@UBOT1>')).toBe(false);
     expect(isBarePrPaste('<@UBOT1> https://github.com/Newton-School/newton-web/issues/9')).toBe(false);
+  });
+});
+
+describe('a mention made in passing (issue #448)', () => {
+  const PR = 'https://github.com/Newton-School/newton-web/pull/9330';
+  const isReference = (text: string) => isReferenceMention(text, 'UBOT1');
+
+  it('recognises a possessive, a cue word, and a message that opens with someone else', () => {
+    // The incident: written to the owner, about miniOG's review.
+    expect(isReference("<@UOWNER1> - I've resolved <@UBOT1>'s comments can u pls take a look on priority?")).toBe(true);
+    expect(isReference('resolved <@UBOT1>’s comments')).toBe(true);
+    expect(isReference('cc: <@UBOT1>')).toBe(true);
+    expect(isReference('done. cc <@U999>, <@U998> and <@UBOT1>')).toBe(true);
+    expect(isReference('this was flagged by <@UBOT1> yesterday')).toBe(true);
+    expect(isReference('the comments from <@UBOT1> are addressed')).toBe(true);
+    expect(isReference('as <@UBOT1> said above, the query is fine')).toBe(true);
+    expect(isReference('FYI <@UBOT1>')).toBe(true);
+    expect(isReference('<!subteam^S02HXP05ZNJ> please check what <@UBOT1> posted')).toBe(true);
+  });
+
+  it('leaves a message addressed to the bot alone', () => {
+    expect(isReference('<@UBOT1> review this PR')).toBe(false);
+    expect(isReference('hey <@UBOT1> can you check the build?')).toBe(false);
+    expect(isReference('<@UBOT1> cc <@U999> please fix the redirect')).toBe(false);
+    expect(isReference("<@UBOT1> what did <@UBOT1>'s last review say?")).toBe(false);
+    expect(isReference('standby <@UBOT1> fix it')).toBe(false);
+    expect(isReference('no bot here')).toBe(false);
+  });
+
+  it('is reported by detectMention as a bot mention that is a reference, never in a DM', () => {
+    expect(detectMention('cc: <@UBOT1>', config)).toEqual({ detected: true, type: 'bot', reference: true });
+    expect(detectMention('<@UBOT1> review this', config)).toEqual({ detected: true, type: 'bot' });
+    expect(detectMention('cc: <@UBOT1>', config, 'im')).toEqual({ detected: true, type: 'bot' });
+  });
+
+  it('is carried on the task', () => {
+    const reference = normalizeTask({ ...baseEvent, userId: 'U123', text: 'cc: <@UBOT1>' }, config);
+    expect(reference).toMatchObject({ mentionDetected: true, mentionType: 'bot', mentionReference: true });
+    const direct = normalizeTask({ ...baseEvent, userId: 'U123', text: '<@UBOT1> hi' }, config);
+    expect(direct).not.toHaveProperty('mentionReference');
+  });
+
+  it('fires no keyword gate while the tool-router decides: the router reads it first', () => {
+    const text = `<@UOWNER1> I've resolved <@UBOT1>'s comments, please review ${PR}`;
+    const task = (options?: { routerDecides: boolean }) =>
+      normalizeTask({ ...baseEvent, userId: 'U123', text }, config, [], options);
+
+    expect(task({ routerDecides: true }).intent).toBe('IMPLEMENTATION');
+    // Without the router deciding nothing changes: the review gate still fires.
+    expect(task().intent).toBe('PR_REVIEW');
+    expect(task({ routerDecides: false }).intent).toBe('PR_REVIEW');
+  });
+
+  it('keeps the deploy gate for a direct address only', () => {
+    const seed = (text: string) =>
+      normalizeTask({ ...baseEvent, userId: 'U123', text }, config, [], { routerDecides: true }).intent;
+
+    expect(seed('<@UBOT1> deploy newton-web to production')).toBe('DEPLOY');
+    expect(seed('<@UOWNER1> can you deploy newton-web to production? cc <@UBOT1>')).not.toBe('DEPLOY');
   });
 });

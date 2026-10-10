@@ -117,11 +117,50 @@ export function isMarketingDeployRequest(text: string): boolean {
   return classifyDeployTarget(text) === 'newton-marketing-web';
 }
 
-export function detectMention(
-  text: string,
-  config: AppConfig,
-  channelType?: string,
-): { detected: boolean; type: 'bot' | 'owner' | 'none' } {
+export interface MentionInfo {
+  detected: boolean;
+  type: 'bot' | 'owner' | 'none';
+  /**
+   * The bot is mentioned, but only in passing: the message may be about miniOG
+   * or addressed to someone else (issue #448). Still a bot mention; what
+   * differs is that staying silent becomes a permitted answer.
+   */
+  reference?: boolean;
+}
+
+/** Words that, right before the bot's tag, make it a reference rather than an address. */
+const REFERENCE_CUE_RE = /(?:^|[^a-z])(cc|fyi|by|from|per|as)\s*[:\-–—]?\s*$/i;
+/** Other people's tags (and joiners) between a cue and the bot's tag: "cc: @a, @b and @miniOG". */
+const TRAILING_TAGS_RE = /(?:\s|,|&|\band\b|<[@!][^>]+>)+$/i;
+/** A message that opens by tagging a person or a user group. */
+const LEADING_TAG_RE = /^[\s\-–—•*>]*<(?:@([A-Z0-9]+)|!subteam\^[^>]+)>/;
+
+/**
+ * True when every mention of the bot in `text` is a reference: a possessive
+ * ("@miniOG's comments"), after a cue ("cc: @miniOG", "flagged by @miniOG",
+ * "as @miniOG said"), or anywhere after another person's tag that opens the
+ * message ("@owner I've resolved @miniOG's comments").
+ *
+ * "I've resolved @miniOG's comments, can you take a look?", written to the
+ * owner, started a second review of a PR that had just been merged.
+ */
+export function isReferenceMention(text: string, botUserId: string): boolean {
+  const token = `<@${botUserId}>`;
+  if (!text.includes(token)) return false;
+
+  const opening = text.match(LEADING_TAG_RE);
+  if (opening && opening[1] !== botUserId) return true;
+
+  for (let at = text.indexOf(token); at !== -1; at = text.indexOf(token, at + token.length)) {
+    const after = text.slice(at + token.length);
+    const before = text.slice(0, at).replace(TRAILING_TAGS_RE, '');
+    const possessive = /^['’]s\b/i.test(after);
+    if (!possessive && !REFERENCE_CUE_RE.test(before)) return false;
+  }
+  return true;
+}
+
+export function detectMention(text: string, config: AppConfig, channelType?: string): MentionInfo {
   if (!text) {
     if (channelType === 'im') {
       return { detected: true, type: 'bot' };
@@ -131,7 +170,9 @@ export function detectMention(
 
   const botMention = `<@${config.botUserId}>`;
   if (text.includes(botMention)) {
-    return { detected: true, type: 'bot' };
+    // In a DM everything is addressed to the bot, however it is phrased.
+    const reference = channelType !== 'im' && isReferenceMention(text, config.botUserId ?? '');
+    return { detected: true, type: 'bot', ...(reference ? { reference } : {}) };
   }
 
   for (const ownerId of config.ownerSlackUserIds) {
@@ -422,10 +463,13 @@ export function parseMiniogSubcommand(text: string): MiniogSubcommand | null {
 function inferIntent(
   event: SlackEventEnvelope,
   config: AppConfig,
-  mention: { detected: boolean; type: 'bot' | 'owner' | 'none' },
+  mention: MentionInfo,
   threadTexts: string[] = [],
   options: NormalizeTaskOptions = {},
 ): { intent: WorkflowIntent; miniogSubcommand?: MiniogSubcommand } {
+  // A keyword gate acts without a second opinion, so it needs a direct address.
+  // While the tool-router decides, a mention in passing is left to it (issue #448).
+  const directBotMention = mention.detected && mention.type === 'bot' && !(options.routerDecides && mention.reference);
   // Dossier subcommands (whoami / set-role / forget) take precedence over every other route
   // when the bot is mentioned. They are read-only or operator-self-edit commands and
   // must not bleed into the AI classifier.
@@ -453,7 +497,7 @@ function inferIntent(
   // Direct address only (an @miniOG mention or a DM). A message that merely
   // tags the owner is a conversation between people; its wording must never
   // start a production deploy (issue #428).
-  if (mention.detected && mention.type === 'bot' && classifyDeployTarget(event.text ?? '') !== null) {
+  if (directBotMention && classifyDeployTarget(event.text ?? '') !== null) {
     return { intent: 'DEPLOY' };
   }
 
@@ -469,15 +513,11 @@ function inferIntent(
   // it"; this gate steers it to WEBAPP_QA while "review this PR" / a bare PR
   // paste still fall through to PR_REVIEW. prContext is populated by
   // normalizeTask regardless, so runWebappQa can resolve the PR downstream.
-  if (mention.detected && mention.type === 'bot' && isWebappQaOnPrRequest(event.text ?? '')) {
+  if (directBotMention && isWebappQaOnPrRequest(event.text ?? '')) {
     return { intent: 'WEBAPP_QA' };
   }
 
-  if (
-    mention.detected &&
-    mention.type === 'bot' &&
-    isPrReviewRequest(event.text ?? '', threadTexts, { explicitOnly: options.explicitReviewGate })
-  ) {
+  if (directBotMention && isPrReviewRequest(event.text ?? '', threadTexts, { explicitOnly: options.routerDecides })) {
     return { intent: 'PR_REVIEW' };
   }
 
@@ -485,7 +525,7 @@ function inferIntent(
   // owners get it too. "QA the login flow on <url>" carries all its routing
   // signal in plain text (a QA verb + a non-PR/Metabase URL), so it skips the
   // AI classifier in routeTask and never misroutes to INVESTIGATION.
-  if (mention.detected && mention.type === 'bot' && isWebappQaRequest(event.text ?? '')) {
+  if (directBotMention && isWebappQaRequest(event.text ?? '')) {
     return { intent: 'WEBAPP_QA' };
   }
 
@@ -521,11 +561,12 @@ function inferIntent(
 
 export interface NormalizeTaskOptions {
   /**
-   * Set while the tool-router decides: the review gate then fires only on an
-   * explicit review ask or a bare PR paste, and every other message with a PR
-   * link reaches the router (issue #447).
+   * Set while the tool-router decides. The keyword gates then leave it what
+   * they cannot be sure of: the review gate fires only on an explicit review
+   * ask or a bare PR paste (issue #447), and no gate fires on a mention made
+   * in passing (issue #448).
    */
-  explicitReviewGate?: boolean;
+  routerDecides?: boolean;
 }
 
 export function normalizeTask(
@@ -546,6 +587,7 @@ export function normalizeTask(
     event,
     mentionDetected: mention.detected,
     mentionType: mention.type,
+    ...(mention.reference ? { mentionReference: true } : {}),
     isOwnerAuthor,
     isCoreDevAuthor,
     intent: inferred.intent,

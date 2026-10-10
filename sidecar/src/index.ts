@@ -948,7 +948,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
   const threadTexts = threadMessages.map(message => message.text);
   logger.info({ eventId: event.eventId, messages: threadMessages.length }, 'thread context fetched for intake');
   let task = {
-    ...normalizeTask(event, config, threadTexts, { explicitReviewGate: readToolRouterMode(store) === 'on' }),
+    ...normalizeTask(event, config, threadTexts, { routerDecides: readToolRouterMode(store) === 'on' }),
     threadMessages,
   };
 
