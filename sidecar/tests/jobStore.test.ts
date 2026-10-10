@@ -219,33 +219,8 @@ describe('jobStore', () => {
   });
 });
 
-describe('activeJobForThread', () => {
-  it('returns undefined when no jobs exist', () => {
-    const store = new JobStore(tempDbPath());
-    expect(store.activeJobForThread('C1', 'T1')).toBeUndefined();
-    store.close();
-  });
-
-  it('returns the active job when status is RUNNING', () => {
-    const store = new JobStore(tempDbPath());
-    store.createJob({
-      id: 'job-run',
-      eventId: 'e1',
-      dedupeKey: 'C1:T1:e1:IMPLEMENTATION',
-      workflow: 'IMPLEMENTATION',
-      channelId: 'C1',
-      threadTs: 'T1',
-      payload: {},
-    });
-    const active = store.activeJobForThread('C1', 'T1');
-    expect(active).toBeDefined();
-    expect(active?.id).toBe('job-run');
-    expect(active?.status).toBe('RUNNING');
-    expect(active?.workflow).toBe('IMPLEMENTATION');
-    store.close();
-  });
-
-  it('does NOT return PAUSED jobs from activeJobForThread (slot is freed); pausedJobForThread returns it instead', () => {
+describe('thread job lookups', () => {
+  it('pausedJobForThread returns a PAUSED job', () => {
     const store = new JobStore(tempDbPath());
     store.createJob({
       id: 'job-pause',
@@ -257,32 +232,10 @@ describe('activeJobForThread', () => {
       payload: {},
     });
     store.markJob('job-pause', 'PAUSED');
-    expect(store.activeJobForThread('C1', 'T2')).toBeUndefined();
     const paused = store.pausedJobForThread('C1', 'T2');
     expect(paused).toBeDefined();
     expect(paused?.id).toBe('job-pause');
     expect(paused?.workflow).toBe('IMPLEMENTATION');
-    store.close();
-  });
-
-  it('returns undefined for terminal statuses', () => {
-    const store = new JobStore(tempDbPath());
-    const statuses = ['SUCCESS', 'FAILED', 'CANCELLED', 'SKIPPED'] as const;
-    for (const [i, status] of statuses.entries()) {
-      const jobId = `job-term-${i}`;
-      const threadTs = `T-${i}`;
-      store.createJob({
-        id: jobId,
-        eventId: `e-${i}`,
-        dedupeKey: `C1:${threadTs}:e-${i}:IMPLEMENTATION`,
-        workflow: 'IMPLEMENTATION',
-        channelId: 'C1',
-        threadTs,
-        payload: {},
-      });
-      store.markJob(jobId, status);
-      expect(store.activeJobForThread('C1', threadTs)).toBeUndefined();
-    }
     store.close();
   });
 
@@ -304,51 +257,6 @@ describe('activeJobForThread', () => {
 
     expect(store.hasJobForEventTs('C1', '111.22')).toBe(false);
     expect(store.hasDedupeKey('C1:T-cancel:e-cancel:IMPLEMENTATION')).toBe(false);
-    store.close();
-  });
-
-  it('returns undefined when job is stale beyond threshold', () => {
-    const store = new JobStore(tempDbPath());
-    store.createJob({
-      id: 'job-stale',
-      eventId: 'e-stale',
-      dedupeKey: 'C1:T-stale:e-stale:IMPLEMENTATION',
-      workflow: 'IMPLEMENTATION',
-      channelId: 'C1',
-      threadTs: 'T-stale',
-      payload: {},
-    });
-    // Manually backdate updated_at to 60 minutes ago
-    store['db'].prepare("UPDATE jobs SET updated_at = datetime('now', '-60 minutes') WHERE id = ?").run('job-stale');
-    expect(store.activeJobForThread('C1', 'T-stale')).toBeUndefined();
-    // With a larger threshold it should still be found
-    expect(store.activeJobForThread('C1', 'T-stale', 120)).toBeDefined();
-    store.close();
-  });
-
-  it('returns the most recently updated job when multiple active jobs exist', () => {
-    const store = new JobStore(tempDbPath());
-    store.createJob({
-      id: 'job-old',
-      eventId: 'e-old',
-      dedupeKey: 'C1:T-multi:e-old:IMPLEMENTATION',
-      workflow: 'IMPLEMENTATION',
-      channelId: 'C1',
-      threadTs: 'T-multi',
-      payload: {},
-    });
-    store['db'].prepare("UPDATE jobs SET updated_at = datetime('now', '-10 minutes') WHERE id = ?").run('job-old');
-    store.createJob({
-      id: 'job-new',
-      eventId: 'e-new',
-      dedupeKey: 'C1:T-multi:e-new:IMPLEMENTATION',
-      workflow: 'IMPLEMENTATION',
-      channelId: 'C1',
-      threadTs: 'T-multi',
-      payload: {},
-    });
-    const active = store.activeJobForThread('C1', 'T-multi');
-    expect(active?.id).toBe('job-new');
     store.close();
   });
 });
@@ -413,7 +321,7 @@ describe('pause / resume lifecycle', () => {
     store.markJob('job-flip', 'PAUSED', { result: { stage: 'awaiting_approval', dummy: true } });
     store.markJobRunning('job-flip');
     // After the flip the row should be RUNNING again, and resume context should be cleared.
-    expect(store.activeJobForThread('C1', 'T-flip')?.id).toBe('job-flip');
+    expect(store['db'].prepare('SELECT status FROM jobs WHERE id = ?').get('job-flip')).toEqual({ status: 'RUNNING' });
     expect(store.loadResumeContext('job-flip')).toBeUndefined();
     store.close();
   });

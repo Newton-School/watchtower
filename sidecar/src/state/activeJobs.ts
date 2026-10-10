@@ -1,12 +1,47 @@
 /** Active jobs tracked for cancellation support. Maps jobId → AbortController. */
 const activeJobs = new Map<string, AbortController>();
 
-export function registerActiveJob(jobId: string, controller: AbortController): void {
+/**
+ * The Slack thread each in-flight job owns, held from register to unregister.
+ * A cancel does not release it: the job still owns the thread (and its
+ * worktree) until its finalizer has cleaned up.
+ */
+const jobThreads = new Map<string, string>();
+
+const threadKey = (channelId: string, threadTs: string): string => `${channelId}:${threadTs}`;
+
+export function registerActiveJob(
+  jobId: string,
+  controller: AbortController,
+  thread?: { channelId: string; threadTs: string },
+): void {
   activeJobs.set(jobId, controller);
+  if (thread) jobThreads.set(jobId, threadKey(thread.channelId, thread.threadTs));
 }
 
 export function unregisterActiveJob(jobId: string): void {
   activeJobs.delete(jobId);
+  jobThreads.delete(jobId);
+}
+
+/**
+ * The in-flight job that owns a Slack thread, if any (issue #261).
+ *
+ * This is the same-thread lock. It used to be a query for a RUNNING row
+ * updated in the last 45 minutes, and jobs.updated_at is only written on a
+ * status change, so the lock lapsed under any long job and a second mention
+ * started a duplicate in the same workspace. (The comparison was also between
+ * an ISO timestamp and SQLite's `datetime()` text, so "45 minutes" really
+ * meant "since UTC midnight".) Only this process runs jobs, so what it has
+ * registered is the truth; a RUNNING row it does not know is an orphan that
+ * startup cleanup handles.
+ */
+export function activeJobIdForThread(channelId: string, threadTs: string): string | undefined {
+  const key = threadKey(channelId, threadTs);
+  for (const [jobId, owned] of jobThreads) {
+    if (owned === key) return jobId;
+  }
+  return undefined;
 }
 
 /** Who cancelled a job. Decides what, if anything, the thread is told. */

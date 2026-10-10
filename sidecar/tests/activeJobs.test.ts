@@ -5,6 +5,7 @@ import {
   cancelJob,
   getActiveJobIds,
   takeCancelReason,
+  activeJobIdForThread,
 } from '../src/state/activeJobs.js';
 
 describe('activeJobs', () => {
@@ -83,5 +84,49 @@ describe('activeJobs', () => {
   it('keeps no reason for a job that was not running', () => {
     expect(cancelJob('never-registered', { source: 'ui', message: 'x' })).toBe(false);
     expect(takeCancelReason('never-registered')).toBeUndefined();
+  });
+});
+
+// Issue #261: the same-thread lock used to be "a RUNNING row updated in the
+// last 45 minutes", and lapsed under any job that ran longer.
+describe('activeJobIdForThread — the same-thread lock', () => {
+  const thread = { channelId: 'C1', threadTs: '1791000000.000100' };
+
+  it('holds the thread from register to unregister, however long the job runs', () => {
+    registerActiveJob('job-long', new AbortController(), thread);
+    expect(activeJobIdForThread('C1', '1791000000.000100')).toBe('job-long');
+
+    unregisterActiveJob('job-long');
+    expect(activeJobIdForThread('C1', '1791000000.000100')).toBeUndefined();
+  });
+
+  it('keeps the thread locked after a cancel, until the job has finished cleaning up', () => {
+    registerActiveJob('job-cancelling', new AbortController(), thread);
+    cancelJob('job-cancelling', { source: 'ui', message: 'Cancelled from Watchtower UI.' });
+
+    // No longer cancellable, but still the owner of the thread and its worktree.
+    expect(getActiveJobIds()).not.toContain('job-cancelling');
+    expect(activeJobIdForThread('C1', '1791000000.000100')).toBe('job-cancelling');
+
+    unregisterActiveJob('job-cancelling');
+    expect(activeJobIdForThread('C1', '1791000000.000100')).toBeUndefined();
+  });
+
+  it('does not lock another thread, or the same thread ts in another channel', () => {
+    registerActiveJob('job-a', new AbortController(), thread);
+
+    expect(activeJobIdForThread('C1', '1791000999.000100')).toBeUndefined();
+    expect(activeJobIdForThread('C2', '1791000000.000100')).toBeUndefined();
+    unregisterActiveJob('job-a');
+  });
+
+  it('is empty in a fresh process: a RUNNING row left by a previous one locks nothing', () => {
+    expect(activeJobIdForThread('C9', '1791000000.000100')).toBeUndefined();
+  });
+
+  it('does not lock a thread for a job registered without one', () => {
+    registerActiveJob('job-no-thread', new AbortController());
+    expect(activeJobIdForThread('C1', '1791000000.000100')).toBeUndefined();
+    unregisterActiveJob('job-no-thread');
   });
 });
