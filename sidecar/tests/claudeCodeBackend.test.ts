@@ -429,6 +429,36 @@ describe('claudeCodeBackend.buildArgs', () => {
     expect(args[idx + 1]).toBe('plan');
   });
 
+  it('passes images by path + --add-dir, never the nonexistent --image flag', () => {
+    const imagePaths = ['/tmp/slack-a/F1-shot.png', '/tmp/slack-a/F2-shot.png', '/tmp/slack-b/F3-shot.png'];
+    const args = claudeCodeBackend.buildArgs({ ...baseRequest, planMode: true, imagePaths }, '/tmp/out.json');
+    // The installed CLI exits with "unknown option '--image'".
+    expect(args).not.toContain('--image');
+    const prompt = args[args.indexOf('-p') + 1];
+    expect(prompt.startsWith('hello')).toBe(true);
+    for (const p of imagePaths) expect(prompt).toContain(`- ${p}`);
+    expect(prompt).toContain('Read tool');
+    // One --add-dir with each image dir once; variadic, so it must follow the prompt.
+    const addDir = args.indexOf('--add-dir');
+    expect(addDir).toBeGreaterThan(args.indexOf('-p') + 1);
+    expect(args.slice(addDir + 1, addDir + 3)).toEqual(['/tmp/slack-a', '/tmp/slack-b']);
+    expect(args.filter(a => a === '--add-dir')).toHaveLength(1);
+  });
+
+  it('leaves the prompt and args alone when there are no images', () => {
+    const args = claudeCodeBackend.buildArgs({ ...baseRequest, imagePaths: [] }, '/tmp/out.json');
+    expect(args[args.indexOf('-p') + 1]).toBe('hello');
+    expect(args).not.toContain('--add-dir');
+  });
+
+  it('adds image paths to a resumed run too', () => {
+    const args = claudeCodeBackend.buildArgs(
+      { ...baseRequest, resumeSessionId: 'sess-1', imagePaths: ['/tmp/slack-a/F1-shot.png'] },
+      '/tmp/out.json',
+    );
+    expect(args[args.indexOf('-p') + 1]).toContain('- /tmp/slack-a/F1-shot.png');
+  });
+
   it('marks plain-text output from an error envelope as status error, not success (issue #342)', () => {
     const wrapper = JSON.stringify({
       type: 'result',

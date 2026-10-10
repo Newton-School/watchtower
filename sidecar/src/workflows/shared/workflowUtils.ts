@@ -3,7 +3,7 @@ import path from 'node:path';
 import type { WebClient } from '@slack/web-api';
 import type { AppConfig, NormalizedTask, WorkflowStepLogger } from '../../types/contracts.js';
 import { fetchThreadContext } from '../../slack/threadContext.js';
-import { downloadSlackFiles } from '../../slack/imageDownloader.js';
+import { downloadSlackFiles, formatUnreadableAttachmentsNote } from '../../slack/imageDownloader.js';
 import type { SlackFileAttachment } from '../../slack/imageDownloader.js';
 import { getBackend } from '../../backends/registry.js';
 import { getActiveBackendId } from '../../codex/runCodex.js';
@@ -392,6 +392,7 @@ export async function prepareWorkflowContext(params: {
   const allFiles = threadMessages.flatMap((m: ThreadMessage) => m.files ?? []) as unknown as SlackFileAttachment[];
   let imagePaths: string[] = [];
   let documentContext = '';
+  let unreadableNote = '';
   if (allFiles.length > 0) {
     try {
       const fileResult = await downloadSlackFiles({
@@ -400,6 +401,7 @@ export async function prepareWorkflowContext(params: {
         logStep,
       });
       imagePaths = fileResult.imagePaths;
+      unreadableNote = formatUnreadableAttachmentsNote(fileResult.skipped);
 
       // Read text-based documents and include their content as context
       if (fileResult.documentPaths.length > 0) {
@@ -419,7 +421,10 @@ export async function prepareWorkflowContext(params: {
         }
       }
     } catch {
-      // Non-fatal
+      // Non-fatal, but the agent must still learn the files exist.
+      unreadableNote = formatUnreadableAttachmentsNote(
+        allFiles.map(f => ({ name: f.name, mimetype: f.mimetype, reason: 'download_error' })),
+      );
     }
   }
 
@@ -427,7 +432,9 @@ export async function prepareWorkflowContext(params: {
   const imageContext =
     (imagePaths.length > 0 && !backend.supportsImages()
       ? `\n\n[${imagePaths.length} image(s) attached in thread — this backend does not support image input]`
-      : '') + documentContext;
+      : '') +
+    documentContext +
+    unreadableNote;
 
   // Resolve GitHub token
   const githubToken = await resolveGithubTokenForCodex();

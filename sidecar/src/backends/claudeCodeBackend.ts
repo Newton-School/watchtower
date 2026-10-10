@@ -174,6 +174,13 @@ function resolveClaudeCodeBinary(): string {
   return 'claude';
 }
 
+/** Name downloaded thread images in the prompt so the agent opens them with Read. */
+export function withImageReadInstructions(prompt: string, imagePaths: string[] | undefined): string {
+  if (!imagePaths || imagePaths.length === 0) return prompt;
+  const list = imagePaths.map(p => `- ${p}`).join('\n');
+  return `${prompt}\n\nImages attached in the Slack thread — open each one with the Read tool before answering:\n${list}`;
+}
+
 export const claudeCodeBackend: AgentBackend = {
   id: 'claude-code',
   displayName: 'Claude Code (Anthropic)',
@@ -198,10 +205,11 @@ export const claudeCodeBackend: AgentBackend = {
 
   buildArgs(request: AgentRunRequest, _outputPath: string): string[] {
     const args: string[] = [];
+    const prompt = withImageReadInstructions(request.prompt, request.imagePaths);
     if (request.resumeSessionId) {
-      args.push('--resume', request.resumeSessionId, '-p', request.prompt);
+      args.push('--resume', request.resumeSessionId, '-p', prompt);
     } else {
-      args.push('-p', request.prompt);
+      args.push('-p', prompt);
     }
     // `stream-json` (which requires `--verbose` under `--print`) emits one JSON
     // event per line as the run progresses instead of a single blob at exit.
@@ -226,10 +234,14 @@ export const claudeCodeBackend: AgentBackend = {
     if (request.reasoningEffort) {
       args.push('--effort', request.reasoningEffort);
     }
-    if (request.imagePaths) {
-      for (const imagePath of request.imagePaths) {
-        args.push('--image', imagePath);
-      }
+    // The CLI has no `--image` flag (it exits with "unknown option '--image'"),
+    // so images go in by path: the prompt names them (see
+    // withImageReadInstructions) and `--add-dir` lets the Read tool open them
+    // from outside the repo, in plan mode too. `--add-dir` is variadic, so it
+    // must stay after the `-p` prompt positional.
+    const imageDirs = [...new Set((request.imagePaths ?? []).map(p => path.dirname(p)))];
+    if (imageDirs.length > 0) {
+      args.push('--add-dir', ...imageDirs);
     }
     // Expose only the requested MCP servers (issue: scoped investigation
     // reaching Metabase). `--strict-mcp-config` makes the headless run ignore

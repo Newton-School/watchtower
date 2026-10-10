@@ -104,9 +104,16 @@ export async function downloadSlackFiles(params: {
 
       if (!response.ok) {
         result.skipped.push({ name: file.name, mimetype: file.mimetype, reason: `http_${response.status}` });
+        // A 403 on url_private_download is almost always the token, not the
+        // file: the scope can be ticked in the app config yet never granted
+        // because the app wasn't reinstalled. `auth.test` → x-oauth-scopes tells.
+        const hint =
+          response.status === 403
+            ? " — the bot token likely lacks 'files:read' (add it to the miniOG Slack app and reinstall)"
+            : '';
         logStep?.({
           stage: 'files.download.http_error',
-          message: `Failed to download ${file.name}: HTTP ${response.status}`,
+          message: `Failed to download ${file.name}: HTTP ${response.status}${hint}`,
           level: 'WARN',
           data: { fileName: file.name, status: response.status },
         });
@@ -166,6 +173,29 @@ export async function downloadSlackFiles(params: {
   });
 
   return result;
+}
+
+/**
+ * Prompt note for thread attachments the agent can't see. Without it a failed
+ * download is indistinguishable from "nothing was attached", and the agent
+ * tells the user there was no screenshot when there was one.
+ */
+export function formatUnreadableAttachmentsNote(skipped: DownloadSlackFilesResult['skipped']): string {
+  if (skipped.length === 0) return '';
+  const list = skipped.map(s => `${s.name} (${describeSkipReason(s.reason)})`).join(', ');
+  return (
+    `\n\n[Attachments in this thread that you could NOT open: ${list}. ` +
+    'They were attached — never tell the user nothing was attached. If the request depends on one, ' +
+    "say you couldn't open it and ask for its content another way (a description, the page URL, or pasted text).]"
+  );
+}
+
+function describeSkipReason(reason: string): string {
+  if (reason === 'unsupported_mimetype') return 'unsupported file type';
+  if (reason === 'max_files_exceeded') return `over the ${MAX_FILES}-file limit`;
+  if (reason === 'too_large') return 'over the 10MB limit';
+  if (reason.startsWith('http_')) return `download failed, HTTP ${reason.slice('http_'.length)}`;
+  return 'download failed';
 }
 
 /** @deprecated Use downloadSlackFiles instead */

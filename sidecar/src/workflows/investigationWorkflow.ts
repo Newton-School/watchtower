@@ -195,6 +195,7 @@ Return strict JSON:
     cwd: repoPath,
     prompt: investigatorPrompt,
     githubToken: ctx.githubToken,
+    imagePaths: ctx.imagePaths.length > 0 ? ctx.imagePaths : undefined,
     model: profile.model,
     reasoningEffort: profile.reasoningEffort,
     mcpServers,
