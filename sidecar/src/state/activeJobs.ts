@@ -6,17 +6,22 @@ const activeJobs = new Map<string, AbortController>();
  * A cancel does not release it: the job still owns the thread (and its
  * worktree) until its finalizer has cleaned up.
  */
-const jobThreads = new Map<string, string>();
+const jobThreads = new Map<string, { key: string; requestedBy?: string }>();
 
 const threadKey = (channelId: string, threadTs: string): string => `${channelId}:${threadTs}`;
 
 export function registerActiveJob(
   jobId: string,
   controller: AbortController,
-  thread?: { channelId: string; threadTs: string },
+  thread?: { channelId: string; threadTs: string; requestedBy?: string },
 ): void {
   activeJobs.set(jobId, controller);
-  if (thread) jobThreads.set(jobId, threadKey(thread.channelId, thread.threadTs));
+  if (thread) {
+    jobThreads.set(jobId, {
+      key: threadKey(thread.channelId, thread.threadTs),
+      requestedBy: thread.requestedBy,
+    });
+  }
 }
 
 export function unregisterActiveJob(jobId: string): void {
@@ -37,15 +42,23 @@ export function unregisterActiveJob(jobId: string): void {
  * startup cleanup handles.
  */
 export function activeJobIdForThread(channelId: string, threadTs: string): string | undefined {
+  return activeJobForThread(channelId, threadTs)?.jobId;
+}
+
+/** The in-flight job that owns a thread, with who asked for it (they may stop it — issue #435). */
+export function activeJobForThread(
+  channelId: string,
+  threadTs: string,
+): { jobId: string; requestedBy?: string } | undefined {
   const key = threadKey(channelId, threadTs);
   for (const [jobId, owned] of jobThreads) {
-    if (owned === key) return jobId;
+    if (owned.key === key) return { jobId, requestedBy: owned.requestedBy };
   }
   return undefined;
 }
 
 /** Who cancelled a job. Decides what, if anything, the thread is told. */
-export type CancelSource = 'ui' | 'source_deleted';
+export type CancelSource = 'ui' | 'source_deleted' | 'slack_stop';
 
 export interface CancelReason {
   source: CancelSource;
