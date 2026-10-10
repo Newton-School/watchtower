@@ -185,6 +185,13 @@ Return strict JSON with:
 }
 
 const MAX_FEEDBACK_ITERATIONS = 5;
+
+/** Deploy semantics in a no-code ask. Wider than the deploy gate on purpose: here a match only withholds an action. */
+export const QUICK_ACTION_DEPLOY_RE =
+  /\b(deploy|release|ship|roll ?back|push (?:it |this |that )?to prod(?:uction)?)\b/i;
+
+export const QUICK_ACTION_DEPLOY_REDIRECT =
+  "I don't deploy or roll back from here. If you want something shipped, ask me directly — `@miniOG deploy newton-web to prod` or `@miniOG deploy marketing to prod` — and I'll confirm with you before anything goes out.";
 const MAX_PAUSE_CYCLES = 10;
 
 type ApprovalLoopState = {
@@ -1062,9 +1069,39 @@ export async function runImplementationWorkflow(params: {
       // INFORMATIONAL path instead. Default to informational — both misroute
       // directions are non-destructive (a misrouted op just gets explained).
       const operationalAction =
-        /\b(merge|close|reopen|revert|deploy|release|ship|rollback|restart|rerun|re-run|run (?:the )?tests?|approve|assign)\b/i.test(
+        /\b(merge|close|reopen|revert|restart|rerun|re-run|run (?:the )?tests?|approve|assign)\b/i.test(
           task.event.text,
         );
+
+      // Deploys never run from here (issue #407). This path has no deploy
+      // capability check and no confirmation, and its agent runs with
+      // permissions bypassed — "release the X fix" must not become an
+      // ungated production deploy. A deploy-only ask is redirected to the
+      // deploy command; a mixed ask ("merge and deploy") keeps its other
+      // operation and the prompt below forbids the deploy half.
+      if (QUICK_ACTION_DEPLOY_RE.test(task.event.text) && !operationalAction) {
+        logStep?.({
+          stage: 'implementation.quick_action.deploy_redirect',
+          message: 'Deploy-shaped ask reached the quick-action path — redirecting to the deploy command.',
+          level: 'WARN',
+          data: { plan: plannerOutput.plan },
+        });
+        await slack.chat
+          .postMessage({
+            channel: task.event.channelId,
+            thread_ts: task.event.threadTs,
+            text: QUICK_ACTION_DEPLOY_REDIRECT,
+          })
+          .catch(() => {});
+        return {
+          workflow: 'IMPLEMENTATION',
+          status: 'SKIPPED',
+          message: QUICK_ACTION_DEPLOY_REDIRECT,
+          notifyDesktop: false,
+          slackPosted: true,
+        };
+      }
+
       if (!operationalAction) {
         logStep?.({
           stage: 'implementation.no_code_needed.informational',
@@ -1093,7 +1130,9 @@ Context:
 - GitHub auth mode: ${githubAuthModeHint(Boolean(ctx.githubToken))}
 
 Task:
-Execute this request directly. No code changes are needed — this is a quick operational action (merge PR, deploy, run command, etc.).
+Execute this request directly. No code changes are needed — this is a quick operational action (merge PR, close PR, run a command, etc.).
+
+Never deploy, release, ship or roll back anything, and never run a deploy command, script or skill, even if the request asks for it. If the request includes that, do the rest and say that deploys go through "@miniOG deploy <target> to prod", which asks for confirmation first.
 
 Slack thread context:
 ${ctx.threadContext}${ctx.imageContext}
