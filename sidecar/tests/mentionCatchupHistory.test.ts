@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { WebClient } from '@slack/web-api';
-import { fetchChannelHistory } from '../src/slack/mentionCatchup.js';
+import { fetchChannelHistory, effectiveOldestTs } from '../src/slack/mentionCatchup.js';
 
 // A WebClient stub whose conversations.history always returns a full page and a
 // non-empty cursor — i.e. an infinite backlog. Without the per-channel cap the
@@ -44,5 +44,29 @@ describe('fetchChannelHistory per-channel cap', () => {
     const messages = await fetchChannelHistory(client, 'C1', 0);
     expect(messages.length).toBe(2);
     expect(calls).toBe(1);
+  });
+});
+
+describe('effectiveOldestTs (catch-up cursor self-heal)', () => {
+  const NOW = 1_000_000; // arbitrary sane "now" in seconds
+  const LOOKBACK = 60 * 60 * 24;
+
+  it('resumes 5s before a sane stored cursor', () => {
+    expect(effectiveOldestTs(NOW - 500, NOW, LOOKBACK)).toBe(NOW - 505);
+  });
+
+  it('falls back to the lookback window when there is no cursor yet', () => {
+    expect(effectiveOldestTs(0, NOW, LOOKBACK)).toBe(NOW - LOOKBACK);
+  });
+
+  it('self-heals a future-parked cursor (clock skew) instead of skipping everything (#mention-catchup)', () => {
+    // The bug: a cursor parked days ahead of now made `oldest` skip all real
+    // messages. The fix: detect cursor > now and fall back to the lookback window.
+    const futureCursor = NOW + 6 * LOOKBACK; // ~6 days ahead
+    expect(effectiveOldestTs(futureCursor, NOW, LOOKBACK)).toBe(NOW - LOOKBACK);
+  });
+
+  it('treats a non-finite cursor as unset', () => {
+    expect(effectiveOldestTs(Number.NaN, NOW, LOOKBACK)).toBe(NOW - LOOKBACK);
   });
 });
