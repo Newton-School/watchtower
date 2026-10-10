@@ -3,6 +3,7 @@ import type { AgentBackendId } from '../backends/types.js';
 import type { PrMetadata } from '../github/prReviewSupport.js';
 import type { PrReviewDeps } from './prReviewAgent.js';
 import { NEVER_POST_RULE, SEVERITY_RUBRIC } from './prReviewAgent.js';
+import { STE_REVIEW_TEXT_RULE } from '../codex/replyStyle.js';
 import type { RepoReviewSkill } from './reviewSkills.js';
 import { highReasoningProfile } from '../codex/modelProfiles.js';
 import { getActiveBackendId } from '../codex/runCodex.js';
@@ -202,6 +203,8 @@ ${NEVER_POST_RULE}
   "reviewApproach": string,
   "skillsApplied": string[]
 }
+
+${STE_REVIEW_TEXT_RULE}
 
 PR Diff:
 \`\`\`diff
