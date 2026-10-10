@@ -24,6 +24,21 @@ const CATCHUP_MAX_MESSAGES_PER_CHANNEL = 1000;
 // `message_deleted` rows it stumbles across.
 const NON_ACTIONABLE_SUBTYPES = new Set(['message_changed', 'message_deleted', 'bot_message']);
 
+/**
+ * Window start for a catch-up scan. Normally we resume a few seconds before the
+ * stored cursor. But the cursor only ever moves forward, so a single jump of the
+ * system clock into the future (or a future-dated message) parks it ahead of
+ * real time *permanently* — and a future cursor makes `oldest` skip every real
+ * message until the wall clock catches up, silently blinding catch-up for the
+ * whole gap. When the stored cursor is ahead of `nowTs`, treat it as corrupt and
+ * fall back to the lookback window so the scanner self-heals. (RCA: a clock
+ * bounce parked the cursor ~6 days ahead and dropped a PR-review mention.)
+ */
+export function effectiveOldestTs(storedCursor: number, nowTs: number, lookbackSeconds: number): number {
+  const valid = Number.isFinite(storedCursor) && storedCursor > 0 && storedCursor <= nowTs;
+  return valid ? Math.max(0, storedCursor - 5) : nowTs - lookbackSeconds;
+}
+
 type CatchupDeps = {
   webClient: WebClient;
   config: AppConfig;
@@ -43,10 +58,13 @@ async function runMentionCatchup(deps: CatchupDeps): Promise<void> {
   const nowTs = Math.floor(Date.now() / 1000);
   const storedCursorRaw = store.getState(CATCHUP_STATE_KEY);
   const storedCursor = storedCursorRaw ? Number(storedCursorRaw) : 0;
-  const oldestTs =
-    Number.isFinite(storedCursor) && storedCursor > 0
-      ? Math.max(0, storedCursor - 5)
-      : nowTs - CATCHUP_LOOKBACK_SECONDS;
+  const oldestTs = effectiveOldestTs(storedCursor, nowTs, CATCHUP_LOOKBACK_SECONDS);
+  if (storedCursor > nowTs) {
+    logger.warn(
+      { component: 'slack-catchup', storedCursor, nowTs },
+      'catch-up cursor is ahead of the clock (clock skew?) — resetting to the lookback window so recovery self-heals',
+    );
+  }
 
   logger.info(
     {
@@ -68,7 +86,6 @@ async function runMentionCatchup(deps: CatchupDeps): Promise<void> {
 
   let recovered = 0;
   let scannedMessages = 0;
-  let maxSeenTs = oldestTs;
 
   for (const channelId of channelIds) {
     const historyMessages = await fetchChannelHistory(webClient, channelId, oldestTs);
@@ -87,7 +104,6 @@ async function runMentionCatchup(deps: CatchupDeps): Promise<void> {
       }
 
       scannedMessages += 1;
-      maxSeenTs = Math.max(maxSeenTs, toEpochSeconds(eventTs));
 
       const subtype = message.subtype ? String(message.subtype) : '';
       if (subtype && NON_ACTIONABLE_SUBTYPES.has(subtype)) {
@@ -139,7 +155,11 @@ async function runMentionCatchup(deps: CatchupDeps): Promise<void> {
     }
   }
 
-  const nextCursor = Math.max(nowTs, maxSeenTs);
+  // Advance to "now" only — never to a future-dated message timestamp. Combined
+  // with the future-cursor self-heal in effectiveOldestTs, this keeps a clock
+  // skew or stray future-dated message from permanently parking the cursor ahead
+  // of real time and blinding the scanner.
+  const nextCursor = nowTs;
   store.setState(CATCHUP_STATE_KEY, String(nextCursor));
 
   logger.info(
