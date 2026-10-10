@@ -1,5 +1,11 @@
 import { describe, expect, it, beforeEach } from 'vitest';
-import { registerActiveJob, unregisterActiveJob, cancelJob, getActiveJobIds } from '../src/state/activeJobs.js';
+import {
+  registerActiveJob,
+  unregisterActiveJob,
+  cancelJob,
+  getActiveJobIds,
+  takeCancelReason,
+} from '../src/state/activeJobs.js';
 
 describe('activeJobs', () => {
   beforeEach(() => {
@@ -45,5 +51,37 @@ describe('activeJobs', () => {
   it('returns false when no job matches', () => {
     const result = cancelJob('nonexistent');
     expect(result).toBe(false);
+  });
+
+  it('remembers why a job was cancelled, once, for its finalizer (issue #438)', () => {
+    registerActiveJob('job-ui', new AbortController());
+    cancelJob('job-ui', { source: 'ui', message: 'Cancelled from Watchtower UI.' });
+
+    expect(takeCancelReason('job-ui')).toEqual({ source: 'ui', message: 'Cancelled from Watchtower UI.' });
+    expect(takeCancelReason('job-ui')).toBeUndefined();
+  });
+
+  it('stores the reason under the full id when cancelled by prefix', () => {
+    registerActiveJob('abcdef-9999-full', new AbortController());
+    cancelJob('abcdef', { source: 'source_deleted', message: 'Source message deleted by author.' });
+
+    expect(takeCancelReason('abcdef-9999-full')?.source).toBe('source_deleted');
+  });
+
+  it('has the reason in place by the time abort listeners run', () => {
+    const controller = new AbortController();
+    registerActiveJob('job-listener', controller);
+    let seen: string | undefined;
+    controller.signal.addEventListener('abort', () => {
+      seen = takeCancelReason('job-listener')?.source;
+    });
+
+    cancelJob('job-listener', { source: 'ui', message: 'x' });
+    expect(seen).toBe('ui');
+  });
+
+  it('keeps no reason for a job that was not running', () => {
+    expect(cancelJob('never-registered', { source: 'ui', message: 'x' })).toBe(false);
+    expect(takeCancelReason('never-registered')).toBeUndefined();
   });
 });

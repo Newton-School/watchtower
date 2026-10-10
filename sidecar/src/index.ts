@@ -45,8 +45,9 @@ import { createThreadStatus, type ThreadStatus } from './slack/threadStatus.js';
 import { resolveUserGroup } from './slack/userGroupResolver.js';
 import { isOlderVersion, readSidecarBuild } from './runtime/buildInfo.js';
 import { acquireInstanceLock, instanceLockPath, releaseInstanceLock } from './runtime/instanceLock.js';
-import { registerActiveJob, unregisterActiveJob, cancelJob } from './state/activeJobs.js';
+import { registerActiveJob, unregisterActiveJob, cancelJob, takeCancelReason } from './state/activeJobs.js';
 import { JobStore } from './state/jobStore.js';
+import { settleAbortedResult } from './workflows/shared/cancelState.js';
 import type { AccessGroupKey, SlackEventEnvelope, SlackReactionEvent, WorkflowStepLog } from './types/contracts.js';
 
 assertMacOS();
@@ -300,7 +301,10 @@ function buildEventAwareClient(client: WebClient, event: SlackEventEnvelope): We
         // delete the orphan and continue without cancellation.
         const active = store.activeJobForEventTs(event.channelId, event.eventTs);
         if (active) {
-          cancelJob(active.id);
+          cancelJob(active.id, {
+            source: 'source_deleted',
+            message: 'Source message deleted during post (orphan-promoted reply).',
+          });
           store.markJob(active.id, 'CANCELLED', {
             errorMessage: 'Source message deleted during post (orphan-promoted reply).',
           });
@@ -386,7 +390,7 @@ async function processMessageDeleted(event: SlackEventEnvelope, client: WebClien
     return;
   }
 
-  const cancelled = cancelJob(active.id);
+  const cancelled = cancelJob(active.id, { source: 'source_deleted', message: 'Source message deleted by author.' });
   store.markJob(active.id, 'CANCELLED', {
     errorMessage: 'Source message deleted by author.',
   });
@@ -1114,6 +1118,39 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     logStep,
   });
 
+  // A cancel from the desktop app is silent in Slack otherwise; whoever
+  // deleted the source message needs no reply.
+  const postCancelNote = async (source: string | undefined): Promise<void> => {
+    if (source !== 'ui') return;
+    await eventClient.chat
+      .postMessage({
+        channel: event.channelId,
+        thread_ts: event.threadTs,
+        text: 'Stopped — this run was cancelled from the Watchtower app.',
+      })
+      .catch(() => {});
+  };
+
+  // An abort that surfaces as an exception is still a cancel (issue #438): no
+  // failure copy, no diagnosis, no desktop failure alert, and the job stays
+  // CANCELLED instead of being overwritten with FAILED.
+  const finalizeCancelledJob = async (detail: string): Promise<void> => {
+    const cancelReason = takeCancelReason(jobId);
+    logStep({
+      stage: 'job.cancelled',
+      message: 'Run was cancelled — recording CANCELLED, not a failure.',
+      level: 'WARN',
+      data: { detail, cancelSource: cancelReason?.source },
+    });
+    await cleanupThreadWorkspaces(event.threadTs);
+    unregisterActiveJob(jobId);
+    failLaunchpadWorkflow({ event, errorMessage: 'Cancelled.', store, logStep });
+    store.markJob(jobId, 'CANCELLED', { errorMessage: cancelReason?.message ?? 'Cancelled.' });
+    await postCancelNote(cancelReason?.source);
+    await removeReaction(client, event.channelId, event.eventTs, 'eyes');
+    await addReaction(client, event.channelId, event.eventTs, 'x');
+  };
+
   try {
     let attempt = 0;
     let lastError: unknown;
@@ -1148,7 +1185,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
           }
         }
 
-        const result = await agentCallContext.run({ jobId, store }, () =>
+        const workflowResult = await agentCallContext.run({ jobId, store }, () =>
           routeTask({
             task: routedTask,
             config,
@@ -1159,6 +1196,23 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
             signal: abortController.signal,
           }),
         );
+        // An aborted run is cancelled, whatever the workflow made of its dead
+        // agent (issue #438). Settled before the diagnosis and the status write
+        // below, which used to report it as a failed job with a "timeout".
+        const result = settleAbortedResult(workflowResult, abortController.signal.aborted);
+        const cancelReason = abortController.signal.aborted ? takeCancelReason(jobId) : undefined;
+        if (result !== workflowResult) {
+          logStep({
+            stage: 'job.cancelled',
+            message: 'Run was cancelled — recording CANCELLED, not the workflow failure.',
+            level: 'WARN',
+            data: {
+              workflowStatus: workflowResult.status,
+              workflowMessage: workflowResult.message,
+              cancelSource: cancelReason?.source,
+            },
+          });
+        }
         const hasPrInResult =
           result.result?.prUrl && typeof result.result.prUrl === 'string' && result.result.prUrl !== '';
         const diagnosis =
@@ -1208,7 +1262,13 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
         } else if (result.status === 'SKIPPED') {
           store.markJob(jobId, 'SKIPPED', { result: result.result, executedWorkflow });
         } else if (result.status === 'CANCELLED') {
-          store.markJob(jobId, 'CANCELLED', { result: result.result, executedWorkflow });
+          store.markJob(jobId, 'CANCELLED', {
+            // Keep who cancelled it; markJob would otherwise blank the reason.
+            errorMessage: cancelReason?.message,
+            result: result.result,
+            executedWorkflow,
+          });
+          await postCancelNote(cancelReason?.source);
         } else {
           store.markJob(jobId, 'FAILED', {
             errorMessage: result.message,
@@ -1317,7 +1377,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
             error: msg,
           },
         });
-        if (!transient || attempt >= 3) {
+        if (abortController.signal.aborted || !transient || attempt >= 3) {
           break;
         }
         logStep({
@@ -1330,6 +1390,11 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
           },
         });
       }
+    }
+
+    if (abortController.signal.aborted) {
+      await finalizeCancelledJob(String(lastError));
+      return;
     }
 
     const errorMessage = `Workflow failed after retries: ${String(lastError)}`;
@@ -1434,6 +1499,10 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     }
   } catch (error) {
     const errorMessage = String(error);
+    if (abortController.signal.aborted) {
+      await finalizeCancelledJob(errorMessage);
+      return;
+    }
     const diagnosis = diagnoseFailure({
       workflow: routedTask.intent,
       message: errorMessage,
@@ -1719,7 +1788,7 @@ async function main(): Promise<void> {
   setInterval(() => {
     const pendingIds = store.popPendingCancels();
     for (const jobId of pendingIds) {
-      const cancelled = cancelJob(jobId);
+      const cancelled = cancelJob(jobId, { source: 'ui', message: 'Cancelled from Watchtower UI.' });
       if (cancelled) {
         store.markJob(jobId, 'CANCELLED', { errorMessage: 'Cancelled from Watchtower UI.' });
         logger.info({ jobId }, 'job cancelled from UI');

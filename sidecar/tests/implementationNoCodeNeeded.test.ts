@@ -363,3 +363,52 @@ describe('implementationWorkflow — quick-action merge needs the owner (#429)',
     expect(runCodex).toHaveBeenCalledTimes(2);
   });
 });
+
+describe('implementationWorkflow — cancelled runs post no failure copy (#438)', () => {
+  beforeEach(() => {
+    vi.mocked(runCodex).mockReset();
+    vi.mocked(runAgenticEntry).mockReset();
+  });
+
+  it('returns CANCELLED when stopped during the quick action, without "Quick action completed."', async () => {
+    const controller = new AbortController();
+    vi.mocked(runCodex)
+      .mockResolvedValueOnce(plannerNoCodeResult())
+      .mockImplementationOnce(async () => {
+        controller.abort();
+        return { ok: false, exitCode: 143, timedOut: false, stdout: '', stderr: '', lastMessage: '' };
+      });
+    const slack = makeSlack();
+
+    const result = await runImplementationWorkflow({
+      task: makeTask('<@UBOT1> rerun the tests'),
+      config,
+      slack: slack as unknown as import('@slack/web-api').WebClient,
+      signal: controller.signal,
+    });
+
+    expect(result.status).toBe('CANCELLED');
+    const posted = slack.chat.postMessage.mock.calls.map(call => call[0].text);
+    expect(posted).not.toContain('Quick action completed.');
+  });
+
+  it('returns CANCELLED when stopped during planning, and never asks for a merge confirmation', async () => {
+    const controller = new AbortController();
+    vi.mocked(runCodex).mockImplementationOnce(async () => {
+      controller.abort();
+      return plannerNoCodeResult();
+    });
+    const slack = makeSlack();
+
+    const result = await runImplementationWorkflow({
+      task: makeTask(`<@UBOT1> merge ${PR_URL}`, { withPr: true }),
+      config,
+      slack: slack as unknown as import('@slack/web-api').WebClient,
+      signal: controller.signal,
+    });
+
+    expect(result.status).toBe('CANCELLED');
+    expect(runCodex).toHaveBeenCalledTimes(1);
+    expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
+  });
+});

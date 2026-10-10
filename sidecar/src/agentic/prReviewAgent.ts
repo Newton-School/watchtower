@@ -1223,6 +1223,8 @@ export async function reviewSinglePr(params: {
   const deps: PrReviewDeps = { ...defaultPrReviewDeps, ...params.deps };
 
   const postToThread = async (text: string) => {
+    // After a cancel there is nothing true left to say about the review (#438).
+    if (signal?.aborted) return;
     await slack.chat
       .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text })
       .catch(() => {});
