@@ -25,6 +25,7 @@ import { evaluatePolicy, loadPolicies } from './policies/evaluator.js';
 import { agentCallContext } from './state/runContext.js';
 import { detectMention, normalizeTask } from './router/intentParser.js';
 import { isRouteQuestionExpired } from './router/routeClarify.js';
+import { readToolRouterMode } from './router/toolRouter.js';
 import { decidePausedResume } from './router/pausedResume.js';
 import { classifyProduct } from './router/productClassifier.js';
 import { routeTask } from './router/taskRouter.js';
@@ -946,7 +947,10 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
   const threadMessages = await fetchThreadContext(eventClient, event.channelId, event.threadTs).catch(() => []);
   const threadTexts = threadMessages.map(message => message.text);
   logger.info({ eventId: event.eventId, messages: threadMessages.length }, 'thread context fetched for intake');
-  let task = { ...normalizeTask(event, config, threadTexts), threadMessages };
+  let task = {
+    ...normalizeTask(event, config, threadTexts, { explicitReviewGate: readToolRouterMode(store) === 'on' }),
+    threadMessages,
+  };
 
   // If this event resumes a paused workflow that asked the user to reply
   // in-thread, synthesize the bot mention so the no-mention gate below does
