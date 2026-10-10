@@ -309,6 +309,7 @@ type ApprovalLoopOutcome =
   | ({ kind: 'approved'; feedbackRounds: number; pipelineCwd: string } & ApprovalLoopState)
   | { kind: 'rejected_then_cancelled'; message: string }
   | { kind: 'exhausted' }
+  | { kind: 'cancelled' }
   | { kind: 'paused'; resumeContext: ImplementationApprovalResume };
 
 /**
@@ -360,6 +361,8 @@ async function runApprovalLoop(input: {
   resumeApprovalPromptTs?: string;
   workflowIntent: 'IMPLEMENTATION' | 'OWNER_AUTOPILOT';
   logStep?: WorkflowStepLogger;
+  /** The job's abort signal: ends the approval wait and stops a revision run (issue #264). */
+  signal?: AbortSignal;
 }): Promise<ApprovalLoopOutcome> {
   const {
     slack,
@@ -376,6 +379,7 @@ async function runApprovalLoop(input: {
     resumeApprovalPromptTs,
     workflowIntent,
     logStep,
+    signal,
   } = input;
 
   const adminUserIds = getAdminUserIds(config);
@@ -457,7 +461,12 @@ async function runApprovalLoop(input: {
       approvalPromptTs,
       logStep: logStep ?? (() => {}),
       botUserId: config.botUserId,
+      signal,
     });
+
+    if (approval.outcome === 'cancelled') {
+      return { kind: 'cancelled' };
+    }
 
     if (approval.outcome === 'paused') {
       pauseCount++;
@@ -522,7 +531,12 @@ async function runApprovalLoop(input: {
         approvalPromptTs: askReviseTs,
         logStep: logStep ?? (() => {}),
         botUserId: config.botUserId,
+        signal,
       });
+
+      if (followUp.outcome === 'cancelled') {
+        return { kind: 'cancelled' };
+      }
 
       if (followUp.outcome === 'paused') {
         pauseCount++;
@@ -623,7 +637,11 @@ Return the JSON now.`;
         // No per-agent timeoutMs — see investigationWorkflow.ts for rationale.
         // Outer abort signal remains the safety net.
         onLog: logStep,
+        signal,
       });
+      if (signal?.aborted) {
+        return { kind: 'cancelled' };
+      }
 
       // Even though we no longer resume, capture sessionId so a later coder
       // step or follow-up logging can reference this revision's session.
@@ -754,7 +772,11 @@ export async function runImplementationWorkflow(params: {
     message: 'Running implementation workflow.',
   });
 
-  const ctx = await prepareWorkflowContext({ task, config, slack, store, logStep });
+  const ctx = await prepareWorkflowContext({ task, config, slack, store, logStep, signal });
+  // Cancelled while asking which repo: no "routing to the desktop queue" copy (issue #264).
+  if (signal?.aborted) {
+    return cancelledResult('IMPLEMENTATION');
+  }
 
   // Fail closed when prepareWorkflowContext could not pin down the target
   // repo: it sets ctx.cwd = os.tmpdir() and ctx.desktopOnly. Without this
@@ -917,8 +939,10 @@ export async function runImplementationWorkflow(params: {
       planMode: plannerPlanMode,
       ...plannerProfile,
       // No per-agent timeoutMs — see investigationWorkflow.ts for rationale.
-      // Outer abort signal remains the safety net.
+      // The outer abort signal is the safety net, so it has to be passed:
+      // without it a cancelled job's planner ran to the end (issue #264).
       onLog: logStep,
+      signal,
     });
 
     // Cancelled while planning: do not post a plan, a question or failure copy (#438).
@@ -1074,7 +1098,11 @@ export async function runImplementationWorkflow(params: {
         // No per-agent timeoutMs — see investigationWorkflow.ts for rationale.
         // Outer abort signal remains the safety net.
         onLog: logStep,
+        signal,
       });
+      if (signal?.aborted) {
+        return cancelledResult('IMPLEMENTATION');
+      }
       plannerSessionId = plannerRunResult.sessionId ?? plannerSessionId;
       if (plannerRunResult.ok && plannerRunResult.parsedJson) {
         plannerOutput = plannerRunResult.parsedJson;
@@ -1126,7 +1154,12 @@ export async function runImplementationWorkflow(params: {
               approvalPromptTs: confirmResult.ts,
               logStep: logStep ?? (() => {}),
               botUserId: config.botUserId,
+              signal,
             });
+
+            if (approval.outcome === 'cancelled') {
+              return cancelledResult('IMPLEMENTATION');
+            }
 
             if (approval.outcome === 'rejected') {
               await slack.chat
@@ -1403,7 +1436,12 @@ Write your response as a ready-to-post Slack message describing what you did.
         planMarkdown,
         threadMessages: ctx.threadMessages,
         repoAffinity,
+        signal,
       });
+
+      if (signal?.aborted) {
+        return cancelledResult('IMPLEMENTATION');
+      }
 
       if (resolution.outcome === 'cancelled') {
         await slack.chat
@@ -1527,8 +1565,12 @@ Write your response as a ready-to-post Slack message describing what you did.
       githubToken: ctx.githubToken,
       workflowIntent: task.intent === 'OWNER_AUTOPILOT' ? 'OWNER_AUTOPILOT' : 'IMPLEMENTATION',
       logStep,
+      signal,
     });
 
+    if (loopOutcome.kind === 'cancelled') {
+      return cancelledResult('IMPLEMENTATION');
+    }
     if (loopOutcome.kind === 'paused') {
       return {
         workflow: loopOutcome.resumeContext.workflow,

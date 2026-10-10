@@ -412,3 +412,26 @@ describe('implementationWorkflow — cancelled runs post no failure copy (#438)'
     expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
   });
 });
+
+describe('implementationWorkflow — the abort signal reaches the planner (#264)', () => {
+  beforeEach(() => {
+    vi.mocked(runCodex).mockReset().mockResolvedValue(plannerNoCodeResult());
+    vi.mocked(runAgenticEntry).mockReset();
+  });
+
+  it("passes the job's signal to the planner run, so a cancel stops it", async () => {
+    const controller = new AbortController();
+    const slack = makeSlack();
+
+    await runImplementationWorkflow({
+      task: makeTask('<@UBOT1> rerun the tests'),
+      config,
+      slack: slack as unknown as import('@slack/web-api').WebClient,
+      signal: controller.signal,
+    });
+
+    // Planner, then the quick action: both must be stoppable.
+    expect(vi.mocked(runCodex).mock.calls[0][0].signal).toBe(controller.signal);
+    expect(vi.mocked(runCodex).mock.calls[1][0].signal).toBe(controller.signal);
+  });
+});

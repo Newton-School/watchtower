@@ -42,7 +42,11 @@ export async function runInvestigationWorkflow(params: {
     signal,
   });
 
-  const ctx = await prepareWorkflowContext({ task, config, slack, logStep, repoOverride: scope.scope });
+  const ctx = await prepareWorkflowContext({ task, config, slack, logStep, repoOverride: scope.scope, signal });
+  // Cancelled while asking which repo: no "routing to the desktop queue" copy (issue #264).
+  if (signal?.aborted) {
+    return cancelledResult('INVESTIGATION');
+  }
 
   if (ctx.desktopOnly) {
     await slack.chat

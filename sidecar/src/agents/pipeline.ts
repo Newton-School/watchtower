@@ -164,7 +164,22 @@ const REJECT_PATTERNS = /^(no|stop|cancel|abort|nevermind|never mind)\b/i;
 const PAUSE_PATTERNS =
   /^(wait|hold on|hold up|pause|brb|one sec|one moment|stand by|i'?ll get back to you|(give me|gimme) (a )?(sec|second|minute|moment|min)|pause for (now|a bit|a sec)|stop for now)[.! ]*$/i;
 
-export type ApprovalOutcome = 'approved' | 'rejected' | 'feedback' | 'paused';
+/** Resolves after `ms`, or as soon as the job is aborted. */
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise(resolve => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      { once: true },
+    );
+  });
+}
+
+export type ApprovalOutcome = 'approved' | 'rejected' | 'feedback' | 'paused' | 'cancelled';
 export type ApprovalResult = {
   outcome: ApprovalOutcome;
   userReply: string;
@@ -277,8 +292,14 @@ export async function waitForApproval(params: {
   approvalPromptTs: string;
   logStep: WorkflowStepLogger;
   botUserId?: string;
+  /** The job's abort signal. Without it a cancelled job kept waiting here forever (issue #264). */
+  signal?: AbortSignal;
 }): Promise<ApprovalResult> {
-  const { slack, channelId, threadTs, approverUserIds, approvalPromptTs, logStep, botUserId } = params;
+  const { slack, channelId, threadTs, approverUserIds, approvalPromptTs, logStep, botUserId, signal } = params;
+  const cancelled = (): ApprovalResult => {
+    logStep({ stage: 'pipeline.approval.cancelled', message: 'Job cancelled while waiting for approval.' });
+    return { outcome: 'cancelled', userReply: '', approverId: '', replyTs: '' };
+  };
   // Callers post the prompt before calling, and posting clears Slack's thread
   // status — this is what puts "is waiting for admin approval" back up.
   logStep({
@@ -292,7 +313,9 @@ export async function waitForApproval(params: {
   const classifiedTs = new Set<string>();
 
   while (true) {
-    await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+    if (signal?.aborted) return cancelled();
+    await abortableDelay(pollIntervalMs, signal);
+    if (signal?.aborted) return cancelled();
 
     let messages: Array<{ text: string; user: string; ts: string }>;
     try {
@@ -1252,8 +1275,13 @@ export async function runAgentPipeline(params: {
             approvalPromptTs,
             logStep,
             botUserId: ctx.config.botUserId,
+            signal,
           });
 
+          if (approval.outcome === 'cancelled') {
+            aborted = true;
+            break;
+          }
           if (approval.outcome === 'rejected') {
             await postSlackProgress({ slack, ctx, text: 'Got it, cancelling.' });
             aborted = true;
