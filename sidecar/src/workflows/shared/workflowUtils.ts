@@ -3,7 +3,7 @@ import path from 'node:path';
 import type { WebClient } from '@slack/web-api';
 import type { AppConfig, NormalizedTask, WorkflowStepLogger } from '../../types/contracts.js';
 import { fetchThreadContext } from '../../slack/threadContext.js';
-import { downloadSlackFiles, formatUnreadableAttachmentsNote } from '../../slack/imageDownloader.js';
+import { collectThreadAttachments } from '../../slack/threadAttachments.js';
 import type { SlackFileAttachment } from '../../slack/imageDownloader.js';
 import { getBackend } from '../../backends/registry.js';
 import { getActiveBackendId } from '../../codex/runCodex.js';
@@ -393,43 +393,11 @@ export async function prepareWorkflowContext(params: {
 
   // Download files (images + documents)
   const allFiles = threadMessages.flatMap((m: ThreadMessage) => m.files ?? []) as unknown as SlackFileAttachment[];
-  let imagePaths: string[] = [];
-  let documentContext = '';
-  let unreadableNote = '';
-  if (allFiles.length > 0) {
-    try {
-      const fileResult = await downloadSlackFiles({
-        files: allFiles,
-        botToken: config.slackBotToken,
-        logStep,
-      });
-      imagePaths = fileResult.imagePaths;
-      unreadableNote = formatUnreadableAttachmentsNote(fileResult.skipped);
-
-      // Read text-based documents and include their content as context
-      if (fileResult.documentPaths.length > 0) {
-        const { readFile } = await import('node:fs/promises');
-        const docParts: string[] = [];
-        for (const docPath of fileResult.documentPaths) {
-          try {
-            const content = await readFile(docPath, 'utf8');
-            const fileName = docPath.split('/').pop() ?? docPath;
-            docParts.push(`--- ${fileName} ---\n${content.slice(0, 8000)}`);
-          } catch {
-            // Non-fatal: skip unreadable docs
-          }
-        }
-        if (docParts.length > 0) {
-          documentContext = `\n\nAttached documents from thread:\n${docParts.join('\n\n')}`;
-        }
-      }
-    } catch {
-      // Non-fatal, but the agent must still learn the files exist.
-      unreadableNote = formatUnreadableAttachmentsNote(
-        allFiles.map(f => ({ name: f.name, mimetype: f.mimetype, reason: 'download_error' })),
-      );
-    }
-  }
+  const { imagePaths, documentContext, unreadableNote } = await collectThreadAttachments({
+    files: allFiles,
+    botToken: config.slackBotToken,
+    logStep,
+  });
 
   const backend = getBackend(getActiveBackendId());
   const imageContext =
