@@ -1178,27 +1178,98 @@ describe('agenticPrReview', () => {
     expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'agentic.pr_review.verify.inconclusive' }));
   });
 
-  it('severity gate: non-blocking findings are not verified', async () => {
-    const slack = makeSlack([`review ${WEB_PR}`]);
-    const runAgent = routedRunAgent({
-      reviewer: agentOk([
-        { role: 'reviewer', severity: 'medium', category: 'bug', message: 'edge case', file: 'src/a.ts', line: 2 },
-      ]),
+  describe('which findings are checked and where they are posted (issue #441)', () => {
+    const finding = (severity: string, n: number, role = 'reviewer') => ({
+      role,
+      severity,
+      category: 'bug',
+      message: `${severity} finding ${n}`,
+      file: 'src/a.ts',
+      line: n,
     });
-    const deps = makeDeps({ runAgent });
+    const review = async (runAgent: any, extraDeps: Record<string, unknown> = {}) => {
+      const slack = makeSlack([`review ${WEB_PR}`]);
+      const deps = makeDeps({ runAgent, ...extraDeps });
+      const result = await runAgenticPrReview({
+        task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+        config,
+        slack: slack as any,
+        store: emptyStore,
+        deps: deps as any,
+      });
+      const texts = slack.chat.postMessage.mock.calls.map(c => c[0].text as string);
+      return { result, deps, texts, outcome: (result.result as any).outcomes[0] };
+    };
 
-    const result = await runAgenticPrReview({
-      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
-      config,
-      slack: slack as any,
-      store: emptyStore,
-      deps: deps as any,
+    it('does not verify low and info findings: they are not posted inline, so they are not worth a run', async () => {
+      const runAgent = routedRunAgent({ reviewer: agentOk([finding('low', 2), finding('info', 3)]) });
+
+      const { outcome } = await review(runAgent);
+
+      expect(verifierCalls(runAgent)).toBe(0);
+      expect(outcome.totalFindings).toBe(2);
     });
 
-    expect(result.status).toBe('SUCCESS');
-    expect(verifierCalls(runAgent)).toBe(0);
-    const outcomes = (result.result as any).outcomes;
-    expect(outcomes[0].totalFindings).toBe(1);
+    it('gives a medium finding one verifier vote and keeps it when confirmed', async () => {
+      const runAgent = routedRunAgent({ reviewer: agentOk([finding('medium', 2)]) });
+
+      const { outcome } = await review(runAgent);
+
+      expect(verifierCalls(runAgent)).toBe(1);
+      expect(outcome.totalFindings).toBe(1);
+    });
+
+    it('drops a medium finding on that one refute, with no adjudication', async () => {
+      // The five false positives an author listed from one batch were all of this kind.
+      const runAgent = routedRunAgent({
+        reviewer: agentOk([finding('medium', 2), finding('low', 3)]),
+        verifier: () => agentVerify('refuted'),
+      });
+
+      const { outcome } = await review(runAgent);
+
+      expect(verifierCalls(runAgent)).toBe(1);
+      expect(outcome.totalFindings).toBe(1); // the low one
+    });
+
+    it('posts at most ten inline, worst first, and lists the rest in the review body', async () => {
+      const findings = [
+        ...Array.from({ length: 5 }, (_, i) => finding('low', 40 + i)),
+        ...Array.from({ length: 12 }, (_, i) => finding('medium', 20 + i)),
+        finding('high', 2, 'security'),
+      ];
+      const runAgent = routedRunAgent({
+        reviewer: agentOk(findings.filter(f => f.role === 'reviewer')),
+        security: agentOk(findings.filter(f => f.role === 'security')),
+      });
+
+      const { deps, texts } = await review(runAgent);
+
+      const submitted = deps.submitReview.mock.calls[0][0];
+      const inline = submitted.findingsByRole.flatMap((r: any) => r.findings);
+      expect(inline).toHaveLength(10);
+      expect(inline.filter((f: any) => f.severity === 'high')).toHaveLength(1);
+      expect(inline.filter((f: any) => f.severity === 'medium')).toHaveLength(9);
+      expect(inline.some((f: any) => f.severity === 'low')).toBe(false);
+      // The other three mediums and the five lows: in the body, once, and counted.
+      expect(submitted.findingsInBody).toBe(8);
+      expect(submitted.summary).toContain('Lower-priority findings (not posted inline):');
+      expect(submitted.summary).toContain('`src/a.ts:44` — low finding 44');
+      expect(submitted.summary.match(/- \[REVIEWER - MEDIUM\]/g)).toHaveLength(3);
+      expect(texts.join('\n')).toContain('8 lower-priority listed in the review summary');
+    });
+
+    it('posts no inline comments when nothing reaches medium, and says that is why', async () => {
+      const runAgent = routedRunAgent({ reviewer: agentOk([finding('low', 2), finding('low', 3)]) });
+      const submitOk = { ...SUBMIT_OK, attemptedComments: 0, commentsPosted: 0, submissionMode: 'summary_only' };
+
+      const { deps, texts } = await review(runAgent, { submitReview: vi.fn().mockResolvedValue(submitOk) });
+
+      const submitted = deps.submitReview.mock.calls[0][0];
+      expect(submitted.findingsByRole.flatMap((r: any) => r.findings)).toEqual([]);
+      expect(submitted.findingsInBody).toBe(2);
+      expect(texts.join('\n')).toContain('2 findings identified, none above low severity');
+    });
   });
 
   it('critical findings get a best-of-3 majority vote and drop on ≥2 refutes', async () => {

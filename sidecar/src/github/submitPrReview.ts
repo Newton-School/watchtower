@@ -337,6 +337,12 @@ export async function submitPrReview(params: {
    */
   prDiff?: string;
   /**
+   * Findings that are written into `summary` instead of being passed here
+   * (issue #441). They still make this a review with findings: without the
+   * count, a PR whose findings were all low would be submitted as APPROVE.
+   */
+  findingsInBody?: number;
+  /**
    * Optional workflow step logger. When provided, GitHub rejection details
    * (HTTP status + truncated error body) are persisted to job_logs so
    * post-mortems can read the exact reason out of SQLite instead of
@@ -348,7 +354,8 @@ export async function submitPrReview(params: {
   const errorContext = { owner, repo, pullNumber };
 
   const allFindings = findingsByRole.flatMap(r => r.findings);
-  const event = determineReviewEvent(allFindings);
+  const event: ReviewEvent =
+    allFindings.length + (params.findingsInBody ?? 0) > 0 ? 'COMMENT' : determineReviewEvent(allFindings);
   const hunkIndex = prDiff ? parseDiffHunks(prDiff) : undefined;
 
   const { inlineComments, fileLevelFindings, droppedOutsideDiff } = classifyFindings(findingsByRole, hunkIndex);

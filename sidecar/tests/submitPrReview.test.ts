@@ -143,6 +143,24 @@ describe('submitPrReview', () => {
     expect(result.submissionMode).toBe('summary_only');
   });
 
+  it('submits COMMENT, not APPROVE, when the only findings are the ones written into the body (issue #441)', async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(new Response('{}', { status: 200 }));
+
+    const result = await submitPrReview({
+      owner: 'Newton-School',
+      repo: 'newton-web',
+      pullNumber: 123,
+      commitId: 'abc123',
+      findingsByRole: [{ role: 'reviewer', findings: [] }],
+      findingsInBody: 4,
+      summary: 'Four low findings, listed here.',
+      githubToken: 'ghp_test',
+    });
+
+    expect(result.event).toBe('COMMENT');
+    expect(JSON.parse(vi.mocked(globalThis.fetch).mock.calls[0][1]?.body as string).event).toBe('COMMENT');
+  });
+
   it('excludes findings without file/line from inline comments and posts file-only as file-level', async () => {
     vi.mocked(globalThis.fetch)
       .mockResolvedValueOnce(new Response('{}', { status: 200 })) // review
