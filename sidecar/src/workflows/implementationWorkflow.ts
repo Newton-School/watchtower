@@ -11,6 +11,7 @@ import type {
   WorkflowStepLogger,
 } from '../types/contracts.js';
 import { formatAdminMention, getAdminUserIds } from '../access/control.js';
+import { connectorsFor, withConnectors } from '../backends/connectors.js';
 import { runCodex, getActiveBackendId, selectBackendForUser } from '../codex/runCodex.js';
 import { connectionLostReply, killedFromOutsideReply, runWithInfraRetry } from '../codex/infraRetry.js';
 import { assembleRecall } from '../codex/recallAssembler.js';
@@ -769,7 +770,30 @@ export function plannerFailureReply(
   return `The planner ${result.timedOut ? 'timed out' : 'stopped with an error'} before it produced a plan. Nothing has been changed. Mention me again to retry.`;
 }
 
-export async function runImplementationWorkflow(params: {
+/**
+ * A code change keeps Figma, to read the design it implements, and for an
+ * admin-tier requester the Newton admin upload tools. Every agent the workflow
+ * starts gets that list instead of the host user's connectors (issue #443);
+ * the pipeline narrows it again to none for the roles that only review.
+ */
+export async function runImplementationWorkflow(
+  params: Parameters<typeof runImplementationWorkflowBody>[0],
+): Promise<WorkflowResult> {
+  const isAdmin = getAdminUserIds(params.config).includes(params.task.event.userId);
+  const connectors = connectorsFor(isAdmin ? 'code_change_admin' : 'code_change', params.config);
+  params.logStep?.({
+    stage: 'workflow.connectors',
+    message:
+      `Connectors for this change: ${Object.keys(connectors.mcpServers).join(', ') || 'none'}` +
+      (connectors.unavailable.length > 0 ? ` (not set up on this host: ${connectors.unavailable.join(', ')})` : '') +
+      '.',
+    level: connectors.unavailable.length > 0 ? 'WARN' : 'INFO',
+    data: { servers: Object.keys(connectors.mcpServers), unavailable: connectors.unavailable, adminTier: isAdmin },
+  });
+  return withConnectors(connectors, () => runImplementationWorkflowBody(params));
+}
+
+async function runImplementationWorkflowBody(params: {
   task: NormalizedTask;
   config: AppConfig;
   slack: WebClient;

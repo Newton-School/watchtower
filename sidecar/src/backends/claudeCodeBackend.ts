@@ -261,7 +261,12 @@ export const claudeCodeBackend: AgentBackend = {
     // personal skills and commands (issue #443). `--disallowedTools` is
     // variadic, so it stays ahead of the flags below.
     if (!request.noTools) {
-      args.push('--disallowedTools', ...PROCESS_KILL_DENY_RULES, ...personalSkillDenyRules(request.cwd));
+      args.push(
+        '--disallowedTools',
+        ...PROCESS_KILL_DENY_RULES,
+        ...personalSkillDenyRules(request.cwd),
+        ...(request.disallowedTools ?? []),
+      );
     }
     if (request.sessionId) {
       args.push('--session-id', request.sessionId);
@@ -281,15 +286,16 @@ export const claudeCodeBackend: AgentBackend = {
     if (imageDirs.length > 0) {
       args.push('--add-dir', ...imageDirs);
     }
-    // Expose only the requested MCP servers (issue: scoped investigation
-    // reaching Metabase). `--strict-mcp-config` makes the headless run ignore
-    // the user's global/project MCP config and load ONLY these — so a bug
-    // investigation can't accidentally pull in unrelated servers. Inline JSON
-    // avoids a temp file. `--dangerously-skip-permissions` (set above in
-    // non-plan mode) auto-allows the MCP tools; OAuth HTTP servers reuse the
-    // CLI's Keychain-cached token, which requires HOME in buildEnv.
-    if (!request.noTools && request.mcpServers && Object.keys(request.mcpServers).length > 0) {
-      args.push('--mcp-config', JSON.stringify({ mcpServers: request.mcpServers }), '--strict-mcp-config');
+    // A run that uses tools loads ONLY the MCP servers named for it, and none
+    // when nothing is named (issue #443). `--strict-mcp-config` makes the CLI
+    // ignore the host user's global and project MCP config, their plugins'
+    // servers and their claude.ai connectors; without it every agent had all
+    // of them. Inline JSON avoids a temp file. `--dangerously-skip-permissions`
+    // (set above in non-plan mode) auto-allows the listed servers' tools;
+    // OAuth HTTP servers reuse the CLI's Keychain-cached token, which requires
+    // HOME in buildEnv. `--mcp-config` is variadic, so a flag must follow it.
+    if (!request.noTools) {
+      args.push('--mcp-config', JSON.stringify({ mcpServers: request.mcpServers ?? {} }), '--strict-mcp-config');
     }
     // Claude Code writes JSON to stdout when --output-format json is set.
     // The generic runner captures stdout and falls back to it when the

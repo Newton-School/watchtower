@@ -9,6 +9,7 @@ import {
 } from '../src/agents/pipeline.js';
 import { runCodex } from '../src/codex/runCodex.js';
 import { __infraRetry } from '../src/codex/infraRetry.js';
+import { currentConnectors, withConnectors } from '../src/backends/connectors.js';
 import { fetchThreadContext } from '../src/slack/threadContext.js';
 import { checkCoderProducedChanges } from '../src/workspaces/gitState.js';
 import type { AgentContext, PipelineConfig } from '../src/agents/types.js';
@@ -164,6 +165,48 @@ describe('agentPipeline', () => {
     expect(result.steps[0].role).toBe('planner');
     expect(result.steps[1].role).toBe('reviewer');
     expect(runCodex).toHaveBeenCalledTimes(2);
+  });
+
+  // Issue #443: a role that only reviews has no use for a design file or an
+  // upload tool, whatever the change's planner and coder were given.
+  it('keeps the change connectors for the planner and takes them away from the reviewer', async () => {
+    const change = {
+      mcpServers: { figma: { type: 'http' as const, url: 'https://figma.example/mcp' } },
+      disallowedTools: [],
+      unavailable: [],
+    };
+    const seen: string[][] = [];
+    const ok = (parsedJson: Record<string, unknown>) => ({
+      ok: true,
+      exitCode: 0,
+      timedOut: false,
+      stdout: '',
+      stderr: '',
+      lastMessage: '',
+      parsedJson,
+    });
+    vi.mocked(runCodex)
+      .mockImplementationOnce(async () => {
+        seen.push(Object.keys(currentConnectors().mcpServers));
+        return ok({
+          plan: ['step 1'],
+          risks: [],
+          affectedFiles: ['file.ts'],
+          scope: 'small',
+          requiresCodeChanges: false,
+        });
+      })
+      .mockImplementationOnce(async () => {
+        seen.push(Object.keys(currentConnectors().mcpServers));
+        return ok({ approved: true, findings: [], blockers: [] });
+      });
+
+    const result = await withConnectors(change, () =>
+      runAgentPipeline({ ctx: makeContext(), slack: slack as any, logStep }),
+    );
+
+    expect(result.steps.map(step => step.role)).toEqual(['planner', 'reviewer']);
+    expect(seen).toEqual([['figma'], []]);
   });
 
   it('triggers coder re-run when reviewer rejects (feedback loop)', async () => {

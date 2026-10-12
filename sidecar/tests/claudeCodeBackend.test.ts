@@ -512,12 +512,11 @@ describe('claudeCodeBackend.buildArgs', () => {
       expect(built.join(' ')).not.toContain('metabase.example');
     });
 
-    it('leaves every other run exactly as it was', () => {
+    it('leaves a run that does work its tools and its bypass', () => {
       const built = claudeCodeBackend.buildArgs(baseRequest, '/tmp/out.json');
       expect(built).toContain('--dangerously-skip-permissions');
       expect(built).not.toContain('--tools');
       expect(built).not.toContain('--safe-mode');
-      expect(built).not.toContain('--strict-mcp-config');
     });
   });
 
@@ -584,15 +583,50 @@ describe('claudeCodeBackend MCP + env wiring (scoped investigation)', () => {
     expect(args).toContain('--strict-mcp-config');
   });
 
-  it('omits MCP flags when no mcpServers are provided', () => {
+  // Issue #443: with no MCP flags a run loaded every server the host user
+  // has, their plugins' servers and their claude.ai connectors.
+  it('loads no MCP server at all when none is named', () => {
     const args = claudeCodeBackend.buildArgs(baseRequest, '/tmp/out.json');
-    expect(args).not.toContain('--mcp-config');
-    expect(args).not.toContain('--strict-mcp-config');
+    const idx = args.indexOf('--mcp-config');
+    expect(JSON.parse(args[idx + 1])).toEqual({ mcpServers: {} });
+    // `--mcp-config` is variadic: a flag has to follow the JSON.
+    expect(args[idx + 2]).toBe('--strict-mcp-config');
   });
 
-  it('omits MCP flags for an empty mcpServers object', () => {
+  it('treats an empty list the same way', () => {
     const args = claudeCodeBackend.buildArgs({ ...baseRequest, mcpServers: {} }, '/tmp/out.json');
-    expect(args).not.toContain('--mcp-config');
+    expect(JSON.parse(args[args.indexOf('--mcp-config') + 1])).toEqual({ mcpServers: {} });
+    expect(args).toContain('--strict-mcp-config');
+  });
+
+  it('is strict in plan mode and on a resumed run too', () => {
+    for (const extra of [{ planMode: true }, { resumeSessionId: 'sess-1' }]) {
+      const args = claudeCodeBackend.buildArgs({ ...baseRequest, ...extra }, '/tmp/out.json');
+      expect(args).toContain('--strict-mcp-config');
+    }
+  });
+
+  it('passes a stdio server through with its command, args and env', () => {
+    const server = {
+      type: 'stdio' as const,
+      command: 'uvx',
+      args: ['--from', 'pkg', 'serve'],
+      env: { BASE_URL: 'https://x' },
+    };
+    const args = claudeCodeBackend.buildArgs({ ...baseRequest, mcpServers: { admin: server } }, '/tmp/out.json');
+    expect(JSON.parse(args[args.indexOf('--mcp-config') + 1])).toEqual({ mcpServers: { admin: server } });
+  });
+
+  it("adds a run's own deny rules after the ones every run gets", () => {
+    const args = claudeCodeBackend.buildArgs(
+      { ...baseRequest, disallowedTools: ['mcp__metabase__update_*', 'mcp__metabase__create_*'] },
+      '/tmp/out.json',
+    );
+    const start = args.indexOf('--disallowedTools');
+    const end = args.findIndex((arg, i) => i > start && arg.startsWith('--'));
+    const rules = args.slice(start + 1, end === -1 ? undefined : end);
+    expect(rules).toContain('Bash(pkill:*)');
+    expect(rules.slice(-2)).toEqual(['mcp__metabase__update_*', 'mcp__metabase__create_*']);
   });
 
   it('passes HOME (and USER) in buildEnv so the MCP OAuth keychain resolves', () => {

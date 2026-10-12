@@ -6,6 +6,7 @@ import type { WebClient } from '@slack/web-api';
 import { runAgenticEntry } from '../src/agentic/agenticEntry.js';
 import { runClaudeAgentic } from '../src/agentic/runClaude.js';
 import { botScopes } from '../src/slack/botScopes.js';
+import { currentConnectors } from '../src/backends/connectors.js';
 import { JobStore } from '../src/state/jobStore.js';
 import type { AppConfig, NormalizedTask, NormalizedThreadMessage } from '../src/types/contracts.js';
 
@@ -242,4 +243,66 @@ describe('runAgenticEntry and what the agent is told about attaching files', () 
       expect(prompt).not.toContain('You CAN attach real files');
     },
   );
+});
+
+// Issue #443: a lookup for a non-owner searched the owner's private Slack and
+// read Drive files through connectors no lookup should have had.
+describe('runAgenticEntry and connectors', () => {
+  let dbDir: string;
+  let store: JobStore;
+  let slack: WebClient;
+  const withMetabase = { ...config, metabaseMcpUrl: 'https://metabase.example/api/mcp' } as unknown as AppConfig;
+
+  beforeEach(() => {
+    dbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'watchtower-agentic-connectors-'));
+    store = new JobStore(path.join(dbDir, 'watchtower.db'));
+    slack = {
+      conversations: { replies: vi.fn(async () => ({ messages: [] })) },
+      chat: { postMessage: vi.fn(async () => ({ ok: true, ts: '2.2' })) },
+    } as unknown as WebClient;
+  });
+
+  afterEach(() => {
+    store.close();
+    fs.rmSync(dbDir, { recursive: true, force: true });
+  });
+
+  const connectorsSeenBy = async (mode: 'informational' | 'conversational' | 'qa', text: string) => {
+    let seen: ReturnType<typeof currentConnectors> | undefined;
+    vi.mocked(runClaudeAgentic)
+      .mockReset()
+      .mockImplementation(async () => {
+        seen = currentConnectors();
+        return { ok: true, reason: 'ok', reply: 'ok' } as never;
+      });
+    await runAgenticEntry({ mode, task: taskWith(text, []), config: withMetabase, slack, store, logStep: vi.fn() });
+    return seen;
+  };
+
+  it('gives a lookup Metabase, read-only', async () => {
+    const seen = await connectorsSeenBy('informational', 'how many students enrolled last week?');
+
+    expect(Object.keys(seen?.mcpServers ?? {})).toEqual(['metabase']);
+    expect(seen?.disallowedTools).toContain('mcp__metabase__update_*');
+  });
+
+  it('tells a lookup what it has, and to say so when the database is out of reach', async () => {
+    await connectorsSeenBy('informational', 'how many students enrolled last week?');
+    const prompt = vi.mocked(runClaudeAgentic).mock.calls[0][0].systemPrompt;
+
+    expect(prompt).toContain('tools named `mcp__metabase__*`');
+    expect(prompt).toContain('say plainly that you could not reach the database');
+    expect(prompt).toContain('You have no other connectors');
+  });
+
+  it('says nothing about a database to a chat reply', async () => {
+    await connectorsSeenBy('conversational', 'thanks!');
+
+    expect(vi.mocked(runClaudeAgentic).mock.calls[0][0].systemPrompt).not.toContain('mcp__metabase__');
+  });
+
+  it('gives a chat reply and a QA run none', async () => {
+    expect((await connectorsSeenBy('conversational', 'thanks!'))?.mcpServers).toEqual({});
+    expect((await connectorsSeenBy('qa', 'test https://example.test/checkout'))?.mcpServers).toEqual({});
+  });
 });

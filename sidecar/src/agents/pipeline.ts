@@ -19,6 +19,7 @@ import {
 } from './normalizePlannerOutput.js';
 import { REPO_KEYS, type RepoKey } from '../repos/registry.js';
 import { withAgentCallContext } from '../state/runContext.js';
+import { currentConnectors, NO_CONNECTORS, withConnectors } from '../backends/connectors.js';
 import { fetchThreadContext } from '../slack/threadContext.js';
 import { currentHead, checkCoderProducedChanges, getDiffVsBase } from '../workspaces/gitState.js';
 
@@ -1293,21 +1294,26 @@ export async function runAgentPipeline(params: {
       }
     }
 
+    // The planner and the coder keep the change's connectors (a design to
+    // read, an asset to upload). A role that only reviews gets none.
+    const roleConnectors = role === 'planner' || role === 'coder' ? currentConnectors() : NO_CONNECTORS;
     const result = await withAgentCallContext({ pipelineRunId, role }, () =>
-      runWithInfraRetry(
-        {
-          cwd: ctx.repoPath,
-          prompt,
-          outputSchemaPath: schemaPath,
-          githubToken: ctx.githubToken,
-          planMode,
-          ...profile,
-          // timeoutMs: perAgentTimeoutMs,
-          onLog: logStep,
-          signal,
-        },
-        // The coder's work is on disk and costly to redo: pick its session back up.
-        { label: role, resume: role === 'coder', logStep },
+      withConnectors(roleConnectors, () =>
+        runWithInfraRetry(
+          {
+            cwd: ctx.repoPath,
+            prompt,
+            outputSchemaPath: schemaPath,
+            githubToken: ctx.githubToken,
+            planMode,
+            ...profile,
+            // timeoutMs: perAgentTimeoutMs,
+            onLog: logStep,
+            signal,
+          },
+          // The coder's work is on disk and costly to redo: pick its session back up.
+          { label: role, resume: role === 'coder', logStep },
+        ),
       ),
     );
     infraWaitMs += result.infraWaitMs;

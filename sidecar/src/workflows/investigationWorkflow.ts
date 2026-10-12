@@ -9,7 +9,7 @@ import { prepareWorkflowContext } from './shared/workflowUtils.js';
 import { assertThreadParentExists, fetchThreadContext } from '../slack/threadContext.js';
 import { classifyInvestigationScope, type InvestigationScope } from '../router/investigationScope.js';
 import { enabledRepoPaths } from '../repos/registry.js';
-import type { McpServerConfig } from '../types/contracts.js';
+import { connectorsFor, NO_CONNECTORS } from '../backends/connectors.js';
 import type { PipelineStore } from '../agents/pipeline.js';
 import type { InvestigationStore } from '../state/investigationStore.js';
 import type { RecallCapableStore } from '../state/dossierStore.js';
@@ -100,18 +100,17 @@ export async function runInvestigationWorkflow(params: {
     }
   }
 
-  // Broad scope sweeps both repos and (on the claude-code backend, when an
-  // endpoint is configured) the read-only Metabase MCP for the data layer.
-  const useMetabase =
-    scope.scope === 'broad' && getActiveBackendId() === 'claude-code' && (config.metabaseMcpUrl ?? '').length > 0;
-  const mcpServers: Record<string, McpServerConfig> | undefined = useMetabase
-    ? { metabase: { type: 'http', url: config.metabaseMcpUrl } }
-    : undefined;
+  // An investigation keeps one connector: Metabase, read-only, for the data
+  // layer (on the claude-code backend, when an endpoint is configured). It
+  // used to be the broad scope only by design, and every other scope got all
+  // of the host user's connectors by omission (issue #443).
+  const connectors = getActiveBackendId() === 'claude-code' ? connectorsFor('lookup', config) : NO_CONNECTORS;
+  const useMetabase = 'metabase' in connectors.mcpServers;
   logStep?.({
     stage: useMetabase ? 'investigation.metabase.enabled' : 'investigation.metabase.skipped',
     message: useMetabase
-      ? 'Broad investigation — Metabase read-only DB inspection enabled.'
-      : `Metabase not used (scope=${scope.scope}, backend=${getActiveBackendId()}, url=${(config.metabaseMcpUrl ?? '').length > 0 ? 'set' : 'unset'}).`,
+      ? 'Metabase read-only DB inspection enabled.'
+      : `Metabase not used (backend=${getActiveBackendId()}, url=${(config.metabaseMcpUrl ?? '').length > 0 ? 'set' : 'unset'}).`,
     data: { scope: scope.scope },
   });
 
@@ -138,8 +137,13 @@ export async function runInvestigationWorkflow(params: {
 - No database access is available this run; investigate the repos only and note in \`summary\` if a data-layer check would help confirm the diagnosis.`
         }
 - Read-only mode: Read, Grep, Glob, read-only git/bash (git log, git show, git blame, git diff)${useMetabase ? ', and read-only Metabase queries' : ''}. Do NOT invoke Edit, Write, any worktree-mutating bash, or any mutating MCP tool.`
-      : `- Working directory: ${repoPath}${repoName ? ` (${repoName})` : ''}${marketingScopeNote}
-- Read-only mode: you may use Read, Grep, Glob, and read-only git/bash (git log, git show, git blame, git diff). Do NOT invoke Edit, Write, or any bash command that mutates the worktree.`;
+      : `- Working directory: ${repoPath}${repoName ? ` (${repoName})` : ''}${marketingScopeNote}${
+          useMetabase
+            ? `
+- A Metabase MCP server is connected (tools named \`mcp__metabase__*\`) for read-only database checks, when the code alone cannot settle whether the data is wrong. If its tools are unavailable, say in \`summary\` that the data layer was not inspected.`
+            : ''
+        }
+- Read-only mode: you may use Read, Grep, Glob, and read-only git/bash (git log, git show, git blame, git diff)${useMetabase ? ', and read-only Metabase queries' : ''}. Do NOT invoke Edit, Write, any bash command that mutates the worktree, or any mutating MCP tool.`;
 
   const investigatorPrompt = `${recallBlock}${`
 ${buildMentionSystemPrompt({ task, workflow: 'INVESTIGATION', toneMode: task.toneMode, dossierRole: task.dossierRole })}
@@ -203,7 +207,8 @@ Return strict JSON:
     imagePaths: ctx.imagePaths.length > 0 ? ctx.imagePaths : undefined,
     model: profile.model,
     reasoningEffort: profile.reasoningEffort,
-    mcpServers,
+    mcpServers: connectors.mcpServers,
+    disallowedTools: connectors.disallowedTools,
     // No per-agent timeoutMs. Substantive investigations on the high-reasoning
     // tier (Opus at xhigh) routinely exceed a fractional sub-budget (e.g. 40%
     // of bugFixTimeoutMs = 18 min) on real feature scoping, and a forced

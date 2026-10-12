@@ -410,12 +410,20 @@ export interface CodexRunRequest {
   planMode?: boolean;
   /**
    * MCP servers to expose to the agent for this run. Only honored by the
-   * claude-code backend (adds `--mcp-config <inline JSON>` + `--strict-mcp-config`
-   * so ONLY these servers load). HTTP/OAuth servers reuse the headless CLI's
-   * Keychain-cached token (requires HOME in the spawn env). The Codex backend
-   * ignores this. Used by the broad-scope investigation to reach Metabase.
+   * claude-code backend, where a run that uses tools always gets
+   * `--mcp-config <inline JSON>` + `--strict-mcp-config`, so ONLY these servers
+   * load and none of the host user's (issue #443). Left unset, the run takes
+   * the list its workflow set with `withConnectors`, which is empty by
+   * default. HTTP/OAuth servers reuse the headless CLI's Keychain-cached token
+   * (requires HOME in the spawn env). The Codex backend ignores this.
    */
   mcpServers?: Record<string, McpServerConfig>;
+  /**
+   * Tool rules the run may not use, on top of the ones every run gets. Only
+   * honored by the claude-code backend (`--disallowedTools`), where deny rules
+   * hold even when permissions are bypassed.
+   */
+  disallowedTools?: string[];
   /**
    * Force a specific backend for this run, overriding the global active
    * backend. Used by the webapp-QA flow, which must run on `claude-code`
@@ -434,10 +442,9 @@ export interface CodexRunRequest {
   noTools?: boolean;
 }
 
-export interface McpServerConfig {
-  type: 'http';
-  url: string;
-}
+export type McpServerConfig =
+  | { type: 'http'; url: string }
+  | { type: 'stdio'; command: string; args: string[]; env?: Record<string, string> };
 
 export interface TokenUsage {
   inputTokens?: number;

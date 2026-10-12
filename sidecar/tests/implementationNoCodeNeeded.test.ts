@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   __quickActionConfirm,
@@ -10,6 +13,7 @@ import {
 import { runCodex } from '../src/codex/runCodex.js';
 import { __infraRetry, connectionLostReply } from '../src/codex/infraRetry.js';
 import { runAgenticEntry } from '../src/agentic/agenticEntry.js';
+import { __connectors, currentConnectors } from '../src/backends/connectors.js';
 
 // Regression coverage for #348 RC2: when the planner concludes no code changes
 // are needed AND the request is not an operational action, the implementation
@@ -141,6 +145,74 @@ function plannerNoCodeResult() {
     },
   };
 }
+
+// Issue #443: every agent used to get every connector the host user has. A
+// code change now names what it keeps, by who asked.
+describe('implementationWorkflow — connectors by requester', () => {
+  let home: string;
+  const realHome = __connectors.home;
+
+  beforeEach(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'watchtower-impl-connectors-'));
+    __connectors.home = () => home;
+    fs.writeFileSync(
+      path.join(home, '.claude.json'),
+      JSON.stringify({
+        mcpServers: {
+          figma: { type: 'http', url: 'https://figma.example/mcp' },
+          openpanel: { type: 'http', url: 'https://openpanel.example/mcp' },
+        },
+      }),
+    );
+    const installPath = path.join(home, 'plugins', 'newton-admin-mcp');
+    fs.mkdirSync(path.join(home, '.claude', 'plugins'), { recursive: true });
+    fs.mkdirSync(installPath, { recursive: true });
+    fs.writeFileSync(
+      path.join(installPath, '.mcp.json'),
+      JSON.stringify({ mcpServers: { 'newton-admin': { command: 'uvx', args: ['serve'] } } }),
+    );
+    fs.writeFileSync(
+      path.join(home, '.claude', 'plugins', 'installed_plugins.json'),
+      JSON.stringify({ plugins: { 'newton-admin-mcp@newton-plugins': [{ installPath }] } }),
+    );
+    vi.mocked(runAgenticEntry).mockReset();
+    vi.mocked(runAgenticEntry).mockResolvedValue({
+      workflow: 'INFORMATIONAL',
+      status: 'SUCCESS',
+      message: 'answered',
+      notifyDesktop: false,
+      slackPosted: true,
+    });
+  });
+
+  afterEach(() => {
+    __connectors.home = realHome;
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  const plannerConnectors = async (byOwner: boolean): Promise<string[]> => {
+    let seen: string[] = [];
+    vi.mocked(runCodex).mockReset();
+    vi.mocked(runCodex).mockImplementation(async () => {
+      seen = Object.keys(currentConnectors().mcpServers);
+      return plannerNoCodeResult();
+    });
+    await runImplementationWorkflow({
+      task: makeTask('<@UBOT1> match the banner to the new design', { byOwner }),
+      config,
+      slack: makeSlack() as unknown as import('@slack/web-api').WebClient,
+    });
+    return seen;
+  };
+
+  it('gives a builder Figma and nothing else', async () => {
+    expect(await plannerConnectors(false)).toEqual(['figma']);
+  });
+
+  it('adds the admin upload server for an admin', async () => {
+    expect(await plannerConnectors(true)).toEqual(['figma', 'plugin_newton-admin-mcp_newton-admin']);
+  });
+});
 
 describe('implementationWorkflow — no code needed (#348 RC2)', () => {
   beforeEach(() => {

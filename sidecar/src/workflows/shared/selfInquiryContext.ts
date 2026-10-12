@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import type { AppConfig } from '../../types/contracts.js';
 import { highReasoningProfile } from '../../codex/modelProfiles.js';
 import { enabledRepoKeys } from '../../repos/registry.js';
+import { describeConnectorPolicy } from '../../backends/connectors.js';
 
 const SIDECAR_PACKAGE_NAME = 'watchtower-sidecar';
 const MAX_WALK_DEPTH = 8;
@@ -47,13 +48,10 @@ export async function buildLiveStateSnapshot(config: AppConfig): Promise<string>
 
   lines.push(`- Sidecar version: \`${await readSidecarVersion()}\``);
 
-  lines.push('- MCP servers (Claude Code):');
-  const claudeMcp = await readClaudeMcpServers();
-  if (claudeMcp.length === 0) {
-    lines.push('    - none detected (no `~/.claude.json` mcpServers entries readable)');
-  } else {
-    for (const name of claudeMcp) lines.push(`    - ${name}`);
-  }
+  // Agents no longer inherit the host user's servers: each kind of run gets a
+  // named list and nothing else (issue #443).
+  lines.push('- Connectors (MCP servers) agents get on Claude Code, by kind of run:');
+  for (const line of describeConnectorPolicy(config)) lines.push(`    - ${line}`);
 
   lines.push('- MCP servers (Codex CLI):');
   const codexMcp = await readCodexMcpServers();
@@ -108,16 +106,6 @@ async function readSidecarVersion(): Promise<string> {
     /* fall through */
   }
   return 'unknown';
-}
-
-async function readClaudeMcpServers(): Promise<string[]> {
-  try {
-    const raw = await fs.readFile(path.join(os.homedir(), '.claude.json'), 'utf8');
-    const parsed = JSON.parse(raw) as { mcpServers?: Record<string, unknown> };
-    return parsed.mcpServers ? Object.keys(parsed.mcpServers).sort() : [];
-  } catch {
-    return [];
-  }
 }
 
 async function readCodexMcpServers(): Promise<string[]> {

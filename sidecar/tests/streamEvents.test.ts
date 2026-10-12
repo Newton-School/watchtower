@@ -119,8 +119,44 @@ describe('createStreamDecoder — claude-code', () => {
       })}\n`,
     );
 
+    expect(steps).toHaveLength(1);
     expect(steps[0].stage).toBe('agent.session.init');
-    expect(steps[0].data).toMatchObject({ model: 'claude-opus-5', tools: 2, skills: 1, mcpServers: 1 });
+    expect(steps[0].data).toMatchObject({
+      model: 'claude-opus-5',
+      tools: 2,
+      skills: 1,
+      mcpServers: 1,
+      mcpServerNames: ['metabase'],
+    });
+  });
+
+  // Seen on the real CLI: the one connector a lookup keeps came up "needs-auth",
+  // which left the agent with no database tools and nothing in the job log.
+  it('warns when a connector the run was given is not usable', () => {
+    const decoder = createStreamDecoder('claude-code');
+    const steps = decoder.push(
+      `${JSON.stringify({
+        type: 'system',
+        subtype: 'init',
+        model: 'claude-opus-5',
+        tools: ['Read'],
+        mcp_servers: [
+          { name: 'metabase', status: 'needs-auth' },
+          { name: 'figma', status: 'connected' },
+          { name: 'slow', status: 'pending' },
+        ],
+        permissionMode: 'bypassPermissions',
+      })}\n`,
+    );
+
+    expect(steps.map(step => step.stage)).toEqual(['agent.session.init', 'agent.mcp.unavailable']);
+    expect(steps[0].data).toMatchObject({ mcpServers: 3, mcpServerNames: ['metabase', 'figma', 'slow'] });
+    expect(steps[1].level).toBe('WARN');
+    expect(steps[1].message).toBe(
+      'Connector not usable in this run: metabase (needs-auth). ' +
+        'Sign in to it once from Claude Code on this machine (/mcp), under the same server name.',
+    );
+    expect(steps[1].data).toEqual({ servers: [{ name: 'metabase', status: 'needs-auth' }] });
   });
 
   // The critical regression guard: parseOutput must still receive the exact

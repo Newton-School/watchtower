@@ -11,6 +11,7 @@ import type {
 } from '../types/contracts.js';
 import type { AgentBackend, AgentBackendId } from '../backends/types.js';
 import { getBackend } from '../backends/registry.js';
+import { currentConnectors } from '../backends/connectors.js';
 import { computeCostUsd } from '../pricing/modelPrices.js';
 import { agentCallContext } from '../state/runContext.js';
 import { createStreamDecoder } from './streamEvents.js';
@@ -295,7 +296,24 @@ export function parseCodexStructuredOutput(raw: string): ParsedCodexOutput {
   };
 }
 
-export async function runAgent(request: CodexRunRequest, backend: AgentBackend): Promise<CodexRunResult> {
+/**
+ * Fill in the connectors a run gets when the caller did not name any: the
+ * list its workflow set, or none. Text-only calls have no tools to connect.
+ */
+export function withWorkflowConnectors(request: CodexRunRequest): CodexRunRequest {
+  if (request.noTools || request.mcpServers) {
+    return request;
+  }
+  const connectors = currentConnectors();
+  return {
+    ...request,
+    mcpServers: connectors.mcpServers,
+    disallowedTools: [...(request.disallowedTools ?? []), ...connectors.disallowedTools],
+  };
+}
+
+export async function runAgent(rawRequest: CodexRunRequest, backend: AgentBackend): Promise<CodexRunResult> {
+  const request = withWorkflowConnectors(rawRequest);
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), `watchtower-${backend.id}-`));
   const outputPath = path.join(tempDir, 'final-message.txt');
 
@@ -313,6 +331,7 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
       reasoningEffort: request.reasoningEffort ?? 'default',
       githubTokenInjected: Boolean(request.githubToken),
       executable,
+      ...(request.noTools ? {} : { connectors: Object.keys(request.mcpServers ?? {}) }),
     },
   });
 

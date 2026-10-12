@@ -93,7 +93,9 @@ describe('runInvestigationWorkflow thread images', () => {
 });
 
 describe('runInvestigationWorkflow scope wiring', () => {
-  it('single-repo scope passes repoOverride and uses NO mcp servers', async () => {
+  // A scoped investigation used to pass no list, which on the backend meant
+  // "everything the host user has" (issue #443). It now names the one it keeps.
+  it('single-repo scope passes repoOverride and keeps only read-only Metabase', async () => {
     classifyInvestigationScope.mockResolvedValue({
       scope: 'newton-web',
       confidence: 0.9,
@@ -106,7 +108,16 @@ describe('runInvestigationWorkflow scope wiring', () => {
 
     expect(prepareWorkflowContext).toHaveBeenCalledWith(expect.objectContaining({ repoOverride: 'newton-web' }));
     expect(runCodex).toHaveBeenCalledOnce();
-    expect(runCodex.mock.calls[0][0].mcpServers).toBeUndefined();
+    expect(runCodex.mock.calls[0][0].mcpServers).toEqual({
+      metabase: { type: 'http', url: 'https://metabase.example/api/mcp' },
+    });
+    expect(runCodex.mock.calls[0][0].disallowedTools).toEqual([
+      'mcp__metabase__create_*',
+      'mcp__metabase__update_*',
+      'mcp__metabase__delete_*',
+      'mcp__metabase__archive_*',
+    ]);
+    expect(runCodex.mock.calls[0][0].prompt as string).toMatch(/mcp__metabase__/);
     // Ack mentions the scoped repo.
     const acks = slack.chat.postMessage.mock.calls.map(c => c[0].text as string);
     expect(acks.some(t => t.includes('newton-web'))).toBe(true);
@@ -127,6 +138,7 @@ describe('runInvestigationWorkflow scope wiring', () => {
     expect(runCodex.mock.calls[0][0].mcpServers).toEqual({
       metabase: { type: 'http', url: 'https://metabase.example/api/mcp' },
     });
+    expect(runCodex.mock.calls[0][0].disallowedTools).toContain('mcp__metabase__update_*');
     // The broad prompt references both repos + read-only Metabase.
     const prompt = runCodex.mock.calls[0][0].prompt as string;
     expect(prompt).toMatch(/newton-web/);
@@ -204,7 +216,7 @@ describe('runInvestigationWorkflow scope wiring', () => {
 
     await runInvestigationWorkflow({ task: makeTask('broken'), config, slack: slackStub() as any });
 
-    expect(runCodex.mock.calls[0][0].mcpServers).toBeUndefined();
+    expect(runCodex.mock.calls[0][0].mcpServers).toEqual({});
   });
 
   it('broad scope degrades to repos-only when no Metabase URL is configured', async () => {
@@ -221,7 +233,7 @@ describe('runInvestigationWorkflow scope wiring', () => {
       slack: slackStub() as any,
     });
 
-    expect(runCodex.mock.calls[0][0].mcpServers).toBeUndefined();
+    expect(runCodex.mock.calls[0][0].mcpServers).toEqual({});
     const prompt = runCodex.mock.calls[0][0].prompt as string;
     expect(prompt).toMatch(/No database access is available/);
   });
