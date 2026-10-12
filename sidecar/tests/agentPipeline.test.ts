@@ -1,7 +1,8 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { runAgentPipeline, waitForApproval } from '../src/agents/pipeline.js';
 import { runCodex } from '../src/codex/runCodex.js';
+import { __infraRetry } from '../src/codex/infraRetry.js';
 import { fetchThreadContext } from '../src/slack/threadContext.js';
 import { checkCoderProducedChanges } from '../src/workspaces/gitState.js';
 import type { AgentContext, PipelineConfig } from '../src/agents/types.js';
@@ -1117,6 +1118,115 @@ vi.mock('../src/slack/threadContext.js', () => ({
   fetchThreadContext: vi.fn(),
   assertThreadParentExists: vi.fn().mockResolvedValue(true),
 }));
+
+describe('agentPipeline and a dropped connection (issue #439)', () => {
+  const savedRetry = { ...__infraRetry };
+  const okStep = (parsedJson: Record<string, unknown>) =>
+    ({
+      ok: true,
+      exitCode: 0,
+      timedOut: false,
+      stdout: '',
+      stderr: '',
+      lastMessage: '',
+      durationMs: 10,
+      parsedJson,
+    }) as any;
+  const dropped = {
+    ok: false,
+    exitCode: 1,
+    timedOut: false,
+    stdout: '',
+    stderr: '',
+    lastMessage: '{"type":"result","is_error":true,"result":"API Error: No response from API"}',
+    durationMs: 0,
+    errorKind: 'API_ERROR',
+    apiErrorDetail: 'API Error: No response from API',
+    sessionId: 'sess-coder',
+  } as any;
+  const coderDone = okStep({ status: 'success', summary: 'changed two strings', filesChanged: ['a.ts'] });
+  const reviewerOk = okStep({ approved: true, findings: [], blockers: [] });
+  const verifierOk = okStep({ verified: true, findings: [] });
+
+  beforeEach(() => {
+    vi.mocked(runCodex).mockReset();
+    logStep.mockClear();
+    __infraRetry.sleep = vi.fn().mockResolvedValue(true);
+  });
+  afterEach(() => Object.assign(__infraRetry, savedRetry));
+
+  const coderPipeline = (overrides: Partial<PipelineConfig> = {}) =>
+    makeContext({
+      workflowIntent: 'IMPLEMENTATION',
+      pipelineConfig: makePipelineConfig({ agents: ['coder', 'reviewer', 'verifier'], ...overrides }),
+    });
+
+  it('runs the coder again when its connection drops, resuming its session, and then carries on', async () => {
+    // The incident: the coder had committed and pushed, then died on "API Error" before finishing.
+    vi.mocked(runCodex)
+      .mockResolvedValueOnce(dropped)
+      .mockResolvedValueOnce(coderDone)
+      .mockResolvedValueOnce(reviewerOk)
+      .mockResolvedValueOnce(verifierOk);
+
+    const result = await runAgentPipeline({ ctx: coderPipeline(), slack: slack as any, logStep });
+
+    expect(result.finalStatus).toBe('passed');
+    expect(result.connectionLost).toBeUndefined();
+    expect(runCodex).toHaveBeenCalledTimes(4);
+    expect(vi.mocked(runCodex).mock.calls[1][0]).toMatchObject({ resumeSessionId: 'sess-coder' });
+    expect(result.steps.map(step => `${step.role}:${step.status}`)).toEqual([
+      'coder:passed',
+      'reviewer:passed',
+      'verifier:passed',
+    ]);
+  });
+
+  it('stops when the connection never comes back, and says that is why', async () => {
+    vi.mocked(runCodex).mockResolvedValue(dropped);
+
+    const result = await runAgentPipeline({ ctx: coderPipeline(), slack: slack as any, logStep });
+
+    expect(result.finalStatus).toBe('failed');
+    expect(result.connectionLost).toEqual({ role: 'coder', retries: 3 });
+    // The coder and its three retries. No reviewer and no verifier on a step that never happened.
+    expect(runCodex).toHaveBeenCalledTimes(4);
+    expect(result.steps.map(step => step.role)).toEqual(['coder']);
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'pipeline.api_error', level: 'ERROR' }));
+  });
+
+  it('does not let the reviewer and verifier run on a coder that failed', async () => {
+    vi.mocked(runCodex).mockResolvedValueOnce({ ...coderDone, ok: false, exitCode: 1, parsedJson: undefined });
+
+    const result = await runAgentPipeline({ ctx: coderPipeline(), slack: slack as any, logStep });
+
+    expect(result.finalStatus).toBe('failed');
+    expect(result.connectionLost).toBeUndefined();
+    expect(runCodex).toHaveBeenCalledTimes(1);
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'pipeline.coder_failed' }));
+  });
+
+  it('does not charge the time a dropped connection cost to the pipeline timeout', async () => {
+    // 80 ms really pass while "offline"; the pipeline's budget is 60 ms.
+    __infraRetry.delaysMs = [80];
+    __infraRetry.sleep = (ms: number) => new Promise(resolve => setTimeout(() => resolve(true), ms));
+    vi.mocked(runCodex)
+      .mockResolvedValueOnce({ ...dropped, sessionId: undefined })
+      .mockResolvedValueOnce(
+        okStep({ plan: ['x'], risks: [], affectedFiles: [], scope: 'small', requiresCodeChanges: false }),
+      )
+      .mockResolvedValueOnce(reviewerOk);
+    const ctx = makeContext({
+      pipelineConfig: makePipelineConfig({ agents: ['planner', 'reviewer'], totalTimeoutMs: 60 }),
+    });
+
+    const result = await runAgentPipeline({ ctx, slack: slack as any, logStep });
+
+    expect(result.finalStatus).toBe('passed');
+    expect(result.steps.map(step => step.role)).toEqual(['planner', 'reviewer']);
+    expect(logStep).not.toHaveBeenCalledWith(expect.objectContaining({ stage: 'pipeline.timeout' }));
+  });
+});
 
 describe('waitForApproval', () => {
   const mockSlack = {

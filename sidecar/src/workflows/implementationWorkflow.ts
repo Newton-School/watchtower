@@ -3,6 +3,7 @@ import type { WebClient } from '@slack/web-api';
 import type {
   AppConfig,
   CodexRunRequest,
+  CodexRunResult,
   ImplementationApprovalResume,
   NormalizedTask,
   ResumeContext,
@@ -11,6 +12,7 @@ import type {
 } from '../types/contracts.js';
 import { formatAdminMention, getAdminUserIds } from '../access/control.js';
 import { runCodex, getActiveBackendId, selectBackendForUser } from '../codex/runCodex.js';
+import { connectionLostReply, runWithInfraRetry } from '../codex/infraRetry.js';
 import { assembleRecall } from '../codex/recallAssembler.js';
 import { highReasoningProfile } from '../codex/modelProfiles.js';
 import { buildMentionSystemPrompt } from '../codex/mentionSystemPrompt.js';
@@ -636,17 +638,20 @@ Revise the plan to incorporate this feedback. Output rules — strict:
 
 Return the JSON now.`;
 
-      const revisedResult = await runCodex({
-        cwd: pipelineCwd,
-        prompt: feedbackPrompt,
-        outputSchemaPath: plannerSchemaPath,
-        githubToken,
-        ...plannerProfile,
-        // No per-agent timeoutMs — see investigationWorkflow.ts for rationale.
-        // Outer abort signal remains the safety net.
-        onLog: logStep,
-        signal,
-      });
+      const revisedResult = await runWithInfraRetry(
+        {
+          cwd: pipelineCwd,
+          prompt: feedbackPrompt,
+          outputSchemaPath: plannerSchemaPath,
+          githubToken,
+          ...plannerProfile,
+          // No per-agent timeoutMs — see investigationWorkflow.ts for rationale.
+          // Outer abort signal remains the safety net.
+          onLog: logStep,
+          signal,
+        },
+        { label: 'plan revision', logStep },
+      );
       if (signal?.aborted) {
         return { kind: 'cancelled' };
       }
@@ -662,15 +667,26 @@ Return the JSON now.`;
         // revised plan" a lie. Tell the user instead and let them rephrase.
         logStep?.({
           stage: 'implementation.approval.revising.failed',
-          message: 'Revised plan generation produced non-JSON output; surfacing recovery prompt to the user.',
+          message:
+            revisedResult.errorKind === 'API_ERROR'
+              ? 'Plan revision lost the connection to the model API; surfacing recovery prompt to the user.'
+              : 'Revised plan generation produced non-JSON output; surfacing recovery prompt to the user.',
           level: 'WARN',
-          data: { feedbackRounds, ok: revisedResult.ok, hasParsedJson: Boolean(revisedResult.parsedJson) },
+          data: {
+            feedbackRounds,
+            ok: revisedResult.ok,
+            hasParsedJson: Boolean(revisedResult.parsedJson),
+            errorKind: revisedResult.errorKind,
+          },
         });
         try {
           const recoveryPosted = await slack.chat.postMessage({
             channel: task.event.channelId,
             thread_ts: task.event.threadTs,
-            text: 'I had trouble revising the plan from that feedback — the planner returned non-JSON output. Reply with rephrased feedback, `yes` to proceed with the original plan, or `no` to cancel.',
+            text:
+              revisedResult.errorKind === 'API_ERROR'
+                ? "I lost my connection to the model while revising the plan, and retrying didn't bring it back. The plan above is unchanged. Reply with your feedback again in a few minutes, `yes` to proceed with the original plan, or `no` to cancel."
+                : 'I had trouble revising the plan from that feedback — the planner returned non-JSON output. Reply with rephrased feedback, `yes` to proceed with the original plan, or `no` to cancel.',
           });
           overrideNextPromptTs = recoveryPosted.ts ?? undefined;
         } catch {
@@ -738,6 +754,18 @@ Return the JSON now.`;
   }
 
   return { kind: 'exhausted' };
+}
+
+/** What the thread is told when the planner run itself failed. Never the run's own last line. */
+export function plannerFailureReply(
+  result: Pick<CodexRunResult, 'errorKind' | 'limitResetsAtText' | 'timedOut'>,
+): string {
+  if (result.errorKind === 'API_ERROR') return connectionLostReply('planning');
+  if (result.errorKind === 'USAGE_LIMIT') {
+    const resets = result.limitResetsAtText ? ` It resets ${result.limitResetsAtText}.` : '';
+    return `I hit the Claude usage limit while planning.${resets} Nothing has been changed. Mention me again after that and I'll start over.`;
+  }
+  return `The planner ${result.timedOut ? 'timed out' : 'stopped with an error'} before it produced a plan. Nothing has been changed. Mention me again to retry.`;
 }
 
 export async function runImplementationWorkflow(params: {
@@ -939,23 +967,47 @@ export async function runImplementationWorkflow(params: {
 
     logStep?.({ stage: 'pipeline.agent.planner.start', message: 'Starting planner agent.' });
 
-    let plannerRunResult = await runCodex({
-      cwd: ctx.cwd,
-      prompt: plannerPrompt,
-      outputSchemaPath: plannerPlanMode ? undefined : plannerSchemaPath,
-      githubToken: ctx.githubToken,
-      planMode: plannerPlanMode,
-      ...plannerProfile,
-      // No per-agent timeoutMs — see investigationWorkflow.ts for rationale.
-      // The outer abort signal is the safety net, so it has to be passed:
-      // without it a cancelled job's planner ran to the end (issue #264).
-      onLog: logStep,
-      signal,
-    });
+    let plannerRunResult: CodexRunResult = await runWithInfraRetry(
+      {
+        cwd: ctx.cwd,
+        prompt: plannerPrompt,
+        outputSchemaPath: plannerPlanMode ? undefined : plannerSchemaPath,
+        githubToken: ctx.githubToken,
+        planMode: plannerPlanMode,
+        ...plannerProfile,
+        // No per-agent timeoutMs — see investigationWorkflow.ts for rationale.
+        // The outer abort signal is the safety net, so it has to be passed:
+        // without it a cancelled job's planner ran to the end (issue #264).
+        onLog: logStep,
+        signal,
+      },
+      { label: 'planner', logStep },
+    );
 
     // Cancelled while planning: do not post a plan, a question or failure copy (#438).
     if (signal?.aborted) {
       return cancelledResult('IMPLEMENTATION');
+    }
+
+    // A planner run that failed has no plan in it, whatever text it ended on.
+    // Its last line used to be harvested and posted for approval: "*Plan*
+    // (scope: medium, 0 files affected) API Error: Can't reach the API
+    // server" (issue #439).
+    if (!plannerRunResult.ok) {
+      const reply = plannerFailureReply(plannerRunResult);
+      logStep?.({
+        stage: 'implementation.planner.failed',
+        message: `Planner run failed (${plannerRunResult.errorKind ?? `exit ${plannerRunResult.exitCode}`}) — not posting a plan.`,
+        level: 'ERROR',
+        data: {
+          errorKind: plannerRunResult.errorKind,
+          exitCode: plannerRunResult.exitCode,
+          timedOut: plannerRunResult.timedOut,
+          detail: plannerRunResult.apiErrorDetail,
+        },
+      });
+      await slack.chat.postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: reply });
+      return { workflow: 'IMPLEMENTATION', status: 'FAILED', message: reply, notifyDesktop: false, slackPosted: true };
     }
 
     let plannerSessionId = plannerRunResult.sessionId;
@@ -1096,18 +1148,21 @@ export async function runImplementationWorkflow(params: {
         ? `The user answered your clarifying question ("${question}") with:\n\n"${answer}"\n\nNow produce the final plan. Return the same JSON schema with \`clarificationNeeded\` set to null.`
         : `You previously asked: "${question}"\nThe user answered: "${answer}"\n\nOriginal plan so far:\n${JSON.stringify(plannerOutput, null, 2)}\n\nNow produce the final plan. Return the same JSON schema with \`clarificationNeeded\` set to null.`;
 
-      plannerRunResult = await runCodex({
-        cwd: ctx.cwd,
-        prompt: followUpPrompt,
-        ...(plannerSessionId ? { resumeSessionId: plannerSessionId } : {}),
-        outputSchemaPath: plannerSchemaPath,
-        githubToken: ctx.githubToken,
-        ...plannerProfile,
-        // No per-agent timeoutMs — see investigationWorkflow.ts for rationale.
-        // Outer abort signal remains the safety net.
-        onLog: logStep,
-        signal,
-      });
+      plannerRunResult = await runWithInfraRetry(
+        {
+          cwd: ctx.cwd,
+          prompt: followUpPrompt,
+          ...(plannerSessionId ? { resumeSessionId: plannerSessionId } : {}),
+          outputSchemaPath: plannerSchemaPath,
+          githubToken: ctx.githubToken,
+          ...plannerProfile,
+          // No per-agent timeoutMs — see investigationWorkflow.ts for rationale.
+          // Outer abort signal remains the safety net.
+          onLog: logStep,
+          signal,
+        },
+        { label: 'planner', logStep },
+      );
       if (signal?.aborted) {
         return cancelledResult('IMPLEMENTATION');
       }
@@ -1891,7 +1946,9 @@ Write your response as a ready-to-post Slack message describing what you did.
         data: { finalStatus: fullResult.finalStatus },
       });
 
-      const failureSummary = `Pipeline finished with status: ${fullResult.finalStatus}. Not opening a PR.`;
+      const failureSummary = fullResult.connectionLost
+        ? `${connectionLostReply(`the ${fullResult.connectionLost.role} was running`)} Any work it had already done is still on its branch.`
+        : `Pipeline finished with status: ${fullResult.finalStatus}. Not opening a PR.`;
       await slack.chat.postMessage({
         channel: task.event.channelId,
         thread_ts: task.event.threadTs,

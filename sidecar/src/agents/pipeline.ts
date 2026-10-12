@@ -8,6 +8,7 @@ import type { WorkflowStepLogger } from '../types/contracts.js';
 import { buildPromptForRole } from './prompts.js';
 import { lightweightProfile, profileForAgentRole } from '../codex/modelProfiles.js';
 import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
+import { runWithInfraRetry } from '../codex/infraRetry.js';
 import { normalizePlannerOutput, type NormalizedPlannerOutput } from './normalizePlannerOutput.js';
 import { REPO_KEYS, type RepoKey } from '../repos/registry.js';
 import { withAgentCallContext } from '../state/runContext.js';
@@ -1023,6 +1024,26 @@ export async function runAgentPipeline(params: {
   let needsInputQuestion: string | undefined;
   let usageLimitHit = false;
   let usageLimitResetsAt: string | undefined;
+  // Connection failures (issue #439): the time they cost is kept off the
+  // pipeline's clock, and one that outlasts its retries stops the run.
+  let infraWaitMs = 0;
+  let connectionLost: PipelineResult['connectionLost'];
+  const stopOnLostConnection = (role: AgentRole, retries: number, durationMs: number): void => {
+    connectionLost = { role, retries };
+    logStep({
+      stage: 'pipeline.api_error',
+      message: `Lost the connection to the model API during ${role}; ${retries} retries did not bring it back — stopping the pipeline.`,
+      level: 'ERROR',
+      data: { role, retries, infraWaitMs },
+    });
+    steps.push({
+      role,
+      status: 'failed',
+      output: { status: 'error', summary: 'The model API could not be reached; this step did not complete.' },
+      findings: [],
+      durationMs,
+    });
+  };
 
   const pipelineRunId = randomUUID();
   if (store && jobId) {
@@ -1066,7 +1087,9 @@ export async function runAgentPipeline(params: {
 
   for (let i = 0; i < agents.length; i++) {
     if (totalTimeoutMs) {
-      const elapsed = Date.now() - pipelineStart;
+      // Time lost to a dead connection is not the pipeline's: a run that sat
+      // offline for an hour has not used an hour of its budget (issue #439).
+      const elapsed = Date.now() - pipelineStart - infraWaitMs;
       if (elapsed >= totalTimeoutMs) {
         logStep({
           stage: 'pipeline.timeout',
@@ -1118,20 +1141,32 @@ export async function runAgentPipeline(params: {
     }
 
     const result = await withAgentCallContext({ pipelineRunId, role }, () =>
-      runCodex({
-        cwd: ctx.repoPath,
-        prompt,
-        outputSchemaPath: schemaPath,
-        githubToken: ctx.githubToken,
-        planMode,
-        ...profile,
-        // timeoutMs: perAgentTimeoutMs,
-        onLog: logStep,
-        signal,
-      }),
+      runWithInfraRetry(
+        {
+          cwd: ctx.repoPath,
+          prompt,
+          outputSchemaPath: schemaPath,
+          githubToken: ctx.githubToken,
+          planMode,
+          ...profile,
+          // timeoutMs: perAgentTimeoutMs,
+          onLog: logStep,
+          signal,
+        },
+        // The coder's work is on disk and costly to redo: pick its session back up.
+        { label: role, resume: role === 'coder', logStep },
+      ),
     );
+    infraWaitMs += result.infraWaitMs;
 
     const durationMs = Date.now() - agentStart;
+
+    // The connection never came back. Not an agent verdict either: stop here
+    // rather than hand the next agent a step that did not happen (issue #439).
+    if (result.errorKind === 'API_ERROR') {
+      stopOnLostConnection(role, result.infraRetries, durationMs);
+      break;
+    }
 
     // Usage-limit hit: the CLI died pre-API with a known reset time. This is
     // not an agent verdict — abort the whole run instead of letting the
@@ -1352,6 +1387,18 @@ export async function runAgentPipeline(params: {
       break;
     }
 
+    // A coder that failed leaves nothing to assess. The reviewer and verifier
+    // used to run anyway, on whatever was on disk, and the run still ended
+    // "failed" (issue #439).
+    if (role === 'coder' && status === 'failed') {
+      logStep({
+        stage: 'pipeline.coder_failed',
+        message: 'Coder failed — stopping the pipeline: there is nothing for the next agents to assess.',
+        level: 'ERROR',
+      });
+      break;
+    }
+
     // Abort on critical security/reviewer finding
     if (abortOnCriticalFinding && hasCriticalFinding(findings)) {
       logStep({
@@ -1393,18 +1440,27 @@ export async function runAgentPipeline(params: {
         const coderStart = Date.now();
 
         const coderRetryResult = await withAgentCallContext({ pipelineRunId, role: 'coder' }, () =>
-          runCodex({
-            cwd: ctx.repoPath,
-            prompt: coderPrompt,
-            outputSchemaPath: coderSchemaPath,
-            githubToken: ctx.githubToken,
-            ...coderProfile,
-            onLog: logStep,
-            signal,
-          }),
+          runWithInfraRetry(
+            {
+              cwd: ctx.repoPath,
+              prompt: coderPrompt,
+              outputSchemaPath: coderSchemaPath,
+              githubToken: ctx.githubToken,
+              ...coderProfile,
+              onLog: logStep,
+              signal,
+            },
+            { label: 'coder', resume: true, logStep },
+          ),
         );
+        infraWaitMs += coderRetryResult.infraWaitMs;
 
         const coderRetryDuration = Date.now() - coderStart;
+
+        if (coderRetryResult.errorKind === 'API_ERROR') {
+          stopOnLostConnection('coder', coderRetryResult.infraRetries, coderRetryDuration);
+          break;
+        }
 
         if (coderRetryResult.errorKind === 'USAGE_LIMIT') {
           usageLimitHit = true;
@@ -1534,9 +1590,11 @@ export async function runAgentPipeline(params: {
         ? `Paused after ${durationSec}s — I need a bit more info before I can code a fix.`
         : finalStatus === 'usage-limit'
           ? `Paused — Claude usage limit hit${usageLimitResetsAt ? ` (resets ${usageLimitResetsAt})` : ''}. No code was lost.`
-          : finalStatus === 'aborted'
-            ? `Finished in ${durationSec}s. Review flagged some concerns — see the summary below.`
-            : `Finished in ${durationSec}s with some issues flagged — details below.`;
+          : connectionLost
+            ? `Stopped after ${durationSec}s — I lost my connection to the model and retrying didn't bring it back.`
+            : finalStatus === 'aborted'
+              ? `Finished in ${durationSec}s. Review flagged some concerns — see the summary below.`
+              : `Finished in ${durationSec}s with some issues flagged — details below.`;
   await postSlackProgress({ slack, ctx, text: finishText });
 
   if (store && jobId) {
@@ -1560,5 +1618,6 @@ export async function runAgentPipeline(params: {
     aggregatedFindings,
     needsInputQuestion,
     usageLimitResetsAt,
+    ...(connectionLost ? { connectionLost } : {}),
   };
 }

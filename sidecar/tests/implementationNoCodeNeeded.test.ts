@@ -1,12 +1,14 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   __quickActionConfirm,
   QUICK_ACTION_APPROVE_REFUSAL,
   QUICK_ACTION_DEPLOY_REDIRECT,
   QUICK_ACTION_DEPLOY_RE,
+  plannerFailureReply,
   runImplementationWorkflow,
 } from '../src/workflows/implementationWorkflow.js';
 import { runCodex } from '../src/codex/runCodex.js';
+import { __infraRetry, connectionLostReply } from '../src/codex/infraRetry.js';
 import { runAgenticEntry } from '../src/agentic/agenticEntry.js';
 
 // Regression coverage for #348 RC2: when the planner concludes no code changes
@@ -433,5 +435,98 @@ describe('implementationWorkflow — the abort signal reaches the planner (#264)
     // Planner, then the quick action: both must be stoppable.
     expect(vi.mocked(runCodex).mock.calls[0][0].signal).toBe(controller.signal);
     expect(vi.mocked(runCodex).mock.calls[1][0].signal).toBe(controller.signal);
+  });
+});
+
+describe('implementationWorkflow — a planner run that failed is not a plan (#439)', () => {
+  const savedRetry = { ...__infraRetry };
+  const API_ERROR_LINE = "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)";
+  // What the run that was posted as a plan looked like: exit 1, and the CLI's
+  // own error line harvested as the "plan".
+  const droppedPlanner = {
+    ok: false,
+    exitCode: 1,
+    timedOut: false,
+    stdout: '',
+    stderr: '',
+    lastMessage: API_ERROR_LINE,
+    durationMs: 0,
+    parsedJson: { summary: API_ERROR_LINE },
+    errorKind: 'API_ERROR' as const,
+    apiErrorDetail: API_ERROR_LINE,
+  };
+  const run = (slack: ReturnType<typeof makeSlack>) =>
+    runImplementationWorkflow({
+      task: makeTask('<@UBOT1> change the CTA copy on the DS page to "Apply Now"'),
+      config,
+      slack: slack as unknown as import('@slack/web-api').WebClient,
+    });
+  const posted = (slack: ReturnType<typeof makeSlack>) =>
+    slack.chat.postMessage.mock.calls.map(call => String(call[0].text));
+
+  beforeEach(() => {
+    vi.mocked(runCodex).mockReset();
+    vi.mocked(runAgenticEntry).mockReset();
+    __infraRetry.sleep = vi.fn().mockResolvedValue(true);
+  });
+  afterEach(() => Object.assign(__infraRetry, savedRetry));
+
+  it('retries, then says the connection was lost: no plan, no approval prompt, no error line', async () => {
+    vi.mocked(runCodex).mockResolvedValue(droppedPlanner);
+    const slack = makeSlack();
+
+    const result = await run(slack);
+
+    expect(runCodex).toHaveBeenCalledTimes(4);
+    expect(result).toMatchObject({ status: 'FAILED', slackPosted: true, message: connectionLostReply('planning') });
+    const messages = posted(slack);
+    expect(messages[messages.length - 1]).toBe(connectionLostReply('planning'));
+    for (const text of messages) {
+      expect(text).not.toContain('API Error');
+      expect(text).not.toContain('*Plan*');
+      expect(text).not.toContain('admin needs to approve');
+    }
+  });
+
+  it('carries on as normal when the connection comes back on a retry', async () => {
+    vi.mocked(runCodex).mockResolvedValueOnce(droppedPlanner).mockResolvedValue(plannerNoCodeResult());
+    vi.mocked(runAgenticEntry).mockResolvedValue({
+      workflow: 'INFORMATIONAL',
+      status: 'SUCCESS',
+      message: 'answered',
+      notifyDesktop: false,
+      slackPosted: true,
+    });
+    const slack = makeSlack();
+
+    const result = await run(slack);
+
+    expect(result.status).toBe('SUCCESS');
+    expect(posted(slack).some(text => text.includes('lost my connection'))).toBe(false);
+  });
+
+  it('does not read a plan out of a planner that failed for any other reason either', async () => {
+    vi.mocked(runCodex).mockResolvedValue({
+      ...droppedPlanner,
+      errorKind: undefined,
+      apiErrorDetail: undefined,
+      parsedJson: { summary: 'Traceback (most recent call last): …' },
+    } as never);
+    const slack = makeSlack();
+
+    const result = await run(slack);
+
+    expect(runCodex).toHaveBeenCalledTimes(1);
+    expect(result.status).toBe('FAILED');
+    expect(result.message).toContain('stopped with an error before it produced a plan');
+    expect(posted(slack).some(text => text.includes('Traceback'))).toBe(false);
+  });
+
+  it('words each kind of failure for the thread', () => {
+    expect(plannerFailureReply({ errorKind: 'API_ERROR', timedOut: false })).toBe(connectionLostReply('planning'));
+    expect(
+      plannerFailureReply({ errorKind: 'USAGE_LIMIT', limitResetsAtText: '9:40pm (Asia/Calcutta)', timedOut: false }),
+    ).toContain('It resets 9:40pm (Asia/Calcutta).');
+    expect(plannerFailureReply({ timedOut: true })).toContain('timed out before it produced a plan');
   });
 });
