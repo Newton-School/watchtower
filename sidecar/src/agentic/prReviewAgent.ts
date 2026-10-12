@@ -36,6 +36,7 @@ import {
   NO_NEW_CHANGES_TEXT,
   formatUnpostedFindings,
   planReviewPosting,
+  fetchDiffSince,
 } from '../github/prReviewSupport.js';
 import type {
   NormalizedPrReviewAgentOutput,
@@ -45,6 +46,7 @@ import type {
 } from '../github/prReviewSupport.js';
 import { isAnchorInDiff, parseDiffHunks } from '../github/diffHunks.js';
 import { resolveWorkspace } from '../workspaces/workspaceManager.js';
+import { applyFollowUpScope, formatFollowUpLine, type FollowUpStats } from './reReview.js';
 import { withAgentCallContext } from '../state/runContext.js';
 
 /**
@@ -70,6 +72,8 @@ export interface PrReviewOutcome {
   droppedOutsideDiff?: number;
   /** Repo review skills the orchestrator actually applied (skills-led review). */
   appliedSkills?: string[];
+  /** Set on a follow-up review: what became of the earlier review's findings (issue #451). */
+  followUp?: FollowUpStats;
   error?: string;
 }
 
@@ -80,6 +84,8 @@ export interface PrReviewOutcome {
 export interface PrReviewDeps {
   fetchMetadata: typeof fetchPrMetadata;
   fetchDiff: typeof fetchPrDiff;
+  /** The diff since an earlier reviewed commit, for a follow-up review (issue #451). */
+  fetchDiffSince: typeof fetchDiffSince;
   resolveHeadSha: typeof fetchPrHeadSha;
   fetchState: typeof fetchPrState;
   submitReview: typeof submitPrReview;
@@ -93,6 +99,7 @@ export interface PrReviewDeps {
 export const defaultPrReviewDeps: PrReviewDeps = {
   fetchMetadata: fetchPrMetadata,
   fetchDiff: fetchPrDiff,
+  fetchDiffSince,
   resolveHeadSha: fetchPrHeadSha,
   fetchState: fetchPrState,
   submitReview: submitPrReview,
@@ -133,8 +140,11 @@ export function buildAgenticPrReviewPrompt(params: {
   userFocusBlock?: string;
   /** When true, omit the tool-use instructions (degraded one-shot retry). */
   oneShot?: boolean;
+  /** Follow-up review: the accounting brief for the earlier findings (issue #451). */
+  priorReviewBlock?: string;
 }): string {
   const { recallBlock, prContext, prMeta, policyBlock, threadContext, diff, userFocusBlock, oneShot } = params;
+  const priorBlock = params.priorReviewBlock;
 
   const toolGuidance = oneShot
     ? 'Analyze the diff below directly. Do not explore the repository — produce your findings from the diff alone.'
@@ -152,7 +162,7 @@ ${prMeta.body ? `Description: ${prMeta.body}` : ''}
 Policy:
 ${policyBlock}
 
-${userFocusBlock ? `${userFocusBlock}\n\n` : ''}Thread context:
+${userFocusBlock ? `${userFocusBlock}\n\n` : ''}${priorBlock ? `${priorBlock}\n\n` : ''}Thread context:
 ${threadContext}
 
 ${toolGuidance}
@@ -204,6 +214,8 @@ type ReviewPromptParams = {
   buildStatusBlock?: string;
   /** Prior-review findings context for re-reviews (addressed/unaddressed/regressed). */
   priorReviewBlock?: string;
+  /** The same findings for the security/performance lenses, which do not track them (issue #451). */
+  priorReviewLensBlock?: string;
 };
 
 /** One persisted finding from a prior review of the same PR. */
@@ -217,21 +229,47 @@ export interface PriorReviewFinding {
   suggestion?: string;
 }
 
-const MAX_PRIOR_FINDINGS_IN_PROMPT = 20;
+const MAX_PRIOR_FINDINGS_IN_PROMPT = 30;
 
-function buildPriorReviewBlock(previousSha: string, priorFindings: PriorReviewFinding[]): string {
+function listPriorFindings(priorFindings: PriorReviewFinding[]): string {
   const shown = priorFindings.slice(0, MAX_PRIOR_FINDINGS_IN_PROMPT);
   const lines = shown.map(
     f =>
       `- [${f.severity.toUpperCase()}][${f.role}] ${f.file ? `${f.file}${typeof f.line === 'number' ? `:${f.line}` : ''} — ` : ''}${f.message}`,
   );
   if (priorFindings.length > shown.length) lines.push(`- … and ${priorFindings.length - shown.length} more.`);
-  return `PRIOR REVIEW — I previously reviewed this PR at commit ${previousSha.slice(0, 10)} and reported:
-${lines.join('\n')}
-The PR has new commits since. To see exactly what changed, run \`git diff ${previousSha.slice(0, 10)}...HEAD\` in the worktree.
-For each prior finding, judge whether the new commits ADDRESSED it, left it UNADDRESSED, or REGRESSED it:
-fold unaddressed/regressed ones into your findings (re-anchored to the current diff), and record addressed
-ones in "summaryNotes" as "Addressed since last review: <short description>".`;
+  return lines.join('\n');
+}
+
+/**
+ * For the lead reviewer of a follow-up review (issue #451). It used to end
+ * "fold unaddressed ones into your findings" and leave the rest of the review
+ * as it was, so a second pass was a second first review: 20 comments after
+ * 13, 19 of them new points, most on code that had not changed.
+ */
+function buildPriorReviewBlock(previousSha: string, priorFindings: PriorReviewFinding[]): string {
+  const sha = previousSha.slice(0, 10);
+  return `PRIOR REVIEW — I previously reviewed this PR at commit ${sha} and reported:
+${listPriorFindings(priorFindings)}
+The PR has new commits since. This is a FOLLOW-UP on that review, not a first review. Do two things:
+1. Account for every prior finding. Decide whether the new commits ADDRESSED it, left it STILL OPEN, or REGRESSED it.
+   Report each one that is still open or regressed as a finding again, re-anchored to the current diff, with its
+   "message" starting "Still open: " or "Regressed: ". Record each addressed one in "summaryNotes" as
+   "Addressed since last review: <short description>".
+2. Review what changed since that commit for NEW problems: run \`git diff ${sha}...HEAD\` in the worktree to see it.
+   Do NOT raise new low or medium points on code that has not changed since ${sha}: the author has already had one
+   pass on that code. A new high or critical problem is reported wherever in the diff it is.`;
+}
+
+/** For the security and performance lenses of a follow-up review: know what was said, do not say it again. */
+function buildPriorReviewLensBlock(previousSha: string, priorFindings: PriorReviewFinding[]): string {
+  const sha = previousSha.slice(0, 10);
+  return `PRIOR REVIEW — this PR was reviewed at commit ${sha}, and these findings were reported then:
+${listPriorFindings(priorFindings)}
+The PR has new commits since. This is a FOLLOW-UP on that review. The lead reviewer tracks what became of those
+findings: do NOT report any of them again, addressed or not. Report only NEW problems in your lens, and only where
+they are in code that changed since that commit (run \`git diff ${sha}...HEAD\` to see it) or are of high or
+critical severity anywhere in the diff.`;
 }
 
 const SEVERITY_RANK: Record<AgentFinding['severity'], number> = {
@@ -323,7 +361,12 @@ export function buildLensPrompt(params: {
   buildStatusBlock?: string;
   /** When true, omit tool-use instructions (no local clone / degraded retry). */
   oneShot?: boolean;
+  /** Follow-up review: the lead reviewer's accounting brief, and the lenses' "do not repeat" brief. */
+  priorReviewBlock?: string;
+  priorReviewLensBlock?: string;
 }): string {
+  // The reviewer lens leads when there is no orchestrator; the other two only add to it.
+  const priorBlock = params.lens === 'reviewer' ? params.priorReviewBlock : params.priorReviewLensBlock;
   const {
     lens,
     recallBlock,
@@ -359,7 +402,7 @@ ${prMeta.body ? `Description: ${prMeta.body}` : ''}
 Policy:
 ${policyBlock}
 
-${userFocusBlock ? `${userFocusBlock}\n\n` : ''}${buildStatusBlock ? `${buildStatusBlock}\n\n` : ''}Thread context:
+${userFocusBlock ? `${userFocusBlock}\n\n` : ''}${buildStatusBlock ? `${buildStatusBlock}\n\n` : ''}${priorBlock ? `${priorBlock}\n\n` : ''}Thread context:
 ${threadContext}
 
 ${toolGuidance}
@@ -1373,9 +1416,14 @@ export async function reviewSinglePr(params: {
   const schemaPath = path.resolve(process.cwd(), 'schemas', 'agentic-pr-review-result.schema.json');
   const orchestratorSchemaPath = path.resolve(process.cwd(), 'schemas', 'pr-review-orchestrator-result.schema.json');
   const verifierSchemaPath = path.resolve(process.cwd(), 'schemas', 'pr-review-verifier.schema.json');
+  const isFollowUp = Boolean(previousReview && priorFindings && priorFindings.length > 0);
   const priorReviewBlock =
-    previousReview && priorFindings && priorFindings.length > 0
+    previousReview && priorFindings && isFollowUp
       ? buildPriorReviewBlock(previousReview.prHeadSha, priorFindings)
+      : undefined;
+  const priorReviewLensBlock =
+    previousReview && priorFindings && isFollowUp
+      ? buildPriorReviewLensBlock(previousReview.prHeadSha, priorFindings)
       : undefined;
 
   const promptParams = {
@@ -1389,6 +1437,7 @@ export async function reviewSinglePr(params: {
     checkoutDegraded,
     buildStatusBlock,
     priorReviewBlock,
+    priorReviewLensBlock,
   };
   let normalizedOutputs: NormalizedPrReviewAgentOutput[] | undefined;
   let agentResult: CodexRunResult | undefined;
@@ -1518,6 +1567,41 @@ export async function reviewSinglePr(params: {
 
   enforceChangedCodeGate(normalizedOutputs, diffResult.diff, prContext.url, logStep);
 
+  // 6b. A second review of the same PR follows up on the first (issue #451):
+  //     what became of its findings, and what is new in the code changed since.
+  //     New low/medium points on code that has not changed are left out.
+  let followUp: FollowUpStats | undefined;
+  if (previousReview && priorFindings && isFollowUp && prHeadSha) {
+    const since = await deps.fetchDiffSince({
+      prContext,
+      baseSha: previousReview.prHeadSha,
+      headSha: prHeadSha,
+      githubToken,
+    });
+    if (since === undefined) {
+      logStep?.({
+        stage: 'agentic.pr_review.follow_up.scope_unavailable',
+        level: 'WARN',
+        message:
+          'Could not get the diff since the last reviewed commit (it may have been force-pushed away) — nothing is left out of this follow-up.',
+        data: { prUrl: prContext.url, previousPrHeadSha: previousReview.prHeadSha },
+      });
+    }
+    const scoped = applyFollowUpScope({
+      outputs: normalizedOutputs,
+      earlier: priorFindings,
+      changedSince: since === undefined ? undefined : parseDiffHunks(since),
+    });
+    normalizedOutputs = scoped.outputs;
+    followUp = scoped.stats;
+    logStep?.({
+      stage: 'agentic.pr_review.follow_up',
+      message: formatFollowUpLine(scoped.stats, previousReview.prHeadSha),
+      data: { prUrl: prContext.url, ...scoped.stats, scoped: since !== undefined },
+    });
+  }
+  const followUpLine = followUp && previousReview ? formatFollowUpLine(followUp, previousReview.prHeadSha) : undefined;
+
   const allFindings = normalizedOutputs.flatMap(output => output.findings);
   const summaryNotesCount = normalizedOutputs.reduce((sum, output) => sum + output.summaryNotes.length, 0);
 
@@ -1546,7 +1630,7 @@ export async function reviewSinglePr(params: {
       commitId: prHeadSha,
       findingsByRole: postingPlan.toSubmit,
       findingsInBody: allFindings.length - postingPlan.toSubmit.reduce((sum, r) => sum + r.findings.length, 0),
-      summary: buildGithubReviewSummary(normalizedOutputs, appliedSkills, postingPlan),
+      summary: buildGithubReviewSummary(normalizedOutputs, appliedSkills, postingPlan, followUpLine),
       githubToken,
       prDiff: diffResult.diff,
       logStep,
@@ -1580,6 +1664,7 @@ export async function reviewSinglePr(params: {
     postingPlan.collapsed.length,
   );
   const summaryParts = [baseSummary];
+  if (followUpLine) summaryParts.push(followUpLine);
   // False when the submission failed or was skipped: then the thread is the
   // only place the findings can be read (issue #449).
   const reviewOnPr = Boolean(reviewResult?.submitted);
@@ -1661,5 +1746,6 @@ export async function reviewSinglePr(params: {
     fileLevelPosted: reviewResult?.fileLevelPosted ?? 0,
     droppedOutsideDiff: reviewResult?.droppedOutsideDiff ?? 0,
     ...(appliedSkills.length > 0 ? { appliedSkills } : {}),
+    ...(followUp ? { followUp } : {}),
   };
 }

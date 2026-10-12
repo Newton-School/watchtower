@@ -167,6 +167,7 @@ function makeDeps(overrides: Record<string, unknown> = {}) {
       truncated: false,
       reason: 'ok',
     }),
+    fetchDiffSince: vi.fn().mockResolvedValue(undefined),
     resolveHeadSha: vi.fn().mockResolvedValue('feedface'),
     fetchState: vi.fn().mockResolvedValue({ state: 'open' }),
     submitReview: vi.fn().mockResolvedValue(SUBMIT_OK),
@@ -937,6 +938,171 @@ describe('agenticPrReview', () => {
         findings: [expect.objectContaining({ role: 'reviewer', message: 'still broken', line: 2 })],
       }),
     );
+  });
+
+  describe('a second review follows up on the first (issue #451)', () => {
+    // The PR adds six lines to src/a.ts. Since the earlier review, only lines 5 and 6 changed.
+    const PR_DIFF =
+      'diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -0,0 +1,6 @@\n+one\n+two\n+three\n+four\n+five\n+six';
+    const SINCE_DIFF =
+      'diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -4,1 +4,3 @@\n four\n+five\n+six';
+    const prior = (message: string, line: number, severity = 'medium') => ({
+      jobId: 'previous-job',
+      prHeadSha: 'oldsha1234',
+      role: 'reviewer',
+      severity,
+      category: 'bug',
+      message,
+      file: 'src/a.ts',
+      line,
+      createdAt: '2026-10-06T10:00:00.000Z',
+    });
+    const storeWithEarlierReview = () => ({
+      findLatestReviewedPrHeadSha: () => ({
+        jobId: 'previous-job',
+        prHeadSha: 'oldsha1234',
+        updatedAt: '2026-10-06T10:00:00.000Z',
+      }),
+      getChannelPolicyPack: () => undefined,
+      recordPrReviewFindings: vi.fn(),
+      getPrReviewFindings: vi
+        .fn()
+        .mockReturnValue([
+          prior('The retry loop never backs off', 2),
+          prior('Rename the helper', 3, 'low'),
+          prior('Missing test for the empty list', 4, 'low'),
+        ]),
+    });
+    const orchestrator = agentOk(
+      [
+        {
+          role: 'reviewer',
+          severity: 'medium',
+          category: 'bug',
+          message: 'Still open: the retry loop never backs off',
+          file: 'src/a.ts',
+          line: 2,
+        },
+        {
+          role: 'reviewer',
+          severity: 'low',
+          category: 'style',
+          message: 'This could be const',
+          file: 'src/a.ts',
+          line: 3,
+        },
+        { role: 'reviewer', severity: 'low', category: 'style', message: 'Magic number', file: 'src/a.ts', line: 5 },
+      ],
+      ['Addressed since last review: helper renamed', 'Addressed since last review: empty-list test added'],
+    );
+    const followUp = async (depsOverrides: Record<string, unknown> = {}) => {
+      const slack = makeSlack([`review ${WEB_PR}`]);
+      const runAgent = routedRunAgent({
+        orchestrator,
+        security: agentOk([
+          {
+            role: 'security',
+            severity: 'high',
+            category: 'secrets',
+            message: 'Token logged in full',
+            file: 'src/a.ts',
+            line: 3,
+          },
+        ]),
+      });
+      const deps = makeDeps({
+        runAgent,
+        resolveHeadSha: vi.fn().mockResolvedValue('newsha9999'),
+        fetchDiff: vi.fn().mockResolvedValue({ diff: PR_DIFF, truncated: false, reason: 'ok' }),
+        fetchDiffSince: vi.fn().mockResolvedValue(SINCE_DIFF),
+        ...depsOverrides,
+      });
+      const logStep = vi.fn();
+      const result = await runAgenticPrReview({
+        task: makeTask(`<@UBOT1> Please review again, resolved and replied on the comments ${WEB_PR}`),
+        config,
+        slack: slack as any,
+        store: storeWithEarlierReview() as any,
+        jobId: 'job-new',
+        deps: deps as any,
+        logStep,
+      });
+      return {
+        deps,
+        runAgent,
+        logStep,
+        outcome: (result.result as any).outcomes[0],
+        texts: slack.chat.postMessage.mock.calls.map(c => c[0].text as string).join('\n---\n'),
+        prompts: runAgent.mock.calls.map((c: any[]) => c[0].prompt as string),
+      };
+    };
+
+    it('reports what became of the earlier findings, and only what is new in the code changed since', async () => {
+      const { deps, outcome, texts } = await followUp();
+
+      const line =
+        'Follow-up on my review at oldsha1: of its 3 findings, 2 addressed, 1 still open; 2 new in the code changed since. 1 further low or medium point on code unchanged since then was left out.';
+      expect(texts).toContain(line);
+      expect(outcome.followUp).toEqual({ earlierTotal: 3, addressed: 2, stillOpen: 1, newFindings: 2, leftOut: 1 });
+      expect(outcome.totalFindings).toBe(3);
+
+      const submitted = deps.submitReview.mock.calls[0][0];
+      expect(submitted.summary.startsWith(line)).toBe(true);
+      const messages = [
+        ...submitted.findingsByRole.flatMap((r: any) => r.findings.map((x: any) => x.message)),
+        submitted.summary,
+      ].join('\n');
+      // Raised again, new on changed code, and a new blocker on unchanged code: all there.
+      expect(messages).toContain('Still open: the retry loop never backs off');
+      expect(messages).toContain('Magic number');
+      expect(messages).toContain('Token logged in full');
+      // A new nit on code the author already had one review of: not there.
+      expect(messages).not.toContain('This could be const');
+      expect(deps.fetchDiffSince).toHaveBeenCalledWith(
+        expect.objectContaining({ baseSha: 'oldsha1234', headSha: 'newsha9999' }),
+      );
+    });
+
+    it('tells every lens about the earlier findings: the lead accounts for them, the others do not repeat them', async () => {
+      const { prompts } = await followUp();
+
+      const lead = prompts.find(p => p.includes(ORCHESTRATOR_PROMPT_MARKER)) as string;
+      expect(lead).toContain('This is a FOLLOW-UP on that review, not a first review.');
+      expect(lead).toContain('"message" starting "Still open: " or "Regressed: "');
+      expect(lead).toContain('Do NOT raise new low or medium points on code that has not changed since oldsha1234');
+      for (const lens of ['security specialist', 'performance specialist']) {
+        const prompt = prompts.find(p => p.includes(lens)) as string;
+        expect(prompt).toContain('PRIOR REVIEW');
+        expect(prompt).toContain('The retry loop never backs off');
+        expect(prompt).toContain('do NOT report any of them again');
+      }
+    });
+
+    it('leaves nothing out when the diff since the earlier review cannot be had, and says so in the log', async () => {
+      const { outcome, logStep, texts } = await followUp({ fetchDiffSince: vi.fn().mockResolvedValue(undefined) });
+
+      expect(outcome.followUp).toMatchObject({ leftOut: 0, newFindings: 3, stillOpen: 1 });
+      expect(texts).toContain('3 new in the code changed since.');
+      expect(logStep).toHaveBeenCalledWith(
+        expect.objectContaining({ stage: 'agentic.pr_review.follow_up.scope_unavailable', level: 'WARN' }),
+      );
+    });
+
+    it('is not a follow-up when there was no earlier review', async () => {
+      const slack = makeSlack([`review ${WEB_PR}`]);
+      const deps = makeDeps();
+      const result = await runAgenticPrReview({
+        task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+        config,
+        slack: slack as any,
+        store: emptyStore,
+        deps: deps as any,
+      });
+
+      expect((result.result as any).outcomes[0]).not.toHaveProperty('followUp');
+      expect(deps.fetchDiffSince).not.toHaveBeenCalled();
+      expect(slack.chat.postMessage.mock.calls.map(c => c[0].text).join('\n')).not.toContain('Follow-up on my review');
+    });
   });
 
   it('kill switch WATCHTOWER_PR_REVIEW_ORCHESTRATED=0 restores the classic 3-lens fan-out', async () => {

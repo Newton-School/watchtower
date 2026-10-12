@@ -247,6 +247,30 @@ export const DIFF_PROMPT_MAX_CHARS = (() => {
   return Number.isFinite(parsed) && parsed >= 10_000 ? parsed : 150_000;
 })();
 
+/**
+ * The diff between a commit reviewed earlier and the PR's current head, for
+ * a follow-up review (issue #451). Undefined when GitHub cannot produce it,
+ * which is what a force-push that orphaned the old commit looks like.
+ */
+export async function fetchDiffSince(params: {
+  prContext: PrContext;
+  baseSha: string;
+  headSha: string;
+  githubToken?: string;
+}): Promise<string | undefined> {
+  const { prContext, baseSha, headSha, githubToken } = params;
+  const url = `https://api.github.com/repos/${prContext.owner}/${prContext.repo}/compare/${baseSha}...${headSha}`;
+  const headers: Record<string, string> = { Accept: 'application/vnd.github.diff' };
+  if (githubToken) headers.Authorization = `Bearer ${githubToken}`;
+  try {
+    const response = await fetch(url, { headers, signal: AbortSignal.timeout(20_000) });
+    if (!response.ok) return undefined;
+    return await response.text();
+  } catch {
+    return undefined;
+  }
+}
+
 export async function fetchPrDiff(params: {
   prContext: PrContext;
   githubToken?: string;
@@ -646,7 +670,12 @@ export function buildGithubReviewSummary(
   outputs: NormalizedPrReviewAgentOutput[],
   appliedSkills?: string[],
   plan?: ReviewPostingPlan,
+  /** For a follow-up review: what became of the earlier findings, as the first line. */
+  followUpLine?: string,
 ): string {
+  if (followUpLine) {
+    return `${followUpLine}\n\n${buildGithubReviewSummary(outputs, appliedSkills, plan)}`;
+  }
   const allFindings = outputs.flatMap(output => output.findings);
   const attachableFindings = outputs.flatMap(output => output.attachableFindings);
   const unattachableFindings = outputs.flatMap(output =>
