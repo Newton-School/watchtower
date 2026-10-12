@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { runAgenticPrReview } from '../src/agentic/agenticPrReview.js';
+import { buildDeferredNote, runAgenticPrReview } from '../src/agentic/agenticPrReview.js';
 import { VERIFIER_PROMPT_MARKER } from '../src/agentic/prReviewAgent.js';
 import { ORCHESTRATOR_PROMPT_MARKER } from '../src/agentic/prReviewOrchestrator.js';
 import { EMPTY_DISCOVERY } from '../src/agentic/reviewSkills.js';
@@ -284,6 +284,98 @@ describe('agenticPrReview', () => {
     const texts = slack.chat.postMessage.mock.calls.map(c => c[0].text as string);
     expect(texts.some(t => t.includes('Reviewing 2 PRs'))).toBe(true);
     expect(texts.filter(t => t.includes('*PR Review Complete*'))).toHaveLength(2);
+  });
+
+  describe('more PRs than one request reviews (issue #442)', () => {
+    const pr = (n: number) => `https://github.com/Newton-School/newton-web/pull/${n}`;
+    const SIX = [9155, 9156, 9157, 9158, 9159, 9160].map(pr);
+
+    it('ends the batch by naming what was not reviewed, with a line to send back', async () => {
+      // The incident: six PRs "in the given order"; three reviewed, the thread ended there.
+      const slack = makeSlack([
+        `Please review in the given order.\n${SIX.map((url, i) => `${i + 1}. ${url}`).join('\n')}`,
+      ]);
+      const deps = makeDeps();
+
+      const result = await runAgenticPrReview({
+        task: makeTask(`<@UBOT1> Please review in the given order.\n${SIX.join('\n')}`),
+        config,
+        slack: slack as any,
+        store: emptyStore,
+        deps: deps as any,
+      });
+
+      const texts = slack.chat.postMessage.mock.calls.map(c => c[0].text as string);
+      expect(texts.filter(t => t.includes('*PR Review Complete*'))).toHaveLength(3);
+      // It is the last thing said, after the third verdict.
+      const closing = texts[texts.length - 1];
+      expect(closing).toContain(
+        'That was 3 of the 6 PRs you listed. Not reviewed yet: newton-web#9158, newton-web#9159, newton-web#9160.',
+      );
+      expect(closing).toContain('> <@UBOT1> review #9158 #9159 #9160');
+      // The acknowledgement no longer buries the instructions.
+      expect(texts[0]).toContain('3 more deferred');
+      expect(texts[0]).not.toContain('reply with a PR link');
+      expect((result.result as any).deferredUrls).toEqual([pr(9158), pr(9159), pr(9160)]);
+    });
+
+    it('reviews exactly the deferred PRs when that line is sent back', async () => {
+      const slack = makeSlack([`Please review in the given order.\n${SIX.join('\n')}`]);
+
+      const result = await runAgenticPrReview({
+        task: makeTask('<@UBOT1> review #9158 #9159 #9160'),
+        config,
+        slack: slack as any,
+        store: emptyStore,
+        deps: makeDeps() as any,
+      });
+
+      const outcomes = (result.result as any).outcomes;
+      expect(outcomes.map((o: any) => o.prUrl)).toEqual([pr(9158), pr(9159), pr(9160)]);
+      const texts = slack.chat.postMessage.mock.calls.map(c => c[0].text as string);
+      expect(texts.some(t => t.includes('Not reviewed yet'))).toBe(false);
+    });
+
+    it('says nothing more when every PR was reviewed', async () => {
+      const slack = makeSlack([`backend : ${API_PR}\nfrontend : ${WEB_PR}`]);
+      const result = await runAgenticPrReview({
+        task: makeTask('<@UBOT1> review both the PRs'),
+        config,
+        slack: slack as any,
+        store: emptyStore,
+        deps: makeDeps() as any,
+      });
+
+      const texts = slack.chat.postMessage.mock.calls.map(c => c[0].text as string);
+      expect(texts.some(t => t.includes('Not reviewed yet'))).toBe(false);
+      expect(result.result as any).not.toHaveProperty('deferredUrls');
+    });
+
+    it('writes the line with #numbers when they are unambiguous, and with links when two repos share one', () => {
+      const target = (repo: string, number: number) => ({
+        repo,
+        number,
+        url: `https://github.com/Newton-School/${repo}/pull/${number}`,
+      });
+
+      expect(
+        buildDeferredNote({
+          deferred: [target('lumina-web', 55), target('newton-web', 9234)],
+          reviewed: [target('Edison-Backend', 102), target('newton-api', 6412), target('lumina-api', 40)],
+          botUserId: 'UBOT1',
+        }),
+      ).toContain('> <@UBOT1> review #55 #9234');
+
+      const clash = buildDeferredNote({
+        deferred: [target('lumina-web', 40)],
+        reviewed: [target('lumina-api', 40), target('newton-api', 1), target('newton-web', 2)],
+        botUserId: 'UBOT1',
+      });
+      expect(clash).toContain('> <@UBOT1> review https://github.com/Newton-School/lumina-web/pull/40');
+      expect(clash).toContain('To have it reviewed');
+      // No bot id known: the line is still there to send with a mention.
+      expect(buildDeferredNote({ deferred: [target('a', 9)], reviewed: [target('a', 1)] })).toContain('> review #9');
+    });
   });
 
   it('tags requester and skips when PR org is outside allowed scope', async () => {

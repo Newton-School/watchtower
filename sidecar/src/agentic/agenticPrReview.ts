@@ -63,6 +63,31 @@ export function buildNotOpenReply(entries: Array<{ target: PrTarget; state: PrSt
   return `${subject} For a post-merge review, say \`post-merge review ${urls}\`. If you had a question about ${entries.length === 1 ? 'it' : 'them'} instead, @ me with the question and I'll answer.`;
 }
 
+/**
+ * The last message of a capped batch: which PRs were not reviewed, and a line
+ * to send back to have them reviewed (issue #442).
+ *
+ * The line uses `#number` when that is unambiguous in the thread, and the PR
+ * links otherwise: two repos in one request can share a PR number.
+ */
+export function buildDeferredNote(params: {
+  deferred: Array<{ url: string; repo: string; number: number }>;
+  reviewed: Array<{ repo: string; number: number }>;
+  botUserId?: string;
+}): string {
+  const { deferred, reviewed, botUserId } = params;
+  const everyNumber = [...reviewed, ...deferred].map(t => t.number);
+  const unambiguous = deferred.every(t => everyNumber.filter(n => n === t.number).length === 1);
+  const selectors = unambiguous ? deferred.map(t => `#${t.number}`) : deferred.map(t => t.url);
+  const names = deferred.map(t => `${t.repo}#${t.number}`).join(', ');
+  const total = reviewed.length + deferred.length;
+  return [
+    `That was ${reviewed.length} of the ${total} PRs you listed. Not reviewed yet: ${names}.`,
+    `To have ${deferred.length === 1 ? 'it' : 'them'} reviewed, send this in the thread:`,
+    `> ${botUserId ? `<@${botUserId}> ` : ''}review ${selectors.join(' ')}`,
+  ].join('\n');
+}
+
 export async function runAgenticPrReview(params: {
   task: NormalizedTask;
   config: AppConfig;
@@ -322,11 +347,14 @@ export async function runAgenticPrReview(params: {
 
   // Single ack. Single-PR keeps the message users know; multi-PR lists the
   // batch (and names anything dropped by the target cap — never silent).
+  // The instructions for the rest come at the end, where they can be acted
+  // on: here they were followed by half an hour of review output (issue #442).
+  const deferred = resolution.truncated ?? [];
   const truncationNote =
-    resolution.truncated && resolution.truncated.length > 0
-      ? ` (capped at ${resolution.targets.length} per request — deferring ${resolution.truncated
+    deferred.length > 0
+      ? ` (capped at ${resolution.targets.length} per request — ${deferred.length} more deferred: ${deferred
           .map(t => `${t.repo}#${t.number}`)
-          .join(', ')}; reply with a PR link or "#number" to review those next)`
+          .join(', ')}; I'll say how to get those reviewed when these are done)`
       : '';
   const focusNote = userFocusBlock ? ' Noted your focus instructions.' : '';
   await postToThread(
@@ -450,6 +478,26 @@ export async function runAgenticPrReview(params: {
     },
   });
 
+  // The PRs past the cap were named once, in the acknowledgement, and never
+  // again: six of them went unreviewed in a month, on jobs recorded as a clean
+  // SUCCESS (issue #442). Say what is left as the last word of the batch, with
+  // a line that can be sent back as it is.
+  if (deferred.length > 0 && !aborted) {
+    await postToThread(
+      buildDeferredNote({
+        deferred,
+        reviewed: resolution.targets,
+        botUserId: config.botUserId,
+      }),
+    );
+    logStep?.({
+      stage: 'agentic.pr_review.deferred',
+      level: 'WARN',
+      message: `${deferred.length} PR(s) past the per-request cap were not reviewed; told the thread how to ask for them.`,
+      data: { deferred: deferred.map(t => t.url) },
+    });
+  }
+
   // result carries per-PR outcomes (the dedup guard reads them) plus
   // top-level prUrl/prHeadSha for single-PR back-compat consumers.
   const result = {
@@ -458,6 +506,7 @@ export async function runAgenticPrReview(params: {
     ...(firstWithSha?.prHeadSha ? { prHeadSha: firstWithSha.prHeadSha } : {}),
     failedCount: failed.length,
     failedUrls: failed.map(o => o.prUrl),
+    ...(deferred.length > 0 ? { deferredUrls: deferred.map(t => t.url) } : {}),
   };
 
   if (aborted) {
