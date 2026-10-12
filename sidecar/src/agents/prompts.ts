@@ -116,8 +116,15 @@ ${ctx.threadContext}
 ${ctx.prContext ? `PR context: ${ctx.prContext.url} (${ctx.prContext.owner}/${ctx.prContext.repo}#${ctx.prContext.number})` : ''}
 
 What the plan must contain (markdown):
+- FIRST, a block for the person who approves this plan. They are not the coder, often did not write the request, and will decide in about a minute. Use exactly this heading and these five lines, in plain words with no code and no file paths except under "Where":
+  ## For the approver
+  - What changes: <one sentence, in terms of what a user of the product will see or get>
+  - Where: <the page, screen or area; at most three>
+  - Behaviour change: <"none", or what will behave differently once this ships, in one or two sentences. A changed default, limit, condition or rule is a behaviour change: say what the new value means for a real user, not just what it is>
+  - Assumptions to confirm: <"none", or anything you had to assume or could not see (a screenshot you could not open, which of two pages was meant, a value you picked)>
+  - Risk: <low, medium or high>
 - A short summary of the user's intent.
-- The concrete files you expect to touch, with brief rationale per file.
+- A section headed exactly \`## Files to change\`: one bullet per file you will edit or create, as a backticked repo-relative path and a few words on why. ONLY files this change edits. Files you only read, files that must not be touched, globs, URLs and branch names do not belong in this section.
 - An ordered list of implementation steps.
 - A scope tag on its own line, exactly one of: \`Scope: small\`, \`Scope: medium\`, or \`Scope: large\`. Treat anything under ~50 lines across 1–2 files as small; multi-file feature work as medium; cross-cutting refactors or new subsystems as large. Coder agent uses this to decide whether to include tests in the PR.
 - A code-changes tag on its own line, exactly one of: \`Requires code changes: yes\` or \`Requires code changes: no\`. Set \`no\` ONLY for purely informational requests (explain, describe, list, check status, answer a question) or operational/lifecycle actions that do NOT modify source (merge PR, close PR, deploy, run tests, restart service; a deploy, release or rollback ask is not executed by this pipeline, it is redirected to the deploy command). For ANY implementation, feature, fix, change, or modification of source files set \`yes\`; when in doubt, \`yes\`.

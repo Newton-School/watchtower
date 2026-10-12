@@ -9,7 +9,13 @@ import { buildPromptForRole } from './prompts.js';
 import { lightweightProfile, profileForAgentRole } from '../codex/modelProfiles.js';
 import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
 import { isInterruption, runWithInfraRetry, type InterruptionKind } from '../codex/infraRetry.js';
-import { normalizePlannerOutput, type NormalizedPlannerOutput } from './normalizePlannerOutput.js';
+import {
+  isNone,
+  normalizePlannerOutput,
+  parseApproverSummary,
+  planWithoutApproverParts,
+  type NormalizedPlannerOutput,
+} from './normalizePlannerOutput.js';
 import { REPO_KEYS, type RepoKey } from '../repos/registry.js';
 import { withAgentCallContext } from '../state/runContext.js';
 import { fetchThreadContext } from '../slack/threadContext.js';
@@ -142,20 +148,73 @@ function stripRepoPrefix(filePath: string, repoPath: string): string {
   return filePath;
 }
 
+/** How many files the plan message lists before it says "and N more". */
+const PLAN_MESSAGE_MAX_FILES = 8;
+
+/**
+ * The plan as posted for approval (issue #437).
+ *
+ * When the planner wrote its approver block, the message opens with it: what
+ * changes, where, whether behaviour changes, what was assumed, the risk, and
+ * the files to change. The full plan follows, marked as detail. If behaviour
+ * changes or something was assumed, the requester is asked to confirm it,
+ * because the approver is usually someone else. A default changed to 0 was
+ * approved in 54 seconds; it meant the opposite of what the requester wanted.
+ *
+ * The header counts files the change edits. It used to count every
+ * path-shaped token in the plan.
+ */
 export function formatPlanMessage(
   planMarkdown: string,
   affectedFiles: string[],
   scope: string,
   repoPath?: string,
   completed?: boolean,
+  requesterId?: string,
 ): string {
-  const header = `*Plan* (scope: ${scope}, ${affectedFiles.length} files affected)`;
   const displayFiles = repoPath ? affectedFiles.map(f => stripRepoPrefix(f, repoPath)) : affectedFiles;
-  const filesSection =
-    displayFiles.length > 0 ? `\n\n*Affected files:*\n${displayFiles.map(f => `• \`${f}\``).join('\n')}` : '';
-  const body = planMarkdown.trim();
+  const count = displayFiles.length;
+  const summary = parseApproverSummary(planMarkdown);
+  const headerParts = [`scope: ${scope}`];
+  if (count > 0) headerParts.push(`${count} file${count === 1 ? '' : 's'} to change`);
+  if (summary?.risk) headerParts.push(`risk: ${summary.risk}`);
+  const header = `*Plan* (${headerParts.join(', ')})`;
+
+  const shownFiles = displayFiles.slice(0, PLAN_MESSAGE_MAX_FILES).map(f => `• \`${f}\``);
+  if (count > PLAN_MESSAGE_MAX_FILES) shownFiles.push(`• … and ${count - PLAN_MESSAGE_MAX_FILES} more`);
+  const filesSection = count > 0 ? `*Files to change:*\n${shownFiles.join('\n')}` : '';
   const completedSuffix = completed ? '\n\n_✅ Plan executed._' : '';
-  return `${header}${body ? `\n${body}` : ''}${filesSection}${completedSuffix}`;
+
+  if (!summary) {
+    const body = planMarkdown.trim();
+    return `${header}${body ? `\n${body}` : ''}${filesSection ? `\n\n${filesSection}` : ''}${completedSuffix}`;
+  }
+
+  const changesBehaviour = !isNone(summary.behaviourChange);
+  const assumed = !isNone(summary.assumptions);
+  const block = [
+    header,
+    `*What changes:* ${summary.whatChanges}`,
+    ...(summary.where ? [`*Where:* ${summary.where}`] : []),
+    `*Behaviour change:* ${changesBehaviour ? `:warning: ${summary.behaviourChange}` : 'none'}`,
+    `*Assumptions to confirm:* ${assumed ? summary.assumptions : 'none'}`,
+  ];
+  if (requesterId && (changesBehaviour || assumed)) {
+    const what = [changesBehaviour ? 'the behaviour change' : '', assumed ? 'the assumptions' : '']
+      .filter(Boolean)
+      .join(' and ');
+    block.push(
+      `<@${requesterId}> please confirm ${what} above ${assumed ? 'are' : 'is'} what you want, before this is approved.`,
+    );
+  }
+  const detail = planWithoutApproverParts(planMarkdown);
+  return [
+    block.join('\n'),
+    ...(filesSection ? [filesSection] : []),
+    ...(detail ? [`_Full plan, for the coder:_\n${detail}`] : []),
+  ]
+    .join('\n\n')
+    .concat(completedSuffix);
 }
 
 const APPROVE_PATTERNS = /^(yes|go|proceed|do it|go ahead|ship it|lgtm)$/i;
@@ -1393,6 +1452,8 @@ export async function runAgentPipeline(params: {
             plannerNormalized.affectedFiles,
             plannerNormalized.scope,
             ctx.repoPath,
+            false,
+            ctx.task.event.userId,
           ),
         });
       }
@@ -1444,6 +1505,7 @@ export async function runAgentPipeline(params: {
           plannerNormalized.scope,
           ctx.repoPath,
           true,
+          ctx.task.event.userId,
         ),
       });
     }

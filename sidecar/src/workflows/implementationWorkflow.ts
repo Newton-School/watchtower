@@ -743,7 +743,7 @@ Return the JSON now.`;
         const revisedPosted = await slack.chat.postMessage({
           channel: task.event.channelId,
           thread_ts: task.event.threadTs,
-          text: formatPlanMessage(planMarkdown, planAffectedFiles, planScope, pipelineCwd),
+          text: formatPlanMessage(planMarkdown, planAffectedFiles, planScope, pipelineCwd, false, task.event.userId),
         });
         planMessageTs = revisedPosted.ts ?? planMessageTs;
       } catch {
@@ -1557,7 +1557,7 @@ Write your response as a ready-to-post Slack message describing what you did.
         const planResult = await slack.chat.postMessage({
           channel: task.event.channelId,
           thread_ts: task.event.threadTs,
-          text: formatPlanMessage(planMarkdown, planAffectedFiles, planScope, pipelineCwd),
+          text: formatPlanMessage(planMarkdown, planAffectedFiles, planScope, pipelineCwd, false, task.event.userId),
         });
         planMessageTs = planResult.ts ?? undefined;
       } catch (error) {
