@@ -70,6 +70,28 @@ export function diagnoseFailure(input: {
     };
   }
 
+  // The run ended because the model API could not be reached and retrying did
+  // not help. Matched on the stages that end a run that way, not on any
+  // `agent.api_error` line: a drop that a retry recovered from is not why a
+  // later failure happened. Ahead of the timeout rules, which used to claim
+  // these (a "timeoutMs" field in the log data is enough for them, issue #439).
+  const endedOnLostConnection = input.logs.some(
+    entry =>
+      entry.stage === 'pipeline.api_error' ||
+      (entry.stage === 'implementation.planner.failed' && entry.data?.errorKind === 'API_ERROR'),
+  );
+  if (endedOnLostConnection || input.message.toLowerCase().includes('lost my connection to the model')) {
+    return {
+      errorKind: 'MODEL_API_UNREACHABLE',
+      summary: 'The model API could not be reached (network drop or the host asleep), and the retries did not recover.',
+      actions: [
+        "Check the host's network and that it was awake at the time.",
+        'Re-mention miniOG in the thread to run the task again; work already committed is still on its branch.',
+        'If this recurs, keep the host awake while jobs run or move the sidecar to an always-on machine.',
+      ],
+    };
+  }
+
   if (
     codexParseFailureCount >= 2 ||
     (codexParseFailureCount >= 1 &&
