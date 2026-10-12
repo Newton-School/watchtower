@@ -107,3 +107,31 @@ describe('process rule on every agent prompt (issue #445)', () => {
     expect(prompt).toContain(PROCESS_HYGIENE_RULE);
   });
 });
+
+describe('plan-mode planner prompt asks for a plan an approver can read (issue #437)', () => {
+  const prompt = buildPlannerPlanModePrompt(makeCtx());
+
+  it('asks for the approver block first, with its five lines', () => {
+    for (const line of [
+      '## For the approver',
+      '- What changes:',
+      '- Where:',
+      '- Behaviour change:',
+      '- Assumptions to confirm:',
+      '- Risk:',
+    ]) {
+      expect(prompt).toContain(line);
+    }
+    expect(prompt.indexOf('## For the approver')).toBeLessThan(prompt.indexOf("A short summary of the user's intent."));
+  });
+
+  it('says what counts as a behaviour change, in the terms of the change that went wrong', () => {
+    expect(prompt).toContain('A changed default, limit, condition or rule is a behaviour change');
+    expect(prompt).toContain('say what the new value means for a real user');
+  });
+
+  it('asks for the files it will edit under their own heading, and nothing else there', () => {
+    expect(prompt).toContain('A section headed exactly `## Files to change`');
+    expect(prompt).toContain('ONLY files this change edits');
+  });
+});

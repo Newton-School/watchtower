@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   buildCoderFollowUpQuestion,
   buildCoderNoDiffQuestion,
+  formatPlanMessage,
   runAgentPipeline,
   waitForApproval,
 } from '../src/agents/pipeline.js';
@@ -1130,6 +1131,122 @@ vi.mock('../src/slack/threadContext.js', () => ({
   fetchThreadContext: vi.fn(),
   assertThreadParentExists: vi.fn().mockResolvedValue(true),
 }));
+
+describe('formatPlanMessage: the plan as the approver sees it (issue #437)', () => {
+  const block = (behaviour: string, assumptions = 'none') =>
+    [
+      '# Default the four proctor breach thresholds to 0',
+      '',
+      '## For the approver',
+      '- What changes: New exams start with all four breach thresholds set to 0.',
+      '- Where: TMS exam form',
+      `- Behaviour change: ${behaviour}`,
+      `- Assumptions to confirm: ${assumptions}`,
+      '- Risk: high',
+      '',
+      '## Files to change',
+      '- `src/tms/exam-form/defaults.ts` — the four defaults',
+      '',
+      '## Steps',
+      '1. Change the four `DEFAULT_*` constants from 3 to 0.',
+      '',
+      'Scope: small',
+    ].join('\n');
+  const FILES = ['/ws/newton-web/1-1/src/tms/exam-form/defaults.ts'];
+  const REPO = '/ws/newton-web/1-1';
+
+  it('opens with what the approver needs, before any of the plan', () => {
+    const message = formatPlanMessage(block('none'), FILES, 'small', REPO);
+    const lines = message.split('\n');
+
+    expect(lines[0]).toBe('*Plan* (scope: small, 1 file to change, risk: high)');
+    expect(lines[1]).toBe('*What changes:* New exams start with all four breach thresholds set to 0.');
+    expect(lines[2]).toBe('*Where:* TMS exam form');
+    expect(lines[3]).toBe('*Behaviour change:* none');
+    expect(lines[4]).toBe('*Assumptions to confirm:* none');
+    expect(message.indexOf('*Files to change:*')).toBeLessThan(message.indexOf('_Full plan, for the coder:_'));
+    expect(message).toContain('• `src/tms/exam-form/defaults.ts`');
+  });
+
+  it('flags a behaviour change and asks the requester to confirm it, not only the approver', () => {
+    // The incident: approved in 54 seconds, and the opposite of what the requester wanted.
+    const message = formatPlanMessage(
+      block('An exam now ends on the very first flagged breach. 0 is the strictest setting, not the most lenient.'),
+      FILES,
+      'small',
+      REPO,
+      false,
+      'UREQUESTER',
+    );
+
+    expect(message).toContain('*Behaviour change:* :warning: An exam now ends on the very first flagged breach.');
+    expect(message).toContain(
+      '<@UREQUESTER> please confirm the behaviour change above is what you want, before this is approved.',
+    );
+  });
+
+  it('asks the requester about assumptions too, and about nothing when there is nothing to confirm', () => {
+    const assumed = formatPlanMessage(
+      block('none', 'I could not open the screenshot.'),
+      FILES,
+      'small',
+      REPO,
+      false,
+      'UREQ',
+    );
+    expect(assumed).toContain('<@UREQ> please confirm the assumptions above are what you want');
+
+    const both = formatPlanMessage(
+      block('Ends on first breach.', 'Picked the web form.'),
+      FILES,
+      'small',
+      REPO,
+      false,
+      'UREQ',
+    );
+    expect(both).toContain('please confirm the behaviour change and the assumptions above are what you want');
+
+    expect(formatPlanMessage(block('none'), FILES, 'small', REPO, false, 'UREQ')).not.toContain('<@UREQ>');
+    // No requester known (older callers): the warning still shows, nobody is tagged.
+    expect(formatPlanMessage(block('Ends on first breach.'), FILES, 'small', REPO)).not.toContain('<@');
+  });
+
+  it('does not repeat the approver block or the file list inside the full plan', () => {
+    const message = formatPlanMessage(block('none'), FILES, 'small', REPO);
+    const detail = message.slice(message.indexOf('_Full plan, for the coder:_'));
+
+    expect(detail).toContain('1. Change the four `DEFAULT_*` constants from 3 to 0.');
+    expect(detail).not.toContain('For the approver');
+    expect(detail).not.toContain('What changes');
+    expect(detail).not.toContain('Files to change');
+  });
+
+  it('keeps the old layout for a plan with no approver block, with an honest header', () => {
+    const plain = '# Fix the redirect\n\n1. Edit `auth.ts`.';
+
+    expect(formatPlanMessage(plain, ['auth.ts', 'login.tsx'], 'medium')).toBe(
+      '*Plan* (scope: medium, 2 files to change)\n# Fix the redirect\n\n1. Edit `auth.ts`.\n\n*Files to change:*\n• `auth.ts`\n• `login.tsx`',
+    );
+    // No count is better than a wrong one.
+    expect(formatPlanMessage(plain, [], 'medium')).toBe(
+      '*Plan* (scope: medium)\n# Fix the redirect\n\n1. Edit `auth.ts`.',
+    );
+  });
+
+  it('lists at most eight files and says how many more there are', () => {
+    const files = Array.from({ length: 11 }, (_, i) => `src/f${i}.ts`);
+    const message = formatPlanMessage('# Big\n\n1. Many edits.', files, 'large');
+
+    expect(message).toContain('11 files to change');
+    expect(message).toContain('• `src/f7.ts`\n• … and 3 more');
+    expect(message).not.toContain('src/f8.ts');
+  });
+
+  it('marks an executed plan at the end, whichever layout', () => {
+    expect(formatPlanMessage(block('none'), FILES, 'small', REPO, true).endsWith('_✅ Plan executed._')).toBe(true);
+    expect(formatPlanMessage('# Plain', [], 'small', undefined, true).endsWith('_✅ Plan executed._')).toBe(true);
+  });
+});
 
 describe('what the thread is told when the coder leaves no diff (issue #432)', () => {
   const PLAN = '# Fix Metabase dashboard 674 — restrict Dyte recording coverage to real course topic classes';
