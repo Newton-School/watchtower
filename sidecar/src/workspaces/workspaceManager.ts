@@ -175,6 +175,32 @@ export async function resolveWorkspace(repoPath: string, threadTs: string): Prom
   }
 }
 
+/** Why a shared clone could not be brought up to date with origin. */
+export type SharedRepoStaleReason =
+  /** `git fetch` failed: everything below is as of the last successful fetch. */
+  | 'fetch_failed'
+  /** Tracked files have uncommitted changes that the update would overwrite. */
+  | 'dirty_tree'
+  /** The clone is checked out on something other than the default branch. */
+  | 'other_branch'
+  /** The clone has commits that are not on origin's default branch. */
+  | 'diverged'
+  | 'not_fast_forwardable';
+
+/** Where a shared clone stands after a refresh attempt. */
+export interface SharedRepoState {
+  branch: string;
+  head: string;
+  /** origin's default branch, e.g. "origin/master". */
+  upstream?: string;
+  /** Commits the working tree is behind `upstream`. 0 when current; absent when it could not be counted. */
+  behind?: number;
+  /** Set when the working tree is not known to be current. */
+  staleReason?: SharedRepoStaleReason;
+  /** For `dirty_tree`: the files in the way (the first few). */
+  dirtyFiles?: string[];
+}
+
 /**
  * Fast-forwards a SHARED repo clone to its default remote branch so an agent
  * that reads the clone directly — the informational Q&A path, which (unlike the
@@ -188,39 +214,83 @@ export async function resolveWorkspace(repoPath: string, threadTs: string): Prom
  * unpushed local commits are never clobbered. The `reset --hard` used for the
  * throwaway worktrees in `resolveWorkspace` would NOT be safe on a shared clone.
  *
- * Best-effort: returns the resolved `{ branch, head }` for telemetry, or null if
- * the repo couldn't be inspected. Never throws.
+ * Best-effort: returns where the checkout ended up, including how far behind
+ * origin it still is and why, or null if the repo couldn't be inspected.
+ * Never throws.
  */
-export async function refreshSharedRepoToDefaultBranch(
-  repoPath: string,
-): Promise<{ branch: string; head: string } | null> {
+export async function refreshSharedRepoToDefaultBranch(repoPath: string): Promise<SharedRepoState | null> {
+  let fetchFailed = false;
+  let upstream: string | undefined;
   try {
     await git(['fetch', 'origin', '--quiet'], { cwd: repoPath, timeoutMs: 30_000 });
-    const defaultBranch = await resolveDefaultRemoteBranch(repoPath);
-    try {
-      await git(['merge', '--ff-only', defaultBranch], { cwd: repoPath, timeoutMs: 30_000 });
-    } catch {
-      // Not fast-forwardable (feature branch, diverged history, or a dirty tree
-      // that would be overwritten) — leave the checkout untouched and answer
-      // against it rather than risk the user's local work.
-      logger.warn(
-        { repoPath, defaultBranch },
-        'could not fast-forward shared repo to default branch; answering against current checkout',
-      );
-    }
   } catch (error) {
+    fetchFailed = true;
     logger.warn(
       { repoPath, error: String(error) },
       'git fetch failed before agent read; answering against local repo state',
     );
   }
   try {
-    const head = await git(['rev-parse', '--short', 'HEAD'], { cwd: repoPath, timeoutMs: 10_000 });
-    const branch = await git(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repoPath, timeoutMs: 10_000 });
-    return { branch, head };
+    upstream = await resolveDefaultRemoteBranch(repoPath);
+    if (!fetchFailed) {
+      await git(['merge', '--ff-only', upstream], { cwd: repoPath, timeoutMs: 30_000 });
+    }
+  } catch {
+    // Not fast-forwardable (feature branch, diverged history, or a dirty tree
+    // that would be overwritten) — leave the checkout untouched rather than
+    // risk the user's local work. What that leaves is reported below.
+    logger.warn({ repoPath, upstream }, 'could not fast-forward shared repo to default branch');
+  }
+
+  let head: string;
+  let branch: string;
+  try {
+    head = await git(['rev-parse', '--short', 'HEAD'], { cwd: repoPath, timeoutMs: 10_000 });
+    branch = await git(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repoPath, timeoutMs: 10_000 });
   } catch {
     return null;
   }
+
+  // The truth about where that leaves the checkout. This used to return the
+  // head and nothing else, and the caller logged "Refreshed" over a clone
+  // that had not moved in four months (issue #446).
+  const count = async (range: string): Promise<number | undefined> => {
+    try {
+      const out = await git(['rev-list', '--count', range], { cwd: repoPath, timeoutMs: 10_000 });
+      const parsed = Number.parseInt(out, 10);
+      return Number.isFinite(parsed) ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const behind = upstream ? await count(`HEAD..${upstream}`) : undefined;
+  const state: SharedRepoState = { branch, head, upstream, behind };
+  if (fetchFailed) {
+    return { ...state, staleReason: 'fetch_failed' };
+  }
+  if (!behind) {
+    return state;
+  }
+  if (upstream && branch !== upstream.replace(/^origin\//, '')) {
+    return { ...state, staleReason: 'other_branch' };
+  }
+  try {
+    const dirty = await git(['status', '--porcelain', '--untracked-files=no'], { cwd: repoPath, timeoutMs: 10_000 });
+    // Porcelain lines are "XY path". The status letters are dropped by pattern,
+    // not by column: `git()` trims its output, which eats the first line's
+    // leading space.
+    const dirtyFiles = dirty
+      .split('\n')
+      .map(line => line.trim().replace(/^\S+\s+/, ''))
+      .filter(Boolean);
+    if (dirtyFiles.length > 0) {
+      return { ...state, staleReason: 'dirty_tree', dirtyFiles: dirtyFiles.slice(0, 5) };
+    }
+  } catch {
+    // fall through to the reasons that need no status
+  }
+  const ahead = upstream ? await count(`${upstream}..HEAD`) : undefined;
+  return { ...state, staleReason: ahead ? 'diverged' : 'not_fast_forwardable' };
 }
 
 /**
