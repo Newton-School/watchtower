@@ -1211,6 +1211,34 @@ describe('formatPlanMessage: the plan as the approver sees it (issue #437)', () 
     expect(formatPlanMessage(block('Ends on first breach.'), FILES, 'small', REPO)).not.toContain('<@');
   });
 
+  it('does not flag or ask about a "none" that comes with an explanation', () => {
+    const message = formatPlanMessage(
+      block(
+        'none. The line is an HTML comment, so nothing in the product changes.',
+        'None — the README at the repo root.',
+      ),
+      FILES,
+      'small',
+      REPO,
+      false,
+      'UREQ',
+    );
+
+    expect(message).toContain(
+      '*Behaviour change:* none. The line is an HTML comment, so nothing in the product changes.',
+    );
+    expect(message).toContain('*Assumptions to confirm:* None — the README at the repo root.');
+    expect(message).not.toContain(':warning:');
+    expect(message).not.toContain('<@UREQ>');
+  });
+
+  it('still flags a change that hides behind a leading "none"', () => {
+    const message = formatPlanMessage(block('none, but the default becomes 0'), FILES, 'small', REPO, false, 'UREQ');
+
+    expect(message).toContain('*Behaviour change:* :warning: none, but the default becomes 0');
+    expect(message).toContain('<@UREQ> please confirm the behaviour change above is what you want');
+  });
+
   it('does not repeat the approver block or the file list inside the full plan', () => {
     const message = formatPlanMessage(block('none'), FILES, 'small', REPO);
     const detail = message.slice(message.indexOf('_Full plan, for the coder:_'));
