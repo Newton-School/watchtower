@@ -25,6 +25,7 @@ import { evaluatePolicy, loadPolicies } from './policies/evaluator.js';
 import { agentCallContext } from './state/runContext.js';
 import { detectMention, normalizeTask } from './router/intentParser.js';
 import { isRouteQuestionExpired } from './router/routeClarify.js';
+import { jobSlots } from './runtime/jobSlots.js';
 import { readToolRouterMode } from './router/toolRouter.js';
 import { decidePausedResume } from './router/pausedResume.js';
 import { classifyProduct } from './router/productClassifier.js';
@@ -146,7 +147,11 @@ let bundlesLoadedAt = new Date().toISOString();
 }
 
 const queue: Array<{ event: SlackEventEnvelope; client: WebClient }> = [];
-let running = 0;
+// How many jobs run at once, and what happens when one stops needing its slot.
+jobSlots.configure({
+  max: () => config.maxConcurrentJobs,
+  onFree: () => void processNext(),
+});
 
 const OPS_FEED_INTERVAL_MS = 30 * 60 * 1000;
 const DAILY_DIGEST_TICK_MS = 60 * 1000;
@@ -799,19 +804,16 @@ async function tryHandleStopControl(event: SlackEventEnvelope, client: WebClient
 }
 
 async function processNext(): Promise<void> {
-  if (running >= config.maxConcurrentJobs) {
+  // Nothing queued, or no slot: a job waiting on a person does not hold one,
+  // and one coming back from such a wait goes ahead of the queue (issue #434).
+  if (queue.length === 0 || !jobSlots.tryAcquire()) {
     return;
   }
-  const item = queue.shift();
-  if (!item) {
-    return;
-  }
+  const item = queue.shift()!;
 
-  running += 1;
   try {
-    await processEvent(item.event, item.client);
+    await jobSlots.run(() => processEvent(item.event, item.client));
   } finally {
-    running -= 1;
     await processNext();
   }
 }
