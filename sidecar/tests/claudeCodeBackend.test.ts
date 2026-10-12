@@ -2,7 +2,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { claudeCodeBackend, NO_TOOLS_ARGS, stripPlanHarnessMeta } from '../src/backends/claudeCodeBackend.js';
+import {
+  claudeCodeBackend,
+  NO_TOOLS_ARGS,
+  stripPlanHarnessMeta,
+  PROCESS_KILL_DENY_RULES,
+} from '../src/backends/claudeCodeBackend.js';
 import { __personalSkills } from '../src/backends/personalSkills.js';
 
 // buildArgs denies the host user's personal skills (personalSkills.test.ts).
@@ -461,6 +466,10 @@ describe('claudeCodeBackend.buildArgs', () => {
   describe('noTools', () => {
     const args = () => claudeCodeBackend.buildArgs({ ...baseRequest, noTools: true }, '/tmp/out.json');
 
+    it('needs no kill-by-name rule: a text-only call has no Bash to deny', () => {
+      expect(args()).not.toContain('--disallowedTools');
+    });
+
     it('removes built-in tools, every MCP server, skills, hooks and plugins', () => {
       const built = args();
       expect(built).toEqual(expect.arrayContaining(NO_TOOLS_ARGS));
@@ -613,5 +622,29 @@ describe('claudeCodeBackend MCP + env wiring (scoped investigation)', () => {
     // Whatever was already there is kept.
     expect(dirs).toContain('/custom/tools');
     expect(new Set(dirs).size).toBe(dirs.length);
+  });
+});
+
+describe('claudeCodeBackend.buildArgs denies killing by name (issue #445)', () => {
+  const request = { cwd: '/tmp/wt-no-such-repo', prompt: 'hello' };
+
+  it.each([
+    ['a working agent', {}],
+    ['the planner', { planMode: true }],
+    ['a resumed session', { resumeSessionId: 'sess-1' }],
+  ])('passes the pkill and killall deny rules to %s', (_name, extra) => {
+    const args = claudeCodeBackend.buildArgs({ ...request, ...extra }, '/tmp/out.json');
+    const at = args.indexOf('--disallowedTools');
+
+    expect(at).toBeGreaterThan(-1);
+    expect(args.slice(at + 1, at + 3)).toEqual(['Bash(pkill:*)', 'Bash(killall:*)']);
+    // Variadic: the rules end the argument list, or a flag follows them. The prompt is never after them.
+    const next = args.slice(at + 1).find(arg => !arg.startsWith('Bash(') && !arg.startsWith('Skill('));
+    expect(next === undefined || next.startsWith('--')).toBe(true);
+    expect(args.indexOf('hello')).toBeLessThan(at);
+  });
+
+  it('exports exactly the two rules probed against the CLI', () => {
+    expect(PROCESS_KILL_DENY_RULES).toEqual(['Bash(pkill:*)', 'Bash(killall:*)']);
   });
 });

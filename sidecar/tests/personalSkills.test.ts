@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { __personalSkills, personalSkillDenyRules } from '../src/backends/personalSkills.js';
-import { claudeCodeBackend } from '../src/backends/claudeCodeBackend.js';
+import { claudeCodeBackend, PROCESS_KILL_DENY_RULES } from '../src/backends/claudeCodeBackend.js';
 
 // Issue #443: every agent could invoke the host user's personal skills and
 // commands, including the production deploy command and a skill that drives
@@ -83,9 +83,15 @@ describe('personal skills are denied to working agents', () => {
       const args = claudeCodeBackend.buildArgs({ ...request, cwd: repo, model: 'claude-opus-5-5' }, '/tmp/out.json');
 
       const at = args.indexOf('--disallowedTools');
-      expect(args.slice(at, at + 3)).toEqual(['--disallowedTools', 'Skill(deploy-prod)', 'Skill(personal-browser)']);
+      // The kill-by-name rules (issue #445) lead; the personal skills follow.
+      expect(args.slice(at, at + 5)).toEqual([
+        '--disallowedTools',
+        ...PROCESS_KILL_DENY_RULES,
+        'Skill(deploy-prod)',
+        'Skill(personal-browser)',
+      ]);
       // Variadic: the next argument must be a flag, and the prompt is still first.
-      expect(args[at + 3].startsWith('--')).toBe(true);
+      expect(args[at + 5].startsWith('--')).toBe(true);
       expect(args.slice(0, 2)).toEqual(['-p', 'hello']);
       expect(args).toContain('--dangerously-skip-permissions');
     });
@@ -102,7 +108,7 @@ describe('personal skills are denied to working agents', () => {
       mkSkill(repo, 'pr-review');
       const args = claudeCodeBackend.buildArgs({ ...request, cwd: repo }, '/tmp/out.json');
       expect(args).not.toContain('Skill(pr-review)');
-      expect(args).not.toContain('--disallowedTools');
+      expect(args.filter(arg => arg.startsWith('Skill('))).toEqual([]);
     });
 
     it('adds nothing to a text-only call, which has no tools at all', () => {
@@ -111,9 +117,9 @@ describe('personal skills are denied to working agents', () => {
       expect(args).not.toContain('--disallowedTools');
     });
 
-    it('adds nothing when there is nothing to deny', () => {
+    it('adds no skill rule when there is no personal skill to deny', () => {
       const args = claudeCodeBackend.buildArgs({ ...request, cwd: repo }, '/tmp/out.json');
-      expect(args).not.toContain('--disallowedTools');
+      expect(args.filter(arg => arg.startsWith('Skill('))).toEqual([]);
     });
   });
 });

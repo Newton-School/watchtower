@@ -199,6 +199,24 @@ export function detectUsageLimit(text: string): { resetsAtText?: string } | unde
   return { resetsAtText: resetsAtText && resetsAtText.length > 0 ? resetsAtText : undefined };
 }
 
+/** Exit codes a process reports when it handles a fatal signal itself: 128 + the signal number. */
+const SIGNAL_EXIT_CODES: Record<number, string> = { 129: 'SIGHUP', 130: 'SIGINT', 137: 'SIGKILL', 143: 'SIGTERM' };
+
+/**
+ * Whether a process ended because something signalled it. The caller rules
+ * out its own timeout and cancel first; what is left came from outside. The
+ * CLI catches SIGTERM and exits 143, so the exit code counts as well as the
+ * signal the OS reports.
+ */
+export function detectExternalKill(
+  exitCode: number | null,
+  signal: string | undefined,
+): { signal: string } | undefined {
+  if (signal) return { signal };
+  if (exitCode !== null && SIGNAL_EXIT_CODES[exitCode]) return { signal: SIGNAL_EXIT_CODES[exitCode] };
+  return undefined;
+}
+
 /** The CLI's whole final message is its own error line: `API Error: …`, bare or inside the result envelope. */
 const API_ERROR_RESULT_RE = /(?:^\s*|"result"\s*:\s*")(API Error:[^"\n]{0,300})/;
 /** The envelope's own flag that the result is an error, not an answer. */
@@ -304,6 +322,7 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
 
   let timedOut = false;
   let cancelled = false;
+  let closeSignal: string | undefined;
   const modelUsed = request.model ?? backend.defaultModel();
   const spawnedAt = Date.now();
   const child = spawn(executable, args, {
@@ -411,7 +430,10 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
   try {
     const childDone = new Promise<number | null>((resolve, reject) => {
       child.on('error', reject);
-      child.on('close', code => resolve(code));
+      child.on('close', (code, signal) => {
+        closeSignal = signal ?? undefined;
+        resolve(code);
+      });
     });
 
     const exitCode = request.timeoutMs
@@ -557,6 +579,19 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
         data: { detail: apiError.detail, exitCode },
       });
     }
+    // Stopped by a signal nobody here sent: another process killed it. The
+    // dead reviewer of one job was read as "Reviewer rejected" when a coder in
+    // a different job ran `pkill` (issue #445).
+    const externalKill =
+      !usageLimit && !apiError && !timedOut && !cancelled ? detectExternalKill(exitCode, closeSignal) : undefined;
+    if (externalKill) {
+      request.onLog?.({
+        stage: 'agent.killed',
+        message: `${backend.displayName} was killed from outside (${externalKill.signal}); not by a timeout or a cancel.`,
+        level: 'WARN',
+        data: { exitCode, signal: externalKill.signal },
+      });
+    }
     const ok = exitedCleanly && !apiError;
     if (usageLimit) {
       request.onLog?.({
@@ -601,6 +636,7 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
       parsedJson,
       ...(usageLimit ? { errorKind: 'USAGE_LIMIT' as const, limitResetsAtText: usageLimit.resetsAtText } : {}),
       ...(apiError ? { errorKind: 'API_ERROR' as const, apiErrorDetail: apiError.detail } : {}),
+      ...(externalKill ? { errorKind: 'EXTERNAL_KILL' as const, killSignal: externalKill.signal } : {}),
       durationMs,
       usage,
       costUsd,

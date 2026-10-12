@@ -8,7 +8,7 @@ import type { WorkflowStepLogger } from '../types/contracts.js';
 import { buildPromptForRole } from './prompts.js';
 import { lightweightProfile, profileForAgentRole } from '../codex/modelProfiles.js';
 import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
-import { runWithInfraRetry } from '../codex/infraRetry.js';
+import { isInterruption, runWithInfraRetry, type InterruptionKind } from '../codex/infraRetry.js';
 import { normalizePlannerOutput, type NormalizedPlannerOutput } from './normalizePlannerOutput.js';
 import { REPO_KEYS, type RepoKey } from '../repos/registry.js';
 import { withAgentCallContext } from '../state/runContext.js';
@@ -1024,22 +1024,36 @@ export async function runAgentPipeline(params: {
   let needsInputQuestion: string | undefined;
   let usageLimitHit = false;
   let usageLimitResetsAt: string | undefined;
-  // Connection failures (issue #439): the time they cost is kept off the
-  // pipeline's clock, and one that outlasts its retries stops the run.
+  // Interruptions — a dropped connection (issue #439) or a process killed from
+  // outside (issue #445): the time they cost is kept off the pipeline's clock,
+  // and one that outlasts its retries stops the run. Neither is ever a verdict.
   let infraWaitMs = 0;
-  let connectionLost: PipelineResult['connectionLost'];
-  const stopOnLostConnection = (role: AgentRole, retries: number, durationMs: number): void => {
-    connectionLost = { role, retries };
+  let interrupted: PipelineResult['interrupted'];
+  const stopOnInterruption = (
+    role: AgentRole,
+    errorKind: InterruptionKind,
+    retries: number,
+    durationMs: number,
+  ): void => {
+    const killed = errorKind === 'EXTERNAL_KILL';
+    interrupted = { kind: killed ? 'killed' : 'connection_lost', role, retries };
     logStep({
-      stage: 'pipeline.api_error',
-      message: `Lost the connection to the model API during ${role}; ${retries} retries did not bring it back — stopping the pipeline.`,
+      stage: killed ? 'pipeline.killed' : 'pipeline.api_error',
+      message: killed
+        ? `The ${role} was killed from outside, and so was the retry — stopping the pipeline. This is not a ${role} verdict.`
+        : `Lost the connection to the model API during ${role}; ${retries} retries did not bring it back — stopping the pipeline.`,
       level: 'ERROR',
       data: { role, retries, infraWaitMs },
     });
     steps.push({
       role,
       status: 'failed',
-      output: { status: 'error', summary: 'The model API could not be reached; this step did not complete.' },
+      output: {
+        status: 'error',
+        summary: killed
+          ? 'The agent process was killed from outside; this step did not complete.'
+          : 'The model API could not be reached; this step did not complete.',
+      },
       findings: [],
       durationMs,
     });
@@ -1161,10 +1175,11 @@ export async function runAgentPipeline(params: {
 
     const durationMs = Date.now() - agentStart;
 
-    // The connection never came back. Not an agent verdict either: stop here
-    // rather than hand the next agent a step that did not happen (issue #439).
-    if (result.errorKind === 'API_ERROR') {
-      stopOnLostConnection(role, result.infraRetries, durationMs);
+    // Still interrupted after the retries. Not an agent verdict: stop here
+    // rather than hand the next agent a step that did not happen (#439), or
+    // read a dead reviewer as "rejected" and send the coder round again (#445).
+    if (isInterruption(result.errorKind)) {
+      stopOnInterruption(role, result.errorKind, result.infraRetries, durationMs);
       break;
     }
 
@@ -1457,8 +1472,8 @@ export async function runAgentPipeline(params: {
 
         const coderRetryDuration = Date.now() - coderStart;
 
-        if (coderRetryResult.errorKind === 'API_ERROR') {
-          stopOnLostConnection('coder', coderRetryResult.infraRetries, coderRetryDuration);
+        if (isInterruption(coderRetryResult.errorKind)) {
+          stopOnInterruption('coder', coderRetryResult.errorKind, coderRetryResult.infraRetries, coderRetryDuration);
           break;
         }
 
@@ -1590,11 +1605,13 @@ export async function runAgentPipeline(params: {
         ? `Paused after ${durationSec}s — I need a bit more info before I can code a fix.`
         : finalStatus === 'usage-limit'
           ? `Paused — Claude usage limit hit${usageLimitResetsAt ? ` (resets ${usageLimitResetsAt})` : ''}. No code was lost.`
-          : connectionLost
+          : interrupted?.kind === 'connection_lost'
             ? `Stopped after ${durationSec}s — I lost my connection to the model and retrying didn't bring it back.`
-            : finalStatus === 'aborted'
-              ? `Finished in ${durationSec}s. Review flagged some concerns — see the summary below.`
-              : `Finished in ${durationSec}s with some issues flagged — details below.`;
+            : interrupted
+              ? `Stopped after ${durationSec}s — the ${interrupted.role} was killed from outside, twice.`
+              : finalStatus === 'aborted'
+                ? `Finished in ${durationSec}s. Review flagged some concerns — see the summary below.`
+                : `Finished in ${durationSec}s with some issues flagged — details below.`;
   await postSlackProgress({ slack, ctx, text: finishText });
 
   if (store && jobId) {
@@ -1618,6 +1635,6 @@ export async function runAgentPipeline(params: {
     aggregatedFindings,
     needsInputQuestion,
     usageLimitResetsAt,
-    ...(connectionLost ? { connectionLost } : {}),
+    ...(interrupted ? { interrupted } : {}),
   };
 }

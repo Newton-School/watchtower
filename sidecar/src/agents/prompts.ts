@@ -12,9 +12,21 @@ function serializePreviousSteps(ctx: AgentContext): string {
     .join('\n\n');
 }
 
+/**
+ * Every agent runs as the same OS user as every other job's agents. One
+ * coder's `pkill -f "next dev" -s 0` killed the agents of two other jobs: on
+ * macOS `-s` and `0` are two more patterns, not "my session" (issue #445).
+ */
+export const PROCESS_HYGIENE_RULE =
+  'Other jobs run on this machine as the same user. Stop only processes you started, and only by PID (`kill <pid>`): ' +
+  'when you start a dev server or any background process, note its PID then and stop that PID before you finish. ' +
+  "Never use `pkill`, `killall` or `kill -1`: they stop other jobs' agents too, and are blocked.";
+
 function policyBlock(ctx: AgentContext): string {
-  if (!ctx.policyPack) return 'No explicit policy pack assigned.';
-  return [`Active policy pack: ${ctx.policyPack.packName}`, ...ctx.policyPack.rules.map(r => `- ${r}`)].join('\n');
+  const pack = ctx.policyPack
+    ? [`Active policy pack: ${ctx.policyPack.packName}`, ...ctx.policyPack.rules.map(r => `- ${r}`)].join('\n')
+    : 'No explicit policy pack assigned.';
+  return `${pack}\nProcesses: ${PROCESS_HYGIENE_RULE}`;
 }
 
 /** The approved plan the coder/reviewer/verifier all read off the planner step. */
@@ -236,6 +248,7 @@ Your role: Audit the code changes for security vulnerabilities and compliance is
 
 Workflow: ${ctx.workflowIntent}
 Repository: ${ctx.repoPath}
+Processes: ${PROCESS_HYGIENE_RULE}
 
 Previous agent results:
 ${serializePreviousSteps(ctx)}
@@ -269,6 +282,7 @@ Your role: Analyze code changes for performance issues and optimization opportun
 
 Workflow: ${ctx.workflowIntent}
 Repository: ${ctx.repoPath}
+Processes: ${PROCESS_HYGIENE_RULE}
 
 Previous agent results:
 ${serializePreviousSteps(ctx)}

@@ -528,5 +528,8 @@ describe('implementationWorkflow — a planner run that failed is not a plan (#4
       plannerFailureReply({ errorKind: 'USAGE_LIMIT', limitResetsAtText: '9:40pm (Asia/Calcutta)', timedOut: false }),
     ).toContain('It resets 9:40pm (Asia/Calcutta).');
     expect(plannerFailureReply({ timedOut: true })).toContain('timed out before it produced a plan');
+    expect(plannerFailureReply({ errorKind: 'EXTERNAL_KILL', timedOut: false })).toContain(
+      'My planning run was killed from outside',
+    );
   });
 });

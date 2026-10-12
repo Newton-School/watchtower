@@ -12,7 +12,7 @@ import type {
 } from '../types/contracts.js';
 import { formatAdminMention, getAdminUserIds } from '../access/control.js';
 import { runCodex, getActiveBackendId, selectBackendForUser } from '../codex/runCodex.js';
-import { connectionLostReply, runWithInfraRetry } from '../codex/infraRetry.js';
+import { connectionLostReply, killedFromOutsideReply, runWithInfraRetry } from '../codex/infraRetry.js';
 import { assembleRecall } from '../codex/recallAssembler.js';
 import { highReasoningProfile } from '../codex/modelProfiles.js';
 import { buildMentionSystemPrompt } from '../codex/mentionSystemPrompt.js';
@@ -761,6 +761,7 @@ export function plannerFailureReply(
   result: Pick<CodexRunResult, 'errorKind' | 'limitResetsAtText' | 'timedOut'>,
 ): string {
   if (result.errorKind === 'API_ERROR') return connectionLostReply('planning');
+  if (result.errorKind === 'EXTERNAL_KILL') return killedFromOutsideReply('My planning run');
   if (result.errorKind === 'USAGE_LIMIT') {
     const resets = result.limitResetsAtText ? ` It resets ${result.limitResetsAtText}.` : '';
     return `I hit the Claude usage limit while planning.${resets} Nothing has been changed. Mention me again after that and I'll start over.`;
@@ -1946,9 +1947,12 @@ Write your response as a ready-to-post Slack message describing what you did.
         data: { finalStatus: fullResult.finalStatus },
       });
 
-      const failureSummary = fullResult.connectionLost
-        ? `${connectionLostReply(`the ${fullResult.connectionLost.role} was running`)} Any work it had already done is still on its branch.`
-        : `Pipeline finished with status: ${fullResult.finalStatus}. Not opening a PR.`;
+      const failureSummary =
+        fullResult.interrupted?.kind === 'connection_lost'
+          ? `${connectionLostReply(`the ${fullResult.interrupted.role} was running`)} Any work it had already done is still on its branch.`
+          : fullResult.interrupted
+            ? `${killedFromOutsideReply(`The ${fullResult.interrupted.role}`)} Any work it had already done is still on its branch.`
+            : `Pipeline finished with status: ${fullResult.finalStatus}. Not opening a PR.`;
       await slack.chat.postMessage({
         channel: task.event.channelId,
         thread_ts: task.event.threadTs,
