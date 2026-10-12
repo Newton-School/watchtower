@@ -20,6 +20,7 @@ import {
 import { startLaunchpadRequestPoller } from './launchpad/launchpadIntake.js';
 import { logger } from './logging/logger.js';
 import { notifyDesktop } from './notify/desktopNotifier.js';
+import { botScopes, missingScopesNotice, NOTIFIED_MISSING_SCOPES_KEY } from './slack/botScopes.js';
 import { assertMacOS } from './platform.js';
 import { evaluatePolicy, loadPolicies } from './policies/evaluator.js';
 import { agentCallContext } from './state/runContext.js';
@@ -1900,6 +1901,35 @@ async function main(): Promise<void> {
 
   await refreshAccessGroups();
   setInterval(refreshAccessGroups, 30 * 60 * 1000);
+
+  // Say which features the installed token cannot serve, once per change
+  // rather than one failed request at a time (issue #433). Rechecked so a
+  // reinstall is picked up without a restart.
+  const checkBotScopes = async () => {
+    const status = await botScopes.refresh(client.webClient);
+    if (!status) {
+      return;
+    }
+    const missing = status.missing.map(feature => feature.scope);
+    if (missing.length === 0) {
+      if (store.getState(NOTIFIED_MISSING_SCOPES_KEY)) {
+        logger.info('slack bot token now carries every scope the sidecar checks for');
+        store.setState(NOTIFIED_MISSING_SCOPES_KEY, '');
+      }
+      return;
+    }
+    logger.warn(
+      { missing, granted: status.granted },
+      'slack bot token is missing scopes; reinstall the app to grant them',
+    );
+    const notice = missingScopesNotice(status, store.getState(NOTIFIED_MISSING_SCOPES_KEY));
+    if (notice) {
+      notifyDesktop(notice.title, notice.body);
+      store.setState(NOTIFIED_MISSING_SCOPES_KEY, notice.fingerprint);
+    }
+  };
+  void checkBotScopes();
+  setInterval(() => void checkBotScopes(), 10 * 60 * 1000);
 
   // Poll for cancel requests from the Watchtower UI (written to SQLite by Tauri)
   setInterval(() => {

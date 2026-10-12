@@ -26,7 +26,12 @@ import {
   DEFAULT_ATTACHMENT_LIMITS,
 } from '../slack/fileAttachments.js';
 import type { AttachmentLimits, UndeliveredAttachment } from '../slack/fileAttachments.js';
-import { buildUndeliveredFollowUp } from '../slack/attachmentFollowUp.js';
+import { buildUndeliveredFollowUp, INLINE_MAX_CHARS } from '../slack/attachmentFollowUp.js';
+import { botScopes } from '../slack/botScopes.js';
+import { collectThreadAttachments, filesForTrigger, type ThreadAttachments } from '../slack/threadAttachments.js';
+import type { SlackFileAttachment } from '../slack/imageDownloader.js';
+import { getActiveBackendId } from '../codex/runCodex.js';
+import type { AgentBackendId } from '../backends/types.js';
 import { preparePrWorktree, bootPrDevServer, runPrBuildGate } from '../devServer/devServerManager.js';
 import type { PrDevServer, PreparedPrWorktree, PrBuildGateResult } from '../devServer/devServerManager.js';
 import { mapRepoPath, SUPPORTED_PR_REPOS } from '../github/prReviewSupport.js';
@@ -206,6 +211,22 @@ const FILES_MARKER = '===FILES===';
  */
 function fileAttachmentPromptBlock(): string {
   const maxMb = Math.round(DEFAULT_ATTACHMENT_LIMITS.maxFileBytes / (1024 * 1024));
+  const manifestExample = `${FILES_MARKER}
+[{"path": "/tmp/company_playbooks.csv", "caption": "company_id, name, question count"}]`;
+  // The installed token cannot upload (issue #433). Telling the agent it can
+  // only produces "full list attached" followed by a correction; tell it what
+  // will really happen to a file it lists.
+  if (botScopes.knownMissing('files:write')) {
+    return `Attaching files:
+- File uploads are NOT working right now (the Slack app is missing a permission). Never say a file is "attached".
+- You can still hand over a full dataset, a long list, or a report: write it to disk as a TEXT file (.csv, .md, .txt, .json and similar; \`/tmp\` is fine), then end your final message with a line containing exactly ${FILES_MARKER}, followed by a JSON array of {"path": "...", "caption": "..."} entries. Everything from that marker onward is stripped from the visible reply, and the file's content is pasted into the thread as text right under your reply.
+- At most ${INLINE_MAX_CHARS.toLocaleString('en-US')} characters across all listed files will be pasted. Anything longer, and anything that is not text (a PDF, an image), will not arrive, so do not produce it: put the most useful part in the reply and say plainly what was left out.
+- Always keep a short summary in the visible reply and say the full list follows below.
+
+Example of a final message that hands over a file:
+2,676 companies have a playbook, 39,873 questions total. Full list below.
+${manifestExample}`;
+  }
   return `Attaching files:
 - You CAN attach real files to your Slack reply. Write the file to disk (\`/tmp\` is fine), then end your final message with a line containing exactly ${FILES_MARKER}, followed by a JSON array of {"path": "...", "caption": "..."} entries. Everything from that marker onward is stripped from the visible reply and uploaded into the thread.
 - Attach a file when the honest answer is a full dataset, a long list, or a report that would be unreadable pasted into Slack. Always keep a short summary in the visible reply — the file supplements the answer, it never replaces it.
@@ -214,8 +235,7 @@ function fileAttachmentPromptBlock(): string {
 
 Example of a final message that attaches a file:
 2,676 companies have a playbook, 39,873 questions total. Full list attached.
-${FILES_MARKER}
-[{"path": "/tmp/company_playbooks.csv", "caption": "company_id, name, question count"}]`;
+${manifestExample}`;
 }
 
 function informationalSystemPrompt(config: AppConfig): string {
@@ -237,7 +257,8 @@ Constraints:
 ${fileAttachmentPromptBlock()}`;
 }
 
-const CONVERSATIONAL_SYSTEM_PROMPT = `You are miniOG, a Slack assistant. The user is making a conversational request — greeting, status check, casual chat, or a question about miniOG itself.
+function conversationalSystemPrompt(): string {
+  return `You are miniOG, a Slack assistant. The user is making a conversational request — greeting, status check, casual chat, or a question about miniOG itself.
 
 Your job:
 1. Produce a short, human reply.
@@ -249,6 +270,7 @@ Keep replies short — one or two sentences usually. Slack markdown is fine but 
 
 ${fileAttachmentPromptBlock()}
 - In this conversational mode, attaching is usually a follow-up to something a previous turn produced ("post it here as a file", "send me that CSV"). If the thread context names a file that still exists on disk, attach it. If it does not exist any more, say so plainly instead of pretending to send it.`;
+}
 
 /**
  * Builds the webapp-QA system prompt with the resolved target URL injected.
@@ -321,7 +343,7 @@ export async function runAgenticEntry(params: RunAgenticEntryParams): Promise<Wo
     return runWebappQa(params);
   }
 
-  const systemPromptBase = mode === 'informational' ? informationalSystemPrompt(config) : CONVERSATIONAL_SYSTEM_PROMPT;
+  const systemPromptBase = mode === 'informational' ? informationalSystemPrompt(config) : conversationalSystemPrompt();
 
   // Conversational guardrail: when investigation findings are pending for
   // this thread, prepend a steer so the agent does NOT claim work is done.
@@ -415,7 +437,21 @@ export async function runAgenticEntry(params: RunAgenticEntryParams): Promise<Wo
     });
   }
 
-  const userMessage = [task.event.text || '(empty message)', threadBlock, recallBlock].filter(Boolean).join('\n\n');
+  // A lookup gets every attachment in the thread; a chat reply only the ones
+  // on the message itself, so "thanks" in a thread full of screenshots does
+  // not open eight images first.
+  const attached = await loadAttachments({
+    task,
+    config,
+    slack,
+    scope: mode === 'informational' ? 'thread' : 'message',
+    backendId: getActiveBackendId(),
+    logStep,
+  });
+
+  const userMessage =
+    [task.event.text || '(empty message)', threadBlock, recallBlock].filter(Boolean).join('\n\n') +
+    attached.promptSuffix;
 
   const result = await runClaudeAgentic({
     systemPrompt,
@@ -424,6 +460,7 @@ export async function runAgenticEntry(params: RunAgenticEntryParams): Promise<Wo
     githubToken,
     tier: MODE_POLICY[mode].tier,
     effort: MODE_POLICY[mode].effort,
+    imagePaths: attached.imagePaths,
     logStep,
     signal,
   });
@@ -519,6 +556,47 @@ export async function runAgenticEntry(params: RunAgenticEntryParams): Promise<Wo
     notifyDesktop: !result.ok,
     slackPosted,
     ...(fileOutcome ? { result: fileOutcome } : {}),
+  };
+}
+
+/**
+ * Fetch what people attached, in the form a prompt needs. Lookup, chat and QA
+ * runs never did this: only the code-change path downloaded files, so a
+ * question about "this screenshot" was answered without it (issue #433).
+ */
+async function loadAttachments(params: {
+  task: NormalizedTask;
+  config: AppConfig;
+  slack: WebClient;
+  /** `thread`: every file in the thread. `message`: only the triggering message's. */
+  scope: 'thread' | 'message';
+  backendId: AgentBackendId;
+  logStep?: WorkflowStepLogger;
+}): Promise<{ imagePaths: string[] | undefined; promptSuffix: string }> {
+  const { task, config, slack, scope, backendId, logStep } = params;
+  const intake = task.threadMessages ?? [];
+  const messages =
+    intake.length > 0
+      ? intake
+      : await fetchThreadContext(slack, task.event.channelId, task.event.threadTs).catch(() => []);
+  const inScope = scope === 'thread' ? messages : messages.filter(m => m.ts === task.event.eventTs);
+  const files: SlackFileAttachment[] = filesForTrigger(inScope, task.event.eventTs);
+  if (files.length === 0) {
+    return { imagePaths: undefined, promptSuffix: '' };
+  }
+  const attachments: ThreadAttachments = await collectThreadAttachments({
+    files,
+    botToken: config.slackBotToken,
+    logStep,
+  });
+  const canSeeImages = attachments.imagePaths.length > 0 && getBackend(backendId).supportsImages();
+  const blindNote =
+    attachments.imagePaths.length > 0 && !canSeeImages
+      ? `\n\n[${attachments.imagePaths.length} image(s) attached in thread — this backend does not support image input]`
+      : '';
+  return {
+    imagePaths: canSeeImages ? attachments.imagePaths : undefined,
+    promptSuffix: `${blindNote}${attachments.documentContext}${attachments.unreadableNote}`,
   };
 }
 
@@ -643,14 +721,17 @@ async function runWebappQa(params: RunAgenticEntryParams): Promise<WorkflowResul
     promptOpts?: { changedPaths?: string[]; depsChanged?: boolean; repoKey?: RepoKey },
     cwd?: string,
   ): Promise<WorkflowResult> => {
+    // A QA ask often points at a screenshot of the bug or the expected state.
+    const attached = await loadAttachments({ task, config, slack, scope: 'thread', backendId: 'claude-code', logStep });
     const result = await runClaudeAgentic({
       systemPrompt: qaSystemPrompt(targetUrl, promptOpts),
-      userMessage: task.event.text || `QA the web app at ${targetUrl}`,
+      userMessage: (task.event.text || `QA the web app at ${targetUrl}`) + attached.promptSuffix,
       cwd: cwd ?? config.repoPaths.newtonWeb,
       forceBackend: 'claude-code',
       tier: MODE_POLICY.qa.tier,
       effort: MODE_POLICY.qa.effort,
       timeoutMs: QA_TIMEOUT_MS,
+      imagePaths: attached.imagePaths,
       logStep,
       signal,
     });

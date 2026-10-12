@@ -197,11 +197,11 @@ export const NO_TOOLS_ARGS = [
   '--disable-slash-commands',
 ];
 
-/** Name downloaded thread images in the prompt so the agent opens them with Read. */
+/** Name downloaded thread images and PDFs in the prompt so the agent opens them with Read. */
 export function withImageReadInstructions(prompt: string, imagePaths: string[] | undefined): string {
   if (!imagePaths || imagePaths.length === 0) return prompt;
   const list = imagePaths.map(p => `- ${p}`).join('\n');
-  return `${prompt}\n\nImages attached in the Slack thread — open each one with the Read tool before answering:\n${list}`;
+  return `${prompt}\n\nFiles attached in the Slack thread (images, PDFs) — open each one with the Read tool before answering:\n${list}`;
 }
 
 export const claudeCodeBackend: AgentBackend = {
