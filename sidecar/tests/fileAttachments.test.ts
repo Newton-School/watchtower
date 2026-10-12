@@ -120,7 +120,7 @@ describe('uploadAttachments', () => {
       sent = (args as { file_uploads: typeof sent }).file_uploads;
       return Promise.resolve({ ok: true });
     });
-    const n = await uploadAttachments({
+    const { uploaded: n, undelivered } = await uploadAttachments({
       slack,
       channelId: 'C1',
       threadTs: '1.1',
@@ -128,6 +128,7 @@ describe('uploadAttachments', () => {
       logStep: e => logs.push(e),
     });
     expect(n).toBe(1);
+    expect(undelivered).toEqual([]);
     expect(sent[0].filename).toBe('company_playbooks.csv');
     expect(sent[0].title).toBe('all rows');
     expect(logs.some(l => l.stage === 'agentic.files.uploaded')).toBe(true);
@@ -140,7 +141,7 @@ describe('uploadAttachments', () => {
       called = true;
       return Promise.resolve({ ok: true });
     });
-    const n = await uploadAttachments({
+    const { uploaded: n, undelivered } = await uploadAttachments({
       slack,
       channelId: 'C1',
       attachments: [{ path: makeTempFile('.env') }, { path: makeTempFile('id_rsa') }],
@@ -148,6 +149,12 @@ describe('uploadAttachments', () => {
     });
     expect(called).toBe(false);
     expect(n).toBe(0);
+    // Refused files are reported, and never with their content: a file the
+    // allowlist turned away must not reach the thread by another route.
+    expect(undelivered).toEqual([
+      { filename: '.env', reason: 'refused', bytes: undefined },
+      { filename: 'id_rsa', reason: 'refused', bytes: undefined },
+    ]);
     const none = logs.find(l => l.stage === 'agentic.files.none');
     expect(none).toBeDefined();
     const skipped = none?.data?.skipped as Array<{ reason: string }>;
@@ -157,7 +164,7 @@ describe('uploadAttachments', () => {
   it('skips a file over the size cap but still uploads the rest', async () => {
     const logs: WorkflowStepLog[] = [];
     const slack = fakeSlack(() => Promise.resolve({ ok: true }));
-    const n = await uploadAttachments({
+    const { uploaded: n, undelivered } = await uploadAttachments({
       slack,
       channelId: 'C1',
       attachments: [
@@ -167,6 +174,9 @@ describe('uploadAttachments', () => {
       logStep: e => logs.push(e),
     });
     expect(n).toBe(1);
+    expect(undelivered).toEqual([
+      { filename: 'huge.csv', reason: 'too_large', bytes: DEFAULT_ATTACHMENT_LIMITS.maxFileBytes + 1 },
+    ]);
     const validated = logs.find(l => l.stage === 'agentic.files.validated');
     expect(validated?.level).toBe('WARN');
     expect(String((validated?.data?.skipped as Array<{ reason: string }>)[0].reason)).toContain('too_large');
@@ -177,20 +187,25 @@ describe('uploadAttachments', () => {
     const attachments = Array.from({ length: DEFAULT_ATTACHMENT_LIMITS.maxFiles + 3 }, (_, i) => ({
       path: makeTempFile(`part-${i}.csv`),
     }));
-    const n = await uploadAttachments({
+    const { uploaded: n, undelivered } = await uploadAttachments({
       slack: fakeSlack(() => Promise.resolve({ ok: true })),
       channelId: 'C1',
       attachments,
       logStep: e => logs.push(e),
     });
     expect(n).toBe(DEFAULT_ATTACHMENT_LIMITS.maxFiles);
+    expect(undelivered.map(file => [file.filename, file.reason])).toEqual([
+      ['part-5.csv', 'over_file_limit'],
+      ['part-6.csv', 'over_file_limit'],
+      ['part-7.csv', 'over_file_limit'],
+    ]);
     expect(logs.find(l => l.stage === 'agentic.files.start')?.data?.capped).toBe(DEFAULT_ATTACHMENT_LIMITS.maxFiles);
   });
 
   it('classifies a missing files:write scope explicitly', async () => {
     const logs: WorkflowStepLog[] = [];
     const slack = fakeSlack(() => Promise.reject(missingScopeError()));
-    const n = await uploadAttachments({
+    const { uploaded: n, undelivered } = await uploadAttachments({
       slack,
       channelId: 'C1',
       attachments: [{ path: makeTempFile('rows.csv') }],
@@ -201,6 +216,28 @@ describe('uploadAttachments', () => {
     expect(scopeLog?.level).toBe('ERROR');
     expect(scopeLog?.data?.needed).toBe('files:write');
     expect(logs.some(l => l.stage === 'agentic.files.upload_failed')).toBe(false);
+    // The file was fine; only the upload failed. Its bytes come back so the
+    // caller can paste them.
+    expect(undelivered).toHaveLength(1);
+    expect(undelivered[0]).toMatchObject({ filename: 'rows.csv', reason: 'missing_scope', bytes: 32 });
+    expect(undelivered[0].content?.toString()).toBe('a'.repeat(32));
+  });
+
+  it('reports every file when Slack rejects the upload for another reason', async () => {
+    const logs: WorkflowStepLog[] = [];
+    const { uploaded, undelivered } = await uploadAttachments({
+      slack: fakeSlack(() => Promise.reject(new Error('An API error occurred: internal_error'))),
+      channelId: 'C1',
+      attachments: [{ path: makeTempFile('rows.csv') }, { path: makeTempFile('notes.md') }, { path: '/nope/gone.csv' }],
+      logStep: e => logs.push(e),
+    });
+    expect(uploaded).toBe(0);
+    expect(logs.some(l => l.stage === 'agentic.files.upload_failed')).toBe(true);
+    expect(undelivered.map(file => [file.filename, file.reason, Boolean(file.content)])).toEqual([
+      ['rows.csv', 'upload_failed', true],
+      ['notes.md', 'upload_failed', true],
+      ['gone.csv', 'not_found', false],
+    ]);
   });
 });
 
@@ -211,7 +248,7 @@ describe('webapp-QA adapter still behaves as before', () => {
     expect(screenshots).toEqual([{ path: '/tmp/a.png', caption: undefined }]);
 
     const logs: WorkflowStepLog[] = [];
-    const n = await uploadScreenshots({
+    const { uploaded: n } = await uploadScreenshots({
       slack: fakeSlack(() => Promise.resolve({ ok: true })),
       channelId: 'C1',
       threadTs: '1.1',
@@ -225,7 +262,7 @@ describe('webapp-QA adapter still behaves as before', () => {
 
   it('keeps the tighter QA size cap (5MB), independent of the agentic limit', async () => {
     const logs: WorkflowStepLog[] = [];
-    const n = await uploadScreenshots({
+    const { uploaded: n } = await uploadScreenshots({
       slack: fakeSlack(() => Promise.resolve({ ok: true })),
       channelId: 'C1',
       screenshots: [{ path: makeTempFile('big.png', 5 * 1024 * 1024 + 1) }],

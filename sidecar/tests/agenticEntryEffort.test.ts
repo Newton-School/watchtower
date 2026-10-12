@@ -23,7 +23,8 @@ vi.mock('../src/backends/registry.js', () => ({
 }));
 vi.mock('../src/slack/imageUploader.js', () => ({
   parseScreenshotManifest: (reply: string) => ({ visibleText: reply, screenshots: [] }),
-  uploadScreenshots: vi.fn(async () => 0),
+  uploadScreenshots: vi.fn(async () => ({ uploaded: 0, undelivered: [] })),
+  QA_LIMITS: { maxFiles: 8, maxFileBytes: 5 * 1024 * 1024 },
 }));
 
 function makeTask(text: string): NormalizedTask {
