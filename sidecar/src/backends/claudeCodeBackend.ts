@@ -176,6 +176,14 @@ function resolveClaudeCodeBinary(): string {
 }
 
 /**
+ * Commands that kill by name rather than by PID. Agents share one OS user, so
+ * these reach other jobs' agents and the owner's own processes (issue #445).
+ * Deny rules hold under `--dangerously-skip-permissions`, and match a command
+ * anywhere in a compound line (`a; pkill -f x; b` is refused whole).
+ */
+export const PROCESS_KILL_DENY_RULES = ['Bash(pkill:*)', 'Bash(killall:*)'];
+
+/**
  * Flags for a text-in, text-out call (`noTools`). `--tools` and `--mcp-config`
  * are variadic, so each must be followed by another flag, never a positional.
  */
@@ -253,10 +261,7 @@ export const claudeCodeBackend: AgentBackend = {
     // personal skills and commands (issue #443). `--disallowedTools` is
     // variadic, so it stays ahead of the flags below.
     if (!request.noTools) {
-      const denied = personalSkillDenyRules(request.cwd);
-      if (denied.length > 0) {
-        args.push('--disallowedTools', ...denied);
-      }
+      args.push('--disallowedTools', ...PROCESS_KILL_DENY_RULES, ...personalSkillDenyRules(request.cwd));
     }
     if (request.sessionId) {
       args.push('--session-id', request.sessionId);

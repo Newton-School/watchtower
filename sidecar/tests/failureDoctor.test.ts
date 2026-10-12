@@ -228,4 +228,17 @@ describe('failureDoctor', () => {
       expect(diagnosis?.errorKind).not.toBe('MODEL_API_UNREACHABLE');
     });
   });
+
+  it('names an agent killed from outside, which exit 143 without a cancel is the sign of (issue #445)', () => {
+    const diagnosis = diagnoseFailure({
+      workflow: 'IMPLEMENTATION',
+      message: 'The reviewer was killed from outside while it was working, and so was my retry.',
+      logs: [
+        { stage: 'agent.process.exit', message: 'exited', level: 'INFO', data: { exitCode: 143, timedOut: false } },
+        { stage: 'pipeline.killed', message: 'The reviewer was killed from outside', level: 'ERROR' },
+      ],
+    });
+
+    expect(diagnosis?.errorKind).toBe('AGENT_KILLED_EXTERNALLY');
+  });
 });

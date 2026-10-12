@@ -463,9 +463,15 @@ export interface CodexRunResult {
    * API tokens were consumed (issue #342) — callers should pause/retry at
    * the reset time instead of treating the output as an agent verdict.
    */
-  errorKind?: 'USAGE_LIMIT' | 'API_ERROR';
+  errorKind?: 'USAGE_LIMIT' | 'API_ERROR' | 'EXTERNAL_KILL';
   /** Verbatim reset clause from the limit message, e.g. "9:40pm (Asia/Calcutta)". */
   limitResetsAtText?: string;
+  /**
+   * For EXTERNAL_KILL: the signal that ended the process, when the OS reported
+   * one. The run was stopped from outside (not by a timeout or a cancel), so
+   * its exit is not a verdict on the work (issue #445).
+   */
+  killSignal?: string;
   /**
    * For API_ERROR: the CLI's own error line ("API Error: Can't reach the API
    * server …"). The run died on the connection, so nothing in it is the

@@ -92,6 +92,20 @@ export function diagnoseFailure(input: {
     };
   }
 
+  // The run ended because an agent's process was killed from outside, twice.
+  // Exit 143 without a cancel is the signature (issue #445).
+  if (input.logs.some(entry => entry.stage === 'pipeline.killed') || /killed from outside/.test(input.message)) {
+    return {
+      errorKind: 'AGENT_KILLED_EXTERNALLY',
+      summary: "An agent's process was killed by something other than miniOG, and the retry was killed too.",
+      actions: [
+        'Look for what signalled it: another job cleaning up by name (`pkill`, `killall`), or the host shutting down.',
+        'Re-mention miniOG in the thread to run the task again; work already committed is still on its branch.',
+        'The kill is not a review or verification verdict; nothing about the change was judged.',
+      ],
+    };
+  }
+
   if (
     codexParseFailureCount >= 2 ||
     (codexParseFailureCount >= 1 &&

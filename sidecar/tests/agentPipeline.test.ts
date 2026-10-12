@@ -1172,7 +1172,7 @@ describe('agentPipeline and a dropped connection (issue #439)', () => {
     const result = await runAgentPipeline({ ctx: coderPipeline(), slack: slack as any, logStep });
 
     expect(result.finalStatus).toBe('passed');
-    expect(result.connectionLost).toBeUndefined();
+    expect(result.interrupted).toBeUndefined();
     expect(runCodex).toHaveBeenCalledTimes(4);
     expect(vi.mocked(runCodex).mock.calls[1][0]).toMatchObject({ resumeSessionId: 'sess-coder' });
     expect(result.steps.map(step => `${step.role}:${step.status}`)).toEqual([
@@ -1188,7 +1188,7 @@ describe('agentPipeline and a dropped connection (issue #439)', () => {
     const result = await runAgentPipeline({ ctx: coderPipeline(), slack: slack as any, logStep });
 
     expect(result.finalStatus).toBe('failed');
-    expect(result.connectionLost).toEqual({ role: 'coder', retries: 3 });
+    expect(result.interrupted).toEqual({ kind: 'connection_lost', role: 'coder', retries: 3 });
     // The coder and its three retries. No reviewer and no verifier on a step that never happened.
     expect(runCodex).toHaveBeenCalledTimes(4);
     expect(result.steps.map(step => step.role)).toEqual(['coder']);
@@ -1201,9 +1201,54 @@ describe('agentPipeline and a dropped connection (issue #439)', () => {
     const result = await runAgentPipeline({ ctx: coderPipeline(), slack: slack as any, logStep });
 
     expect(result.finalStatus).toBe('failed');
-    expect(result.connectionLost).toBeUndefined();
+    expect(result.interrupted).toBeUndefined();
     expect(runCodex).toHaveBeenCalledTimes(1);
     expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'pipeline.coder_failed' }));
+  });
+
+  describe('an agent killed from outside (issue #445)', () => {
+    const killed = {
+      ok: false,
+      exitCode: 143,
+      timedOut: false,
+      stdout: '',
+      stderr: '',
+      lastMessage: '',
+      durationMs: 0,
+      errorKind: 'EXTERNAL_KILL',
+      killSignal: 'SIGTERM',
+    } as any;
+
+    it('runs a killed reviewer again instead of reading its death as "rejected"', async () => {
+      // The incident: the reviewer had flagged nothing. Its process was killed
+      // by another job's `pkill`, and the coder was sent round again.
+      vi.mocked(runCodex)
+        .mockResolvedValueOnce(coderDone)
+        .mockResolvedValueOnce(killed)
+        .mockResolvedValueOnce(reviewerOk)
+        .mockResolvedValueOnce(verifierOk);
+
+      const result = await runAgentPipeline({ ctx: coderPipeline(), slack: slack as any, logStep });
+
+      expect(result.finalStatus).toBe('passed');
+      expect(result.retryLoops).toBe(0);
+      expect(runCodex).toHaveBeenCalledTimes(4);
+      expect(logStep).not.toHaveBeenCalledWith(expect.objectContaining({ stage: 'pipeline.feedback_loop' }));
+    });
+
+    it('stops when the retry is killed too: no feedback loop, no coder re-run, and it says why', async () => {
+      vi.mocked(runCodex).mockResolvedValueOnce(coderDone).mockResolvedValue(killed);
+
+      const result = await runAgentPipeline({ ctx: coderPipeline(), slack: slack as any, logStep });
+
+      expect(result.finalStatus).toBe('failed');
+      expect(result.interrupted).toEqual({ kind: 'killed', role: 'reviewer', retries: 1 });
+      expect(result.retryLoops).toBe(0);
+      // The coder once, the reviewer twice. Not the coder again, and not the verifier.
+      expect(runCodex).toHaveBeenCalledTimes(3);
+      expect(logStep).not.toHaveBeenCalledWith(expect.objectContaining({ stage: 'pipeline.feedback_loop' }));
+      expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'pipeline.killed', level: 'ERROR' }));
+    });
   });
 
   it('does not charge the time a dropped connection cost to the pipeline timeout', async () => {

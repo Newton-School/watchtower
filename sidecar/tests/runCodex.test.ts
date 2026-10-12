@@ -1,6 +1,12 @@
 import os from 'node:os';
 import { describe, expect, it, vi } from 'vitest';
-import { detectApiError, detectUsageLimit, parseCodexStructuredOutput, runAgent } from '../src/codex/runCodex.js';
+import {
+  detectApiError,
+  detectExternalKill,
+  detectUsageLimit,
+  parseCodexStructuredOutput,
+  runAgent,
+} from '../src/codex/runCodex.js';
 import type { AgentBackend } from '../src/backends/types.js';
 
 describe('runCodex structured output parsing', () => {
@@ -148,5 +154,69 @@ describe('detectApiError (issue #439)', () => {
     expect(
       detectApiError(envelope('TypeError: cannot read properties of undefined', true), { failedRun: true }),
     ).toBeUndefined();
+  });
+});
+
+describe('a run killed from outside (issue #445)', () => {
+  const shell = (script: string): AgentBackend => ({
+    id: 'claude-code',
+    displayName: 'Shell',
+    resolveBinary: () => '/bin/sh',
+    isAvailable: () => true,
+    supportsImages: () => false,
+    buildArgs: () => ['-c', script],
+    buildEnv: () => ({}),
+    parseOutput: () => ({}),
+    availableModels: () => ['test'],
+    defaultModel: () => 'test',
+  });
+  const run = (script: string, extra: Record<string, unknown> = {}) => {
+    const onLog = vi.fn();
+    return runAgent({ cwd: os.tmpdir(), prompt: 'unused', onLog, ...extra }, shell(script)).then(result => ({
+      result,
+      stages: onLog.mock.calls.map(call => call[0].stage as string),
+    }));
+  };
+
+  it('reads the signal, or the 128+signal exit code a process reports when it handles one', () => {
+    expect(detectExternalKill(null, 'SIGTERM')).toEqual({ signal: 'SIGTERM' });
+    expect(detectExternalKill(143, undefined)).toEqual({ signal: 'SIGTERM' });
+    expect(detectExternalKill(137, undefined)).toEqual({ signal: 'SIGKILL' });
+    expect(detectExternalKill(0, undefined)).toBeUndefined();
+    expect(detectExternalKill(1, undefined)).toBeUndefined();
+  });
+
+  it('classifies a process that is signalled as killed from outside, not as a failed run to read', async () => {
+    const { result, stages } = await run('kill -TERM $$');
+
+    expect(result).toMatchObject({ ok: false, errorKind: 'EXTERNAL_KILL', killSignal: 'SIGTERM' });
+    expect(stages).toContain('agent.killed');
+  });
+
+  it('classifies exit 143, which is how the CLI leaves when it is sent SIGTERM', async () => {
+    const { result } = await run('exit 143');
+
+    expect(result).toMatchObject({ ok: false, exitCode: 143, errorKind: 'EXTERNAL_KILL', killSignal: 'SIGTERM' });
+  });
+
+  it('does not call its own timeout or an ordinary failure a kill', async () => {
+    const timedOut = await run('sleep 5', { timeoutMs: 100 });
+    expect(timedOut.result.timedOut).toBe(true);
+    expect(timedOut.result.errorKind).toBeUndefined();
+
+    const failed = await run('exit 1');
+    expect(failed.result).toMatchObject({ ok: false, exitCode: 1 });
+    expect(failed.result.errorKind).toBeUndefined();
+  });
+
+  it('does not call a cancel a kill', async () => {
+    const controller = new AbortController();
+    const pending = run('sleep 5', { signal: controller.signal });
+    setTimeout(() => controller.abort(), 50);
+
+    const { result } = await pending;
+
+    expect(result.cancelled).toBe(true);
+    expect(result.errorKind).toBeUndefined();
   });
 });

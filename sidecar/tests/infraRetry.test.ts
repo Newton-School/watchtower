@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   INFRA_RETRY_DELAYS_MS,
+  KILL_RETRY_DELAYS_MS,
   RESUME_AFTER_DROP_PROMPT,
   __infraRetry,
   connectionLostReply,
+  killedFromOutsideReply,
   runWithInfraRetry,
 } from '../src/codex/infraRetry.js';
 import type { CodexRunRequest, CodexRunResult } from '../src/types/contracts.js';
@@ -135,7 +137,7 @@ describe('runWithInfraRetry (issue #439)', () => {
     expect(result.ok).toBe(true);
     expect(run).toHaveBeenCalledTimes(3);
     expect(run.mock.calls[2][0]).toBe(request);
-    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'agent.api_error.resume_failed' }));
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'agent.retry.resume_failed' }));
   });
 
   it('starts over when the dropped run left no session to resume', async () => {
@@ -144,6 +146,77 @@ describe('runWithInfraRetry (issue #439)', () => {
     await runWithInfraRetry(request, { label: 'coder', resume: true });
 
     expect(run.mock.calls[1][0]).toBe(request);
+  });
+
+  describe('a run killed from outside (issue #445)', () => {
+    const killed = (extra: Partial<CodexRunResult> = {}): CodexRunResult =>
+      ({
+        ...base,
+        ok: false,
+        exitCode: 143,
+        durationMs: 20_000,
+        errorKind: 'EXTERNAL_KILL',
+        killSignal: 'SIGTERM',
+        sessionId: 'sess-reviewer',
+        ...extra,
+      }) as CodexRunResult;
+
+    it('is run again once, after a short pause', async () => {
+      run.mockResolvedValueOnce(killed()).mockResolvedValueOnce(ok());
+      const logStep = vi.fn();
+
+      const result = await runWithInfraRetry(request, { label: 'reviewer', logStep });
+
+      expect(result).toMatchObject({ ok: true, infraRetries: 1, infraWaitMs: 20_000 + KILL_RETRY_DELAYS_MS[0] });
+      expect(sleep).toHaveBeenCalledExactlyOnceWith(KILL_RETRY_DELAYS_MS[0], undefined);
+      expect(logStep).toHaveBeenCalledWith(
+        expect.objectContaining({
+          stage: 'agent.killed.retry',
+          message: 'The reviewer run was killed from outside — retrying in 5s (attempt 1 of 1).',
+        }),
+      );
+    });
+
+    it('is handed back as a kill, not a result, when the retry is killed too', async () => {
+      run.mockResolvedValue(killed());
+
+      const result = await runWithInfraRetry(request, { label: 'reviewer' });
+
+      expect(result).toMatchObject({ ok: false, errorKind: 'EXTERNAL_KILL', infraRetries: 1 });
+      expect(run).toHaveBeenCalledTimes(2);
+    });
+
+    it("resumes the coder's session, like a dropped connection does", async () => {
+      run.mockResolvedValueOnce(killed({ sessionId: 'sess-coder' })).mockResolvedValueOnce(ok());
+
+      await runWithInfraRetry(request, { label: 'coder', resume: true });
+
+      expect(run.mock.calls[1][0]).toMatchObject({ resumeSessionId: 'sess-coder', prompt: RESUME_AFTER_DROP_PROMPT });
+    });
+
+    it('keeps its own budget: a kill does not use up the waits for a dropped connection', async () => {
+      run
+        .mockResolvedValueOnce(killed())
+        .mockResolvedValueOnce(dropped())
+        .mockResolvedValueOnce(dropped())
+        .mockResolvedValueOnce(ok());
+
+      const result = await runWithInfraRetry(request, { label: 'coder' });
+
+      expect(result.ok).toBe(true);
+      expect(result.infraRetries).toBe(3);
+      expect(sleep.mock.calls.map(call => call[0])).toEqual([
+        KILL_RETRY_DELAYS_MS[0],
+        INFRA_RETRY_DELAYS_MS[0],
+        INFRA_RETRY_DELAYS_MS[1],
+      ]);
+    });
+
+    it('words the reply for the thread', () => {
+      expect(killedFromOutsideReply('The reviewer')).toBe(
+        "The reviewer was killed from outside while it was working, and so was my retry. That was not a verdict on the change. Nothing has been merged. Mention me again and I'll run it again.",
+      );
+    });
   });
 
   it('words the reply for the thread around what was happening', () => {
