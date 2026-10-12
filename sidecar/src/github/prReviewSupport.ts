@@ -625,6 +625,44 @@ export function buildGithubReviewSummary(outputs: NormalizedPrReviewAgentOutput[
   return lines.join('\n');
 }
 
+const capitalize = (text: string): string => text.charAt(0).toUpperCase() + text.slice(1);
+
+/** Why the review is not on the PR, as the clause after "but". */
+function notPostedClause(reviewResult: SubmitPrReviewResult | undefined): string {
+  if (reviewResult?.fallbackReason === 'no_token') {
+    return 'GitHub review submission was skipped (no GitHub token — nothing was posted to the PR)';
+  }
+  if (reviewResult?.unconfirmed) {
+    return `I could not confirm whether the review reached GitHub (${reviewResult.failureReason ?? 'the request failed'}) — check the PR before asking again`;
+  }
+  if (reviewResult?.failureReason) {
+    return `I couldn't post the review to GitHub (${reviewResult.failureReason})`;
+  }
+  return 'GitHub review submission was skipped';
+}
+
+/** How many findings the Slack message carries when the PR carries none of them. */
+const UNPOSTED_FINDINGS_IN_SLACK = 15;
+const SEVERITY_ORDER: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
+
+/**
+ * The findings themselves, for the thread, when the review could not be put
+ * on the PR. Without this they exist nowhere a person can read them.
+ */
+export function formatUnpostedFindings(findings: AgentFinding[]): string {
+  if (findings.length === 0) return '';
+  const ordered = [...findings].sort((a, b) => (SEVERITY_ORDER[a.severity] ?? 9) - (SEVERITY_ORDER[b.severity] ?? 9));
+  const lines = ordered.slice(0, UNPOSTED_FINDINGS_IN_SLACK).map(f => {
+    const where = f.file ? `${f.file}${typeof f.line === 'number' ? `:${f.line}` : ''} — ` : '';
+    const message = f.message.length > 240 ? `${f.message.slice(0, 240).trim()}…` : f.message;
+    return `• [${f.severity.toUpperCase()}] ${where}${message}`;
+  });
+  if (ordered.length > UNPOSTED_FINDINGS_IN_SLACK) {
+    lines.push(`… and ${ordered.length - UNPOSTED_FINDINGS_IN_SLACK} more that are not shown here.`);
+  }
+  return ['The review is not on the PR, so here is what it found:', ...lines].join('\n');
+}
+
 export function formatSlackReviewSummary(
   outputs: NormalizedPrReviewAgentOutput[],
   prUrl: string,
@@ -641,14 +679,14 @@ export function formatSlackReviewSummary(
   const resolvedEvent = deriveReviewEvent(allFindings, reviewResult?.event, totalSummaryNotes);
   const verdict = resolvedEvent === 'APPROVE' ? '✅' : resolvedEvent === 'REQUEST_CHANGES' ? '🚫' : '💬';
 
-  // When the GitHub token is missing, findings are computed but never posted —
-  // surface that explicitly so a skip reads as "couldn't post" not "all clear".
-  const noToken = reviewResult?.fallbackReason === 'no_token';
-  const skippedReason = noToken ? ' (no GitHub token — nothing was posted to the PR)' : '';
+  // Say why nothing is on the PR, so a skip reads as "couldn't post" and never
+  // as "all clear". "Skipped" alone was posted for a review that was on the PR
+  // with 16 inline comments (issue #449).
+  const notPosted = notPostedClause(reviewResult);
 
   if (totalFindings === 0 && totalSummaryNotes === 0) {
     if (reviewResult?.submissionMode === 'skipped') {
-      return `*PR Review Complete* - No actionable findings. GitHub review submission was skipped${skippedReason}. ${verdict}\n${prUrl}${skillsSuffix}`;
+      return `*PR Review Complete* - No actionable findings. ${capitalize(notPosted)}. ${verdict}\n${prUrl}${skillsSuffix}`;
     }
     return `*PR Review Complete* - No actionable findings. Good to go. ${verdict}\n${prUrl}${skillsSuffix}`;
   }
@@ -657,13 +695,13 @@ export function formatSlackReviewSummary(
 
   if (totalFindings === 0) {
     if (reviewResult?.submissionMode === 'skipped') {
-      return `*PR Review Complete* - ${totalSummaryNotes} review note(s) identified, but GitHub review submission was skipped${skippedReason}. ${verdict}\n${prUrl}${skillsSuffix}`;
+      return `*PR Review Complete* - ${totalSummaryNotes} review note(s) identified, but ${notPosted}. ${verdict}\n${prUrl}${skillsSuffix}`;
     }
     return `*PR Review Complete* - ${totalSummaryNotes} review note(s) were posted in the review summary. No inline comments were attached. ${verdict}\n${prUrl}${skillsSuffix}`;
   }
 
   if (!reviewResult || reviewResult.submissionMode === 'skipped') {
-    return `*PR Review Complete* - ${totalFindings} findings identified, but GitHub review submission was skipped${skippedReason}${breakdown} ${verdict}\n${prUrl}${skillsSuffix}`;
+    return `*PR Review Complete* - ${totalFindings} findings identified, but ${notPosted}${breakdown} ${verdict}\n${prUrl}${skillsSuffix}`;
   }
 
   const placedParts: string[] = [];

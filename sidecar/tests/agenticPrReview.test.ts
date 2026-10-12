@@ -410,6 +410,62 @@ describe('agenticPrReview', () => {
     );
   });
 
+  describe('when the review could not be put on the PR (issue #449)', () => {
+    const findings = [
+      { role: 'security', severity: 'high', category: 'authz', message: 'Missing check', file: 'src/a.ts', line: 2 },
+      { role: 'reviewer', severity: 'low', category: 'style', message: 'Rename x', file: 'src/a.ts', line: 3 },
+      { role: 'reviewer', severity: 'medium', category: 'logic', message: 'Off by one', file: 'src/a.ts', line: 2 },
+    ];
+    const review = async (submitResult: Record<string, unknown>) => {
+      const slack = makeSlack([`review ${WEB_PR}`]);
+      const deps = makeDeps({
+        runAgent: vi.fn().mockResolvedValue(agentOk(findings)),
+        submitReview: vi.fn().mockResolvedValue(submitResult),
+      });
+      await runAgenticPrReview({
+        task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+        config,
+        slack: slack as any,
+        store: emptyStore,
+        deps: deps as any,
+      });
+      return slack.chat.postMessage.mock.calls.map(c => c[0].text as string).join('\n---\n');
+    };
+    const failed = {
+      ...SUBMIT_OK,
+      submitted: false,
+      commentsPosted: 0,
+      submissionMode: 'skipped' as const,
+      failureReason: 'HTTP 502',
+    };
+
+    it('says why, and puts every finding in the thread, worst first', async () => {
+      const posted = await review(failed);
+
+      expect(posted).toContain("I couldn't post the review to GitHub (HTTP 502)");
+      expect(posted).toContain('The review is not on the PR, so here is what it found:');
+      expect(posted.indexOf('[HIGH] src/a.ts:2 — Missing check')).toBeGreaterThan(-1);
+      expect(posted.indexOf('[HIGH]')).toBeLessThan(posted.indexOf('[MEDIUM] src/a.ts:2 — Off by one'));
+      expect(posted.indexOf('[MEDIUM]')).toBeLessThan(posted.indexOf('[LOW] src/a.ts:3 — Rename x'));
+      // Nothing is "on the PR" to point at.
+      expect(posted).not.toContain('more on the PR');
+    });
+
+    it('says it could not confirm when GitHub could not be asked', async () => {
+      const posted = await review({ ...failed, failureReason: 'timed out after 30s', unconfirmed: true });
+
+      expect(posted).toContain('I could not confirm whether the review reached GitHub (timed out after 30s)');
+      expect(posted).toContain('check the PR before asking again');
+    });
+
+    it('does not repeat the findings in the thread when the review is on the PR', async () => {
+      const posted = await review(SUBMIT_OK);
+
+      expect(posted).not.toContain('The review is not on the PR');
+      expect(posted).not.toContain('Rename x');
+    });
+  });
+
   it('downgrades a security finding anchored outside the diff to a summary note (#7)', async () => {
     const slack = makeSlack([`review ${WEB_PR}`]);
     const deps = makeDeps({
