@@ -140,19 +140,28 @@ export function allowedAttachmentExtensions(): string[] {
  * bookkeeping out of the Slack text. A missing or malformed manifest is
  * non-fatal: the reply (minus a present-but-broken marker) comes back as
  * visible text with no attachments.
+ *
+ * The marker counts only at the start of a line, and only its last occurrence.
+ * It used to match anywhere: a reply that described this very file ("generic
+ * `===FILES===` manifest parser") was cut off mid-sentence at that word and
+ * its real manifest, further down, was thrown away as malformed JSON.
  */
 export function parseFileManifest(reply: string, marker: string): ParsedAttachmentReply {
-  const markerRe = new RegExp(`${marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*([\\s\\S]*)$`);
-  const match = markerRe.exec(reply);
+  const markerRe = new RegExp(`^[ \\t]*${marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'gm');
+  let match: RegExpExecArray | null = null;
+  for (let next = markerRe.exec(reply); next; next = markerRe.exec(reply)) {
+    match = next;
+  }
   if (!match) {
     return { visibleText: reply.trim(), attachments: [] };
   }
 
   const visibleText = reply.slice(0, match.index).trim();
+  const manifest = reply.slice(match.index + match[0].length);
 
   let attachments: FileAttachment[] = [];
   try {
-    const body = match[1]
+    const body = manifest
       .trim()
       .replace(/^```(?:json)?/i, '')
       .replace(/```$/i, '')

@@ -71,6 +71,45 @@ describe('parseFileManifest', () => {
     expect(parseFileManifest(reply, FILES_MARKER).attachments).toEqual([{ path: '/tmp/ok.csv', caption: undefined }]);
   });
 
+  // Live on 0.6.118: asked to describe sidecar/src/slack, the agent wrote
+  // "generic `===FILES===` manifest parse…" and the reply was posted cut off
+  // at that word, with the CSV it listed at the end dropped.
+  it('ignores the marker inside a sentence and uses the one that starts a line', () => {
+    const reply = [
+      '10 files in `sidecar/src/slack`:',
+      '• `fileAttachments.ts:1` — generic `===FILES===` manifest parse + validate + upload',
+      '• `imageUploader.ts:1` — the QA adapter',
+      FILES_MARKER,
+      '[{"path": "/tmp/slack_files.csv", "caption": "file, purpose, notes"}]',
+    ].join('\n');
+
+    const { visibleText, attachments } = parseFileManifest(reply, FILES_MARKER);
+
+    expect(visibleText).toBe(reply.split('\n').slice(0, 3).join('\n'));
+    expect(attachments).toEqual([{ path: '/tmp/slack_files.csv', caption: 'file, purpose, notes' }]);
+  });
+
+  it('keeps the whole reply when the marker is only mentioned, never used', () => {
+    const reply = 'The manifest marker is `===FILES===`, followed by a JSON array.';
+    expect(parseFileManifest(reply, FILES_MARKER)).toEqual({ visibleText: reply, attachments: [] });
+  });
+
+  it('uses the last marker when a line of the answer starts with one', () => {
+    const reply = `Format:\n${FILES_MARKER} then JSON.\nDone.\n${FILES_MARKER}\n[{"path":"/tmp/a.csv"}]`;
+
+    const { visibleText, attachments } = parseFileManifest(reply, FILES_MARKER);
+
+    expect(visibleText).toBe(`Format:\n${FILES_MARKER} then JSON.\nDone.`);
+    expect(attachments).toEqual([{ path: '/tmp/a.csv', caption: undefined }]);
+  });
+
+  it('still accepts an indented marker and a manifest on the same line', () => {
+    expect(parseFileManifest(`Done.\n  ${FILES_MARKER} [{"path":"/tmp/a.csv"}]`, FILES_MARKER)).toEqual({
+      visibleText: 'Done.',
+      attachments: [{ path: '/tmp/a.csv', caption: undefined }],
+    });
+  });
+
   it('does not treat the QA marker as a file manifest (markers are distinct)', () => {
     const reply = 'qa report\n===SCREENSHOTS===\n[{"path":"/tmp/a.png"}]';
     expect(parseFileManifest(reply, FILES_MARKER).attachments).toEqual([]);
