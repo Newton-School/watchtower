@@ -23,6 +23,37 @@ export interface AttachmentLimits {
   maxFileBytes: number;
 }
 
+/** Why a file the reply listed never reached the thread. */
+export type UndeliveredReason =
+  | 'missing_scope'
+  | 'upload_failed'
+  | 'over_file_limit'
+  | 'refused'
+  | 'not_found'
+  | 'empty'
+  | 'too_large';
+
+export interface UndeliveredAttachment {
+  filename: string;
+  reason: UndeliveredReason;
+  /** Size on disk, when the file could be read. */
+  bytes?: number;
+  /**
+   * The file's bytes, set only when it passed every check and it was the Slack
+   * upload itself that failed. This is the one case where the content may be
+   * pasted into the thread instead: a file the allowlist refused must never be
+   * published by another route.
+   */
+  content?: Buffer;
+}
+
+export interface AttachmentUploadReport {
+  /** How many files reached the thread. */
+  uploaded: number;
+  /** Every listed file that did not. */
+  undelivered: UndeliveredAttachment[];
+}
+
 /**
  * Extensions miniOG is allowed to hand to Slack. This is an ALLOWLIST, not a
  * denylist, and it is a security control rather than a convenience: the agent
@@ -149,9 +180,12 @@ export function parseFileManifest(reply: string, marker: string): ParsedAttachme
  *
  * Best-effort by design: it validates each path against the allowlist, checks
  * the file exists and fits the size cap, caps the count, and swallows Slack
- * errors (returning how many actually landed) so an upload hiccup never fails
- * the run that produced the files. The text reply is posted separately by the
- * caller and always survives.
+ * errors so an upload hiccup never fails the run that produced the files. The
+ * text reply is posted separately by the caller and always survives.
+ *
+ * It reports how many files landed and which did not, because the reply text
+ * was written before the upload and may already say "attached" (issue #433):
+ * the caller owes the thread a correction for every file listed here.
  *
  * `stagePrefix` / `noun` let callers keep their own step-log vocabulary — the
  * webapp-QA path reports `qa.evidence.*` / "screenshot", agentic replies
@@ -166,7 +200,7 @@ export async function uploadAttachments(params: {
   stagePrefix?: string;
   noun?: string;
   limits?: AttachmentLimits;
-}): Promise<number> {
+}): Promise<AttachmentUploadReport> {
   const {
     slack,
     channelId,
@@ -185,10 +219,11 @@ export async function uploadAttachments(params: {
       message: `No ${noun}s in the reply manifest — nothing to upload.`,
       data: { listed: 0 },
     });
-    return 0;
+    return { uploaded: 0, undelivered: [] };
   }
 
   const candidates = attachments.slice(0, limits.maxFiles);
+  const undelivered: UndeliveredAttachment[] = [];
   logStep?.({
     stage: stage('start'),
     message: `Preparing ${noun} upload: ${attachments.length} listed${
@@ -199,33 +234,40 @@ export async function uploadAttachments(params: {
 
   const uploads: Array<{ file: Buffer; filename: string; title: string }> = [];
   const skipped: Array<{ path: string; reason: string }> = [];
+  const skip = (attachment: FileAttachment, logReason: string, reason: UndeliveredReason, bytes?: number): void => {
+    skipped.push({ path: attachment.path, reason: logReason });
+    undelivered.push({ filename: path.basename(attachment.path) || attachment.path, reason, bytes });
+  };
 
   for (const attachment of candidates) {
     const refusal = attachmentRefusalReason(attachment.path);
     if (refusal) {
-      skipped.push({ path: attachment.path, reason: refusal });
+      skip(attachment, refusal, 'refused');
       continue;
     }
     try {
       const stat = await fs.stat(attachment.path);
       if (!stat.isFile()) {
-        skipped.push({ path: attachment.path, reason: 'not_a_file' });
+        skip(attachment, 'not_a_file', 'not_found');
         continue;
       }
       if (stat.size === 0) {
-        skipped.push({ path: attachment.path, reason: 'empty' });
+        skip(attachment, 'empty', 'empty', 0);
         continue;
       }
       if (stat.size > limits.maxFileBytes) {
-        skipped.push({ path: attachment.path, reason: `too_large_${stat.size}b` });
+        skip(attachment, `too_large_${stat.size}b`, 'too_large', stat.size);
         continue;
       }
       const buffer = await fs.readFile(attachment.path);
       const filename = path.basename(attachment.path) || `${noun}-${uploads.length + 1}`;
       uploads.push({ file: buffer, filename, title: attachment.caption ?? filename });
     } catch (err) {
-      skipped.push({ path: attachment.path, reason: `unreadable: ${String(err)}` });
+      skip(attachment, `unreadable: ${String(err)}`, 'not_found');
     }
+  }
+  for (const attachment of attachments.slice(limits.maxFiles)) {
+    undelivered.push({ filename: path.basename(attachment.path) || attachment.path, reason: 'over_file_limit' });
   }
 
   logStep?.({
@@ -242,7 +284,7 @@ export async function uploadAttachments(params: {
       level: 'WARN',
       data: { skipped },
     });
-    return 0;
+    return { uploaded: 0, undelivered };
   }
 
   const totalBytes = uploads.reduce((sum, u) => sum + u.file.length, 0);
@@ -263,9 +305,15 @@ export async function uploadAttachments(params: {
       message: `Uploaded ${uploads.length} ${noun}(s) to the thread.`,
       data: { count: uploads.length, totalBytes },
     });
-    return uploads.length;
+    return { uploaded: uploads.length, undelivered };
   } catch (error) {
     const info = describeSlackError(error);
+    // Nothing in the batch landed. Hand the bytes back so the caller can paste
+    // what is small enough to read in a message.
+    const failedAs = (reason: UndeliveredReason): UndeliveredAttachment[] => [
+      ...uploads.map(u => ({ filename: u.filename, reason, bytes: u.file.length, content: u.file })),
+      ...undelivered,
+    ];
     // Surface the `files:write` scope gap explicitly — it's the single most
     // common reason attachments silently don't appear, and the raw Slack error
     // (`missing_scope`) is otherwise easy to miss in the log noise.
@@ -280,7 +328,7 @@ export async function uploadAttachments(params: {
           `The text reply still posted; only the ${noun}s were dropped.`,
         data: { count: uploads.length, needed: info.needed, provided: info.provided, slackError: info.slackError },
       });
-      return 0;
+      return { uploaded: 0, undelivered: failedAs('missing_scope') };
     }
     logStep?.({
       stage: stage('upload_failed'),
@@ -288,7 +336,7 @@ export async function uploadAttachments(params: {
       level: 'WARN',
       data: { count: uploads.length, slackError: info.slackError },
     });
-    return 0;
+    return { uploaded: 0, undelivered: failedAs('upload_failed') };
   }
 }
 

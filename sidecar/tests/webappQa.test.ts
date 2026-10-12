@@ -251,7 +251,7 @@ describe('uploadScreenshots logging', () => {
   it('classifies a missing files:write scope explicitly (needed/provided surfaced)', async () => {
     const logs: WorkflowStepLog[] = [];
     const slack = fakeSlack(() => Promise.reject(missingScopeError()));
-    const n = await uploadScreenshots({
+    const { uploaded: n } = await uploadScreenshots({
       slack,
       channelId: 'C1',
       threadTs: '1.1',
@@ -276,7 +276,7 @@ describe('uploadScreenshots logging', () => {
       called = true;
       return Promise.resolve({ ok: true });
     });
-    const n = await uploadScreenshots({
+    const { uploaded: n } = await uploadScreenshots({
       slack,
       channelId: 'C1',
       threadTs: '1.1',
@@ -295,7 +295,12 @@ describe('uploadScreenshots logging', () => {
       called = true;
       return Promise.resolve({ ok: true });
     });
-    const n = await uploadScreenshots({ slack, channelId: 'C1', screenshots: [], logStep: e => logs.push(e) });
+    const { uploaded: n } = await uploadScreenshots({
+      slack,
+      channelId: 'C1',
+      screenshots: [],
+      logStep: e => logs.push(e),
+    });
     expect(called).toBe(false);
     expect(n).toBe(0);
     expect(logs.some(l => l.stage === 'qa.evidence.skip')).toBe(true);
@@ -308,7 +313,7 @@ describe('uploadScreenshots logging', () => {
       called = true;
       return Promise.resolve({ ok: true });
     });
-    const n = await uploadScreenshots({
+    const { uploaded: n } = await uploadScreenshots({
       slack,
       channelId: 'C1',
       screenshots: [{ path: '/nonexistent/nope.png' }],

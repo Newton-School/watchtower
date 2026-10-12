@@ -17,7 +17,8 @@ vi.mock('../src/workspaces/workspaceManager.js', () => ({
 vi.mock('../src/backends/registry.js', () => ({ getBackend: () => ({ isAvailable: () => true }) }));
 vi.mock('../src/slack/imageUploader.js', () => ({
   parseScreenshotManifest: (reply: string) => ({ visibleText: reply, screenshots: [] }),
-  uploadScreenshots: vi.fn(async () => 0),
+  uploadScreenshots: vi.fn(async () => ({ uploaded: 0, undelivered: [] })),
+  QA_LIMITS: { maxFiles: 8, maxFileBytes: 5 * 1024 * 1024 },
 }));
 
 const config = {

@@ -1,6 +1,11 @@
 import type { WebClient } from '@slack/web-api';
 import type { WorkflowStepLogger } from '../types/contracts.js';
-import { parseFileManifest, uploadAttachments, type AttachmentLimits } from './fileAttachments.js';
+import {
+  parseFileManifest,
+  uploadAttachments,
+  type AttachmentLimits,
+  type AttachmentUploadReport,
+} from './fileAttachments.js';
 
 /**
  * Webapp-QA adapter over the generic attachment plumbing in
@@ -26,7 +31,7 @@ export interface ParsedQaReply {
 
 const SCREENSHOT_MARKER = '===SCREENSHOTS===';
 
-const QA_LIMITS: AttachmentLimits = {
+export const QA_LIMITS: AttachmentLimits = {
   maxFiles: 8,
   maxFileBytes: 5 * 1024 * 1024,
 };
@@ -46,8 +51,8 @@ export function parseScreenshotManifest(reply: string): ParsedQaReply {
 /**
  * Upload QA screenshots into a Slack thread. Best-effort: validates each file
  * exists and is within size limits, caps the count, and swallows upload errors
- * (returning the number actually uploaded) so a Slack hiccup never fails the
- * QA run. Mirrors the Bearer-auth file IO in `imageDownloader.ts`, but in
+ * (reporting how many landed and which did not) so a Slack hiccup never fails
+ * the QA run. Mirrors the Bearer-auth file IO in `imageDownloader.ts`, but in
  * reverse.
  */
 export async function uploadScreenshots(params: {
@@ -56,7 +61,7 @@ export async function uploadScreenshots(params: {
   threadTs?: string;
   screenshots: ScreenshotEntry[];
   logStep?: WorkflowStepLogger;
-}): Promise<number> {
+}): Promise<AttachmentUploadReport> {
   const { slack, channelId, threadTs, screenshots, logStep } = params;
   return uploadAttachments({
     slack,

@@ -18,13 +18,15 @@ import { refreshSharedRepoToDefaultBranch } from '../workspaces/workspaceManager
 import { buildStaleCheckoutBlock, describeRepoRefresh } from '../workspaces/staleCheckout.js';
 import { getBackend } from '../backends/registry.js';
 import { extractQaTargetUrl } from '../router/intentParser.js';
-import { parseScreenshotManifest, uploadScreenshots } from '../slack/imageUploader.js';
+import { parseScreenshotManifest, QA_LIMITS, uploadScreenshots } from '../slack/imageUploader.js';
 import {
   allowedAttachmentExtensions,
   parseFileManifest,
   uploadAttachments,
   DEFAULT_ATTACHMENT_LIMITS,
 } from '../slack/fileAttachments.js';
+import type { AttachmentLimits, UndeliveredAttachment } from '../slack/fileAttachments.js';
+import { buildUndeliveredFollowUp } from '../slack/attachmentFollowUp.js';
 import { preparePrWorktree, bootPrDevServer, runPrBuildGate } from '../devServer/devServerManager.js';
 import type { PrDevServer, PreparedPrWorktree, PrBuildGateResult } from '../devServer/devServerManager.js';
 import { mapRepoPath, SUPPORTED_PR_REPOS } from '../github/prReviewSupport.js';
@@ -477,9 +479,9 @@ export async function runAgenticEntry(params: RunAgenticEntryParams): Promise<Wo
 
   // Attachments are supplementary: upload them only once the text landed, and
   // never let an upload failure downgrade an otherwise-good answer.
-  let uploaded = 0;
+  let fileOutcome: Record<string, unknown> | undefined;
   if (attachments.length > 0) {
-    uploaded = await uploadAttachments({
+    const report = await uploadAttachments({
       slack,
       channelId: task.event.channelId,
       threadTs: task.event.threadTs,
@@ -488,10 +490,26 @@ export async function runAgenticEntry(params: RunAgenticEntryParams): Promise<Wo
     });
     logStep?.({
       stage: 'agentic.files.summary',
-      message: `Reply attachments: ${attachments.length} listed, ${uploaded} uploaded to Slack.`,
-      level: uploaded === 0 ? 'WARN' : 'INFO',
-      data: { listed: attachments.length, uploaded },
+      message: `Reply attachments: ${attachments.length} listed, ${report.uploaded} uploaded to Slack.`,
+      level: report.uploaded === 0 ? 'WARN' : 'INFO',
+      data: { listed: attachments.length, uploaded: report.uploaded },
     });
+    const followUp = await postUndeliveredFollowUp({
+      slack,
+      channelId: task.event.channelId,
+      threadTs: task.event.threadTs,
+      undelivered: report.undelivered,
+      limits: DEFAULT_ATTACHMENT_LIMITS,
+      stagePrefix: 'agentic.files',
+      logStep,
+    });
+    fileOutcome = {
+      filesListed: attachments.length,
+      filesUploaded: report.uploaded,
+      ...(report.undelivered.length > 0
+        ? { filesInlined: followUp.inlined.length, filesLost: followUp.lost.length }
+        : {}),
+    };
   }
 
   return {
@@ -500,8 +518,59 @@ export async function runAgenticEntry(params: RunAgenticEntryParams): Promise<Wo
     message: result.ok ? replyText : (result.error ?? `Agentic ${mode} run failed.`),
     notifyDesktop: !result.ok,
     slackPosted,
-    ...(attachments.length > 0 ? { result: { filesListed: attachments.length, filesUploaded: uploaded } } : {}),
+    ...(fileOutcome ? { result: fileOutcome } : {}),
   };
+}
+
+/**
+ * Tell the thread which listed files never arrived, pasting the content of the
+ * ones short enough to read in a message. The reply was posted before the
+ * upload and may already say "attached" (issue #433).
+ */
+async function postUndeliveredFollowUp(params: {
+  slack: WebClient;
+  channelId: string;
+  threadTs?: string;
+  undelivered: UndeliveredAttachment[];
+  limits: AttachmentLimits;
+  stagePrefix: string;
+  logStep?: WorkflowStepLogger;
+}): Promise<{ inlined: string[]; lost: string[] }> {
+  const { slack, channelId, threadTs, undelivered, limits, stagePrefix, logStep } = params;
+  const followUp = buildUndeliveredFollowUp(undelivered, limits);
+  if (followUp.messages.length === 0) {
+    return { inlined: [], lost: [] };
+  }
+  let posted = 0;
+  try {
+    for (const text of followUp.messages) {
+      await slack.chat.postMessage({ channel: channelId, thread_ts: threadTs, text });
+      posted += 1;
+    }
+  } catch (err) {
+    logStep?.({
+      stage: `${stagePrefix}.follow_up_failed`,
+      level: 'ERROR',
+      message: `Could not tell the thread that ${undelivered.length} file(s) did not attach: ${String(err)}`,
+      data: { posted, planned: followUp.messages.length },
+    });
+    // Nothing reached the thread in full, so nothing counts as pasted.
+    return { inlined: [], lost: undelivered.map(file => file.filename) };
+  }
+  logStep?.({
+    stage: `${stagePrefix}.follow_up`,
+    level: 'WARN',
+    message:
+      `Told the thread that ${undelivered.length} file(s) did not attach: ` +
+      `${followUp.inlined.length} pasted as text, ${followUp.lost.length} not delivered.`,
+    data: {
+      inlined: followUp.inlined,
+      lost: followUp.lost,
+      reasons: undelivered.map(file => ({ filename: file.filename, reason: file.reason })),
+      messages: followUp.messages.length,
+    },
+  });
+  return { inlined: followUp.inlined, lost: followUp.lost };
 }
 
 /** Render the install+build-gate verdict for a deps/runtime-only PR as Slack mrkdwn. */
@@ -608,19 +677,29 @@ async function runWebappQa(params: RunAgenticEntryParams): Promise<WorkflowResul
     });
     const slackPosted = await postReply(reportText);
 
-    const uploaded = await uploadScreenshots({
+    const evidence = await uploadScreenshots({
       slack,
       channelId: task.event.channelId,
       threadTs: task.event.threadTs,
       screenshots,
       logStep,
     });
+    const uploaded = evidence.uploaded;
 
     logStep?.({
       stage: 'qa.evidence.summary',
       message: `QA evidence: ${screenshots.length} captured, ${uploaded} uploaded to Slack.`,
       level: screenshots.length > 0 && uploaded === 0 ? 'WARN' : 'INFO',
       data: { captured: screenshots.length, uploaded },
+    });
+    await postUndeliveredFollowUp({
+      slack,
+      channelId: task.event.channelId,
+      threadTs: task.event.threadTs,
+      undelivered: evidence.undelivered,
+      limits: QA_LIMITS,
+      stagePrefix: 'qa.evidence',
+      logStep,
     });
 
     return {
