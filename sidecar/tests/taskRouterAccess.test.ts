@@ -10,6 +10,7 @@ const runDeployWorkflow = vi.fn();
 const runAgenticEntry = vi.fn();
 const runUnknownTaskWorkflow = vi.fn();
 const classifyWorkflowIntent = vi.fn();
+const decideTool = vi.fn();
 
 vi.mock('../src/agentic/agenticPrReview.js', () => ({
   runAgenticPrReview: runAgenticPrReview,
@@ -37,6 +38,13 @@ vi.mock('../src/agentic/agenticEntry.js', () => ({
 
 vi.mock('../src/workflows/unknownTaskWorkflow.js', () => ({
   runUnknownTaskWorkflow,
+}));
+
+// The tool-router runs in shadow beside every routed mention (issue #456).
+// Stub its model call so no test can spawn the real CLI; keep the rest real.
+vi.mock('../src/router/toolRouter.js', async importOriginal => ({
+  ...(await importOriginal<typeof import('../src/router/toolRouter.js')>()),
+  decideTool,
 }));
 
 vi.mock('../src/router/classifyIntent.js', () => ({
@@ -167,6 +175,8 @@ function makeSlack() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Shadow router: by default it "fails", which must never matter to a job.
+  decideTool.mockResolvedValue({ ok: false, error: 'stubbed', durationMs: 0 });
   classifyWorkflowIntent.mockResolvedValue({
     intent: 'PR_REVIEW',
     confidence: 0.91,
@@ -788,5 +798,722 @@ describe('deterministic PR_REVIEW seed (issue #334 bug B)', () => {
     expect(result.status).toBe('SUCCESS');
     expect(classifyWorkflowIntent).not.toHaveBeenCalled();
     expect(runAgenticPrReview).toHaveBeenCalledOnce();
+  });
+});
+
+describe('routeTask and the tool registry (issue #456)', () => {
+  it('can start a workflow for exactly the intents the registry says are runnable', async () => {
+    const { ROUTED_INTENTS } = await import('../src/router/taskRouter.js');
+    const { RUNNABLE_INTENTS } = await import('../src/router/toolRegistry.js');
+    expect([...ROUTED_INTENTS].sort()).toEqual([...RUNNABLE_INTENTS].sort());
+  });
+});
+
+describe('routeTask runs the tool-router in shadow (issue #456)', () => {
+  const settle = () => new Promise(resolve => setTimeout(resolve, 0));
+  const shadowLog = (logStep: ReturnType<typeof vi.fn>) =>
+    logStep.mock.calls.map(call => call[0]).find(entry => entry.stage === 'router.shadow');
+
+  async function route(text: string, store: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) {
+    const logStep = vi.fn();
+    const result = await routeTask({
+      task: makeTask({ userId: 'UOWNER1', channelId: 'C-VIEW', text, ...extra }),
+      config: makeConfig('audit'),
+      slack: makeSlack() as never,
+      store: store as never,
+      logStep,
+    });
+    await settle();
+    return { result, logStep };
+  }
+
+  it('asks the router beside the classifier and logs whether they agree, without changing what runs', async () => {
+    classifyWorkflowIntent.mockResolvedValue({ intent: 'INFORMATIONAL', confidence: 0.9, reasoning: 'a question' });
+    decideTool.mockResolvedValue({
+      ok: true,
+      decision: { tool: 'answer', confidence: 0.93, reason: 'a question about the code' },
+      durationMs: 812,
+    });
+
+    const { result, logStep } = await route('<@UBOT1> how does the login redirect work?');
+
+    expect(result.workflow).toBe('INFORMATIONAL');
+    expect(decideTool).toHaveBeenCalledTimes(1);
+    expect(decideTool.mock.calls[0][0]).toMatchObject({
+      role: 'router_shadow',
+      facts: { message: 'how does the login redirect work?', addressing: 'direct', hints: [] },
+    });
+    // No onLog: the shadow call must not move the Slack status line.
+    expect(decideTool.mock.calls[0][0].logStep).toBeUndefined();
+    expect(shadowLog(logStep).data).toMatchObject({
+      agree: true,
+      legacyIntent: 'INFORMATIONAL',
+      legacyDecidedBy: 'classifier',
+      routerWouldRun: 'INFORMATIONAL',
+      tool: 'answer',
+      confidence: 0.93,
+      durationMs: 812,
+    });
+  });
+
+  it('records a disagreement and still runs what the legacy path chose', async () => {
+    classifyWorkflowIntent.mockResolvedValue({ intent: 'INFORMATIONAL', confidence: 0.9, reasoning: 'q' });
+    decideTool.mockResolvedValue({
+      ok: true,
+      decision: { tool: 'ask_user', confidence: 0.8, reason: 'nothing to act on', question: 'What should I look at?' },
+      durationMs: 5,
+    });
+
+    const { result, logStep } = await route('<@UBOT1> check now');
+
+    expect(result.workflow).toBe('INFORMATIONAL');
+    expect(runAgenticEntry).toHaveBeenCalledTimes(1);
+    expect(shadowLog(logStep).data).toMatchObject({
+      agree: false,
+      routerWouldRun: 'ASK_USER',
+      routerAsClassifier: 'INFORMATIONAL',
+      question: 'What should I look at?',
+    });
+  });
+
+  it('shadows a message the keyword gate decided, and says a gate decided it', async () => {
+    decideTool.mockResolvedValue({
+      ok: true,
+      decision: { tool: 'answer', confidence: 0.9, reason: 'a question about a merged PR' },
+      durationMs: 5,
+    });
+
+    const { result, logStep } = await route('<@UBOT1> is this merged?', {}, { intent: 'PR_REVIEW' });
+
+    expect(result.workflow).toBe('PR_REVIEW');
+    expect(classifyWorkflowIntent).not.toHaveBeenCalled();
+    expect(decideTool.mock.calls[0][0].facts.hints).toEqual(['review gate matched']);
+    expect(shadowLog(logStep).data).toMatchObject({
+      agree: false,
+      legacyIntent: 'PR_REVIEW',
+      legacyDecidedBy: 'gate',
+      routerWouldRun: 'INFORMATIONAL',
+    });
+  });
+
+  it('is unaffected when the router fails or throws', async () => {
+    classifyWorkflowIntent.mockResolvedValue({ intent: 'INFORMATIONAL', confidence: 0.9, reasoning: 'q' });
+    decideTool.mockRejectedValue(new Error('spawn failed'));
+
+    const { result, logStep } = await route('<@UBOT1> how does the login redirect work?');
+
+    expect(result.status).toBe('SUCCESS');
+    expect(shadowLog(logStep).data).toMatchObject({ agree: false, routerWouldRun: 'FAILED' });
+    // A shadow call decides nothing, so a failed one is not worth a second.
+    expect(decideTool).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not run in legacy mode', async () => {
+    const store = { getState: (key: string) => (key === 'tool_router_mode' ? 'legacy' : undefined) };
+    const { logStep } = await route('<@UBOT1> how does the login redirect work?', store);
+
+    expect(decideTool).not.toHaveBeenCalled();
+    expect(shadowLog(logStep)).toBeUndefined();
+  });
+
+  it('skips exact-syntax commands, which leave nothing to decide', async () => {
+    await route('<@UBOT1> wt status', {}, { intent: 'DEV_ASSIST' });
+    expect(decideTool).not.toHaveBeenCalled();
+  });
+});
+
+describe('routeTask lets the tool-router decide when it is on (issue #456)', () => {
+  const settle = () => new Promise(resolve => setTimeout(resolve, 0));
+  const stageLog = (logStep: ReturnType<typeof vi.fn>, stage: string) =>
+    logStep.mock.calls.map(call => call[0]).find(entry => entry.stage === stage);
+  const routerSays = (tool: string, confidence = 0.9, extra: Record<string, unknown> = {}) =>
+    decideTool.mockResolvedValue({
+      ok: true,
+      decision: { tool, confidence, reason: `router picked ${tool}`, ...extra },
+      durationMs: 7,
+    });
+
+  function onStore(extra: Record<string, unknown> = {}) {
+    return { getState: (key: string) => (key === 'tool_router_mode' ? 'on' : undefined), ...extra };
+  }
+
+  async function route(
+    text: string,
+    task: Record<string, unknown> = {},
+    options: { store?: Record<string, unknown>; config?: AppConfig; log?: boolean; signal?: AbortSignal } = {},
+  ) {
+    const logStep = vi.fn();
+    const slack = makeSlack();
+    const {
+      mentionType = 'bot',
+      mentionReference,
+      clarification,
+      ...input
+    } = task as {
+      mentionType?: 'bot' | 'owner';
+      mentionReference?: boolean;
+      clarification?: NormalizedTask['clarification'];
+    };
+    const result = await routeTask({
+      task: {
+        ...makeTask({ userId: 'UOWNER1', channelId: 'C-VIEW', text, ...input }),
+        mentionType,
+        ...(mentionReference ? { mentionReference } : {}),
+        ...(clarification ? { clarification } : {}),
+      },
+      config: options.config ?? makeConfig('audit'),
+      slack: slack as never,
+      store: (options.store ?? onStore()) as never,
+      signal: options.signal,
+      ...(options.log === false ? {} : { logStep }),
+    });
+    await settle();
+    return { result, logStep, slack };
+  }
+
+  it('uses the router where the classifier was, with one call and no classifier call', async () => {
+    routerSays('answer', 0.93);
+
+    const { result, logStep } = await route('<@UBOT1> how does the login redirect work?');
+
+    expect(result.workflow).toBe('INFORMATIONAL');
+    expect(classifyWorkflowIntent).not.toHaveBeenCalled();
+    expect(decideTool).toHaveBeenCalledTimes(1);
+    // The deciding call is the job's own: costed as the router and logged like the classifier's was.
+    expect(decideTool.mock.calls[0][0]).toMatchObject({ role: 'router', logStep });
+    expect(stageLog(logStep, 'router.shadow')).toBeUndefined();
+    expect(stageLog(logStep, 'router.decision')).toMatchObject({
+      message: 'Router chose answer; running INFORMATIONAL.',
+      data: { mode: 'on', legacyDecidedBy: 'router', tool: 'answer', confidence: 0.93, agree: true },
+    });
+  });
+
+  it.each([
+    ['review_pr', 'PR_REVIEW', runAgenticPrReview],
+    ['change_code', 'IMPLEMENTATION', runImplementationWorkflow],
+    ['investigate', 'INVESTIGATION', runInvestigationWorkflow],
+    ['chat', 'CONVERSATIONAL', runAgenticEntry],
+  ] as const)('runs what the classifier could have returned for %s', async (tool, workflow, runner) => {
+    routerSays(tool);
+
+    const { result } = await route('<@UBOT1> the export job fails with a 500 on /api/export, fix it');
+
+    expect(result.workflow).toBe(workflow);
+    expect(runner).toHaveBeenCalledOnce();
+  });
+
+  it.each(['unsupported', 'qa_webapp'])(
+    'cannot start anything new: %s on a direct mention is a lookup, as an invalid classification was',
+    async tool => {
+      routerSays(tool, 0.95);
+
+      const { result, logStep } = await route('<@UBOT1> ship it to production now');
+
+      expect(result.workflow).toBe('INFORMATIONAL');
+      expect(runDeployWorkflow).not.toHaveBeenCalled();
+      expect(runImplementationWorkflow).not.toHaveBeenCalled();
+      // The row says what the router wanted, so the difference stays visible.
+      expect(stageLog(logStep, 'router.decision').data).toMatchObject({ tool, agree: false });
+    },
+  );
+
+  const routerFails = { ok: false, error: 'router call failed (exit 1)', durationMs: 3 };
+
+  it('tries once more when the router call fails, and acts on the second answer (issue #440)', async () => {
+    routerSays('change_code');
+    decideTool.mockResolvedValueOnce(routerFails);
+
+    const { result, logStep, slack } = await route('<@UBOT1> replace "See how" with "Apply Now" on the DS page', {
+      intent: 'IMPLEMENTATION',
+    });
+
+    expect(decideTool).toHaveBeenCalledTimes(2);
+    expect(result.workflow).toBe('IMPLEMENTATION');
+    expect(runImplementationWorkflow).toHaveBeenCalledOnce();
+    expect(stageLog(logStep, 'router.decision.retry')).toMatchObject({
+      level: 'WARN',
+      data: { error: 'router call failed (exit 1)' },
+    });
+    expect(slack.chat.postMessage).not.toHaveBeenCalled();
+  });
+
+  it('says it could not read the message when the router fails twice, and runs nothing (issue #440)', async () => {
+    const { ROUTER_FAILED_REPLY } = await import('../src/router/taskRouter.js');
+    decideTool.mockResolvedValue(routerFails);
+
+    const { result, logStep, slack } = await route('<@UBOT1> replace "See how" with "Apply Now" on the DS page', {
+      intent: 'IMPLEMENTATION',
+    });
+
+    expect(decideTool).toHaveBeenCalledTimes(2);
+    // Not a lookup that describes the change without making it, and not the keyword seed either.
+    expect(runAgenticEntry).not.toHaveBeenCalled();
+    expect(runImplementationWorkflow).not.toHaveBeenCalled();
+    expect(slack.chat.postMessage).toHaveBeenCalledExactlyOnceWith({
+      channel: 'C-VIEW',
+      thread_ts: '111.22',
+      text: ROUTER_FAILED_REPLY,
+    });
+    expect(result).toMatchObject({ workflow: 'UNKNOWN', status: 'FAILED', slackPosted: true });
+    expect(stageLog(logStep, 'router.decision.failed')).toMatchObject({ level: 'ERROR' });
+    expect(stageLog(logStep, 'router.decision').message).toBe(
+      'Router chose nothing (the call failed); running INFORMATIONAL.',
+    );
+  });
+
+  it('gives a requester who would be denied the denial, not the could-not-read reply', async () => {
+    decideTool.mockResolvedValue(routerFails);
+
+    const { result, slack } = await route(
+      '<@UBOT1> how does login work?',
+      { userId: 'USTRANGER', channelId: 'C-VIEW' },
+      { config: makeConfig('enforce') },
+    );
+
+    expect(result.status).toBe('SKIPPED');
+    expect(slack.chat.postMessage).toHaveBeenCalledOnce();
+    expect(slack.chat.postMessage.mock.calls[0][0].text).not.toContain("couldn't work out");
+  });
+
+  it('neither retries nor replies once the job is cancelled', async () => {
+    decideTool.mockResolvedValue(routerFails);
+    const controller = new AbortController();
+    controller.abort();
+
+    const { result, slack } = await route('<@UBOT1> fix the login redirect', {}, { signal: controller.signal });
+
+    expect(decideTool).toHaveBeenCalledTimes(1);
+    expect(slack.chat.postMessage).not.toHaveBeenCalled();
+    expect(result.status).toBe('FAILED');
+  });
+
+  it('stays silent on an owner mention when the router fails, throws, or says stay_silent', async () => {
+    const ownerMention = { mentionType: 'owner' as const, userId: 'UVIEWER' };
+
+    decideTool.mockRejectedValue(new Error('spawn failed'));
+    const thrown = await route('<@UOWNER1> fyi the release went out', ownerMention);
+    expect(thrown.result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
+    expect(stageLog(thrown.logStep, 'router.silent').message).toContain('Router returned NONE');
+    // Two tries, then silence: a failure never makes miniOG speak into people's conversation.
+    expect(decideTool).toHaveBeenCalledTimes(2);
+    expect(thrown.slack.chat.postMessage).not.toHaveBeenCalled();
+
+    routerSays('stay_silent');
+    const silent = await route('<@UOWNER1> fyi the release went out', ownerMention);
+    expect(silent.result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
+
+    // Nothing the classifier could not say reaches a workflow on an owner mention either.
+    routerSays('deploy');
+    const deploy = await route('<@UOWNER1> deploy went fine', ownerMention);
+    expect(deploy.result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
+    expect(runAgenticEntry).not.toHaveBeenCalled();
+    expect(runDeployWorkflow).not.toHaveBeenCalled();
+  });
+
+  describe('asking instead of guessing (issue #431)', () => {
+    const builder = { userId: 'UBUILDER', channelId: 'C-BUILD', intent: 'IMPLEMENTATION' as const };
+    const enforce = () => ({ config: makeConfig('enforce') });
+    const nothingRan = () => {
+      expect(runImplementationWorkflow).not.toHaveBeenCalled();
+      expect(runAgenticEntry).not.toHaveBeenCalled();
+      expect(runAgenticPrReview).not.toHaveBeenCalled();
+      expect(runInvestigationWorkflow).not.toHaveBeenCalled();
+    };
+
+    it("asks the router's question and parks the job when the message has nothing to act on", async () => {
+      routerSays('ask_user', 0.85, { question: 'What should I check?' });
+
+      const { result, logStep, slack } = await route('<@UBOT1> check now', builder, enforce());
+
+      nothingRan();
+      expect(slack.chat.postMessage).toHaveBeenCalledExactlyOnceWith({
+        channel: 'C-BUILD',
+        thread_ts: '111.22',
+        text: '<@UBUILDER> What should I check?',
+      });
+      expect(result).toMatchObject({ status: 'PAUSED', workflow: 'UNKNOWN', slackPosted: true });
+      expect(stageLog(logStep, 'router.clarify.asked').data).toMatchObject({
+        question: 'What should I check?',
+        requesterId: 'UBUILDER',
+        askedText: 'check now',
+        reason: 'router_asked',
+      });
+      expect(stageLog(logStep, 'router.decision')).toMatchObject({
+        message: 'Router chose ask_user; asking the requester.',
+        data: { tool: 'ask_user', agree: true },
+      });
+    });
+
+    it('asks instead of keeping the keyword seed when the confidence floor would have held it', async () => {
+      // "cc:" used to stay IMPLEMENTATION here and page the admins with "which repo?".
+      routerSays('chat', 0.6);
+
+      const { result, logStep, slack } = await route('<@UBOT1> cc:', builder, enforce());
+
+      nothingRan();
+      expect(result.status).toBe('PAUSED');
+      expect(slack.chat.postMessage.mock.calls[0][0].text).toContain('<@UBUILDER> ');
+      expect(stageLog(logStep, 'router.clarify.decided').data).toMatchObject({ action: 'ask', tool: 'chat' });
+      // The router wanted to chat; asking is policy's doing, and the row says they differ.
+      expect(stageLog(logStep, 'router.decision').data).toMatchObject({ tool: 'chat', agree: false });
+      expect(stageLog(logStep, 'router.classify.low_confidence_hold')).toBeUndefined();
+    });
+
+    it('asks before starting the change pipeline on a low-confidence change_code', async () => {
+      routerSays('change_code', 0.62);
+
+      const { result } = await route('<@UBOT1> change the highlighted text', builder, enforce());
+
+      nothingRan();
+      expect(result.status).toBe('PAUSED');
+    });
+
+    it('asks rather than obeying a model that wants to ignore a direct mention', async () => {
+      routerSays('stay_silent', 0.9);
+
+      const { result, slack } = await route('<@UBOT1> no deployment', builder, enforce());
+
+      nothingRan();
+      expect(result.status).toBe('PAUSED');
+      expect(slack.chat.postMessage).toHaveBeenCalledOnce();
+    });
+
+    it('routes a clear reply to the question as a normal request, with the question in the facts', async () => {
+      routerSays('change_code', 0.9);
+      const clarification = { question: 'What should I check?', askedText: 'check now' };
+
+      const { result } = await route('the login redirect is broken, fix it', { ...builder, clarification }, enforce());
+
+      expect(result.workflow).toBe('IMPLEMENTATION');
+      expect(decideTool.mock.calls[0][0].facts.answering).toEqual(clarification);
+    });
+
+    it('does not ask twice: an unclear reply to the question gets one closing line', async () => {
+      routerSays('ask_user', 0.8, { question: 'Which redirect?' });
+      const clarification = { question: 'What should I check?', askedText: 'check now' };
+
+      const { result, slack, logStep } = await route('that one', { ...builder, clarification }, enforce());
+
+      nothingRan();
+      expect(result.status).toBe('SKIPPED');
+      expect(slack.chat.postMessage.mock.calls[0][0].text).toContain("I still can't tell what you need");
+      expect(stageLog(logStep, 'router.clarify.asked')).toBeUndefined();
+    });
+
+    it('stays silent when the reply to the question drops it', async () => {
+      routerSays('stay_silent', 0.9);
+      const clarification = { question: 'What should I check?', askedText: 'check now' };
+
+      const { result, slack } = await route('never mind', { ...builder, clarification }, enforce());
+
+      nothingRan();
+      expect(result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
+      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+    });
+
+    it('never answers an owner mention with a question', async () => {
+      routerSays('ask_user', 0.8, { question: 'Review what?' });
+
+      const { result, slack } = await route('<@UOWNER1> can anyone review this', {
+        mentionType: 'owner' as const,
+        userId: 'UVIEWER',
+      });
+
+      expect(result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
+      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+    });
+
+    it('gives a requester who would be denied the denial, not a question', async () => {
+      routerSays('ask_user', 0.8, { question: 'What do you need?' });
+
+      const { result, slack } = await route(
+        '<@UBOT1> check now',
+        { userId: 'USTRANGER', channelId: 'C-VIEW' },
+        enforce(),
+      );
+
+      expect(result.status).toBe('SKIPPED');
+      expect(slack.chat.postMessage).toHaveBeenCalledOnce();
+      expect(slack.chat.postMessage.mock.calls[0][0].text).not.toContain('What do you need?');
+    });
+
+    it('asks nothing once the job is cancelled', async () => {
+      routerSays('ask_user', 0.8, { question: 'What do you need?' });
+      const controller = new AbortController();
+      controller.abort();
+
+      const { result, slack } = await route('<@UBOT1> check now', builder, { ...enforce(), signal: controller.signal });
+
+      expect(result.status).toBe('CANCELLED');
+      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+    });
+
+    it('leaves a question unparked when another job is already parked in the thread', async () => {
+      routerSays('ask_user', 0.8, { question: 'What do you need?' });
+      const store = onStore({ pausedJobForThread: () => ({ id: 'job-plan', workflow: 'IMPLEMENTATION' }) });
+
+      const { result } = await route('<@UBOT1> no', builder, { ...enforce(), store });
+
+      expect(result.status).toBe('SKIPPED');
+    });
+  });
+
+  describe('a mention made in passing (issue #448)', () => {
+    const inPassing = {
+      mentionReference: true,
+      userId: 'UBUILDER',
+      channelId: 'C-BUILD',
+      intent: 'IMPLEMENTATION' as const,
+    };
+    const text = "<@UOWNER1> - I've resolved <@UBOT1>'s comments can u pls take a look on priority?";
+
+    it('may be met with silence: nothing runs and nothing is posted', async () => {
+      routerSays('stay_silent', 0.9);
+
+      const { result, slack } = await route(text, inPassing, { config: makeConfig('enforce') });
+
+      expect(result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
+      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+      expect(runAgenticPrReview).not.toHaveBeenCalled();
+      expect(decideTool.mock.calls[0][0].facts.addressing).toBe('reference');
+    });
+
+    it('still gets what it asks for when it does ask miniOG for something', async () => {
+      routerSays('answer', 0.9);
+
+      const { result } = await route('<@U999> not sure — <@UBOT1> which service sends this email?', inPassing, {
+        config: makeConfig('enforce'),
+      });
+
+      expect(result.workflow).toBe('INFORMATIONAL');
+    });
+
+    it('is not asked a question, and not told the router failed', async () => {
+      routerSays('ask_user', 0.8, { question: 'What do you need?' });
+      const asked = await route('cc: <@UBOT1>', inPassing, { config: makeConfig('enforce') });
+      expect(asked.result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
+      expect(asked.slack.chat.postMessage).not.toHaveBeenCalled();
+
+      decideTool.mockResolvedValue({ ok: false, error: 'router call failed (exit 1)', durationMs: 3 });
+      const failed = await route('cc: <@UBOT1>', inPassing, { config: makeConfig('enforce') });
+      expect(failed.result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
+      expect(failed.slack.chat.postMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  it('leaves the keyword gates deciding: a gate-seeded review runs and the router is only shadowed', async () => {
+    routerSays('answer');
+
+    const { result, logStep } = await route('<@UBOT1> is this merged?', { intent: 'PR_REVIEW' });
+
+    expect(result.workflow).toBe('PR_REVIEW');
+    expect(runAgenticPrReview).toHaveBeenCalledOnce();
+    expect(stageLog(logStep, 'router.decision')).toBeUndefined();
+    expect(stageLog(logStep, 'router.shadow').data).toMatchObject({
+      mode: 'on',
+      legacyDecidedBy: 'gate',
+      routerWouldRun: 'INFORMATIONAL',
+      agree: false,
+    });
+  });
+
+  describe('a message that tags the owner (issue #430)', () => {
+    const tagger = {
+      mentionType: 'owner' as const,
+      userId: 'UBUILDER',
+      channelId: 'C-BUILD',
+      intent: 'UNKNOWN' as const,
+    };
+    const CHANGE = '<@UOWNER1> we need to remove the disclaimer from the S-VYASA landing page, on priority';
+
+    it('asks the tagger before starting a change, and parks on the answer', async () => {
+      routerSays('change_code', 0.92);
+
+      const { result, slack } = await route(CHANGE, tagger, { config: makeConfig('enforce') });
+
+      expect(runImplementationWorkflow).not.toHaveBeenCalled();
+      expect(slack.chat.postMessage).toHaveBeenCalledOnce();
+      expect(slack.chat.postMessage.mock.calls[0][0].text).toContain('<@UBUILDER> Want me to pick this up');
+      expect(result.status).toBe('PAUSED');
+    });
+
+    it('starts the change once the tagger says yes', async () => {
+      routerSays('change_code', 0.9);
+      const clarification = { question: 'Want me to pick this up and make the change?', askedText: CHANGE };
+
+      // The reply resumes as a message to miniOG, checked against the tagger's own access.
+      const { result } = await route(
+        'yes',
+        { userId: 'UBUILDER', channelId: 'C-BUILD', intent: 'IMPLEMENTATION', clarification },
+        { config: makeConfig('enforce') },
+      );
+
+      expect(result.workflow).toBe('IMPLEMENTATION');
+      expect(runImplementationWorkflow).toHaveBeenCalledOnce();
+    });
+
+    it('does not ask someone who could not say yes: the access check comes first, at the change tier', async () => {
+      routerSays('change_code', 0.92);
+
+      const { result, slack } = await route(
+        CHANGE,
+        { ...tagger, userId: 'UVIEWER', channelId: 'C-VIEW' },
+        { config: makeConfig('enforce') },
+      );
+
+      expect(result.status).toBe('SKIPPED');
+      expect(runImplementationWorkflow).not.toHaveBeenCalled();
+      expect(slack.chat.postMessage.mock.calls.some(call => String(call[0].text).includes('Want me to pick'))).toBe(
+        false,
+      );
+    });
+
+    it('runs a review the gate seeded without waiting on the router', async () => {
+      decideTool.mockResolvedValue({ ok: false, error: 'router call failed (exit 1)', durationMs: 3 });
+
+      const { result } = await route(
+        '<@UOWNER1> please review https://github.com/Newton-School/newton-web/pull/9210',
+        { mentionType: 'owner' as const, userId: 'UREVIEW', channelId: 'C-REVIEW', intent: 'PR_REVIEW' },
+        { config: makeConfig('enforce') },
+      );
+
+      // The model was down for this one, which is the case #430 lost twice.
+      expect(result.workflow).toBe('PR_REVIEW');
+      expect(runAgenticPrReview).toHaveBeenCalledOnce();
+      expect(classifyWorkflowIntent).not.toHaveBeenCalled();
+    });
+
+    it('still reviews a PR posted with only its title, by the router', async () => {
+      routerSays('review_pr', 0.8);
+
+      const { result } = await route(
+        '<@UOWNER1> NS-14362: Map playlists to company https://github.com/Newton-School/newton-web/pull/9318',
+        { ...tagger, userId: 'UREVIEW', channelId: 'C-REVIEW' },
+        { config: makeConfig('enforce') },
+      );
+
+      expect(result.workflow).toBe('PR_REVIEW');
+      expect(runImplementationWorkflow).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('a production deploy (issue #428)', () => {
+    const DEPLOY_ASK = '<@UBOT1> deploy newton-web to production';
+    const NEAR_MISS =
+      '<@UBOT1> could you review these two please? • newton-web <https://github.com/Newton-School/newton-web/pull/9276|#9276> *Deploy order:* #9276 → web';
+
+    it('starts when the router says deploy, the message is addressed to miniOG and code finds the target', async () => {
+      routerSays('deploy', 0.95);
+
+      const { result } = await route(DEPLOY_ASK);
+
+      expect(result.workflow).toBe('DEPLOY');
+      expect(runDeployWorkflow).toHaveBeenCalledOnce();
+      expect(decideTool.mock.calls[0][0].facts).toMatchObject({ deployTarget: 'newton-web' });
+    });
+
+    it('is not started by keywords: the message that nearly deployed is reviewed', async () => {
+      routerSays('review_pr', 0.95);
+
+      const { result } = await route(NEAR_MISS);
+
+      expect(result.workflow).toBe('PR_REVIEW');
+      expect(runDeployWorkflow).not.toHaveBeenCalled();
+    });
+
+    it('is not started on the model alone: the message that nearly deployed gets a reply on how to ask', async () => {
+      // Even if the model misread it as a deploy, code finds no deploy ask leading the message.
+      routerSays('deploy', 0.95);
+
+      const { result, slack } = await route(NEAR_MISS);
+
+      expect(runDeployWorkflow).not.toHaveBeenCalled();
+      expect(result.status).toBe('SKIPPED');
+      expect(slack.chat.postMessage.mock.calls[0][0].text).toContain('say which app in one message');
+    });
+
+    it.each([
+      ['an owner mention', { mentionType: 'owner' as const, userId: 'UADMIN', channelId: 'C-ADMIN' }],
+      ['a mention in passing', { mentionReference: true, userId: 'UADMIN', channelId: 'C-ADMIN' }],
+    ])('is never started for %s, whatever the model says', async (_name, task) => {
+      routerSays('deploy', 0.99);
+
+      const { result, slack } = await route('<@UOWNER1> deploy newton-web to production cc <@UBOT1>', task);
+
+      expect(runDeployWorkflow).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
+      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+    });
+
+    it('is never started from a reply to a question miniOG asked', async () => {
+      routerSays('deploy', 0.99);
+      const clarification = { question: 'What do you need?', askedText: 'ship it' };
+
+      const { result } = await route('deploy newton-web to production', { clarification });
+
+      expect(runDeployWorkflow).not.toHaveBeenCalled();
+      expect(result.status).toBe('SKIPPED');
+    });
+
+    it('still needs the admin tier', async () => {
+      routerSays('deploy', 0.95);
+
+      const { result } = await route(
+        DEPLOY_ASK,
+        { userId: 'UBUILDER', channelId: 'C-BUILD', intent: 'IMPLEMENTATION' },
+        { config: makeConfig('enforce') },
+      );
+
+      expect(runDeployWorkflow).not.toHaveBeenCalled();
+      expect(result.status).toBe('SKIPPED');
+    });
+  });
+
+  it('leaves a gate-seeded deploy with the deploy gate', async () => {
+    routerSays('answer');
+
+    const { result } = await route('<@UBOT1> deploy newton-web to production', { intent: 'DEPLOY' });
+
+    expect(result.workflow).toBe('DEPLOY');
+    expect(runDeployWorkflow).toHaveBeenCalledOnce();
+  });
+
+  it('leaves the "yes, fix it" resume gate ahead of the router', async () => {
+    routerSays('chat', 0.99);
+    const store = onStore({
+      investigationStore: () => ({ getForThread: () => ({ summary: 'prior RCA', repoName: 'newton-web' }) }),
+    });
+
+    const { result, logStep } = await route(
+      '<@UBOT1> yes, fix it',
+      { userId: 'UBUILDER', channelId: 'C-BUILD', intent: 'IMPLEMENTATION' },
+      { store, config: makeConfig('enforce') },
+    );
+
+    expect(result.workflow).toBe('IMPLEMENTATION');
+    expect(runImplementationWorkflow).toHaveBeenCalledOnce();
+    expect(stageLog(logStep, 'router.shadow').data).toMatchObject({ legacyDecidedBy: 'resume_gate' });
+  });
+
+  it('decides without a logger', async () => {
+    routerSays('investigate');
+
+    const { result } = await route('<@UBOT1> the dashboard looks off since morning', {}, { log: false });
+
+    expect(result.workflow).toBe('INVESTIGATION');
+    expect(classifyWorkflowIntent).not.toHaveBeenCalled();
+  });
+
+  it('applies the access tiers to what the router chose', async () => {
+    routerSays('change_code');
+
+    const { result } = await route(
+      '<@UBOT1> fix the login redirect in auth.ts',
+      { userId: 'UVIEWER', channelId: 'C-VIEW', intent: 'INFORMATIONAL' },
+      { config: makeConfig('enforce') },
+    );
+
+    expect(result.status).toBe('SKIPPED');
+    expect(runImplementationWorkflow).not.toHaveBeenCalled();
   });
 });

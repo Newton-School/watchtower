@@ -25,6 +25,7 @@ import { createInvestigationStore, type InvestigationStore } from './investigati
 import { createDossierStore, type DossierStore } from './dossierStore.js';
 import { createConversationStore, type ConversationStore } from './conversationStore.js';
 import { createExportLog, type ExportLog } from '../egress/exportLog.js';
+import { ROUTE_CLARIFY_STAGE, parsePendingRouteQuestion, type PendingRouteQuestion } from '../router/routeClarify.js';
 
 function normalizeStoredPersonalityMode(mode: unknown): PersonalityMode {
   return mode === 'terse' || mode === 'technical' || mode === 'casual' ? mode : 'normal';
@@ -1118,9 +1119,10 @@ export class JobStore {
   /**
    * Find the job (if any) currently RUNNING or PAUSED for a given Slack
    * message ts. Used by the `message_deleted` handler to cancel jobs whose
-   * source message the author just removed. Unlike `activeJobForThread`,
-   * this matches the underlying message identity (`payload_json.eventTs`)
-   * rather than the thread root — so it catches the case where the deleted
+   * source message the author just removed. Unlike the same-thread lock
+   * (`activeJobIdForThread` in state/activeJobs.ts), this matches the
+   * underlying message identity (`payload_json.eventTs`) rather than the
+   * thread root — so it catches the case where the deleted
    * message was a top-level mention that owns its own thread.
    */
   activeJobForEventTs(
@@ -1415,8 +1417,8 @@ export class JobStore {
 
   /**
    * Find a PAUSED job in this thread that should be resumed by the next
-   * @miniOG mention. Uses a wider stale window than activeJobForThread
-   * (24h vs 45min) since paused jobs can sit overnight waiting for the user.
+   * @miniOG mention. The stale window is 24h since paused jobs can sit
+   * overnight waiting for the user.
    */
   pausedJobForThread(
     channelId: string,
@@ -1528,6 +1530,51 @@ export class JobStore {
   }
 
   /**
+   * The question a job parked itself on (issue #431): the requester's next
+   * reply in the thread is its answer. Read from the stage the router logged
+   * before pausing, like the other pause causes above.
+   */
+  pausedRouteQuestion(jobId: string): PendingRouteQuestion | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT data_json
+         FROM job_logs
+         WHERE job_id = ? AND stage = '${ROUTE_CLARIFY_STAGE}'
+         ORDER BY id DESC
+         LIMIT 1`,
+      )
+      .get(jobId) as { data_json?: string | null } | undefined;
+    if (!row?.data_json) return undefined;
+    try {
+      return parsePendingRouteQuestion(JSON.parse(row.data_json));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Every job still parked on a question, for the sweeper that expires them. */
+  pausedRouteQuestions(): Array<{ id: string; pending: PendingRouteQuestion }> {
+    const rows = this.db
+      .prepare(
+        `SELECT j.id AS id, l.data_json AS data_json
+         FROM jobs j
+         JOIN job_logs l ON l.job_id = j.id AND l.stage = '${ROUTE_CLARIFY_STAGE}'
+         WHERE j.status = 'PAUSED'`,
+      )
+      .all() as Array<{ id: string; data_json?: string | null }>;
+    const parked: Array<{ id: string; pending: PendingRouteQuestion }> = [];
+    for (const row of rows) {
+      try {
+        const pending = parsePendingRouteQuestion(JSON.parse(row.data_json ?? 'null'));
+        if (pending) parked.push({ id: row.id, pending });
+      } catch {
+        // an unreadable row is not a pending question
+      }
+    }
+    return parked;
+  }
+
+  /**
    * Read a paused job's resume context from result_json. Returns undefined if
    * the job has no result, or if the stored payload doesn't match the
    * ResumeContext schema (caller should treat as a corrupt resume and fail
@@ -1560,46 +1607,6 @@ export class JobStore {
          WHERE id = ? AND status = 'PAUSED'`,
       )
       .run(new Date().toISOString(), jobId);
-  }
-
-  /**
-   * Find the currently-RUNNING job in a thread (if any) — the one that's
-   * actively holding a worker slot. PAUSED jobs are intentionally NOT
-   * considered active here: they've released their slot and a new @miniOG
-   * mention should start a fresh job (a later PR can wire up "resume the
-   * paused job in place" using the persisted resumeContext; today the
-   * resumeContext is forward-compat groundwork + the sweeper's input).
-   */
-  activeJobForThread(
-    channelId: string,
-    threadTs: string,
-    staleMinutes = 45,
-  ): { id: string; workflow: WorkflowIntent; status: JobRecord['status']; updatedAt: string } | undefined {
-    const row = this.db
-      .prepare(
-        `SELECT id, workflow, status, updated_at
-         FROM jobs
-         WHERE channel_id = ?
-           AND thread_ts = ?
-           AND status = 'RUNNING'
-           AND updated_at > datetime('now', '-' || ? || ' minutes')
-         ORDER BY updated_at DESC
-         LIMIT 1`,
-      )
-      .get(channelId, threadTs, staleMinutes) as
-      | { id?: string; workflow?: WorkflowIntent; status?: JobRecord['status']; updated_at?: string }
-      | undefined;
-
-    if (!row?.id || !row?.workflow || !row?.status || !row?.updated_at) {
-      return undefined;
-    }
-
-    return {
-      id: row.id,
-      workflow: row.workflow,
-      status: row.status,
-      updatedAt: row.updated_at,
-    };
   }
 
   hasDedupeKey(dedupeKey: string): boolean {
@@ -1673,6 +1680,42 @@ export class JobStore {
    * Their processes are gone (sidecar restarted) but SQLite still has them as RUNNING.
    * Returns the number of orphaned jobs cleaned up.
    */
+  /**
+   * RUNNING jobs with the stage of their newest log entry. Read at startup,
+   * before cleanupOrphanedRunningJobs fails them, to find the ones that were
+   * waiting on a person so their thread can be told (issue #436).
+   */
+  listRunningJobsWithLastStage(): Array<{
+    id: string;
+    channelId: string;
+    threadTs: string;
+    requestedBy?: string;
+    lastStage?: string;
+  }> {
+    const rows = this.db
+      .prepare(
+        `SELECT j.id, j.channel_id, j.thread_ts,
+                json_extract(j.payload_json, '$.requestUserId') AS requested_by,
+                (SELECT l.stage FROM job_logs l WHERE l.job_id = j.id ORDER BY l.created_at DESC, l.id DESC LIMIT 1) AS last_stage
+         FROM jobs j
+         WHERE j.status = 'RUNNING'`,
+      )
+      .all() as Array<{
+      id: string;
+      channel_id: string;
+      thread_ts: string;
+      requested_by: string | null;
+      last_stage: string | null;
+    }>;
+    return rows.map(row => ({
+      id: row.id,
+      channelId: row.channel_id,
+      threadTs: row.thread_ts,
+      requestedBy: row.requested_by ?? undefined,
+      lastStage: row.last_stage ?? undefined,
+    }));
+  }
+
   cleanupOrphanedRunningJobs(): number {
     const now = new Date().toISOString();
     const result = this.db

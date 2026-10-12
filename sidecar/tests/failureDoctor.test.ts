@@ -152,4 +152,93 @@ describe('failureDoctor', () => {
     expect(diagnosis?.errorKind).toBe('USAGE_LIMIT');
     expect(diagnosis?.actions.join(' ')).toContain('resume');
   });
+
+  it('does not diagnose a cancelled run, even though its logs mention a timeout (issue #438)', () => {
+    const logs = [
+      {
+        stage: 'pipeline.start',
+        message: 'Pipeline started.',
+        level: 'INFO' as const,
+        data: { totalTimeoutMs: 2700000 },
+      },
+      { stage: 'agent.cancelled', message: 'Agent run cancelled.', level: 'WARN' as const },
+    ];
+
+    expect(
+      diagnoseFailure({ workflow: 'IMPLEMENTATION', message: 'Investigator produced no usable output.', logs }),
+    ).toBeUndefined();
+    // The same logs without the cancel are what produced the wrong "timeout" diagnosis.
+    expect(diagnoseFailure({ workflow: 'IMPLEMENTATION', message: 'x', logs: logs.slice(0, 1) })?.errorKind).toBe(
+      'WORKFLOW_TIMEOUT',
+    );
+  });
+
+  it('does not diagnose a run the finalizer recorded as cancelled', () => {
+    const logs = [{ stage: 'job.cancelled', message: 'Run was cancelled.', level: 'WARN' as const }];
+    expect(diagnoseFailure({ workflow: 'DEPLOY', message: 'spawn codex ENOENT', logs })).toBeUndefined();
+  });
+
+  describe('a lost connection to the model API (issue #439)', () => {
+    it('is named for what it was, ahead of the timeout rules its log data would also match', () => {
+      const diagnosis = diagnoseFailure({
+        workflow: 'IMPLEMENTATION',
+        message: 'Pipeline finished with status: failed. Not opening a PR.',
+        logs: [
+          { stage: 'agent.prepare', message: 'Preparing', level: 'INFO', data: { timeoutMs: 45000 } },
+          { stage: 'agent.api_error', message: 'could not reach the model API', level: 'WARN' },
+          { stage: 'pipeline.api_error', message: 'Lost the connection during coder', level: 'ERROR' },
+        ],
+      });
+
+      expect(diagnosis?.errorKind).toBe('MODEL_API_UNREACHABLE');
+    });
+
+    it('is diagnosed for a planner that never got through', () => {
+      const diagnosis = diagnoseFailure({
+        workflow: 'IMPLEMENTATION',
+        message: "I lost my connection to the model while planning, and retrying didn't bring it back.",
+        logs: [
+          {
+            stage: 'implementation.planner.failed',
+            message: 'Planner run failed',
+            level: 'ERROR',
+            data: { errorKind: 'API_ERROR' },
+          },
+        ],
+      });
+
+      expect(diagnosis?.errorKind).toBe('MODEL_API_UNREACHABLE');
+    });
+
+    it('is not blamed for a later failure when a retry had recovered from the drop', () => {
+      const diagnosis = diagnoseFailure({
+        workflow: 'IMPLEMENTATION',
+        message: 'Pipeline finished with status: failed. Not opening a PR.',
+        logs: [
+          { stage: 'agent.api_error', message: 'could not reach the model API', level: 'WARN' },
+          { stage: 'agent.api_error.retry', message: 'retrying in 30s', level: 'WARN' },
+          {
+            stage: 'pipeline.abort',
+            message: 'Pipeline aborted due to critical finding from reviewer.',
+            level: 'ERROR',
+          },
+        ],
+      });
+
+      expect(diagnosis?.errorKind).not.toBe('MODEL_API_UNREACHABLE');
+    });
+  });
+
+  it('names an agent killed from outside, which exit 143 without a cancel is the sign of (issue #445)', () => {
+    const diagnosis = diagnoseFailure({
+      workflow: 'IMPLEMENTATION',
+      message: 'The reviewer was killed from outside while it was working, and so was my retry.',
+      logs: [
+        { stage: 'agent.process.exit', message: 'exited', level: 'INFO', data: { exitCode: 143, timedOut: false } },
+        { stage: 'pipeline.killed', message: 'The reviewer was killed from outside', level: 'ERROR' },
+      ],
+    });
+
+    expect(diagnosis?.errorKind).toBe('AGENT_KILLED_EXTERNALLY');
+  });
 });

@@ -20,10 +20,14 @@ import {
 import { startLaunchpadRequestPoller } from './launchpad/launchpadIntake.js';
 import { logger } from './logging/logger.js';
 import { notifyDesktop } from './notify/desktopNotifier.js';
+import { botScopes, missingScopesNotice, NOTIFIED_MISSING_SCOPES_KEY } from './slack/botScopes.js';
 import { assertMacOS } from './platform.js';
 import { evaluatePolicy, loadPolicies } from './policies/evaluator.js';
 import { agentCallContext } from './state/runContext.js';
-import { normalizeTask } from './router/intentParser.js';
+import { detectMention, normalizeTask } from './router/intentParser.js';
+import { isRouteQuestionExpired } from './router/routeClarify.js';
+import { jobSlots } from './runtime/jobSlots.js';
+import { readToolRouterMode } from './router/toolRouter.js';
 import { decidePausedResume } from './router/pausedResume.js';
 import { classifyProduct } from './router/productClassifier.js';
 import { routeTask } from './router/taskRouter.js';
@@ -43,8 +47,20 @@ import { narrateStep } from './slack/statusNarrator.js';
 import { fetchThreadContext } from './slack/threadContext.js';
 import { createThreadStatus, type ThreadStatus } from './slack/threadStatus.js';
 import { resolveUserGroup } from './slack/userGroupResolver.js';
-import { registerActiveJob, unregisterActiveJob, cancelJob } from './state/activeJobs.js';
+import { isOlderVersion, readSidecarBuild } from './runtime/buildInfo.js';
+import { buildRestartNotice, humanGateForStage } from './runtime/restartNotice.js';
+import { acquireInstanceLock, instanceLockPath, releaseInstanceLock } from './runtime/instanceLock.js';
+import {
+  registerActiveJob,
+  unregisterActiveJob,
+  cancelJob,
+  takeCancelReason,
+  activeJobIdForThread,
+  activeJobForThread,
+} from './state/activeJobs.js';
+import { decideStop } from './router/stopIntent.js';
 import { JobStore } from './state/jobStore.js';
+import { settleAbortedResult } from './workflows/shared/cancelState.js';
 import type { AccessGroupKey, SlackEventEnvelope, SlackReactionEvent, WorkflowStepLog } from './types/contracts.js';
 
 assertMacOS();
@@ -52,6 +68,37 @@ loadPolicies();
 loadWorkflowTemplates();
 
 const dbPath = process.env.WATCHTOWER_DB_PATH ?? path.resolve(process.cwd(), 'watchtower.db');
+
+// Stamped on every job so a run can be traced to the bundle that handled it
+// (issue #450).
+const sidecarBuild = readSidecarBuild({ pid: process.pid, argv: process.argv, env: process.env });
+
+// One sidecar per database. Take the instance lock before touching the DB or
+// Slack; a second sidecar waits here until the first one exits.
+const lockPath = instanceLockPath(dbPath);
+let standbyPolls = 0;
+const { replaced: staleLock } = await acquireInstanceLock({
+  lockPath,
+  self: {
+    pid: sidecarBuild.sidecarPid,
+    entry: sidecarBuild.sidecarEntry,
+    version: sidecarBuild.appVersion,
+    startedAt: new Date().toISOString(),
+  },
+  onStandby: holder => {
+    // First poll, then every 5 minutes at the default 5s interval.
+    if (standbyPolls++ % 60 === 0) {
+      logger.warn(
+        { lockPath, holder, ...sidecarBuild },
+        'another watchtower sidecar holds the instance lock — standing by until it exits',
+      );
+    }
+  },
+});
+process.on('exit', () => releaseInstanceLock(lockPath));
+if (staleLock) {
+  logger.info({ lockPath, staleLock }, 'took over a stale sidecar instance lock');
+}
 
 let config: ReturnType<typeof loadConfigFromDb>;
 try {
@@ -101,7 +148,11 @@ let bundlesLoadedAt = new Date().toISOString();
 }
 
 const queue: Array<{ event: SlackEventEnvelope; client: WebClient }> = [];
-let running = 0;
+// How many jobs run at once, and what happens when one stops needing its slot.
+jobSlots.configure({
+  max: () => config.maxConcurrentJobs,
+  onFree: () => void processNext(),
+});
 
 const OPS_FEED_INTERVAL_MS = 30 * 60 * 1000;
 const DAILY_DIGEST_TICK_MS = 60 * 1000;
@@ -267,7 +318,10 @@ function buildEventAwareClient(client: WebClient, event: SlackEventEnvelope): We
         // delete the orphan and continue without cancellation.
         const active = store.activeJobForEventTs(event.channelId, event.eventTs);
         if (active) {
-          cancelJob(active.id);
+          cancelJob(active.id, {
+            source: 'source_deleted',
+            message: 'Source message deleted during post (orphan-promoted reply).',
+          });
           store.markJob(active.id, 'CANCELLED', {
             errorMessage: 'Source message deleted during post (orphan-promoted reply).',
           });
@@ -353,7 +407,7 @@ async function processMessageDeleted(event: SlackEventEnvelope, client: WebClien
     return;
   }
 
-  const cancelled = cancelJob(active.id);
+  const cancelled = cancelJob(active.id, { source: 'source_deleted', message: 'Source message deleted by author.' });
   store.markJob(active.id, 'CANCELLED', {
     errorMessage: 'Source message deleted by author.',
   });
@@ -690,25 +744,77 @@ async function enqueueSlackEvent(
   client: WebClient,
   source: 'socket' | 'catchup' | 'launchpad',
 ): Promise<void> {
+  // A stop must not wait in the queue behind the job it is meant to stop.
+  if (source !== 'launchpad' && (await tryHandleStopControl(event, client))) {
+    return;
+  }
   queue.push({ event, client });
   logger.info({ queueDepth: queue.length, eventId: event.eventId, source }, 'event queued for processing');
   await processNext();
 }
 
-async function processNext(): Promise<void> {
-  if (running >= config.maxConcurrentJobs) {
-    return;
-  }
-  const item = queue.shift();
-  if (!item) {
-    return;
-  }
+/** Stop messages already acted on. Slack delivers one message as both `app_mention` and `message`. */
+const handledStopMessages = new Set<string>();
 
-  running += 1;
+/**
+ * "@miniOG stop" in a thread with a running job cancels that job at once
+ * (issue #435). It used to be dropped by the same-thread lock, or queued
+ * behind the job and answered "nothing's running" once it had finished.
+ * Returns true when the event was a stop and must not be queued.
+ */
+async function tryHandleStopControl(event: SlackEventEnvelope, client: WebClient): Promise<boolean> {
+  if (event.messageSubtype) return false;
+  const messageKey = `${event.channelId}:${event.eventTs}`;
+  if (handledStopMessages.has(messageKey)) return true;
+
+  const active = activeJobForThread(event.channelId, event.threadTs);
+  const decision = decideStop({
+    isBotMention: detectMention(event.text, config, event.channelType).type === 'bot',
+    text: event.text,
+    senderId: event.userId,
+    activeJob: active,
+    adminUserIds: getAdminUserIds(config),
+    ownerUserIds: config.ownerSlackUserIds,
+  });
+  if (!decision.stop || !active) return false;
+
+  handledStopMessages.add(messageKey);
+  if (handledStopMessages.size > 500) {
+    handledStopMessages.delete(handledStopMessages.values().next().value as string);
+  }
+  store.recordEvent(event.eventId, event.channelId, event.threadTs);
+
+  const reason = { source: 'slack_stop' as const, message: `Stopped from Slack by <@${event.userId}>.` };
+  if (!cancelJob(active.jobId, reason)) {
+    // Already stopping: a second "stop" needs no second reply.
+    return true;
+  }
+  store.markJob(active.jobId, 'CANCELLED', { errorMessage: reason.message });
+  store.appendJobLog({
+    jobId: active.jobId,
+    stage: 'job.stopped_from_slack',
+    level: 'WARN',
+    message: `Stopped from Slack by <@${event.userId}>.`,
+    data: { stoppedBy: event.userId, requestedBy: active.requestedBy ?? null, eventTs: event.eventTs },
+  });
+  logger.info({ jobId: active.jobId, stoppedBy: event.userId, eventId: event.eventId }, 'job stopped from Slack');
+  await client.chat
+    .postMessage({ channel: event.channelId, thread_ts: event.threadTs, text: 'Stopped.' })
+    .catch(() => {});
+  return true;
+}
+
+async function processNext(): Promise<void> {
+  // Nothing queued, or no slot: a job waiting on a person does not hold one,
+  // and one coming back from such a wait goes ahead of the queue (issue #434).
+  if (queue.length === 0 || !jobSlots.tryAcquire()) {
+    return;
+  }
+  const item = queue.shift()!;
+
   try {
-    await processEvent(item.event, item.client);
+    await jobSlots.run(() => processEvent(item.event, item.client));
   } finally {
-    running -= 1;
     await processNext();
   }
 }
@@ -787,18 +893,18 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     return;
   }
 
-  // Thread-level dedup: skip if this thread already has a running/paused job
-  const activeThreadJob = store.activeJobForThread(event.channelId, event.threadTs);
-  if (activeThreadJob) {
+  // Thread-level dedup: one in-flight job per thread. Asked of the in-process
+  // registry, not the jobs table — a time window on jobs.updated_at let the
+  // lock lapse under a long job (issue #261).
+  const activeThreadJobId = activeJobIdForThread(event.channelId, event.threadTs);
+  if (activeThreadJobId) {
     store.recordEvent(event.eventId, event.channelId, event.threadTs);
     logger.info(
       {
         eventId: event.eventId,
         channelId: event.channelId,
         threadTs: event.threadTs,
-        activeJobId: activeThreadJob.id,
-        activeJobStatus: activeThreadJob.status,
-        activeJobWorkflow: activeThreadJob.workflow,
+        activeJobId: activeThreadJobId,
       },
       'skipped: thread already has an active job',
     );
@@ -815,6 +921,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
   // that column as OWNER_AUTOPILOT even when the classifier later routed
   // them to PR_REVIEW. Read the actual pause cause from job_logs instead.
   const pausedJob = store.pausedJobForThread(event.channelId, event.threadTs);
+  const routeQuestion = pausedJob ? store.pausedRouteQuestion(pausedJob.id) : undefined;
   const pauseSignal = pausedJob
     ? store.isPausedAwaitingPrUrl(pausedJob.id)
       ? 'pr_review_awaiting_url'
@@ -822,12 +929,16 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
         ? 'pr_review_target_choice'
         : store.isPausedAwaitingUsageLimitRetry(pausedJob.id)
           ? 'usage_limit_retry'
-          : undefined
+          : routeQuestion
+            ? 'route_clarify'
+            : undefined
     : undefined;
   const resumeDecision = decidePausedResume({
     pausedJob: pausedJob ? { id: pausedJob.id, workflow: pausedJob.workflow } : undefined,
     pauseSignal,
     eventText: event.text ?? '',
+    routeQuestion,
+    senderId: event.userId,
   });
 
   const eventClient = buildEventAwareClient(client, event);
@@ -839,7 +950,10 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
   const threadMessages = await fetchThreadContext(eventClient, event.channelId, event.threadTs).catch(() => []);
   const threadTexts = threadMessages.map(message => message.text);
   logger.info({ eventId: event.eventId, messages: threadMessages.length }, 'thread context fetched for intake');
-  let task = { ...normalizeTask(event, config, threadTexts), threadMessages };
+  let task = {
+    ...normalizeTask(event, config, threadTexts, { routerDecides: readToolRouterMode(store) === 'on' }),
+    threadMessages,
+  };
 
   // If this event resumes a paused workflow that asked the user to reply
   // in-thread, synthesize the bot mention so the no-mention gate below does
@@ -853,6 +967,10 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
       mentionDetected: true,
       mentionType: 'bot',
       ...(resumeDecision.forceIntent ? { intent: resumeDecision.forceIntent } : {}),
+      // The reply to a question miniOG asked: the router reads the two together (issue #431).
+      ...(resumeDecision.reason === 'route_clarify_answer' && routeQuestion
+        ? { clarification: { question: routeQuestion.question, askedText: routeQuestion.askedText } }
+        : {}),
     };
     store.markJob(resumeDecision.paused.id, 'SKIPPED', {
       result: {
@@ -977,7 +1095,11 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
   });
 
   const abortController = new AbortController();
-  registerActiveJob(jobId, abortController);
+  registerActiveJob(jobId, abortController, {
+    channelId: event.channelId,
+    threadTs: event.threadTs,
+    requestedBy: event.userId,
+  });
 
   const stepLogs: WorkflowStepLog[] = [];
 
@@ -1070,6 +1192,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
       threadMessages: threadMessages.length,
       ingestSource: event.ingestSource ?? 'socket',
       launchpadRequestId: event.launchpadRequestId ?? null,
+      ...sidecarBuild,
     },
   });
 
@@ -1079,6 +1202,39 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     store,
     logStep,
   });
+
+  // A cancel from the desktop app is silent in Slack otherwise; whoever
+  // deleted the source message needs no reply.
+  const postCancelNote = async (source: string | undefined): Promise<void> => {
+    if (source !== 'ui') return;
+    await eventClient.chat
+      .postMessage({
+        channel: event.channelId,
+        thread_ts: event.threadTs,
+        text: 'Stopped — this run was cancelled from the Watchtower app.',
+      })
+      .catch(() => {});
+  };
+
+  // An abort that surfaces as an exception is still a cancel (issue #438): no
+  // failure copy, no diagnosis, no desktop failure alert, and the job stays
+  // CANCELLED instead of being overwritten with FAILED.
+  const finalizeCancelledJob = async (detail: string): Promise<void> => {
+    const cancelReason = takeCancelReason(jobId);
+    logStep({
+      stage: 'job.cancelled',
+      message: 'Run was cancelled — recording CANCELLED, not a failure.',
+      level: 'WARN',
+      data: { detail, cancelSource: cancelReason?.source },
+    });
+    await cleanupThreadWorkspaces(event.threadTs);
+    unregisterActiveJob(jobId);
+    failLaunchpadWorkflow({ event, errorMessage: 'Cancelled.', store, logStep });
+    store.markJob(jobId, 'CANCELLED', { errorMessage: cancelReason?.message ?? 'Cancelled.' });
+    await postCancelNote(cancelReason?.source);
+    await removeReaction(client, event.channelId, event.eventTs, 'eyes');
+    await addReaction(client, event.channelId, event.eventTs, 'x');
+  };
 
   try {
     let attempt = 0;
@@ -1114,7 +1270,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
           }
         }
 
-        const result = await agentCallContext.run({ jobId, store }, () =>
+        const workflowResult = await agentCallContext.run({ jobId, store }, () =>
           routeTask({
             task: routedTask,
             config,
@@ -1125,6 +1281,23 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
             signal: abortController.signal,
           }),
         );
+        // An aborted run is cancelled, whatever the workflow made of its dead
+        // agent (issue #438). Settled before the diagnosis and the status write
+        // below, which used to report it as a failed job with a "timeout".
+        const result = settleAbortedResult(workflowResult, abortController.signal.aborted);
+        const cancelReason = abortController.signal.aborted ? takeCancelReason(jobId) : undefined;
+        if (result !== workflowResult) {
+          logStep({
+            stage: 'job.cancelled',
+            message: 'Run was cancelled — recording CANCELLED, not the workflow failure.',
+            level: 'WARN',
+            data: {
+              workflowStatus: workflowResult.status,
+              workflowMessage: workflowResult.message,
+              cancelSource: cancelReason?.source,
+            },
+          });
+        }
         const hasPrInResult =
           result.result?.prUrl && typeof result.result.prUrl === 'string' && result.result.prUrl !== '';
         const diagnosis =
@@ -1174,7 +1347,13 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
         } else if (result.status === 'SKIPPED') {
           store.markJob(jobId, 'SKIPPED', { result: result.result, executedWorkflow });
         } else if (result.status === 'CANCELLED') {
-          store.markJob(jobId, 'CANCELLED', { result: result.result, executedWorkflow });
+          store.markJob(jobId, 'CANCELLED', {
+            // Keep who cancelled it; markJob would otherwise blank the reason.
+            errorMessage: cancelReason?.message,
+            result: result.result,
+            executedWorkflow,
+          });
+          await postCancelNote(cancelReason?.source);
         } else {
           store.markJob(jobId, 'FAILED', {
             errorMessage: result.message,
@@ -1283,7 +1462,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
             error: msg,
           },
         });
-        if (!transient || attempt >= 3) {
+        if (abortController.signal.aborted || !transient || attempt >= 3) {
           break;
         }
         logStep({
@@ -1296,6 +1475,11 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
           },
         });
       }
+    }
+
+    if (abortController.signal.aborted) {
+      await finalizeCancelledJob(String(lastError));
+      return;
     }
 
     const errorMessage = `Workflow failed after retries: ${String(lastError)}`;
@@ -1400,6 +1584,10 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     }
   } catch (error) {
     const errorMessage = String(error);
+    if (abortController.signal.aborted) {
+      await finalizeCancelledJob(errorMessage);
+      return;
+    }
     const diagnosis = diagnoseFailure({
       workflow: routedTask.intent,
       message: errorMessage,
@@ -1471,6 +1659,11 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
       // ignore persistence failures in terminal error path
     }
   } finally {
+    // The same-thread lock lives in this process (issue #261), so it must be
+    // released on every way out, including a throw inside the handlers above.
+    // Idempotent: the normal paths have already unregistered.
+    unregisterActiveJob(jobId);
+
     // Slack clears the status automatically whenever miniOG posts a message,
     // but SKIPPED jobs can end without ever posting — clear explicitly so the
     // thread does not keep showing "miniOG is …" after the job is done.
@@ -1482,8 +1675,22 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
 }
 
 async function main(): Promise<void> {
-  logger.info({ dbPath, maxConcurrentJobs: config.maxConcurrentJobs }, 'watchtower sidecar starting');
+  logger.info({ dbPath, maxConcurrentJobs: config.maxConcurrentJobs, ...sidecarBuild }, 'watchtower sidecar starting');
   await cleanupStaleWorkspaces();
+
+  // An older bundle starting after a newer one is how two builds ended up
+  // serving the same Slack app (issue #450). The lock stops them overlapping;
+  // this makes a rollback-by-accident visible.
+  const lastAppVersion = store.getState('last_app_version');
+  if (lastAppVersion && isOlderVersion(sidecarBuild.appVersion, lastAppVersion)) {
+    logger.warn({ lastAppVersion, ...sidecarBuild }, 'this build is older than the one that last used this database');
+    notifyDesktop(
+      'Older Watchtower build started',
+      `Running ${sidecarBuild.appVersion}, but ${lastAppVersion} last used this database. Quit this copy unless that is intended.`,
+    );
+  } else if (sidecarBuild.appVersion !== 'dev') {
+    store.setState('last_app_version', sidecarBuild.appVersion);
+  }
 
   // Boot the optional Obsidian-compatible vault writer. When disabled (or no
   // path configured), scheduleVaultRender calls become no-ops; the dossier
@@ -1513,10 +1720,38 @@ async function main(): Promise<void> {
   // synthesizer (idle + delta + interval gates, light tier, concurrency 2).
   startThreadSynthesizerScheduler(store);
 
+  // Jobs that were waiting on a person when the previous process went away.
+  // Read before the cleanup below fails them; their threads are told after.
+  const parkedAtRestart = store
+    .listRunningJobsWithLastStage()
+    .map(job => ({ ...job, gate: humanGateForStage(job.lastStage) }))
+    .filter(job => job.gate !== undefined);
+
   // Mark any leftover RUNNING jobs as FAILED — their processes are gone after restart
   const orphaned = store.cleanupOrphanedRunningJobs();
   if (orphaned > 0) {
     logger.warn({ orphaned }, 'cleaned up orphaned RUNNING jobs from previous session');
+  }
+
+  // A plan awaiting approval used to vanish on a restart without a word
+  // (issue #436). Best effort, and never blocks startup.
+  if (parkedAtRestart.length > 0 && config.slackBotToken) {
+    const noticeClient = new WebClient(config.slackBotToken);
+    for (const job of parkedAtRestart) {
+      const text = buildRestartNotice({ gate: job.gate!, requestedBy: job.requestedBy });
+      void noticeClient.chat
+        .postMessage({ channel: job.channelId, thread_ts: job.threadTs, text })
+        .then(() =>
+          store.appendJobLog({
+            jobId: job.id,
+            stage: 'job.restart_notice',
+            level: 'WARN',
+            message: `Told the thread the request was dropped by a restart (was waiting: ${job.gate}).`,
+            data: { gate: job.gate, lastStage: job.lastStage },
+          }),
+        )
+        .catch(err => logger.warn({ jobId: job.id, err: String(err) }, 'restart notice failed'));
+    }
   }
 
   // Revert launchpad requests stranded in CLAIMED/QUEUED back to PENDING so
@@ -1667,11 +1902,40 @@ async function main(): Promise<void> {
   await refreshAccessGroups();
   setInterval(refreshAccessGroups, 30 * 60 * 1000);
 
+  // Say which features the installed token cannot serve, once per change
+  // rather than one failed request at a time (issue #433). Rechecked so a
+  // reinstall is picked up without a restart.
+  const checkBotScopes = async () => {
+    const status = await botScopes.refresh(client.webClient);
+    if (!status) {
+      return;
+    }
+    const missing = status.missing.map(feature => feature.scope);
+    if (missing.length === 0) {
+      if (store.getState(NOTIFIED_MISSING_SCOPES_KEY)) {
+        logger.info('slack bot token now carries every scope the sidecar checks for');
+        store.setState(NOTIFIED_MISSING_SCOPES_KEY, '');
+      }
+      return;
+    }
+    logger.warn(
+      { missing, granted: status.granted },
+      'slack bot token is missing scopes; reinstall the app to grant them',
+    );
+    const notice = missingScopesNotice(status, store.getState(NOTIFIED_MISSING_SCOPES_KEY));
+    if (notice) {
+      notifyDesktop(notice.title, notice.body);
+      store.setState(NOTIFIED_MISSING_SCOPES_KEY, notice.fingerprint);
+    }
+  };
+  void checkBotScopes();
+  setInterval(() => void checkBotScopes(), 10 * 60 * 1000);
+
   // Poll for cancel requests from the Watchtower UI (written to SQLite by Tauri)
   setInterval(() => {
     const pendingIds = store.popPendingCancels();
     for (const jobId of pendingIds) {
-      const cancelled = cancelJob(jobId);
+      const cancelled = cancelJob(jobId, { source: 'ui', message: 'Cancelled from Watchtower UI.' });
       if (cancelled) {
         store.markJob(jobId, 'CANCELLED', { errorMessage: 'Cancelled from Watchtower UI.' });
         logger.info({ jobId }, 'job cancelled from UI');
@@ -1687,6 +1951,19 @@ async function main(): Promise<void> {
   const PAUSED_MAX_AGE_MIN = 24 * 60;
   setInterval(
     () => {
+      // A question nobody answered is not a failure, and it is not worth a
+      // day: after 30 minutes the next reply is no longer "the answer" (#431).
+      try {
+        for (const parked of store.pausedRouteQuestions()) {
+          if (!isRouteQuestionExpired(parked.pending, Date.now())) continue;
+          store.markJob(parked.id, 'SKIPPED', { result: { reason: 'clarify_unanswered' } });
+          const anchor = store.eventAnchorFor(parked.id);
+          if (anchor) void removeReaction(client.webClient, anchor.channelId, anchor.eventTs, 'zzz');
+          logger.info({ jobId: parked.id }, 'unanswered clarify question expired');
+        }
+      } catch (err) {
+        logger.warn({ err: String(err) }, 'clarify-question sweeper tick failed');
+      }
       try {
         const stale = store.stalePausedJobs(PAUSED_MAX_AGE_MIN);
         for (const job of stale) {

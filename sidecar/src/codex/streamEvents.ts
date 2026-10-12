@@ -134,8 +134,9 @@ function decodeClaudeLine(raw: string, state: DecoderState): WorkflowStepLog[] {
   if (type === 'system' && asString(event.subtype) === 'init') {
     const tools = Array.isArray(event.tools) ? event.tools.length : undefined;
     const skills = Array.isArray(event.skills) ? event.skills.length : undefined;
-    const mcpServers = Array.isArray(event.mcp_servers) ? event.mcp_servers.length : undefined;
-    return [
+    const servers = Array.isArray(event.mcp_servers) ? event.mcp_servers.filter(isRecord) : undefined;
+    const mcpServers = servers?.length;
+    const steps: WorkflowStepLog[] = [
       {
         stage: 'agent.session.init',
         message: 'Agent session initialized.',
@@ -144,10 +145,33 @@ function decodeClaudeLine(raw: string, state: DecoderState): WorkflowStepLog[] {
           tools,
           skills,
           mcpServers,
+          // Which connectors this run really has, not just how many (issue #443).
+          mcpServerNames: servers?.map(server => asString(server.name) ?? 'unknown'),
           permissionMode: asString(event.permissionMode),
         },
       },
     ];
+    // A run is given only the servers its workflow names, so one that did not
+    // connect is a capability the agent was meant to have and does not. The
+    // usual cause is an OAuth server nobody has signed in to for the headless CLI.
+    // Only a status that says so: a server still connecting is not a failure.
+    const unusable = (servers ?? [])
+      .map(server => ({ name: asString(server.name) ?? 'unknown', status: asString(server.status) ?? 'unknown' }))
+      .filter(server => server.status === 'needs-auth' || server.status === 'failed');
+    if (unusable.length > 0) {
+      const list = unusable.map(server => `${server.name} (${server.status})`).join(', ');
+      steps.push({
+        stage: 'agent.mcp.unavailable',
+        level: 'WARN',
+        message:
+          `Connector not usable in this run: ${list}.` +
+          (unusable.some(server => server.status === 'needs-auth')
+            ? ' Sign in to it once from Claude Code on this machine (/mcp), under the same server name.'
+            : ''),
+        data: { servers: unusable },
+      });
+    }
+    return steps;
   }
 
   if (type === 'assistant') {

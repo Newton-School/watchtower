@@ -8,9 +8,18 @@ import type { WorkflowStepLogger } from '../types/contracts.js';
 import { buildPromptForRole } from './prompts.js';
 import { lightweightProfile, profileForAgentRole } from '../codex/modelProfiles.js';
 import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
-import { normalizePlannerOutput, type NormalizedPlannerOutput } from './normalizePlannerOutput.js';
+import { isInterruption, runWithInfraRetry, type InterruptionKind } from '../codex/infraRetry.js';
+import { jobSlots } from '../runtime/jobSlots.js';
+import {
+  isNone,
+  normalizePlannerOutput,
+  parseApproverSummary,
+  planWithoutApproverParts,
+  type NormalizedPlannerOutput,
+} from './normalizePlannerOutput.js';
 import { REPO_KEYS, type RepoKey } from '../repos/registry.js';
 import { withAgentCallContext } from '../state/runContext.js';
+import { currentConnectors, NO_CONNECTORS, withConnectors } from '../backends/connectors.js';
 import { fetchThreadContext } from '../slack/threadContext.js';
 import { currentHead, checkCoderProducedChanges, getDiffVsBase } from '../workspaces/gitState.js';
 
@@ -141,20 +150,74 @@ function stripRepoPrefix(filePath: string, repoPath: string): string {
   return filePath;
 }
 
+/** How many files the plan message lists before it says "and N more". */
+const PLAN_MESSAGE_MAX_FILES = 8;
+
+/**
+ * The plan as posted for approval (issue #437).
+ *
+ * When the planner wrote its approver block, the message opens with it: what
+ * changes, where, whether behaviour changes, what was assumed, the risk, and
+ * the files to change. The full plan follows, marked as detail. If behaviour
+ * changes or something was assumed, the requester is asked to confirm it,
+ * because the approver is usually someone else. A default changed to 0 was
+ * approved in 54 seconds; it meant the opposite of what the requester wanted.
+ *
+ * The header counts files the change edits. It used to count every
+ * path-shaped token in the plan.
+ */
 export function formatPlanMessage(
   planMarkdown: string,
   affectedFiles: string[],
   scope: string,
   repoPath?: string,
   completed?: boolean,
+  requesterId?: string,
 ): string {
-  const header = `*Plan* (scope: ${scope}, ${affectedFiles.length} files affected)`;
   const displayFiles = repoPath ? affectedFiles.map(f => stripRepoPrefix(f, repoPath)) : affectedFiles;
-  const filesSection =
-    displayFiles.length > 0 ? `\n\n*Affected files:*\n${displayFiles.map(f => `• \`${f}\``).join('\n')}` : '';
-  const body = planMarkdown.trim();
+  const count = displayFiles.length;
+  const summary = parseApproverSummary(planMarkdown);
+  const headerParts = [`scope: ${scope}`];
+  if (count > 0) headerParts.push(`${count} file${count === 1 ? '' : 's'} to change`);
+  if (summary?.risk) headerParts.push(`risk: ${summary.risk}`);
+  const header = `*Plan* (${headerParts.join(', ')})`;
+
+  const shownFiles = displayFiles.slice(0, PLAN_MESSAGE_MAX_FILES).map(f => `• \`${f}\``);
+  if (count > PLAN_MESSAGE_MAX_FILES) shownFiles.push(`• … and ${count - PLAN_MESSAGE_MAX_FILES} more`);
+  const filesSection = count > 0 ? `*Files to change:*\n${shownFiles.join('\n')}` : '';
   const completedSuffix = completed ? '\n\n_✅ Plan executed._' : '';
-  return `${header}${body ? `\n${body}` : ''}${filesSection}${completedSuffix}`;
+
+  if (!summary) {
+    const body = planMarkdown.trim();
+    return `${header}${body ? `\n${body}` : ''}${filesSection ? `\n\n${filesSection}` : ''}${completedSuffix}`;
+  }
+
+  const changesBehaviour = !isNone(summary.behaviourChange);
+  const assumed = !isNone(summary.assumptions);
+  const block = [
+    header,
+    `*What changes:* ${summary.whatChanges}`,
+    ...(summary.where ? [`*Where:* ${summary.where}`] : []),
+    // "none" keeps whatever the planner added to it ("none. It is only a comment.").
+    `*Behaviour change:* ${changesBehaviour ? ':warning: ' : ''}${summary.behaviourChange.trim() || 'none'}`,
+    `*Assumptions to confirm:* ${summary.assumptions.trim() || 'none'}`,
+  ];
+  if (requesterId && (changesBehaviour || assumed)) {
+    const what = [changesBehaviour ? 'the behaviour change' : '', assumed ? 'the assumptions' : '']
+      .filter(Boolean)
+      .join(' and ');
+    block.push(
+      `<@${requesterId}> please confirm ${what} above ${assumed ? 'are' : 'is'} what you want, before this is approved.`,
+    );
+  }
+  const detail = planWithoutApproverParts(planMarkdown);
+  return [
+    block.join('\n'),
+    ...(filesSection ? [filesSection] : []),
+    ...(detail ? [`_Full plan, for the coder:_\n${detail}`] : []),
+  ]
+    .join('\n\n')
+    .concat(completedSuffix);
 }
 
 const APPROVE_PATTERNS = /^(yes|go|proceed|do it|go ahead|ship it|lgtm)$/i;
@@ -164,7 +227,22 @@ const REJECT_PATTERNS = /^(no|stop|cancel|abort|nevermind|never mind)\b/i;
 const PAUSE_PATTERNS =
   /^(wait|hold on|hold up|pause|brb|one sec|one moment|stand by|i'?ll get back to you|(give me|gimme) (a )?(sec|second|minute|moment|min)|pause for (now|a bit|a sec)|stop for now)[.! ]*$/i;
 
-export type ApprovalOutcome = 'approved' | 'rejected' | 'feedback' | 'paused';
+/** Resolves after `ms`, or as soon as the job is aborted. */
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise(resolve => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      { once: true },
+    );
+  });
+}
+
+export type ApprovalOutcome = 'approved' | 'rejected' | 'feedback' | 'paused' | 'cancelled';
 export type ApprovalResult = {
   outcome: ApprovalOutcome;
   userReply: string;
@@ -230,6 +308,7 @@ Return strict JSON:
     const profile = lightweightProfile(getActiveBackendId());
     const result = await runCodex({
       cwd: os.tmpdir(),
+      noTools: true,
       prompt,
       model: profile.model,
       reasoningEffort: profile.reasoningEffort,
@@ -268,7 +347,15 @@ Return strict JSON:
   }
 }
 
-export async function waitForApproval(params: {
+/** Waits for a plan to be approved. The job's slot is free while it waits (issue #434). */
+export function waitForApproval(params: Parameters<typeof pollForApproval>[0]): Promise<ApprovalResult> {
+  return jobSlots.whileWaitingOnHuman(() => pollForApproval(params), {
+    signal: params.signal,
+    logStep: params.logStep,
+  });
+}
+
+async function pollForApproval(params: {
   slack: WebClient;
   channelId: string;
   threadTs: string;
@@ -277,8 +364,26 @@ export async function waitForApproval(params: {
   approvalPromptTs: string;
   logStep: WorkflowStepLogger;
   botUserId?: string;
+  /** The job's abort signal. Without it a cancelled job kept waiting here forever (issue #264). */
+  signal?: AbortSignal;
+  /**
+   * Re-ping while the plan waits (issue #436): `text` is posted once when each
+   * delay in `afterMs` has passed. The wait has no other way to be noticed.
+   */
+  reminders?: { afterMs: number[]; text: string };
+  /** Who can approve, as a Slack mention. Used once when someone who cannot approve says yes. */
+  approverMention?: string;
 }): Promise<ApprovalResult> {
-  const { slack, channelId, threadTs, approverUserIds, approvalPromptTs, logStep, botUserId } = params;
+  const { slack, channelId, threadTs, approverUserIds, approvalPromptTs, logStep, botUserId, signal } = params;
+  const { reminders, approverMention } = params;
+  const waitStartedAt = Date.now();
+  const reminderDelays = [...(reminders?.afterMs ?? [])].sort((a, b) => a - b);
+  let remindersSent = 0;
+  let approversTagged = false;
+  const cancelled = (): ApprovalResult => {
+    logStep({ stage: 'pipeline.approval.cancelled', message: 'Job cancelled while waiting for approval.' });
+    return { outcome: 'cancelled', userReply: '', approverId: '', replyTs: '' };
+  };
   // Callers post the prompt before calling, and posting clears Slack's thread
   // status — this is what puts "is waiting for admin approval" back up.
   logStep({
@@ -292,7 +397,23 @@ export async function waitForApproval(params: {
   const classifiedTs = new Set<string>();
 
   while (true) {
-    await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+    if (signal?.aborted) return cancelled();
+    await abortableDelay(pollIntervalMs, signal);
+    if (signal?.aborted) return cancelled();
+
+    // One reminder per threshold. If several have passed at once (the host
+    // slept), they collapse into a single message.
+    let due = remindersSent;
+    while (due < reminderDelays.length && Date.now() - waitStartedAt >= reminderDelays[due]) due += 1;
+    if (reminders && due > remindersSent) {
+      remindersSent = due;
+      logStep({
+        stage: 'pipeline.approval.reminder',
+        message: `Reminded approvers (${remindersSent} of ${reminderDelays.length}).`,
+        data: { waitedMs: Date.now() - waitStartedAt },
+      });
+      slack.chat.postMessage({ channel: channelId, thread_ts: threadTs, text: reminders.text }).catch(() => {});
+    }
 
     let messages: Array<{ text: string; user: string; ts: string }>;
     try {
@@ -329,13 +450,19 @@ export async function waitForApproval(params: {
               message: `Non-admin user <@${reply.user}> attempted to approve.`,
               level: 'WARN',
             });
+            const tagApprovers = Boolean(approverMention) && !approversTagged;
             slack.chat
               .postMessage({
                 channel: channelId,
                 thread_ts: threadTs,
-                text: `<@${reply.user}> Only admins can approve plans. Waiting for an admin to respond.`,
+                // Say who can, and tag them once: "waiting for an admin" told
+                // the requester nothing and reached no admin (issue #436).
+                text: tagApprovers
+                  ? `<@${reply.user}> only admins can approve plans. ${approverMention}, this one is waiting for you.`
+                  : `<@${reply.user}> Only admins can approve plans. Waiting for an admin to respond.`,
               })
               .catch(() => {});
+            if (tagApprovers) approversTagged = true;
           }
           continue;
         }
@@ -559,6 +686,7 @@ Return strict JSON:
     const profile = lightweightProfile(getActiveBackendId());
     const result = await runCodex({
       cwd: os.tmpdir(),
+      noTools: true,
       prompt,
       model: profile.model,
       reasoningEffort: profile.reasoningEffort,
@@ -599,7 +727,15 @@ Return strict JSON:
  * `waitForApproval`: 5-second polling loop, ignores non-admin replies, nudges
  * non-admins who try to answer. Returns the resolved repo or 'cancelled'.
  */
-export async function waitForRepoChoice(params: {
+/** Waits for someone to say which repo. The job's slot is free while it waits (issue #434). */
+export function waitForRepoChoice(params: Parameters<typeof pollForRepoChoice>[0]): Promise<RepoChoiceResult> {
+  return jobSlots.whileWaitingOnHuman(() => pollForRepoChoice(params), {
+    signal: params.signal,
+    logStep: params.logStep,
+  });
+}
+
+async function pollForRepoChoice(params: {
   slack: WebClient;
   channelId: string;
   threadTs: string;
@@ -637,7 +773,7 @@ export async function waitForRepoChoice(params: {
   // post-message clear.
   logStep({
     stage: 'pipeline.repo_choice.waiting',
-    message: 'Waiting for an admin to pick the target repo.',
+    message: 'Waiting to hear which repo this is for.',
   });
   const pollIntervalMs = 5_000;
   const notifiedUsers = new Set<string>();
@@ -791,7 +927,12 @@ export async function waitForRepoChoice(params: {
 
 export type ClarificationResult = { answer: string; answererId: string };
 
-export async function waitForClarification(params: {
+/** Waits for an answer to the planner's question. The job's slot is free while it waits (issue #434). */
+export function waitForClarification(params: Parameters<typeof pollForClarification>[0]): Promise<ClarificationResult> {
+  return jobSlots.whileWaitingOnHuman(() => pollForClarification(params), { logStep: params.logStep });
+}
+
+async function pollForClarification(params: {
   slack: WebClient;
   channelId: string;
   threadTs: string;
@@ -885,7 +1026,9 @@ export function buildCoderFollowUpQuestion(
   const preview = trimmed.length > 200 ? `${trimmed.slice(0, 200).trim()}…` : trimmed;
   const filePreview = planAffectedFiles.slice(0, 3).join(', ');
 
-  const lines = ["I couldn't pin down a concrete change from the info I have, so I haven't touched any files."];
+  // Says what is known and no more. This used to add "so I haven't touched
+  // any files", which nothing here had checked (issue #432).
+  const lines = ["I couldn't pin down a concrete change from the info I have."];
   if (preview) {
     lines.push(`The plan opened with: _${preview}_`);
   }
@@ -900,6 +1043,61 @@ export function buildCoderFollowUpQuestion(
     'Reply in this thread with any of the above and I\'ll pick it up from there — or say "cancel" to stop.',
   );
   void ctx;
+  return lines.join('\n');
+}
+
+/** How much of the coder's own account is quoted back. A before/after report fits; a transcript does not. */
+const CODER_REPORT_QUOTE_CHARS = 900;
+
+/**
+ * Asked when the coder says it finished and the repository shows no change.
+ *
+ * A clean worktree is not proof that nothing happened: the work may have been
+ * outside the repo. A coder that had just updated seven Metabase cards in
+ * production, and written a before/after report, was answered with "I haven't
+ * touched any files"; its report was thrown away and the requester never
+ * learned the dashboard had changed (issue #432).
+ *
+ * So this states only what was checked (the repository), quotes what the
+ * coder said it did, and tells the requester to look before asking again.
+ */
+export function buildCoderNoDiffQuestion(
+  planMarkdown: string,
+  planAffectedFiles: string[],
+  coderSummary: string,
+): string {
+  const report = coderSummary.trim();
+  const quoted = (
+    report.length > CODER_REPORT_QUOTE_CHARS ? `${report.slice(0, CODER_REPORT_QUOTE_CHARS).trim()}…` : report
+  )
+    .split('\n')
+    .map(line => `> ${line}`)
+    .join('\n');
+  const plan = planMarkdown.trim();
+  const planPreview = plan.length > 200 ? `${plan.slice(0, 200).trim()}…` : plan;
+  const filePreview = planAffectedFiles.slice(0, 3).join(', ');
+
+  const lines = ['The coder finished, but nothing changed in the repository: no commit and no edited file.'];
+  if (report) {
+    lines.push(
+      'This is what it says it did:',
+      quoted,
+      'If that describes work outside the repository (a dashboard, a setting, a record), it may already be in place. Check it before you ask me to do it again.',
+    );
+  } else {
+    lines.push(
+      'It gave no account of what it did, so I cannot tell you whether anything outside the repository changed.',
+    );
+  }
+  if (planPreview) {
+    lines.push(`The plan opened with: _${planPreview}_`);
+  }
+  if (filePreview) {
+    lines.push(`Planned files: \`${filePreview}\`${planAffectedFiles.length > 3 ? ' …' : ''}`);
+  }
+  lines.push(
+    'If a code change is still needed, tell me the specific change and where it should land, and I\'ll pick it up from there — or say "cancel" to stop.',
+  );
   return lines.join('\n');
 }
 
@@ -966,6 +1164,40 @@ export async function runAgentPipeline(params: {
   let needsInputQuestion: string | undefined;
   let usageLimitHit = false;
   let usageLimitResetsAt: string | undefined;
+  // Interruptions — a dropped connection (issue #439) or a process killed from
+  // outside (issue #445): the time they cost is kept off the pipeline's clock,
+  // and one that outlasts its retries stops the run. Neither is ever a verdict.
+  let infraWaitMs = 0;
+  let interrupted: PipelineResult['interrupted'];
+  const stopOnInterruption = (
+    role: AgentRole,
+    errorKind: InterruptionKind,
+    retries: number,
+    durationMs: number,
+  ): void => {
+    const killed = errorKind === 'EXTERNAL_KILL';
+    interrupted = { kind: killed ? 'killed' : 'connection_lost', role, retries };
+    logStep({
+      stage: killed ? 'pipeline.killed' : 'pipeline.api_error',
+      message: killed
+        ? `The ${role} was killed from outside, and so was the retry — stopping the pipeline. This is not a ${role} verdict.`
+        : `Lost the connection to the model API during ${role}; ${retries} retries did not bring it back — stopping the pipeline.`,
+      level: 'ERROR',
+      data: { role, retries, infraWaitMs },
+    });
+    steps.push({
+      role,
+      status: 'failed',
+      output: {
+        status: 'error',
+        summary: killed
+          ? 'The agent process was killed from outside; this step did not complete.'
+          : 'The model API could not be reached; this step did not complete.',
+      },
+      findings: [],
+      durationMs,
+    });
+  };
 
   const pipelineRunId = randomUUID();
   if (store && jobId) {
@@ -1009,7 +1241,9 @@ export async function runAgentPipeline(params: {
 
   for (let i = 0; i < agents.length; i++) {
     if (totalTimeoutMs) {
-      const elapsed = Date.now() - pipelineStart;
+      // Time lost to a dead connection is not the pipeline's: a run that sat
+      // offline for an hour has not used an hour of its budget (issue #439).
+      const elapsed = Date.now() - pipelineStart - infraWaitMs;
       if (elapsed >= totalTimeoutMs) {
         logStep({
           stage: 'pipeline.timeout',
@@ -1060,21 +1294,39 @@ export async function runAgentPipeline(params: {
       }
     }
 
+    // The planner and the coder keep the change's connectors (a design to
+    // read, an asset to upload). A role that only reviews gets none.
+    const roleConnectors = role === 'planner' || role === 'coder' ? currentConnectors() : NO_CONNECTORS;
     const result = await withAgentCallContext({ pipelineRunId, role }, () =>
-      runCodex({
-        cwd: ctx.repoPath,
-        prompt,
-        outputSchemaPath: schemaPath,
-        githubToken: ctx.githubToken,
-        planMode,
-        ...profile,
-        // timeoutMs: perAgentTimeoutMs,
-        onLog: logStep,
-        signal,
-      }),
+      withConnectors(roleConnectors, () =>
+        runWithInfraRetry(
+          {
+            cwd: ctx.repoPath,
+            prompt,
+            outputSchemaPath: schemaPath,
+            githubToken: ctx.githubToken,
+            planMode,
+            ...profile,
+            // timeoutMs: perAgentTimeoutMs,
+            onLog: logStep,
+            signal,
+          },
+          // The coder's work is on disk and costly to redo: pick its session back up.
+          { label: role, resume: role === 'coder', logStep },
+        ),
+      ),
     );
+    infraWaitMs += result.infraWaitMs;
 
     const durationMs = Date.now() - agentStart;
+
+    // Still interrupted after the retries. Not an agent verdict: stop here
+    // rather than hand the next agent a step that did not happen (#439), or
+    // read a dead reviewer as "rejected" and send the coder round again (#445).
+    if (isInterruption(result.errorKind)) {
+      stopOnInterruption(role, result.errorKind, result.infraRetries, durationMs);
+      break;
+    }
 
     // Usage-limit hit: the CLI died pre-API with a known reset time. This is
     // not an agent verdict — abort the whole run instead of letting the
@@ -1148,7 +1400,7 @@ export async function runAgentPipeline(params: {
             severity: 'critical',
             category: 'coder-empty-output',
             message:
-              'Coder reported success but the worktree has no new commits, no uncommitted changes, and HEAD has not moved. Likely a hallucinated response with no actual tool use.',
+              'Coder reported success but the worktree has no new commits, no uncommitted changes, and HEAD has not moved. Either nothing was done, or the work was done outside the repository.',
             suggestion:
               'Gather missing context (error text, failing request, explicit file scope) and re-run with concrete targets.',
           });
@@ -1165,10 +1417,10 @@ export async function runAgentPipeline(params: {
             },
           });
           pendingNeedsInput = true;
-          needsInputQuestion = buildCoderFollowUpQuestion(
-            ctx,
+          needsInputQuestion = buildCoderNoDiffQuestion(
             plannerNormalized?.planMarkdown ?? '',
             plannerNormalized?.affectedFiles ?? [],
+            typeof output.summary === 'string' ? output.summary : '',
           );
         } else {
           output.filesChanged = changes.filesChanged;
@@ -1229,6 +1481,8 @@ export async function runAgentPipeline(params: {
             plannerNormalized.affectedFiles,
             plannerNormalized.scope,
             ctx.repoPath,
+            false,
+            ctx.task.event.userId,
           ),
         });
       }
@@ -1252,8 +1506,13 @@ export async function runAgentPipeline(params: {
             approvalPromptTs,
             logStep,
             botUserId: ctx.config.botUserId,
+            signal,
           });
 
+          if (approval.outcome === 'cancelled') {
+            aborted = true;
+            break;
+          }
           if (approval.outcome === 'rejected') {
             await postSlackProgress({ slack, ctx, text: 'Got it, cancelling.' });
             aborted = true;
@@ -1275,6 +1534,7 @@ export async function runAgentPipeline(params: {
           plannerNormalized.scope,
           ctx.repoPath,
           true,
+          ctx.task.event.userId,
         ),
       });
     }
@@ -1286,6 +1546,18 @@ export async function runAgentPipeline(params: {
         message: 'Coder produced no diff — pausing for user input instead of retrying.',
         level: 'WARN',
         data: { question: needsInputQuestion },
+      });
+      break;
+    }
+
+    // A coder that failed leaves nothing to assess. The reviewer and verifier
+    // used to run anyway, on whatever was on disk, and the run still ended
+    // "failed" (issue #439).
+    if (role === 'coder' && status === 'failed') {
+      logStep({
+        stage: 'pipeline.coder_failed',
+        message: 'Coder failed — stopping the pipeline: there is nothing for the next agents to assess.',
+        level: 'ERROR',
       });
       break;
     }
@@ -1331,18 +1603,27 @@ export async function runAgentPipeline(params: {
         const coderStart = Date.now();
 
         const coderRetryResult = await withAgentCallContext({ pipelineRunId, role: 'coder' }, () =>
-          runCodex({
-            cwd: ctx.repoPath,
-            prompt: coderPrompt,
-            outputSchemaPath: coderSchemaPath,
-            githubToken: ctx.githubToken,
-            ...coderProfile,
-            onLog: logStep,
-            signal,
-          }),
+          runWithInfraRetry(
+            {
+              cwd: ctx.repoPath,
+              prompt: coderPrompt,
+              outputSchemaPath: coderSchemaPath,
+              githubToken: ctx.githubToken,
+              ...coderProfile,
+              onLog: logStep,
+              signal,
+            },
+            { label: 'coder', resume: true, logStep },
+          ),
         );
+        infraWaitMs += coderRetryResult.infraWaitMs;
 
         const coderRetryDuration = Date.now() - coderStart;
+
+        if (isInterruption(coderRetryResult.errorKind)) {
+          stopOnInterruption('coder', coderRetryResult.errorKind, coderRetryResult.infraRetries, coderRetryDuration);
+          break;
+        }
 
         if (coderRetryResult.errorKind === 'USAGE_LIMIT') {
           usageLimitHit = true;
@@ -1393,10 +1674,10 @@ export async function runAgentPipeline(params: {
                 data: { retryLoops },
               });
               pendingNeedsInput = true;
-              needsInputQuestion = buildCoderFollowUpQuestion(
-                ctx,
+              needsInputQuestion = buildCoderNoDiffQuestion(
                 plannerNormalized?.planMarkdown ?? '',
                 plannerNormalized?.affectedFiles ?? [],
+                typeof coderOutput.summary === 'string' ? coderOutput.summary : '',
               );
             } else {
               coderOutput.filesChanged = changes.filesChanged;
@@ -1472,9 +1753,13 @@ export async function runAgentPipeline(params: {
         ? `Paused after ${durationSec}s — I need a bit more info before I can code a fix.`
         : finalStatus === 'usage-limit'
           ? `Paused — Claude usage limit hit${usageLimitResetsAt ? ` (resets ${usageLimitResetsAt})` : ''}. No code was lost.`
-          : finalStatus === 'aborted'
-            ? `Finished in ${durationSec}s. Review flagged some concerns — see the summary below.`
-            : `Finished in ${durationSec}s with some issues flagged — details below.`;
+          : interrupted?.kind === 'connection_lost'
+            ? `Stopped after ${durationSec}s — I lost my connection to the model and retrying didn't bring it back.`
+            : interrupted
+              ? `Stopped after ${durationSec}s — the ${interrupted.role} was killed from outside, twice.`
+              : finalStatus === 'aborted'
+                ? `Finished in ${durationSec}s. Review flagged some concerns — see the summary below.`
+                : `Finished in ${durationSec}s with some issues flagged — details below.`;
   await postSlackProgress({ slack, ctx, text: finishText });
 
   if (store && jobId) {
@@ -1498,5 +1783,6 @@ export async function runAgentPipeline(params: {
     aggregatedFindings,
     needsInputQuestion,
     usageLimitResetsAt,
+    ...(interrupted ? { interrupted } : {}),
   };
 }

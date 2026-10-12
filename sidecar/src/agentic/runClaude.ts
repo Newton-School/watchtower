@@ -30,6 +30,12 @@ export interface RunClaudeAgenticRequest {
    * backend-portable, unlike model ids. See docs/model-effort-audit.md.
    */
   effort?: CodexReasoningEffort;
+  /**
+   * Images from the Slack thread, already downloaded. The backend names them
+   * in the prompt and lets the Read tool open their folder. Pass them only for
+   * a backend that supports image input.
+   */
+  imagePaths?: string[];
 }
 
 export interface RunClaudeAgenticResult {
@@ -52,8 +58,19 @@ export interface RunClaudeAgenticResult {
  * wrapping.
  */
 export async function runClaudeAgentic(request: RunClaudeAgenticRequest): Promise<RunClaudeAgenticResult> {
-  const { systemPrompt, userMessage, cwd, githubToken, logStep, signal, forceBackend, timeoutMs, tier, effort } =
-    request;
+  const {
+    systemPrompt,
+    userMessage,
+    cwd,
+    githubToken,
+    logStep,
+    signal,
+    forceBackend,
+    timeoutMs,
+    tier,
+    effort,
+    imagePaths,
+  } = request;
 
   const prompt = `${systemPrompt}\n\n---\n\nUser message:\n${userMessage}`;
   const backendId = forceBackend ?? getActiveBackendId();
@@ -68,6 +85,7 @@ export async function runClaudeAgentic(request: RunClaudeAgenticRequest): Promis
       reasoningEffort: effort ?? profile.reasoningEffort,
       backendOverride: forceBackend,
       timeoutMs,
+      imagePaths: imagePaths && imagePaths.length > 0 ? imagePaths : undefined,
       onLog: logStep,
       signal,
     });

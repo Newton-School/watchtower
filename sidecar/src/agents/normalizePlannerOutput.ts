@@ -2,12 +2,30 @@ import type { AgentBackendId } from '../types/contracts.js';
 
 export type PlanScope = 'small' | 'medium' | 'large';
 
+/**
+ * The five lines a plan opens with for the person who approves it (issue
+ * #437). Plans ran to a median of 8,000 characters for a ten-line change and
+ * were approved in under two minutes; what the approver needed (what changes
+ * for users, and whether behaviour changes) was somewhere inside.
+ */
+export interface ApproverSummary {
+  whatChanges: string;
+  where: string;
+  /** "none", or what will behave differently afterwards, in plain words. */
+  behaviourChange: string;
+  /** "none", or what the planner had to assume (a screenshot it could not see, a default it picked). */
+  assumptions: string;
+  risk: 'low' | 'medium' | 'high' | null;
+}
+
 export interface NormalizedPlannerOutput {
   planMarkdown: string;
   scope: PlanScope;
   requiresCodeChanges: boolean;
   clarificationNeeded: string | null;
   affectedFiles: string[];
+  /** Parsed from the plan's opening block. Null when the planner did not write one. */
+  approverSummary: ApproverSummary | null;
 }
 
 function coerceScope(value: unknown): PlanScope {
@@ -118,15 +136,142 @@ function looksLikeFilePath(candidate: string): boolean {
   return FILE_EXTENSION_PATTERN.test(candidate);
 }
 
-function extractAffectedFilesFromMarkdown(markdown: string): string[] {
-  const files = new Set<string>();
+/**
+ * Whether a path-shaped token names one file a change could edit. Stricter
+ * than `looksLikeFilePath`, which accepts anything with a slash: the plan
+ * header read "29 files affected" for a 3-file change because it counted
+ * `origin/main`, `worker/**`, `../nsat/page`, URL paths and build output
+ * (issue #437).
+ */
+function looksLikeEditableFile(candidate: string): boolean {
+  if (!looksLikeFilePath(candidate)) return false;
+  if (/[*?{}]/.test(candidate)) return false; // a glob is a set of files, or none
+  if (candidate.startsWith('/')) return false; // a URL path or an absolute path, not repo-relative
+  if (/^(origin|upstream|refs|heads)\//.test(candidate)) return false; // a git ref
+  if (/^(out|dist|build|\.next|node_modules)\//.test(candidate)) return false; // build output
+  const base = basenameOf(candidate);
+  return KNOWN_BASENAMES.has(base) || DOTFILE_PATTERN.test(base) || FILE_EXTENSION_PATTERN.test(candidate);
+}
+
+function backtickedTokens(text: string): string[] {
+  const tokens: string[] = [];
   const pattern = /`([^`\n]{1,200})`/g;
   let match: RegExpExecArray | null;
-  while ((match = pattern.exec(markdown)) !== null) {
-    const candidate = match[1].trim();
-    if (looksLikeFilePath(candidate)) files.add(candidate);
+  while ((match = pattern.exec(text)) !== null) tokens.push(match[1].trim());
+  return tokens;
+}
+
+function extractAffectedFilesFromMarkdown(markdown: string): string[] {
+  return [...new Set(backtickedTokens(markdown).filter(looksLikeEditableFile))];
+}
+
+const FILES_TO_CHANGE_HEADING_RE = /^#{1,6}\s*files?\s+to\s+(?:change|touch|modify|edit|update)\b/i;
+const ANY_HEADING_RE = /^#{1,6}\s+\S/;
+
+/** The lines of the plan's "Files to change" section: `[start, end)` over `lines`, or undefined. */
+function filesToChangeSection(lines: string[]): { start: number; end: number } | undefined {
+  const start = lines.findIndex(line => FILES_TO_CHANGE_HEADING_RE.test(line.trim()));
+  if (start === -1) return undefined;
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (ANY_HEADING_RE.test(lines[i].trim())) {
+      end = i;
+      break;
+    }
+  }
+  return { start, end };
+}
+
+/**
+ * The files the planner says it will edit: the first path on each bullet of
+ * its "Files to change" section. Undefined when the plan has no such section,
+ * so the caller can fall back to reading the whole plan.
+ */
+export function extractFilesToChange(markdown: string): string[] | undefined {
+  const lines = markdown.split('\n');
+  const section = filesToChangeSection(lines);
+  if (!section) return undefined;
+  const files = new Set<string>();
+  for (const line of lines.slice(section.start + 1, section.end)) {
+    const first = backtickedTokens(line).find(looksLikeEditableFile);
+    if (first) files.add(first);
   }
   return [...files];
+}
+
+const APPROVER_HEADING_RE = /^#{1,6}\s*for\s+the\s+approver\b/i;
+const APPROVER_LINE_RE =
+  /^[\s>*-]*\**\s*(what changes|where|behaviou?r change|assumptions to confirm|risk)\s*\**\s*:\s*\**\s*(.*)$/i;
+/** The approver block is the plan's opening: lines this far down are something else. */
+const APPROVER_BLOCK_MAX_LINE = 40;
+
+function approverLines(lines: string[]): Array<{ index: number; label: string; value: string }> {
+  const found: Array<{ index: number; label: string; value: string }> = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < Math.min(lines.length, APPROVER_BLOCK_MAX_LINE); i++) {
+    const match = APPROVER_LINE_RE.exec(lines[i]);
+    if (!match) continue;
+    const label = match[1].toLowerCase().replace('behavior', 'behaviour');
+    if (seen.has(label)) continue;
+    seen.add(label);
+    found.push({ index: i, label, value: match[2].replace(/\*+$/, '').trim() });
+  }
+  return found;
+}
+
+/** Reads the plan's opening block. Null unless it says both what changes and whether behaviour does. */
+export function parseApproverSummary(markdown: string): ApproverSummary | null {
+  const byLabel = new Map(approverLines(markdown.split('\n')).map(line => [line.label, line.value]));
+  const whatChanges = byLabel.get('what changes') ?? '';
+  const behaviourChange = byLabel.get('behaviour change') ?? '';
+  if (!whatChanges || !behaviourChange) return null;
+  const risk = (byLabel.get('risk') ?? '').toLowerCase().match(/\b(low|medium|high)\b/)?.[1] as
+    | ApproverSummary['risk']
+    | undefined;
+  return {
+    whatChanges,
+    where: byLabel.get('where') ?? '',
+    behaviourChange,
+    assumptions: byLabel.get('assumptions to confirm') || 'none',
+    risk: risk ?? null,
+  };
+}
+
+const NONE_LEAD_RE = /^(?:none|nothing|no|n\/a|na)(?=$|[.!,;:]|\s*[—–(-])/i;
+/** Words that take a leading "none" back: "none, but the default becomes 0". */
+const NONE_TAKEN_BACK_RE = /\b(?:but|however|except|although|though|unless|other than|apart from|aside from)\b/i;
+
+/**
+ * Whether an approver-block value says there is nothing to report.
+ *
+ * Planners rarely write a bare "none". The first live plan said "none. The
+ * line is an HTML comment, so it does not render…", which a whole-value match
+ * read as a behaviour change. So a value that leads with "none" and goes on
+ * to explain counts as none, unless it then takes it back.
+ */
+export function isNone(value: string): boolean {
+  const text = value.trim();
+  if (text === '' || text === '-') return true;
+  return NONE_LEAD_RE.test(text) && !NONE_TAKEN_BACK_RE.test(text);
+}
+
+/**
+ * The plan without its approver block and its "Files to change" section, for
+ * a message that has already shown both in its own words.
+ */
+export function planWithoutApproverParts(markdown: string): string {
+  const lines = markdown.split('\n');
+  const drop = new Set<number>(approverLines(lines).map(line => line.index));
+  lines.forEach((line, index) => {
+    if (index < APPROVER_BLOCK_MAX_LINE && APPROVER_HEADING_RE.test(line.trim())) drop.add(index);
+  });
+  const section = filesToChangeSection(lines);
+  if (section) for (let i = section.start; i < section.end; i++) drop.add(i);
+  return lines
+    .filter((_, index) => !drop.has(index))
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 export function normalizePlannerOutput(raw: unknown, backendId: AgentBackendId): NormalizedPlannerOutput {
@@ -144,9 +289,15 @@ export function normalizePlannerOutput(raw: unknown, backendId: AgentBackendId):
             ? raw.trim()
             : '';
 
+    // What the planner listed as files to change wins over a guess from every
+    // path-shaped token in the plan (issue #437).
     const carriedFiles = coerceStringArray(rawObj?.affectedFiles);
-    const affectedFiles = carriedFiles.length > 0 ? carriedFiles : extractAffectedFilesFromMarkdown(markdown);
+    const affectedFiles =
+      carriedFiles.length > 0
+        ? carriedFiles
+        : (extractFilesToChange(markdown) ?? extractAffectedFilesFromMarkdown(markdown));
     return {
+      approverSummary: parseApproverSummary(markdown),
       planMarkdown: markdown,
       scope: extractScopeFromMarkdown(markdown),
       // Prefer an already-normalized boolean (idempotent re-normalize), else
@@ -175,5 +326,6 @@ export function normalizePlannerOutput(raw: unknown, backendId: AgentBackendId):
     requiresCodeChanges,
     clarificationNeeded,
     affectedFiles,
+    approverSummary: null,
   };
 }

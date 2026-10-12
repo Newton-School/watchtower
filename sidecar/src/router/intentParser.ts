@@ -42,11 +42,17 @@ const NEWTON_WEB_REF_RE = /\bnewton[- ]?web\b/;
 const AMBIGUOUS_DEPLOY_TARGET_RE = /\b(landing([- ]?pages?)?|homepage|newton[- ]?school|nsat|nst)\b/;
 
 function normalizeDeployText(text: string): string {
-  return text
-    .replace(/<@[^>]+>/g, ' ')
-    .replace(/\s+/g, ' ')
-    .toLowerCase()
-    .trim();
+  return (
+    text
+      .replace(/<@[^>]+>/g, ' ')
+      // A link is not an instruction: a newton-web PR URL must not count as
+      // naming the deploy target (issue #428). A Slack link keeps its label.
+      .replace(/<https?:[^>|]*(?:\|([^>]*))?>/g, ' $1 ')
+      .replace(/https?:\/\/\S+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .toLowerCase()
+      .trim()
+  );
 }
 
 export type DeployTarget = 'newton-web' | 'newton-marketing-web' | 'ambiguous';
@@ -93,6 +99,29 @@ export function classifyDeployTarget(text: string): DeployTarget | null {
 }
 
 /**
+ * The deploy target, but only when the message leads with the deploy ask:
+ * the verb has to be in its first sentence. Used where a deploy is about to
+ * be allowed (see `mayDeploy`), which is stricter than seeding a hint.
+ *
+ * `classifyDeployTarget` alone finds "newton-web" and "deploy" anywhere, so
+ * "could you review these two please? • newton-web <PR> *Deploy order:* …"
+ * has a target by its lights (issue #428). A request that leads with something
+ * else is not a deploy request, whatever its later lines mention.
+ */
+export function leadingDeployTarget(text: string): DeployTarget | null {
+  const firstSentence =
+    text
+      .replace(/<@[^>]+>/g, ' ')
+      .replace(/<https?:[^>|]*(?:\|([^>]*))?>/g, ' $1 ')
+      .replace(/https?:\/\/\S+/g, ' ')
+      .split(/[.?!\n•]+/)
+      .map(part => part.trim())
+      .find(part => part.length > 0) ?? '';
+  if (!DEPLOY_VERB_RE.test(firstSentence.toLowerCase())) return null;
+  return classifyDeployTarget(text);
+}
+
+/**
  * Deterministic check: does the message unambiguously ask to deploy
  * newton-web to production? Runs before the AI classifier so deploy requests
  * are never misrouted.
@@ -111,11 +140,50 @@ export function isMarketingDeployRequest(text: string): boolean {
   return classifyDeployTarget(text) === 'newton-marketing-web';
 }
 
-export function detectMention(
-  text: string,
-  config: AppConfig,
-  channelType?: string,
-): { detected: boolean; type: 'bot' | 'owner' | 'none' } {
+export interface MentionInfo {
+  detected: boolean;
+  type: 'bot' | 'owner' | 'none';
+  /**
+   * The bot is mentioned, but only in passing: the message may be about miniOG
+   * or addressed to someone else (issue #448). Still a bot mention; what
+   * differs is that staying silent becomes a permitted answer.
+   */
+  reference?: boolean;
+}
+
+/** Words that, right before the bot's tag, make it a reference rather than an address. */
+const REFERENCE_CUE_RE = /(?:^|[^a-z])(cc|fyi|by|from|per|as)\s*[:\-–—]?\s*$/i;
+/** Other people's tags (and joiners) between a cue and the bot's tag: "cc: @a, @b and @miniOG". */
+const TRAILING_TAGS_RE = /(?:\s|,|&|\band\b|<[@!][^>]+>)+$/i;
+/** A message that opens by tagging a person or a user group. */
+const LEADING_TAG_RE = /^[\s\-–—•*>]*<(?:@([A-Z0-9]+)|!subteam\^[^>]+)>/;
+
+/**
+ * True when every mention of the bot in `text` is a reference: a possessive
+ * ("@miniOG's comments"), after a cue ("cc: @miniOG", "flagged by @miniOG",
+ * "as @miniOG said"), or anywhere after another person's tag that opens the
+ * message ("@owner I've resolved @miniOG's comments").
+ *
+ * "I've resolved @miniOG's comments, can you take a look?", written to the
+ * owner, started a second review of a PR that had just been merged.
+ */
+export function isReferenceMention(text: string, botUserId: string): boolean {
+  const token = `<@${botUserId}>`;
+  if (!text.includes(token)) return false;
+
+  const opening = text.match(LEADING_TAG_RE);
+  if (opening && opening[1] !== botUserId) return true;
+
+  for (let at = text.indexOf(token); at !== -1; at = text.indexOf(token, at + token.length)) {
+    const after = text.slice(at + token.length);
+    const before = text.slice(0, at).replace(TRAILING_TAGS_RE, '');
+    const possessive = /^['’]s\b/i.test(after);
+    if (!possessive && !REFERENCE_CUE_RE.test(before)) return false;
+  }
+  return true;
+}
+
+export function detectMention(text: string, config: AppConfig, channelType?: string): MentionInfo {
   if (!text) {
     if (channelType === 'im') {
       return { detected: true, type: 'bot' };
@@ -125,7 +193,9 @@ export function detectMention(
 
   const botMention = `<@${config.botUserId}>`;
   if (text.includes(botMention)) {
-    return { detected: true, type: 'bot' };
+    // In a DM everything is addressed to the bot, however it is phrased.
+    const reference = channelType !== 'im' && isReferenceMention(text, config.botUserId ?? '');
+    return { detected: true, type: 'bot', ...(reference ? { reference } : {}) };
   }
 
   for (const ownerId of config.ownerSlackUserIds) {
@@ -187,6 +257,37 @@ function isReviewRequestVerb(normalized: string): boolean {
 const CONFLICTING_CHANGE_VERB_RE =
   /\b(create|open|raise|fix|implement|merge|close|revert|rebase|update|address|resolve)\b/;
 
+/** "review and merge", "review, approve, merge", "review & approve": a review ask with more after it. */
+const REVIEW_THEN_MERGE_RE = /\breview\s*(?:,|&|\+|\/|\band\b|\bthen\b)\s*(?:approve|merge)\b/;
+
+/** `<https://x|label>` and `<https://x>` → `https://x`, as the sender typed it. */
+function unwrapSlackLinks(text: string): string {
+  return text
+    .replace(/<(https?:\/\/[^>|\s]+)(?:\|[^>]*)?>/g, ' $1 ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** The footer Slack adds to a message a person sends through the Claude app. */
+const SENT_USING_FOOTER_RE = /\*sent using\*\s*<@[^>]+>\s*$/i;
+
+/**
+ * True when a message is nothing but mentions and pull-request links: a PR
+ * pasted at miniOG with no words around it, which has only one reading.
+ */
+export function isBarePrPaste(triggerText: string): boolean {
+  if (!GITHUB_PR_URL_TEST_RE.test(triggerText)) return false;
+  const rest = triggerText
+    .replace(SENT_USING_FOOTER_RE, ' ')
+    // Slack's link form, with or without a label: <https://github.com/o/r/pull/1|label>
+    .replace(/<https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+[^>]*>/g, ' ')
+    .replace(/https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+[^\s<>|]*/g, ' ')
+    // user, user-group and special mentions
+    .replace(/<[@!][^>]+>/g, ' ')
+    .replace(/[\s\p{P}\p{S}]+/gu, '');
+  return rest.length === 0;
+}
+
 /**
  * Deterministic check: is the message asking for a PR review? Runs before
  * the AI classifier (pattern: isDeployRequest) so a message that carries
@@ -201,18 +302,40 @@ const CONFLICTING_CHANGE_VERB_RE =
  * Tier 2 — review verb in the trigger, PR URL(s) elsewhere in the thread:
  * fires only when no conflicting change verb muddies the ask ("review and
  * fix X" is mixed intent — let the classifier decide).
+ *
+ * `explicitOnly` narrows Tier 1 to its two unambiguous forms: a review verb
+ * with the URL, or a message that is nothing but mentions and PR links. A PR
+ * link with anything else around it (a question about the PR, a status
+ * update) is then left to the tool-router: "no change verb" used to make it
+ * a review, and a PM's four questions about a merged PR got 13 inline review
+ * comments instead of answers (issue #447).
  */
-export function isPrReviewRequest(triggerText: string, threadTexts: string[] = []): boolean {
+export function isPrReviewRequest(
+  triggerText: string,
+  threadTexts: string[] = [],
+  options: { explicitOnly?: boolean } = {},
+): boolean {
   if (!triggerText) return false;
   const normalized = triggerText
     .replace(/<@[^>]+>/g, ' ')
     .replace(/\s+/g, ' ')
     .toLowerCase()
     .trim();
-  const hasReviewVerb = isReviewRequestVerb(normalized);
+  // Slack delivers a link as <https://…> or <https://…|label>. The verb test
+  // looks for "review https://", so in explicit mode the brackets come off
+  // first: without the old "no change verb" fallback, "review <link>" would
+  // otherwise miss the gate it is the plainest case for.
+  const verbText = options.explicitOnly ? unwrapSlackLinks(normalized) : normalized;
+  // "Review and merge" asks for a review first, whatever follows it. Outside
+  // explicit mode "merge" is a conflicting verb and the classifier decided,
+  // which sent the same sentence to a review, to the change pipeline or to
+  // nothing on different days (issue #430).
+  const hasReviewVerb =
+    isReviewRequestVerb(verbText) || Boolean(options.explicitOnly && REVIEW_THEN_MERGE_RE.test(verbText));
   const hasConflictingVerb = CONFLICTING_CHANGE_VERB_RE.test(normalized);
 
   if (GITHUB_PR_URL_TEST_RE.test(triggerText)) {
+    if (options.explicitOnly) return hasReviewVerb || isBarePrPaste(triggerText);
     return hasReviewVerb || !hasConflictingVerb;
   }
 
@@ -384,9 +507,13 @@ export function parseMiniogSubcommand(text: string): MiniogSubcommand | null {
 function inferIntent(
   event: SlackEventEnvelope,
   config: AppConfig,
-  mention: { detected: boolean; type: 'bot' | 'owner' | 'none' },
+  mention: MentionInfo,
   threadTexts: string[] = [],
+  options: NormalizeTaskOptions = {},
 ): { intent: WorkflowIntent; miniogSubcommand?: MiniogSubcommand } {
+  // A keyword gate acts without a second opinion, so it needs a direct address.
+  // While the tool-router decides, a mention in passing is left to it (issue #448).
+  const directBotMention = mention.detected && mention.type === 'bot' && !(options.routerDecides && mention.reference);
   // Dossier subcommands (whoami / set-role / forget) take precedence over every other route
   // when the bot is mentioned. They are read-only or operator-self-edit commands and
   // must not bleed into the AI classifier.
@@ -410,7 +537,14 @@ function inferIntent(
   // ambiguous between the frontends) lands on the DEPLOY intent here;
   // deployWorkflow re-derives the target the same way and resolves
   // 'ambiguous' with config.
-  if (mention.detected && classifyDeployTarget(event.text ?? '') !== null) {
+  //
+  // Direct address only (an @miniOG mention or a DM). A message that merely
+  // tags the owner is a conversation between people; its wording must never
+  // start a production deploy (issue #428).
+  // While the tool-router decides, the keywords are only a hint to it: "Deploy
+  // order: …" in a review request for a newton-web PR used to start the
+  // production deploy workflow from here (issue #428).
+  if (directBotMention && !options.routerDecides && classifyDeployTarget(event.text ?? '') !== null) {
     return { intent: 'DEPLOY' };
   }
 
@@ -426,11 +560,24 @@ function inferIntent(
   // it"; this gate steers it to WEBAPP_QA while "review this PR" / a bare PR
   // paste still fall through to PR_REVIEW. prContext is populated by
   // normalizeTask regardless, so runWebappQa can resolve the PR downstream.
-  if (mention.detected && mention.type === 'bot' && isWebappQaOnPrRequest(event.text ?? '')) {
+  if (directBotMention && isWebappQaOnPrRequest(event.text ?? '')) {
     return { intent: 'WEBAPP_QA' };
   }
 
-  if (mention.detected && mention.type === 'bot' && isPrReviewRequest(event.text ?? '', threadTexts)) {
+  if (directBotMention && isPrReviewRequest(event.text ?? '', threadTexts, { explicitOnly: options.routerDecides })) {
+    return { intent: 'PR_REVIEW' };
+  }
+
+  // A review ask that tags the owner (or the core-dev group) instead of miniOG
+  // gets the same gate, in its explicit forms and with the link in the message
+  // itself. Left to a model call, the same "please review <PR>" was reviewed,
+  // sent to the change pipeline or ignored on different days (issue #430).
+  if (
+    options.routerDecides &&
+    mention.detected &&
+    mention.type === 'owner' &&
+    isPrReviewRequest(event.text ?? '', [], { explicitOnly: true })
+  ) {
     return { intent: 'PR_REVIEW' };
   }
 
@@ -438,7 +585,7 @@ function inferIntent(
   // owners get it too. "QA the login flow on <url>" carries all its routing
   // signal in plain text (a QA verb + a non-PR/Metabase URL), so it skips the
   // AI classifier in routeTask and never misroutes to INVESTIGATION.
-  if (mention.detected && mention.type === 'bot' && isWebappQaRequest(event.text ?? '')) {
+  if (directBotMention && isWebappQaRequest(event.text ?? '')) {
     return { intent: 'WEBAPP_QA' };
   }
 
@@ -472,10 +619,21 @@ function inferIntent(
   return { intent: 'UNKNOWN' };
 }
 
+export interface NormalizeTaskOptions {
+  /**
+   * Set while the tool-router decides. The keyword gates then leave it what
+   * they cannot be sure of: the review gate fires only on an explicit review
+   * ask or a bare PR paste (issue #447), and no gate fires on a mention made
+   * in passing (issue #448).
+   */
+  routerDecides?: boolean;
+}
+
 export function normalizeTask(
   event: SlackEventEnvelope,
   config: AppConfig,
   threadTexts: string[] = [],
+  options: NormalizeTaskOptions = {},
 ): NormalizedTask {
   const mention = detectMention(event.text, config, event.channelType);
   const isOwnerAuthor = config.ownerSlackUserIds.includes(event.userId);
@@ -483,12 +641,13 @@ export function normalizeTask(
   const prContexts = extractAllPrContexts({ triggerText: event.text, threadTexts });
   const first = prContexts[0];
   const prContext = first ? { url: first.url, owner: first.owner, repo: first.repo, number: first.number } : undefined;
-  const inferred = inferIntent(event, config, mention, threadTexts);
+  const inferred = inferIntent(event, config, mention, threadTexts, options);
 
   return {
     event,
     mentionDetected: mention.detected,
     mentionType: mention.type,
+    ...(mention.reference ? { mentionReference: true } : {}),
     isOwnerAuthor,
     isCoreDevAuthor,
     intent: inferred.intent,

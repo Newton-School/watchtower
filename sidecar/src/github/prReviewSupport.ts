@@ -124,6 +124,56 @@ async function fetchCiStatus(params: {
   }
 }
 
+export type PrLifecycleState = 'open' | 'merged' | 'closed';
+
+export interface PrState {
+  state: PrLifecycleState;
+  /** When it was merged or closed (ISO), if GitHub said. */
+  at?: string;
+}
+
+/**
+ * Whether a pull request is still open (issue #447). Returns undefined when
+ * GitHub cannot be asked, so callers fail open and review as before.
+ */
+export async function fetchPrState(params: {
+  prContext: PrContext;
+  githubToken?: string;
+  logStep?: WorkflowStepLogger;
+}): Promise<PrState | undefined> {
+  const { prContext, githubToken, logStep } = params;
+  const url = `https://api.github.com/repos/${prContext.owner}/${prContext.repo}/pulls/${prContext.number}`;
+  const headers: Record<string, string> = { Accept: 'application/vnd.github+json' };
+  if (githubToken) headers.Authorization = `Bearer ${githubToken}`;
+
+  try {
+    const response = await fetch(url, { headers, signal: AbortSignal.timeout(15_000) });
+    if (!response.ok) {
+      logStep?.({
+        stage: 'pr_review.state.fetch_failed',
+        message: 'Could not read the PR state from GitHub; treating it as open.',
+        level: 'WARN',
+        data: { status: response.status, prUrl: prContext.url },
+      });
+      return undefined;
+    }
+    const payload = (await response.json()) as Record<string, unknown>;
+    const text = (value: unknown) => (typeof value === 'string' ? value : undefined);
+    if (payload.merged === true || text(payload.merged_at)) return { state: 'merged', at: text(payload.merged_at) };
+    if (payload.state === 'closed') return { state: 'closed', at: text(payload.closed_at) };
+    if (payload.state === 'open') return { state: 'open' };
+    return undefined;
+  } catch (error) {
+    logStep?.({
+      stage: 'pr_review.state.fetch_failed',
+      message: 'Could not read the PR state from GitHub; treating it as open.',
+      level: 'WARN',
+      data: { error: String(error), prUrl: prContext.url },
+    });
+    return undefined;
+  }
+}
+
 export async function fetchPrMetadata(params: {
   prContext: PrContext;
   githubToken?: string;
@@ -196,6 +246,30 @@ export const DIFF_PROMPT_MAX_CHARS = (() => {
   const parsed = raw ? Number(raw) : Number.NaN;
   return Number.isFinite(parsed) && parsed >= 10_000 ? parsed : 150_000;
 })();
+
+/**
+ * The diff between a commit reviewed earlier and the PR's current head, for
+ * a follow-up review (issue #451). Undefined when GitHub cannot produce it,
+ * which is what a force-push that orphaned the old commit looks like.
+ */
+export async function fetchDiffSince(params: {
+  prContext: PrContext;
+  baseSha: string;
+  headSha: string;
+  githubToken?: string;
+}): Promise<string | undefined> {
+  const { prContext, baseSha, headSha, githubToken } = params;
+  const url = `https://api.github.com/repos/${prContext.owner}/${prContext.repo}/compare/${baseSha}...${headSha}`;
+  const headers: Record<string, string> = { Accept: 'application/vnd.github.diff' };
+  if (githubToken) headers.Authorization = `Bearer ${githubToken}`;
+  try {
+    const response = await fetch(url, { headers, signal: AbortSignal.timeout(20_000) });
+    if (!response.ok) return undefined;
+    return await response.text();
+  } catch {
+    return undefined;
+  }
+}
 
 export async function fetchPrDiff(params: {
   prContext: PrContext;
@@ -527,7 +601,81 @@ function buildSummaryOnlyFinding(role: string, finding: AgentFinding): string {
   return `- [${role.toUpperCase()} - ${finding.severity.toUpperCase()}] ${finding.message}${suggestion}`;
 }
 
-export function buildGithubReviewSummary(outputs: NormalizedPrReviewAgentOutput[], appliedSkills?: string[]): string {
+/** Worst first. */
+const SEVERITY_ORDER: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
+
+/** Inline comments one review may carry. Past this, a review is a wall nobody reads. */
+export const MAX_INLINE_COMMENTS = 10;
+const INLINE_FLOOR_RANK = SEVERITY_ORDER.medium;
+
+/**
+ * Which findings become comments on the diff and which are listed in the
+ * review body (issue #441).
+ *
+ * Every finding used to be its own inline comment: a median of 11 per PR, 65%
+ * of them low or info. Authors faced a wall and stopped reading it, which
+ * buried the high-severity findings the review exists for.
+ *
+ * Inline: line-mapped findings of medium severity and above, worst first, at
+ * most MAX_INLINE_COMMENTS. Collapsed: every other line-mapped finding (lows,
+ * infos, and mediums past the cap), listed once in the review body. Findings
+ * with no line were already listed there and are not part of the plan.
+ */
+export interface ReviewPostingPlan {
+  /** What to hand to the GitHub submission, by role. */
+  toSubmit: Array<{ role: string; findings: AgentFinding[] }>;
+  /** Line-mapped findings that are listed in the body instead of posted inline. */
+  collapsed: Array<{ role: string; finding: AgentFinding }>;
+  /** How many inline comments the plan asks for. */
+  inlineCount: number;
+}
+
+export function planReviewPosting(outputs: NormalizedPrReviewAgentOutput[]): ReviewPostingPlan {
+  const rank = (finding: AgentFinding): number => SEVERITY_ORDER[finding.severity] ?? 9;
+  const lineMapped = outputs.flatMap(output =>
+    output.attachableFindings.map(finding => ({ role: output.role, finding })),
+  );
+  const eligible = lineMapped
+    .filter(item => rank(item.finding) <= INLINE_FLOOR_RANK)
+    .sort((a, b) => rank(a.finding) - rank(b.finding));
+  const inline = new Set(eligible.slice(0, MAX_INLINE_COMMENTS).map(item => item.finding));
+  const collapsed = lineMapped
+    .filter(item => !inline.has(item.finding))
+    .sort((a, b) => rank(a.finding) - rank(b.finding));
+
+  return {
+    toSubmit: outputs.map(output => ({
+      role: output.role,
+      findings: [
+        ...output.attachableFindings.filter(finding => inline.has(finding)),
+        // A finding on a file but no line is posted as a file-level comment,
+        // under the same severity floor.
+        ...output.unattachableFindings.filter(finding => rank(finding) <= INLINE_FLOOR_RANK),
+      ],
+    })),
+    collapsed,
+    inlineCount: inline.size,
+  };
+}
+
+function buildCollapsedFinding(role: string, finding: AgentFinding): string {
+  const where = finding.file
+    ? `\`${finding.file}${typeof finding.line === 'number' ? `:${finding.line}` : ''}\` — `
+    : '';
+  const suggestion = finding.suggestion ? ` Suggestion: ${finding.suggestion}` : '';
+  return `- [${role.toUpperCase()} - ${finding.severity.toUpperCase()}] ${where}${finding.message}${suggestion}`;
+}
+
+export function buildGithubReviewSummary(
+  outputs: NormalizedPrReviewAgentOutput[],
+  appliedSkills?: string[],
+  plan?: ReviewPostingPlan,
+  /** For a follow-up review: what became of the earlier findings, as the first line. */
+  followUpLine?: string,
+): string {
+  if (followUpLine) {
+    return `${followUpLine}\n\n${buildGithubReviewSummary(outputs, appliedSkills, plan)}`;
+  }
   const allFindings = outputs.flatMap(output => output.findings);
   const attachableFindings = outputs.flatMap(output => output.attachableFindings);
   const unattachableFindings = outputs.flatMap(output =>
@@ -552,8 +700,16 @@ export function buildGithubReviewSummary(outputs: NormalizedPrReviewAgentOutput[
     lines.push('Watchtower review complete - no line-attachable findings were identified.');
   }
 
-  if (attachableFindings.length > 0) {
-    lines.push(`${attachableFindings.length} inline comment(s) were prepared from line-mapped findings.`);
+  const inlineCount = plan ? plan.inlineCount : attachableFindings.length;
+  if (inlineCount > 0) {
+    lines.push(
+      plan
+        ? `${inlineCount} of them, of medium severity or above, are inline comments on the diff.`
+        : `${inlineCount} inline comment(s) were prepared from line-mapped findings.`,
+    );
+  }
+  if (plan && plan.collapsed.length > 0) {
+    lines.push(`${plan.collapsed.length} lower-priority finding(s) are listed below instead of inline.`);
   }
   if (unattachableFindings.length > 0) {
     lines.push(`${unattachableFindings.length} finding(s) could not be attached inline and are listed below.`);
@@ -572,7 +728,51 @@ export function buildGithubReviewSummary(outputs: NormalizedPrReviewAgentOutput[
     }
   }
 
+  if (plan && plan.collapsed.length > 0) {
+    lines.push('', 'Lower-priority findings (not posted inline):');
+    for (const { role, finding } of plan.collapsed) {
+      lines.push(buildCollapsedFinding(role, finding));
+    }
+  }
+
   return lines.join('\n');
+}
+
+const capitalize = (text: string): string => text.charAt(0).toUpperCase() + text.slice(1);
+
+/** Why the review is not on the PR, as the clause after "but". */
+function notPostedClause(reviewResult: SubmitPrReviewResult | undefined): string {
+  if (reviewResult?.fallbackReason === 'no_token') {
+    return 'GitHub review submission was skipped (no GitHub token — nothing was posted to the PR)';
+  }
+  if (reviewResult?.unconfirmed) {
+    return `I could not confirm whether the review reached GitHub (${reviewResult.failureReason ?? 'the request failed'}) — check the PR before asking again`;
+  }
+  if (reviewResult?.failureReason) {
+    return `I couldn't post the review to GitHub (${reviewResult.failureReason})`;
+  }
+  return 'GitHub review submission was skipped';
+}
+
+/** How many findings the Slack message carries when the PR carries none of them. */
+const UNPOSTED_FINDINGS_IN_SLACK = 15;
+
+/**
+ * The findings themselves, for the thread, when the review could not be put
+ * on the PR. Without this they exist nowhere a person can read them.
+ */
+export function formatUnpostedFindings(findings: AgentFinding[]): string {
+  if (findings.length === 0) return '';
+  const ordered = [...findings].sort((a, b) => (SEVERITY_ORDER[a.severity] ?? 9) - (SEVERITY_ORDER[b.severity] ?? 9));
+  const lines = ordered.slice(0, UNPOSTED_FINDINGS_IN_SLACK).map(f => {
+    const where = f.file ? `${f.file}${typeof f.line === 'number' ? `:${f.line}` : ''} — ` : '';
+    const message = f.message.length > 240 ? `${f.message.slice(0, 240).trim()}…` : f.message;
+    return `• [${f.severity.toUpperCase()}] ${where}${message}`;
+  });
+  if (ordered.length > UNPOSTED_FINDINGS_IN_SLACK) {
+    lines.push(`… and ${ordered.length - UNPOSTED_FINDINGS_IN_SLACK} more that are not shown here.`);
+  }
+  return ['The review is not on the PR, so here is what it found:', ...lines].join('\n');
 }
 
 export function formatSlackReviewSummary(
@@ -580,6 +780,8 @@ export function formatSlackReviewSummary(
   prUrl: string,
   reviewResult?: SubmitPrReviewResult,
   appliedSkills?: string[],
+  /** Line-mapped findings listed in the review body instead of inline (issue #441). */
+  collapsedCount = 0,
 ): string {
   const skillsSuffix =
     appliedSkills && appliedSkills.length > 0
@@ -591,14 +793,14 @@ export function formatSlackReviewSummary(
   const resolvedEvent = deriveReviewEvent(allFindings, reviewResult?.event, totalSummaryNotes);
   const verdict = resolvedEvent === 'APPROVE' ? '✅' : resolvedEvent === 'REQUEST_CHANGES' ? '🚫' : '💬';
 
-  // When the GitHub token is missing, findings are computed but never posted —
-  // surface that explicitly so a skip reads as "couldn't post" not "all clear".
-  const noToken = reviewResult?.fallbackReason === 'no_token';
-  const skippedReason = noToken ? ' (no GitHub token — nothing was posted to the PR)' : '';
+  // Say why nothing is on the PR, so a skip reads as "couldn't post" and never
+  // as "all clear". "Skipped" alone was posted for a review that was on the PR
+  // with 16 inline comments (issue #449).
+  const notPosted = notPostedClause(reviewResult);
 
   if (totalFindings === 0 && totalSummaryNotes === 0) {
     if (reviewResult?.submissionMode === 'skipped') {
-      return `*PR Review Complete* - No actionable findings. GitHub review submission was skipped${skippedReason}. ${verdict}\n${prUrl}${skillsSuffix}`;
+      return `*PR Review Complete* - No actionable findings. ${capitalize(notPosted)}. ${verdict}\n${prUrl}${skillsSuffix}`;
     }
     return `*PR Review Complete* - No actionable findings. Good to go. ${verdict}\n${prUrl}${skillsSuffix}`;
   }
@@ -607,13 +809,13 @@ export function formatSlackReviewSummary(
 
   if (totalFindings === 0) {
     if (reviewResult?.submissionMode === 'skipped') {
-      return `*PR Review Complete* - ${totalSummaryNotes} review note(s) identified, but GitHub review submission was skipped${skippedReason}. ${verdict}\n${prUrl}${skillsSuffix}`;
+      return `*PR Review Complete* - ${totalSummaryNotes} review note(s) identified, but ${notPosted}. ${verdict}\n${prUrl}${skillsSuffix}`;
     }
     return `*PR Review Complete* - ${totalSummaryNotes} review note(s) were posted in the review summary. No inline comments were attached. ${verdict}\n${prUrl}${skillsSuffix}`;
   }
 
   if (!reviewResult || reviewResult.submissionMode === 'skipped') {
-    return `*PR Review Complete* - ${totalFindings} findings identified, but GitHub review submission was skipped${skippedReason}${breakdown} ${verdict}\n${prUrl}${skillsSuffix}`;
+    return `*PR Review Complete* - ${totalFindings} findings identified, but ${notPosted}${breakdown} ${verdict}\n${prUrl}${skillsSuffix}`;
   }
 
   const placedParts: string[] = [];
@@ -625,10 +827,11 @@ export function formatSlackReviewSummary(
   if (reviewResult.droppedOutsideDiff > 0) {
     dropReasons.push(`${reviewResult.droppedOutsideDiff} outside the PR diff`);
   }
-  const unplaced = totalFindings - totalPlaced - reviewResult.droppedOutsideDiff;
+  const unplaced = totalFindings - totalPlaced - reviewResult.droppedOutsideDiff - collapsedCount;
   if (unplaced > 0) {
     dropReasons.push(`${unplaced} without an anchor`);
   }
+  const collapsedClause = collapsedCount > 0 ? `; ${collapsedCount} lower-priority listed in the review summary` : '';
 
   if (totalPlaced === 0) {
     // Every finding was dropped because its anchor fell outside the diff — the
@@ -638,12 +841,16 @@ export function formatSlackReviewSummary(
       return `*PR Review Complete* - ⚠️ all ${totalFindings} finding(s) fell outside the PR diff and could NOT be posted inline; only the review summary was posted${breakdown} ${verdict}\n${prUrl}${skillsSuffix}`;
     }
     const reason = dropReasons.length > 0 ? ` — ${dropReasons.join(', ')}` : '';
-    return `*PR Review Complete* - ${totalFindings} findings identified; review summary posted, no inline comments attached${reason}${breakdown} ${verdict}\n${prUrl}${skillsSuffix}`;
+    // Nothing reached medium severity: no inline comments is the intended result, not a failure.
+    if (collapsedCount > 0 && dropReasons.length === 0) {
+      return `*PR Review Complete* - ${totalFindings} findings identified, none above low severity; they are listed in the review summary, not inline${breakdown} ${verdict}\n${prUrl}${skillsSuffix}`;
+    }
+    return `*PR Review Complete* - ${totalFindings} findings identified; review summary posted, no inline comments attached${reason}${collapsedClause}${breakdown} ${verdict}\n${prUrl}${skillsSuffix}`;
   }
 
   const placed = placedParts.join(' + ') + ' posted';
   const droppedClause = dropReasons.length > 0 ? `; ${dropReasons.join(', ')} dropped` : '';
-  return `*PR Review Complete* - ${totalFindings} findings identified; ${placed}${droppedClause}${breakdown} ${verdict}\n${prUrl}${skillsSuffix}`;
+  return `*PR Review Complete* - ${totalFindings} findings identified; ${placed}${collapsedClause}${droppedClause}${breakdown} ${verdict}\n${prUrl}${skillsSuffix}`;
 }
 
 export const NO_NEW_CHANGES_TEXT =

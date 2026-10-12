@@ -14,7 +14,13 @@ import { assertThreadParentExists, fetchThreadContext } from '../slack/threadCon
 import { resolvePrReviewTargets } from '../router/prTargetResolver.js';
 import { assembleRecall } from '../codex/recallAssembler.js';
 import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
-import { buildOutOfScopePrReply, mapRepoPath, fetchPrHeadSha } from '../github/prReviewSupport.js';
+import {
+  buildOutOfScopePrReply,
+  mapRepoPath,
+  fetchPrHeadSha,
+  fetchPrState,
+  type PrState,
+} from '../github/prReviewSupport.js';
 import { isRepoEnabled } from '../repos/registry.js';
 import { extractUserFocus } from './reviewFocus.js';
 import { reviewSinglePr, type PrReviewDeps, type PrReviewOutcome } from './prReviewAgent.js';
@@ -37,6 +43,51 @@ export type AgenticPrReviewStore = Pick<JobStore, 'findLatestReviewedPrHeadSha' 
  * - recall stages `workflow.recall.injected` / `workflow.recall.failed`;
  * - submitPrReview (hunk-validating) is the only GitHub write path.
  */
+/** The requester knows the PR has shipped and wants it reviewed regardless. */
+export function wantsPostMergeReview(text: string): boolean {
+  return /\bpost[- ]?merge\b|\banyway\b/i.test(text);
+}
+
+/** What to say instead of reviewing a PR that is already merged or closed. */
+export function buildNotOpenReply(entries: Array<{ target: PrTarget; state: PrState }>): string {
+  const describe = ({ target, state }: { target: PrTarget; state: PrState }) => {
+    const when = state.at ? ` (${state.at.slice(0, 10)})` : '';
+    const what = state.state === 'merged' ? `already merged${when}` : `closed without merging${when}`;
+    return `\`${target.repo}#${target.number}\` is ${what}`;
+  };
+  const urls = entries.map(({ target }) => target.url).join(' ');
+  const subject =
+    entries.length === 1
+      ? `${describe(entries[0])}, so I haven't reviewed it.`
+      : `${entries.map(describe).join('; ')}, so I haven't reviewed ${entries.length === 2 ? 'either' : 'them'}.`;
+  return `${subject} For a post-merge review, say \`post-merge review ${urls}\`. If you had a question about ${entries.length === 1 ? 'it' : 'them'} instead, @ me with the question and I'll answer.`;
+}
+
+/**
+ * The last message of a capped batch: which PRs were not reviewed, and a line
+ * to send back to have them reviewed (issue #442).
+ *
+ * The line uses `#number` when that is unambiguous in the thread, and the PR
+ * links otherwise: two repos in one request can share a PR number.
+ */
+export function buildDeferredNote(params: {
+  deferred: Array<{ url: string; repo: string; number: number }>;
+  reviewed: Array<{ repo: string; number: number }>;
+  botUserId?: string;
+}): string {
+  const { deferred, reviewed, botUserId } = params;
+  const everyNumber = [...reviewed, ...deferred].map(t => t.number);
+  const unambiguous = deferred.every(t => everyNumber.filter(n => n === t.number).length === 1);
+  const selectors = unambiguous ? deferred.map(t => `#${t.number}`) : deferred.map(t => t.url);
+  const names = deferred.map(t => `${t.repo}#${t.number}`).join(', ');
+  const total = reviewed.length + deferred.length;
+  return [
+    `That was ${reviewed.length} of the ${total} PRs you listed. Not reviewed yet: ${names}.`,
+    `To have ${deferred.length === 1 ? 'it' : 'them'} reviewed, send this in the thread:`,
+    `> ${botUserId ? `<@${botUserId}> ` : ''}review ${selectors.join(' ')}`,
+  ].join('\n');
+}
+
 export async function runAgenticPrReview(params: {
   task: NormalizedTask;
   config: AppConfig;
@@ -55,6 +106,8 @@ export async function runAgenticPrReview(params: {
   };
 
   const postToThread = async (text: string) => {
+    // After a cancel there is nothing true left to say about the review (#438).
+    if (signal?.aborted) return;
     await slack.chat
       .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text })
       .catch(() => {});
@@ -208,6 +261,46 @@ export async function runAgenticPrReview(params: {
 
   const githubToken = await resolveGithubTokenForCodex();
 
+  // A merged or closed PR is not reviewed unless a post-merge review is asked
+  // for: its findings cannot be "addressed before merge", and a question about
+  // a PR that had already shipped was getting a full review (issue #447). An
+  // unreadable state counts as open, so a GitHub blip never blocks a review.
+  const fetchState = deps.fetchState ?? fetchPrState;
+  const states = await Promise.all(
+    reviewable.map(({ target }) =>
+      fetchState({ prContext: target as PrContext, githubToken, logStep }).catch(() => undefined),
+    ),
+  );
+  const stateByUrl = new Map<string, PrState | undefined>(reviewable.map((entry, i) => [entry.target.url, states[i]]));
+  const notOpen = reviewable.filter(({ target }) => {
+    const state = stateByUrl.get(target.url)?.state;
+    return state === 'merged' || state === 'closed';
+  });
+  if (notOpen.length > 0 && !wantsPostMergeReview(task.event.text ?? '')) {
+    for (const { target } of notOpen) {
+      logStep?.({
+        stage: 'agentic.pr_review.guard.not_open',
+        message: `${target.repo}#${target.number} is ${stateByUrl.get(target.url)?.state} — not reviewing it.`,
+        level: 'WARN',
+        data: { prUrl: target.url, ...stateByUrl.get(target.url) },
+      });
+    }
+    await postToThread(
+      buildNotOpenReply(notOpen.map(({ target }) => ({ target, state: stateByUrl.get(target.url)! }))),
+    );
+    const stillOpen = reviewable.filter(entry => !notOpen.includes(entry));
+    reviewable.splice(0, reviewable.length, ...stillOpen);
+    if (reviewable.length === 0) {
+      return {
+        workflow: 'PR_REVIEW',
+        status: 'SKIPPED',
+        message: 'No open PR to review; told the requester and offered a post-merge review.',
+        notifyDesktop: false,
+        slackPosted: true,
+      };
+    }
+  }
+
   // Recall assembled once per job and prepended to every per-PR prompt —
   // same stage names as every other workflow (dossier invariant).
   let recallBlock = '';
@@ -254,11 +347,14 @@ export async function runAgenticPrReview(params: {
 
   // Single ack. Single-PR keeps the message users know; multi-PR lists the
   // batch (and names anything dropped by the target cap — never silent).
+  // The instructions for the rest come at the end, where they can be acted
+  // on: here they were followed by half an hour of review output (issue #442).
+  const deferred = resolution.truncated ?? [];
   const truncationNote =
-    resolution.truncated && resolution.truncated.length > 0
-      ? ` (capped at ${resolution.targets.length} per request — deferring ${resolution.truncated
+    deferred.length > 0
+      ? ` (capped at ${resolution.targets.length} per request — ${deferred.length} more deferred: ${deferred
           .map(t => `${t.repo}#${t.number}`)
-          .join(', ')}; reply with a PR link or "#number" to review those next)`
+          .join(', ')}; I'll say how to get those reviewed when these are done)`
       : '';
   const focusNote = userFocusBlock ? ' Noted your focus instructions.' : '';
   await postToThread(
@@ -355,6 +451,7 @@ export async function runAgenticPrReview(params: {
       threadContext,
       userFocusBlock,
       githubToken,
+      prState: stateByUrl.get(target.url)?.state,
       previousReview,
       priorFindings,
       persistFindings,
@@ -368,7 +465,9 @@ export async function runAgenticPrReview(params: {
   const failed = outcomes.filter(o => o.status === 'FAILED');
   const completed = outcomes.filter(o => o.status === 'SUCCESS');
   const skipped = outcomes.filter(o => o.status === 'SKIPPED');
-  const aborted = Boolean(signal?.aborted) && outcomes.length < reviewable.length;
+  // Aborted unless every PR was reviewed or skipped before the cancel landed.
+  // Counting only unstarted PRs made a cancelled single-PR review a FAILED one (#438).
+  const aborted = Boolean(signal?.aborted) && completed.length + skipped.length < reviewable.length;
   const firstWithSha = outcomes.find(o => o.prHeadSha);
 
   logStep?.({
@@ -379,6 +478,26 @@ export async function runAgenticPrReview(params: {
     },
   });
 
+  // The PRs past the cap were named once, in the acknowledgement, and never
+  // again: six of them went unreviewed in a month, on jobs recorded as a clean
+  // SUCCESS (issue #442). Say what is left as the last word of the batch, with
+  // a line that can be sent back as it is.
+  if (deferred.length > 0 && !aborted) {
+    await postToThread(
+      buildDeferredNote({
+        deferred,
+        reviewed: resolution.targets,
+        botUserId: config.botUserId,
+      }),
+    );
+    logStep?.({
+      stage: 'agentic.pr_review.deferred',
+      level: 'WARN',
+      message: `${deferred.length} PR(s) past the per-request cap were not reviewed; told the thread how to ask for them.`,
+      data: { deferred: deferred.map(t => t.url) },
+    });
+  }
+
   // result carries per-PR outcomes (the dedup guard reads them) plus
   // top-level prUrl/prHeadSha for single-PR back-compat consumers.
   const result = {
@@ -387,6 +506,7 @@ export async function runAgenticPrReview(params: {
     ...(firstWithSha?.prHeadSha ? { prHeadSha: firstWithSha.prHeadSha } : {}),
     failedCount: failed.length,
     failedUrls: failed.map(o => o.prUrl),
+    ...(deferred.length > 0 ? { deferredUrls: deferred.map(t => t.url) } : {}),
   };
 
   if (aborted) {

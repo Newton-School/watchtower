@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
+  PROCESS_HYGIENE_RULE,
   buildCoderPrompt,
+  buildPromptForRole,
   buildVerifierPrompt,
   buildPlannerPrompt,
   buildPlannerPlanModePrompt,
@@ -81,5 +83,55 @@ describe('plan-mode planner delivery contract (#408)', () => {
     // The parse-critical tags survive the rewrite.
     expect(prompt).toContain('Scope: small');
     expect(prompt).toContain('Requires code changes: yes');
+  });
+});
+
+describe('process rule on every agent prompt (issue #445)', () => {
+  it.each(['planner', 'coder', 'reviewer', 'security', 'performance', 'verifier'] as const)(
+    'tells the %s to stop only what it started, by PID, and never by name',
+    role => {
+      expect(buildPromptForRole(role, makeCtx())).toContain(PROCESS_HYGIENE_RULE);
+    },
+  );
+
+  it('names the commands that killed other jobs, and says they are blocked', () => {
+    expect(PROCESS_HYGIENE_RULE).toContain('`pkill`');
+    expect(PROCESS_HYGIENE_RULE).toContain('`killall`');
+    expect(PROCESS_HYGIENE_RULE).toContain('only by PID');
+    expect(PROCESS_HYGIENE_RULE).toContain('are blocked');
+  });
+
+  it('keeps the repo policy pack beside it', () => {
+    const prompt = buildCoderPrompt(makeCtx(MARKETING_PACK));
+    expect(prompt).toContain('Active policy pack: repo:newton-marketing-web');
+    expect(prompt).toContain(PROCESS_HYGIENE_RULE);
+  });
+});
+
+describe('plan-mode planner prompt asks for a plan an approver can read (issue #437)', () => {
+  const prompt = buildPlannerPlanModePrompt(makeCtx());
+
+  it('asks for the approver block first, with its five lines', () => {
+    for (const line of [
+      '## For the approver',
+      '- What changes:',
+      '- Where:',
+      '- Behaviour change:',
+      '- Assumptions to confirm:',
+      '- Risk:',
+    ]) {
+      expect(prompt).toContain(line);
+    }
+    expect(prompt.indexOf('## For the approver')).toBeLessThan(prompt.indexOf("A short summary of the user's intent."));
+  });
+
+  it('says what counts as a behaviour change, in the terms of the change that went wrong', () => {
+    expect(prompt).toContain('A changed default, limit, condition or rule is a behaviour change');
+    expect(prompt).toContain('say what the new value means for a real user');
+  });
+
+  it('asks for the files it will edit under their own heading, and nothing else there', () => {
+    expect(prompt).toContain('A section headed exactly `## Files to change`');
+    expect(prompt).toContain('ONLY files this change edits');
   });
 });

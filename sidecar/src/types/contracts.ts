@@ -340,6 +340,11 @@ export interface NormalizedTask {
   event: SlackEventEnvelope;
   mentionDetected: boolean;
   mentionType: 'bot' | 'owner' | 'none';
+  /**
+   * The bot is mentioned only in passing ("@miniOG's comments", "cc: @miniOG"):
+   * the message may be about it or addressed to someone else (issue #448).
+   */
+  mentionReference?: boolean;
   isOwnerAuthor: boolean;
   isCoreDevAuthor: boolean;
   intent: WorkflowIntent;
@@ -367,6 +372,11 @@ export interface NormalizedTask {
    * (non-dev roles get plain-language, low-code answers).
    */
   dossierRole?: DossierRole;
+  /**
+   * Set when this message is the requester's reply to a question miniOG asked
+   * about an earlier message it could not act on (issue #431).
+   */
+  clarification?: { question: string; askedText: string };
 }
 
 export interface RepoClassificationResult {
@@ -400,12 +410,20 @@ export interface CodexRunRequest {
   planMode?: boolean;
   /**
    * MCP servers to expose to the agent for this run. Only honored by the
-   * claude-code backend (adds `--mcp-config <inline JSON>` + `--strict-mcp-config`
-   * so ONLY these servers load). HTTP/OAuth servers reuse the headless CLI's
-   * Keychain-cached token (requires HOME in the spawn env). The Codex backend
-   * ignores this. Used by the broad-scope investigation to reach Metabase.
+   * claude-code backend, where a run that uses tools always gets
+   * `--mcp-config <inline JSON>` + `--strict-mcp-config`, so ONLY these servers
+   * load and none of the host user's (issue #443). Left unset, the run takes
+   * the list its workflow set with `withConnectors`, which is empty by
+   * default. HTTP/OAuth servers reuse the headless CLI's Keychain-cached token
+   * (requires HOME in the spawn env). The Codex backend ignores this.
    */
   mcpServers?: Record<string, McpServerConfig>;
+  /**
+   * Tool rules the run may not use, on top of the ones every run gets. Only
+   * honored by the claude-code backend (`--disallowedTools`), where deny rules
+   * hold even when permissions are bypassed.
+   */
+  disallowedTools?: string[];
   /**
    * Force a specific backend for this run, overriding the global active
    * backend. Used by the webapp-QA flow, which must run on `claude-code`
@@ -413,12 +431,20 @@ export interface CodexRunRequest {
    * deployed default. `runCodex` resolves `backendOverride ?? activeBackendId`.
    */
   backendOverride?: AgentBackendId;
+  /**
+   * The call only has to turn text into text: a classification, a summary.
+   * On the claude-code backend it then gets no built-in tools, no MCP
+   * servers, no skills, no hooks and no bypassed permissions (issue #443).
+   * Such calls read arbitrary Slack text, and used to run with every tool and
+   * every connector the host user has. The Codex backend ignores this; it
+   * runs sandboxed.
+   */
+  noTools?: boolean;
 }
 
-export interface McpServerConfig {
-  type: 'http';
-  url: string;
-}
+export type McpServerConfig =
+  | { type: 'http'; url: string }
+  | { type: 'stdio'; command: string; args: string[]; env?: Record<string, string> };
 
 export interface TokenUsage {
   inputTokens?: number;
@@ -444,9 +470,21 @@ export interface CodexRunResult {
    * API tokens were consumed (issue #342) — callers should pause/retry at
    * the reset time instead of treating the output as an agent verdict.
    */
-  errorKind?: 'USAGE_LIMIT';
+  errorKind?: 'USAGE_LIMIT' | 'API_ERROR' | 'EXTERNAL_KILL';
   /** Verbatim reset clause from the limit message, e.g. "9:40pm (Asia/Calcutta)". */
   limitResetsAtText?: string;
+  /**
+   * For EXTERNAL_KILL: the signal that ended the process, when the OS reported
+   * one. The run was stopped from outside (not by a timeout or a cancel), so
+   * its exit is not a verdict on the work (issue #445).
+   */
+  killSignal?: string;
+  /**
+   * For API_ERROR: the CLI's own error line ("API Error: Can't reach the API
+   * server …"). The run died on the connection, so nothing in it is the
+   * agent's output and `ok` is false whatever the exit code (issue #439).
+   */
+  apiErrorDetail?: string;
   /** Wall-clock duration from process spawn to exit, in milliseconds. */
   durationMs: number;
   /** Token usage extracted from backend output, when available. */

@@ -1,7 +1,15 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { runAgentPipeline, waitForApproval } from '../src/agents/pipeline.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  buildCoderFollowUpQuestion,
+  buildCoderNoDiffQuestion,
+  formatPlanMessage,
+  runAgentPipeline,
+  waitForApproval,
+} from '../src/agents/pipeline.js';
 import { runCodex } from '../src/codex/runCodex.js';
+import { __infraRetry } from '../src/codex/infraRetry.js';
+import { currentConnectors, withConnectors } from '../src/backends/connectors.js';
 import { fetchThreadContext } from '../src/slack/threadContext.js';
 import { checkCoderProducedChanges } from '../src/workspaces/gitState.js';
 import type { AgentContext, PipelineConfig } from '../src/agents/types.js';
@@ -157,6 +165,48 @@ describe('agentPipeline', () => {
     expect(result.steps[0].role).toBe('planner');
     expect(result.steps[1].role).toBe('reviewer');
     expect(runCodex).toHaveBeenCalledTimes(2);
+  });
+
+  // Issue #443: a role that only reviews has no use for a design file or an
+  // upload tool, whatever the change's planner and coder were given.
+  it('keeps the change connectors for the planner and takes them away from the reviewer', async () => {
+    const change = {
+      mcpServers: { figma: { type: 'http' as const, url: 'https://figma.example/mcp' } },
+      disallowedTools: [],
+      unavailable: [],
+    };
+    const seen: string[][] = [];
+    const ok = (parsedJson: Record<string, unknown>) => ({
+      ok: true,
+      exitCode: 0,
+      timedOut: false,
+      stdout: '',
+      stderr: '',
+      lastMessage: '',
+      parsedJson,
+    });
+    vi.mocked(runCodex)
+      .mockImplementationOnce(async () => {
+        seen.push(Object.keys(currentConnectors().mcpServers));
+        return ok({
+          plan: ['step 1'],
+          risks: [],
+          affectedFiles: ['file.ts'],
+          scope: 'small',
+          requiresCodeChanges: false,
+        });
+      })
+      .mockImplementationOnce(async () => {
+        seen.push(Object.keys(currentConnectors().mcpServers));
+        return ok({ approved: true, findings: [], blockers: [] });
+      });
+
+    const result = await withConnectors(change, () =>
+      runAgentPipeline({ ctx: makeContext(), slack: slack as any, logStep }),
+    );
+
+    expect(result.steps.map(step => step.role)).toEqual(['planner', 'reviewer']);
+    expect(seen).toEqual([['figma'], []]);
   });
 
   it('triggers coder re-run when reviewer rejects (feedback loop)', async () => {
@@ -655,7 +705,11 @@ describe('agentPipeline', () => {
 
     expect(result.finalStatus).toBe('needs-input');
     expect(result.needsInputQuestion).toBeDefined();
-    expect(result.needsInputQuestion).toContain('error text');
+    // It says what was checked (the repository), quotes the coder's own account,
+    // and does not claim that nothing was touched (issue #432).
+    expect(result.needsInputQuestion).toContain('nothing changed in the repository');
+    expect(result.needsInputQuestion).toContain('> I totally wrote code (hallucinated to pass old guard).');
+    expect(result.needsInputQuestion).not.toContain("haven't touched");
     // Reviewer should NOT have run — feedback loop short-circuited
     expect(result.steps.map(s => s.role)).toEqual(['planner', 'coder']);
   });
@@ -839,6 +893,9 @@ describe('agentPipeline', () => {
     expect(coderSteps[1].findings.some(f => f.category === 'coder-empty-output')).toBe(true);
     expect(result.finalStatus).toBe('needs-input');
     expect(result.needsInputQuestion).toBeDefined();
+    // The retry's own account is what gets quoted, not the first run's (issue #432).
+    expect(result.needsInputQuestion).toContain('> Retry said it fixed but did not');
+    expect(result.needsInputQuestion).not.toContain("haven't touched");
   });
 
   describe('approved plan reaches the agents (#413)', () => {
@@ -1118,6 +1175,357 @@ vi.mock('../src/slack/threadContext.js', () => ({
   assertThreadParentExists: vi.fn().mockResolvedValue(true),
 }));
 
+describe('formatPlanMessage: the plan as the approver sees it (issue #437)', () => {
+  const block = (behaviour: string, assumptions = 'none') =>
+    [
+      '# Default the four proctor breach thresholds to 0',
+      '',
+      '## For the approver',
+      '- What changes: New exams start with all four breach thresholds set to 0.',
+      '- Where: TMS exam form',
+      `- Behaviour change: ${behaviour}`,
+      `- Assumptions to confirm: ${assumptions}`,
+      '- Risk: high',
+      '',
+      '## Files to change',
+      '- `src/tms/exam-form/defaults.ts` — the four defaults',
+      '',
+      '## Steps',
+      '1. Change the four `DEFAULT_*` constants from 3 to 0.',
+      '',
+      'Scope: small',
+    ].join('\n');
+  const FILES = ['/ws/newton-web/1-1/src/tms/exam-form/defaults.ts'];
+  const REPO = '/ws/newton-web/1-1';
+
+  it('opens with what the approver needs, before any of the plan', () => {
+    const message = formatPlanMessage(block('none'), FILES, 'small', REPO);
+    const lines = message.split('\n');
+
+    expect(lines[0]).toBe('*Plan* (scope: small, 1 file to change, risk: high)');
+    expect(lines[1]).toBe('*What changes:* New exams start with all four breach thresholds set to 0.');
+    expect(lines[2]).toBe('*Where:* TMS exam form');
+    expect(lines[3]).toBe('*Behaviour change:* none');
+    expect(lines[4]).toBe('*Assumptions to confirm:* none');
+    expect(message.indexOf('*Files to change:*')).toBeLessThan(message.indexOf('_Full plan, for the coder:_'));
+    expect(message).toContain('• `src/tms/exam-form/defaults.ts`');
+  });
+
+  it('flags a behaviour change and asks the requester to confirm it, not only the approver', () => {
+    // The incident: approved in 54 seconds, and the opposite of what the requester wanted.
+    const message = formatPlanMessage(
+      block('An exam now ends on the very first flagged breach. 0 is the strictest setting, not the most lenient.'),
+      FILES,
+      'small',
+      REPO,
+      false,
+      'UREQUESTER',
+    );
+
+    expect(message).toContain('*Behaviour change:* :warning: An exam now ends on the very first flagged breach.');
+    expect(message).toContain(
+      '<@UREQUESTER> please confirm the behaviour change above is what you want, before this is approved.',
+    );
+  });
+
+  it('asks the requester about assumptions too, and about nothing when there is nothing to confirm', () => {
+    const assumed = formatPlanMessage(
+      block('none', 'I could not open the screenshot.'),
+      FILES,
+      'small',
+      REPO,
+      false,
+      'UREQ',
+    );
+    expect(assumed).toContain('<@UREQ> please confirm the assumptions above are what you want');
+
+    const both = formatPlanMessage(
+      block('Ends on first breach.', 'Picked the web form.'),
+      FILES,
+      'small',
+      REPO,
+      false,
+      'UREQ',
+    );
+    expect(both).toContain('please confirm the behaviour change and the assumptions above are what you want');
+
+    expect(formatPlanMessage(block('none'), FILES, 'small', REPO, false, 'UREQ')).not.toContain('<@UREQ>');
+    // No requester known (older callers): the warning still shows, nobody is tagged.
+    expect(formatPlanMessage(block('Ends on first breach.'), FILES, 'small', REPO)).not.toContain('<@');
+  });
+
+  it('does not flag or ask about a "none" that comes with an explanation', () => {
+    const message = formatPlanMessage(
+      block(
+        'none. The line is an HTML comment, so nothing in the product changes.',
+        'None — the README at the repo root.',
+      ),
+      FILES,
+      'small',
+      REPO,
+      false,
+      'UREQ',
+    );
+
+    expect(message).toContain(
+      '*Behaviour change:* none. The line is an HTML comment, so nothing in the product changes.',
+    );
+    expect(message).toContain('*Assumptions to confirm:* None — the README at the repo root.');
+    expect(message).not.toContain(':warning:');
+    expect(message).not.toContain('<@UREQ>');
+  });
+
+  it('still flags a change that hides behind a leading "none"', () => {
+    const message = formatPlanMessage(block('none, but the default becomes 0'), FILES, 'small', REPO, false, 'UREQ');
+
+    expect(message).toContain('*Behaviour change:* :warning: none, but the default becomes 0');
+    expect(message).toContain('<@UREQ> please confirm the behaviour change above is what you want');
+  });
+
+  it('does not repeat the approver block or the file list inside the full plan', () => {
+    const message = formatPlanMessage(block('none'), FILES, 'small', REPO);
+    const detail = message.slice(message.indexOf('_Full plan, for the coder:_'));
+
+    expect(detail).toContain('1. Change the four `DEFAULT_*` constants from 3 to 0.');
+    expect(detail).not.toContain('For the approver');
+    expect(detail).not.toContain('What changes');
+    expect(detail).not.toContain('Files to change');
+  });
+
+  it('keeps the old layout for a plan with no approver block, with an honest header', () => {
+    const plain = '# Fix the redirect\n\n1. Edit `auth.ts`.';
+
+    expect(formatPlanMessage(plain, ['auth.ts', 'login.tsx'], 'medium')).toBe(
+      '*Plan* (scope: medium, 2 files to change)\n# Fix the redirect\n\n1. Edit `auth.ts`.\n\n*Files to change:*\n• `auth.ts`\n• `login.tsx`',
+    );
+    // No count is better than a wrong one.
+    expect(formatPlanMessage(plain, [], 'medium')).toBe(
+      '*Plan* (scope: medium)\n# Fix the redirect\n\n1. Edit `auth.ts`.',
+    );
+  });
+
+  it('lists at most eight files and says how many more there are', () => {
+    const files = Array.from({ length: 11 }, (_, i) => `src/f${i}.ts`);
+    const message = formatPlanMessage('# Big\n\n1. Many edits.', files, 'large');
+
+    expect(message).toContain('11 files to change');
+    expect(message).toContain('• `src/f7.ts`\n• … and 3 more');
+    expect(message).not.toContain('src/f8.ts');
+  });
+
+  it('marks an executed plan at the end, whichever layout', () => {
+    expect(formatPlanMessage(block('none'), FILES, 'small', REPO, true).endsWith('_✅ Plan executed._')).toBe(true);
+    expect(formatPlanMessage('# Plain', [], 'small', undefined, true).endsWith('_✅ Plan executed._')).toBe(true);
+  });
+});
+
+describe('what the thread is told when the coder leaves no diff (issue #432)', () => {
+  const PLAN = '# Fix Metabase dashboard 674 — restrict Dyte recording coverage to real course topic classes';
+  const REPORT =
+    'Updated all 7 cards on dashboard 674 and its description.\nBefore: 1,204 sessions counted. After: 987 (topic classes only).';
+
+  it('quotes the coder own account of what it did, line by line', () => {
+    const question = buildCoderNoDiffQuestion(PLAN, ['video_sessions/models.py'], REPORT);
+
+    expect(question).toContain('This is what it says it did:');
+    expect(question).toContain('> Updated all 7 cards on dashboard 674 and its description.');
+    expect(question).toContain('> Before: 1,204 sessions counted. After: 987 (topic classes only).');
+  });
+
+  it('says only what was checked, and never that nothing was touched', () => {
+    const question = buildCoderNoDiffQuestion(PLAN, [], REPORT);
+
+    expect(question.startsWith('The coder finished, but nothing changed in the repository')).toBe(true);
+    expect(question).toContain('it may already be in place. Check it before you ask me to do it again.');
+    expect(question).not.toContain("haven't touched");
+    expect(question).not.toContain('hallucinat');
+  });
+
+  it('admits it cannot tell when the coder gave no account', () => {
+    const question = buildCoderNoDiffQuestion(PLAN, [], '   ');
+
+    expect(question).toContain('It gave no account of what it did');
+    expect(question).toContain('cannot tell you whether anything outside the repository changed');
+    expect(question).not.toContain('This is what it says it did');
+  });
+
+  it('keeps a long report to a readable length', () => {
+    const question = buildCoderNoDiffQuestion('', [], 'x'.repeat(5000));
+
+    expect(question).toContain(`> ${'x'.repeat(900)}…`);
+    expect(question.length).toBeLessThan(1500);
+  });
+
+  it('still shows the plan and the planned files, and how to go on', () => {
+    const question = buildCoderNoDiffQuestion(PLAN, ['a.py', 'b.py', 'c.py', 'd.py'], REPORT);
+
+    expect(question).toContain(`The plan opened with: _${PLAN}_`);
+    expect(question).toContain('Planned files: `a.py, b.py, c.py` …');
+    expect(question).toContain('or say "cancel" to stop.');
+  });
+
+  it('no longer claims untouched files when the coder could not pin a change down either', () => {
+    const question = buildCoderFollowUpQuestion(makeContext(), PLAN, []);
+
+    expect(question.startsWith("I couldn't pin down a concrete change from the info I have.")).toBe(true);
+    expect(question).not.toContain("haven't touched");
+  });
+});
+
+describe('agentPipeline and a dropped connection (issue #439)', () => {
+  const savedRetry = { ...__infraRetry };
+  const okStep = (parsedJson: Record<string, unknown>) =>
+    ({
+      ok: true,
+      exitCode: 0,
+      timedOut: false,
+      stdout: '',
+      stderr: '',
+      lastMessage: '',
+      durationMs: 10,
+      parsedJson,
+    }) as any;
+  const dropped = {
+    ok: false,
+    exitCode: 1,
+    timedOut: false,
+    stdout: '',
+    stderr: '',
+    lastMessage: '{"type":"result","is_error":true,"result":"API Error: No response from API"}',
+    durationMs: 0,
+    errorKind: 'API_ERROR',
+    apiErrorDetail: 'API Error: No response from API',
+    sessionId: 'sess-coder',
+  } as any;
+  const coderDone = okStep({ status: 'success', summary: 'changed two strings', filesChanged: ['a.ts'] });
+  const reviewerOk = okStep({ approved: true, findings: [], blockers: [] });
+  const verifierOk = okStep({ verified: true, findings: [] });
+
+  beforeEach(() => {
+    vi.mocked(runCodex).mockReset();
+    logStep.mockClear();
+    __infraRetry.sleep = vi.fn().mockResolvedValue(true);
+  });
+  afterEach(() => Object.assign(__infraRetry, savedRetry));
+
+  const coderPipeline = (overrides: Partial<PipelineConfig> = {}) =>
+    makeContext({
+      workflowIntent: 'IMPLEMENTATION',
+      pipelineConfig: makePipelineConfig({ agents: ['coder', 'reviewer', 'verifier'], ...overrides }),
+    });
+
+  it('runs the coder again when its connection drops, resuming its session, and then carries on', async () => {
+    // The incident: the coder had committed and pushed, then died on "API Error" before finishing.
+    vi.mocked(runCodex)
+      .mockResolvedValueOnce(dropped)
+      .mockResolvedValueOnce(coderDone)
+      .mockResolvedValueOnce(reviewerOk)
+      .mockResolvedValueOnce(verifierOk);
+
+    const result = await runAgentPipeline({ ctx: coderPipeline(), slack: slack as any, logStep });
+
+    expect(result.finalStatus).toBe('passed');
+    expect(result.interrupted).toBeUndefined();
+    expect(runCodex).toHaveBeenCalledTimes(4);
+    expect(vi.mocked(runCodex).mock.calls[1][0]).toMatchObject({ resumeSessionId: 'sess-coder' });
+    expect(result.steps.map(step => `${step.role}:${step.status}`)).toEqual([
+      'coder:passed',
+      'reviewer:passed',
+      'verifier:passed',
+    ]);
+  });
+
+  it('stops when the connection never comes back, and says that is why', async () => {
+    vi.mocked(runCodex).mockResolvedValue(dropped);
+
+    const result = await runAgentPipeline({ ctx: coderPipeline(), slack: slack as any, logStep });
+
+    expect(result.finalStatus).toBe('failed');
+    expect(result.interrupted).toEqual({ kind: 'connection_lost', role: 'coder', retries: 3 });
+    // The coder and its three retries. No reviewer and no verifier on a step that never happened.
+    expect(runCodex).toHaveBeenCalledTimes(4);
+    expect(result.steps.map(step => step.role)).toEqual(['coder']);
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'pipeline.api_error', level: 'ERROR' }));
+  });
+
+  it('does not let the reviewer and verifier run on a coder that failed', async () => {
+    vi.mocked(runCodex).mockResolvedValueOnce({ ...coderDone, ok: false, exitCode: 1, parsedJson: undefined });
+
+    const result = await runAgentPipeline({ ctx: coderPipeline(), slack: slack as any, logStep });
+
+    expect(result.finalStatus).toBe('failed');
+    expect(result.interrupted).toBeUndefined();
+    expect(runCodex).toHaveBeenCalledTimes(1);
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'pipeline.coder_failed' }));
+  });
+
+  describe('an agent killed from outside (issue #445)', () => {
+    const killed = {
+      ok: false,
+      exitCode: 143,
+      timedOut: false,
+      stdout: '',
+      stderr: '',
+      lastMessage: '',
+      durationMs: 0,
+      errorKind: 'EXTERNAL_KILL',
+      killSignal: 'SIGTERM',
+    } as any;
+
+    it('runs a killed reviewer again instead of reading its death as "rejected"', async () => {
+      // The incident: the reviewer had flagged nothing. Its process was killed
+      // by another job's `pkill`, and the coder was sent round again.
+      vi.mocked(runCodex)
+        .mockResolvedValueOnce(coderDone)
+        .mockResolvedValueOnce(killed)
+        .mockResolvedValueOnce(reviewerOk)
+        .mockResolvedValueOnce(verifierOk);
+
+      const result = await runAgentPipeline({ ctx: coderPipeline(), slack: slack as any, logStep });
+
+      expect(result.finalStatus).toBe('passed');
+      expect(result.retryLoops).toBe(0);
+      expect(runCodex).toHaveBeenCalledTimes(4);
+      expect(logStep).not.toHaveBeenCalledWith(expect.objectContaining({ stage: 'pipeline.feedback_loop' }));
+    });
+
+    it('stops when the retry is killed too: no feedback loop, no coder re-run, and it says why', async () => {
+      vi.mocked(runCodex).mockResolvedValueOnce(coderDone).mockResolvedValue(killed);
+
+      const result = await runAgentPipeline({ ctx: coderPipeline(), slack: slack as any, logStep });
+
+      expect(result.finalStatus).toBe('failed');
+      expect(result.interrupted).toEqual({ kind: 'killed', role: 'reviewer', retries: 1 });
+      expect(result.retryLoops).toBe(0);
+      // The coder once, the reviewer twice. Not the coder again, and not the verifier.
+      expect(runCodex).toHaveBeenCalledTimes(3);
+      expect(logStep).not.toHaveBeenCalledWith(expect.objectContaining({ stage: 'pipeline.feedback_loop' }));
+      expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'pipeline.killed', level: 'ERROR' }));
+    });
+  });
+
+  it('does not charge the time a dropped connection cost to the pipeline timeout', async () => {
+    // 80 ms really pass while "offline"; the pipeline's budget is 60 ms.
+    __infraRetry.delaysMs = [80];
+    __infraRetry.sleep = (ms: number) => new Promise(resolve => setTimeout(() => resolve(true), ms));
+    vi.mocked(runCodex)
+      .mockResolvedValueOnce({ ...dropped, sessionId: undefined })
+      .mockResolvedValueOnce(
+        okStep({ plan: ['x'], risks: [], affectedFiles: [], scope: 'small', requiresCodeChanges: false }),
+      )
+      .mockResolvedValueOnce(reviewerOk);
+    const ctx = makeContext({
+      pipelineConfig: makePipelineConfig({ agents: ['planner', 'reviewer'], totalTimeoutMs: 60 }),
+    });
+
+    const result = await runAgentPipeline({ ctx, slack: slack as any, logStep });
+
+    expect(result.finalStatus).toBe('passed');
+    expect(result.steps.map(step => step.role)).toEqual(['planner', 'reviewer']);
+    expect(logStep).not.toHaveBeenCalledWith(expect.objectContaining({ stage: 'pipeline.timeout' }));
+  });
+});
+
 describe('waitForApproval', () => {
   const mockSlack = {
     chat: { postMessage: vi.fn().mockResolvedValue({}) },
@@ -1146,6 +1554,151 @@ describe('waitForApproval', () => {
       ...overrides,
     });
   }
+
+  // Issue #436: the wait had no reminder, so a plan could sit unseen for a day.
+  describe('reminders', () => {
+    const MIN = 60_000;
+    const reminders = {
+      afterMs: [15 * MIN, 120 * MIN],
+      text: "<!subteam^S1> <@UTRIGGER>'s plan above still needs a yes or no.",
+    };
+    const reminderPosts = () =>
+      mockSlack.chat.postMessage.mock.calls.filter((call: any[]) => call[0].text === reminders.text).length;
+
+    it('re-pings once after 15 minutes and once after 2 hours, and not before', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([]);
+      const controller = new AbortController();
+      const promise = runApproval({ reminders, signal: controller.signal });
+
+      await vi.advanceTimersByTimeAsync(14 * MIN);
+      expect(reminderPosts()).toBe(0);
+
+      await vi.advanceTimersByTimeAsync(2 * MIN);
+      expect(reminderPosts()).toBe(1);
+      expect(mockSlack.chat.postMessage.mock.calls[0][0]).toMatchObject({ channel: 'C1', thread_ts: '100.00' });
+
+      await vi.advanceTimersByTimeAsync(60 * MIN);
+      expect(reminderPosts()).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(50 * MIN);
+      expect(reminderPosts()).toBe(2);
+
+      await vi.advanceTimersByTimeAsync(600 * MIN);
+      expect(reminderPosts()).toBe(2);
+
+      controller.abort();
+      await promise;
+    });
+
+    it('sends one message, not two, when both thresholds have passed at once', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([]);
+      const controller = new AbortController();
+      const promise = runApproval({ reminders: { ...reminders, afterMs: [1000, 2000] }, signal: controller.signal });
+
+      await vi.advanceTimersByTimeAsync(6000); // the first poll is already past both
+      expect(reminderPosts()).toBe(1);
+
+      controller.abort();
+      await promise;
+    });
+
+    it('sends nothing when no reminders are configured', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([]);
+      const controller = new AbortController();
+      const promise = runApproval({ signal: controller.signal });
+
+      await vi.advanceTimersByTimeAsync(200 * MIN);
+      expect(mockSlack.chat.postMessage).not.toHaveBeenCalled();
+
+      controller.abort();
+      await promise;
+    });
+
+    it('still approves on an admin yes after a reminder', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([]);
+      const promise = runApproval({ reminders });
+      await vi.advanceTimersByTimeAsync(16 * MIN);
+      vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'yes', user: 'UCOREDEV', ts: '200.00' }]);
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect((await promise).outcome).toBe('approved');
+    });
+  });
+
+  describe('a yes from someone who cannot approve', () => {
+    const texts = () => mockSlack.chat.postMessage.mock.calls.map((call: any[]) => call[0].text as string);
+
+    it('names who can approve and tags them once', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([
+        { text: 'yes', user: 'UREQUESTER', ts: '200.00' },
+        { text: 'yes', user: 'UOTHER', ts: '201.00' },
+      ]);
+      const controller = new AbortController();
+      const promise = runApproval({ approverMention: '<!subteam^S1>', signal: controller.signal });
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect(texts()).toEqual([
+        '<@UREQUESTER> only admins can approve plans. <!subteam^S1>, this one is waiting for you.',
+        '<@UOTHER> Only admins can approve plans. Waiting for an admin to respond.',
+      ]);
+
+      // And it is not repeated on later polls.
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(texts()).toHaveLength(2);
+
+      controller.abort();
+      await promise;
+    });
+
+    it('keeps the plain reply when it does not know who can approve', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'yes', user: 'UREQUESTER', ts: '200.00' }]);
+      const controller = new AbortController();
+      const promise = runApproval({ signal: controller.signal });
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect(texts()).toEqual(['<@UREQUESTER> Only admins can approve plans. Waiting for an admin to respond.']);
+
+      controller.abort();
+      await promise;
+    });
+  });
+
+  // Issue #264: a cancelled job used to wait here until an admin replied.
+  it('returns cancelled as soon as the job is aborted, without waiting out the poll', async () => {
+    vi.mocked(fetchThreadContext).mockResolvedValue([]);
+    const controller = new AbortController();
+    const stages: string[] = [];
+
+    const promise = runApproval({ signal: controller.signal, logStep: (entry: any) => stages.push(entry.stage) });
+    await vi.advanceTimersByTimeAsync(1000); // mid-poll: the 5s tick has not fired
+    controller.abort();
+    const result = await promise;
+
+    expect(result).toEqual({ outcome: 'cancelled', userReply: '', approverId: '', replyTs: '' });
+    expect(fetchThreadContext).not.toHaveBeenCalled();
+    expect(stages).toContain('pipeline.approval.cancelled');
+  });
+
+  it('returns cancelled without polling when the job was aborted before the wait began', async () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await runApproval({ signal: controller.signal });
+
+    expect(result.outcome).toBe('cancelled');
+    expect(fetchThreadContext).not.toHaveBeenCalled();
+  });
+
+  it('does not read an approval that arrives in the same tick as the cancel', async () => {
+    vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'yes', user: 'UCOREDEV', ts: '200.00' }]);
+    const controller = new AbortController();
+
+    const promise = runApproval({ signal: controller.signal });
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(6000);
+
+    expect((await promise).outcome).toBe('cancelled');
+  });
 
   it('rejects when message starts with "stop" followed by a reason', async () => {
     vi.mocked(fetchThreadContext).mockResolvedValue([

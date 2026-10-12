@@ -206,6 +206,7 @@ export async function classifyReviewSkills(params: {
     const profile = lightweightProfile(getActiveBackendId());
     const result = await runAgent({
       cwd: os.tmpdir(),
+      noTools: true,
       prompt: buildClassifierPrompt({ skills, prContext, prTitle, changedPaths }),
       model: profile.model,
       reasoningEffort: profile.reasoningEffort,

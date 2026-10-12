@@ -61,6 +61,16 @@ if (!env.CARGO) {
   }
 }
 
+// Bake the commit into the app so the sidecar can stamp jobs with the exact
+// build that handled them (issue #450). lib.rs reads it via option_env!.
+if (!env.WATCHTOWER_GIT_SHA) {
+  try {
+    env.WATCHTOWER_GIT_SHA = execFileSync('git', ['rev-parse', '--short', 'HEAD'], { encoding: 'utf8' }).trim();
+  } catch {
+    // Not a git checkout — the app reports 'unknown'.
+  }
+}
+
 const args = process.argv.slice(2);
 const child = spawn(tauriCmd, args, {
   stdio: 'inherit',

@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { runAgenticPrReview } from '../src/agentic/agenticPrReview.js';
+import { buildDeferredNote, runAgenticPrReview } from '../src/agentic/agenticPrReview.js';
 import { VERIFIER_PROMPT_MARKER } from '../src/agentic/prReviewAgent.js';
 import { ORCHESTRATOR_PROMPT_MARKER } from '../src/agentic/prReviewOrchestrator.js';
 import { EMPTY_DISCOVERY } from '../src/agentic/reviewSkills.js';
@@ -167,7 +167,9 @@ function makeDeps(overrides: Record<string, unknown> = {}) {
       truncated: false,
       reason: 'ok',
     }),
+    fetchDiffSince: vi.fn().mockResolvedValue(undefined),
     resolveHeadSha: vi.fn().mockResolvedValue('feedface'),
+    fetchState: vi.fn().mockResolvedValue({ state: 'open' }),
     submitReview: vi.fn().mockResolvedValue(SUBMIT_OK),
     checkoutPr: vi.fn().mockResolvedValue(true),
     resolveWorkspaceFn: vi.fn((repoPath: string) => repoPath),
@@ -283,6 +285,98 @@ describe('agenticPrReview', () => {
     const texts = slack.chat.postMessage.mock.calls.map(c => c[0].text as string);
     expect(texts.some(t => t.includes('Reviewing 2 PRs'))).toBe(true);
     expect(texts.filter(t => t.includes('*PR Review Complete*'))).toHaveLength(2);
+  });
+
+  describe('more PRs than one request reviews (issue #442)', () => {
+    const pr = (n: number) => `https://github.com/Newton-School/newton-web/pull/${n}`;
+    const SIX = [9155, 9156, 9157, 9158, 9159, 9160].map(pr);
+
+    it('ends the batch by naming what was not reviewed, with a line to send back', async () => {
+      // The incident: six PRs "in the given order"; three reviewed, the thread ended there.
+      const slack = makeSlack([
+        `Please review in the given order.\n${SIX.map((url, i) => `${i + 1}. ${url}`).join('\n')}`,
+      ]);
+      const deps = makeDeps();
+
+      const result = await runAgenticPrReview({
+        task: makeTask(`<@UBOT1> Please review in the given order.\n${SIX.join('\n')}`),
+        config,
+        slack: slack as any,
+        store: emptyStore,
+        deps: deps as any,
+      });
+
+      const texts = slack.chat.postMessage.mock.calls.map(c => c[0].text as string);
+      expect(texts.filter(t => t.includes('*PR Review Complete*'))).toHaveLength(3);
+      // It is the last thing said, after the third verdict.
+      const closing = texts[texts.length - 1];
+      expect(closing).toContain(
+        'That was 3 of the 6 PRs you listed. Not reviewed yet: newton-web#9158, newton-web#9159, newton-web#9160.',
+      );
+      expect(closing).toContain('> <@UBOT1> review #9158 #9159 #9160');
+      // The acknowledgement no longer buries the instructions.
+      expect(texts[0]).toContain('3 more deferred');
+      expect(texts[0]).not.toContain('reply with a PR link');
+      expect((result.result as any).deferredUrls).toEqual([pr(9158), pr(9159), pr(9160)]);
+    });
+
+    it('reviews exactly the deferred PRs when that line is sent back', async () => {
+      const slack = makeSlack([`Please review in the given order.\n${SIX.join('\n')}`]);
+
+      const result = await runAgenticPrReview({
+        task: makeTask('<@UBOT1> review #9158 #9159 #9160'),
+        config,
+        slack: slack as any,
+        store: emptyStore,
+        deps: makeDeps() as any,
+      });
+
+      const outcomes = (result.result as any).outcomes;
+      expect(outcomes.map((o: any) => o.prUrl)).toEqual([pr(9158), pr(9159), pr(9160)]);
+      const texts = slack.chat.postMessage.mock.calls.map(c => c[0].text as string);
+      expect(texts.some(t => t.includes('Not reviewed yet'))).toBe(false);
+    });
+
+    it('says nothing more when every PR was reviewed', async () => {
+      const slack = makeSlack([`backend : ${API_PR}\nfrontend : ${WEB_PR}`]);
+      const result = await runAgenticPrReview({
+        task: makeTask('<@UBOT1> review both the PRs'),
+        config,
+        slack: slack as any,
+        store: emptyStore,
+        deps: makeDeps() as any,
+      });
+
+      const texts = slack.chat.postMessage.mock.calls.map(c => c[0].text as string);
+      expect(texts.some(t => t.includes('Not reviewed yet'))).toBe(false);
+      expect(result.result as any).not.toHaveProperty('deferredUrls');
+    });
+
+    it('writes the line with #numbers when they are unambiguous, and with links when two repos share one', () => {
+      const target = (repo: string, number: number) => ({
+        repo,
+        number,
+        url: `https://github.com/Newton-School/${repo}/pull/${number}`,
+      });
+
+      expect(
+        buildDeferredNote({
+          deferred: [target('lumina-web', 55), target('newton-web', 9234)],
+          reviewed: [target('Edison-Backend', 102), target('newton-api', 6412), target('lumina-api', 40)],
+          botUserId: 'UBOT1',
+        }),
+      ).toContain('> <@UBOT1> review #55 #9234');
+
+      const clash = buildDeferredNote({
+        deferred: [target('lumina-web', 40)],
+        reviewed: [target('lumina-api', 40), target('newton-api', 1), target('newton-web', 2)],
+        botUserId: 'UBOT1',
+      });
+      expect(clash).toContain('> <@UBOT1> review https://github.com/Newton-School/lumina-web/pull/40');
+      expect(clash).toContain('To have it reviewed');
+      // No bot id known: the line is still there to send with a mention.
+      expect(buildDeferredNote({ deferred: [target('a', 9)], reviewed: [target('a', 1)] })).toContain('> review #9');
+    });
   });
 
   it('tags requester and skips when PR org is outside allowed scope', async () => {
@@ -407,6 +501,62 @@ describe('agenticPrReview', () => {
     expect(slack.chat.postMessage).toHaveBeenCalledWith(
       expect.objectContaining({ text: expect.stringContaining('blocking-severity finding') }),
     );
+  });
+
+  describe('when the review could not be put on the PR (issue #449)', () => {
+    const findings = [
+      { role: 'security', severity: 'high', category: 'authz', message: 'Missing check', file: 'src/a.ts', line: 2 },
+      { role: 'reviewer', severity: 'low', category: 'style', message: 'Rename x', file: 'src/a.ts', line: 3 },
+      { role: 'reviewer', severity: 'medium', category: 'logic', message: 'Off by one', file: 'src/a.ts', line: 2 },
+    ];
+    const review = async (submitResult: Record<string, unknown>) => {
+      const slack = makeSlack([`review ${WEB_PR}`]);
+      const deps = makeDeps({
+        runAgent: vi.fn().mockResolvedValue(agentOk(findings)),
+        submitReview: vi.fn().mockResolvedValue(submitResult),
+      });
+      await runAgenticPrReview({
+        task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+        config,
+        slack: slack as any,
+        store: emptyStore,
+        deps: deps as any,
+      });
+      return slack.chat.postMessage.mock.calls.map(c => c[0].text as string).join('\n---\n');
+    };
+    const failed = {
+      ...SUBMIT_OK,
+      submitted: false,
+      commentsPosted: 0,
+      submissionMode: 'skipped' as const,
+      failureReason: 'HTTP 502',
+    };
+
+    it('says why, and puts every finding in the thread, worst first', async () => {
+      const posted = await review(failed);
+
+      expect(posted).toContain("I couldn't post the review to GitHub (HTTP 502)");
+      expect(posted).toContain('The review is not on the PR, so here is what it found:');
+      expect(posted.indexOf('[HIGH] src/a.ts:2 — Missing check')).toBeGreaterThan(-1);
+      expect(posted.indexOf('[HIGH]')).toBeLessThan(posted.indexOf('[MEDIUM] src/a.ts:2 — Off by one'));
+      expect(posted.indexOf('[MEDIUM]')).toBeLessThan(posted.indexOf('[LOW] src/a.ts:3 — Rename x'));
+      // Nothing is "on the PR" to point at.
+      expect(posted).not.toContain('more on the PR');
+    });
+
+    it('says it could not confirm when GitHub could not be asked', async () => {
+      const posted = await review({ ...failed, failureReason: 'timed out after 30s', unconfirmed: true });
+
+      expect(posted).toContain('I could not confirm whether the review reached GitHub (timed out after 30s)');
+      expect(posted).toContain('check the PR before asking again');
+    });
+
+    it('does not repeat the findings in the thread when the review is on the PR', async () => {
+      const posted = await review(SUBMIT_OK);
+
+      expect(posted).not.toContain('The review is not on the PR');
+      expect(posted).not.toContain('Rename x');
+    });
   });
 
   it('downgrades a security finding anchored outside the diff to a summary note (#7)', async () => {
@@ -790,6 +940,171 @@ describe('agenticPrReview', () => {
     );
   });
 
+  describe('a second review follows up on the first (issue #451)', () => {
+    // The PR adds six lines to src/a.ts. Since the earlier review, only lines 5 and 6 changed.
+    const PR_DIFF =
+      'diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -0,0 +1,6 @@\n+one\n+two\n+three\n+four\n+five\n+six';
+    const SINCE_DIFF =
+      'diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -4,1 +4,3 @@\n four\n+five\n+six';
+    const prior = (message: string, line: number, severity = 'medium') => ({
+      jobId: 'previous-job',
+      prHeadSha: 'oldsha1234',
+      role: 'reviewer',
+      severity,
+      category: 'bug',
+      message,
+      file: 'src/a.ts',
+      line,
+      createdAt: '2026-10-06T10:00:00.000Z',
+    });
+    const storeWithEarlierReview = () => ({
+      findLatestReviewedPrHeadSha: () => ({
+        jobId: 'previous-job',
+        prHeadSha: 'oldsha1234',
+        updatedAt: '2026-10-06T10:00:00.000Z',
+      }),
+      getChannelPolicyPack: () => undefined,
+      recordPrReviewFindings: vi.fn(),
+      getPrReviewFindings: vi
+        .fn()
+        .mockReturnValue([
+          prior('The retry loop never backs off', 2),
+          prior('Rename the helper', 3, 'low'),
+          prior('Missing test for the empty list', 4, 'low'),
+        ]),
+    });
+    const orchestrator = agentOk(
+      [
+        {
+          role: 'reviewer',
+          severity: 'medium',
+          category: 'bug',
+          message: 'Still open: the retry loop never backs off',
+          file: 'src/a.ts',
+          line: 2,
+        },
+        {
+          role: 'reviewer',
+          severity: 'low',
+          category: 'style',
+          message: 'This could be const',
+          file: 'src/a.ts',
+          line: 3,
+        },
+        { role: 'reviewer', severity: 'low', category: 'style', message: 'Magic number', file: 'src/a.ts', line: 5 },
+      ],
+      ['Addressed since last review: helper renamed', 'Addressed since last review: empty-list test added'],
+    );
+    const followUp = async (depsOverrides: Record<string, unknown> = {}) => {
+      const slack = makeSlack([`review ${WEB_PR}`]);
+      const runAgent = routedRunAgent({
+        orchestrator,
+        security: agentOk([
+          {
+            role: 'security',
+            severity: 'high',
+            category: 'secrets',
+            message: 'Token logged in full',
+            file: 'src/a.ts',
+            line: 3,
+          },
+        ]),
+      });
+      const deps = makeDeps({
+        runAgent,
+        resolveHeadSha: vi.fn().mockResolvedValue('newsha9999'),
+        fetchDiff: vi.fn().mockResolvedValue({ diff: PR_DIFF, truncated: false, reason: 'ok' }),
+        fetchDiffSince: vi.fn().mockResolvedValue(SINCE_DIFF),
+        ...depsOverrides,
+      });
+      const logStep = vi.fn();
+      const result = await runAgenticPrReview({
+        task: makeTask(`<@UBOT1> Please review again, resolved and replied on the comments ${WEB_PR}`),
+        config,
+        slack: slack as any,
+        store: storeWithEarlierReview() as any,
+        jobId: 'job-new',
+        deps: deps as any,
+        logStep,
+      });
+      return {
+        deps,
+        runAgent,
+        logStep,
+        outcome: (result.result as any).outcomes[0],
+        texts: slack.chat.postMessage.mock.calls.map(c => c[0].text as string).join('\n---\n'),
+        prompts: runAgent.mock.calls.map((c: any[]) => c[0].prompt as string),
+      };
+    };
+
+    it('reports what became of the earlier findings, and only what is new in the code changed since', async () => {
+      const { deps, outcome, texts } = await followUp();
+
+      const line =
+        'Follow-up on my review at oldsha1: of its 3 findings, 2 addressed, 1 still open; 2 new in the code changed since. 1 further low or medium point on code unchanged since then was left out.';
+      expect(texts).toContain(line);
+      expect(outcome.followUp).toEqual({ earlierTotal: 3, addressed: 2, stillOpen: 1, newFindings: 2, leftOut: 1 });
+      expect(outcome.totalFindings).toBe(3);
+
+      const submitted = deps.submitReview.mock.calls[0][0];
+      expect(submitted.summary.startsWith(line)).toBe(true);
+      const messages = [
+        ...submitted.findingsByRole.flatMap((r: any) => r.findings.map((x: any) => x.message)),
+        submitted.summary,
+      ].join('\n');
+      // Raised again, new on changed code, and a new blocker on unchanged code: all there.
+      expect(messages).toContain('Still open: the retry loop never backs off');
+      expect(messages).toContain('Magic number');
+      expect(messages).toContain('Token logged in full');
+      // A new nit on code the author already had one review of: not there.
+      expect(messages).not.toContain('This could be const');
+      expect(deps.fetchDiffSince).toHaveBeenCalledWith(
+        expect.objectContaining({ baseSha: 'oldsha1234', headSha: 'newsha9999' }),
+      );
+    });
+
+    it('tells every lens about the earlier findings: the lead accounts for them, the others do not repeat them', async () => {
+      const { prompts } = await followUp();
+
+      const lead = prompts.find(p => p.includes(ORCHESTRATOR_PROMPT_MARKER)) as string;
+      expect(lead).toContain('This is a FOLLOW-UP on that review, not a first review.');
+      expect(lead).toContain('"message" starting "Still open: " or "Regressed: "');
+      expect(lead).toContain('Do NOT raise new low or medium points on code that has not changed since oldsha1234');
+      for (const lens of ['security specialist', 'performance specialist']) {
+        const prompt = prompts.find(p => p.includes(lens)) as string;
+        expect(prompt).toContain('PRIOR REVIEW');
+        expect(prompt).toContain('The retry loop never backs off');
+        expect(prompt).toContain('do NOT report any of them again');
+      }
+    });
+
+    it('leaves nothing out when the diff since the earlier review cannot be had, and says so in the log', async () => {
+      const { outcome, logStep, texts } = await followUp({ fetchDiffSince: vi.fn().mockResolvedValue(undefined) });
+
+      expect(outcome.followUp).toMatchObject({ leftOut: 0, newFindings: 3, stillOpen: 1 });
+      expect(texts).toContain('3 new in the code changed since.');
+      expect(logStep).toHaveBeenCalledWith(
+        expect.objectContaining({ stage: 'agentic.pr_review.follow_up.scope_unavailable', level: 'WARN' }),
+      );
+    });
+
+    it('is not a follow-up when there was no earlier review', async () => {
+      const slack = makeSlack([`review ${WEB_PR}`]);
+      const deps = makeDeps();
+      const result = await runAgenticPrReview({
+        task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+        config,
+        slack: slack as any,
+        store: emptyStore,
+        deps: deps as any,
+      });
+
+      expect((result.result as any).outcomes[0]).not.toHaveProperty('followUp');
+      expect(deps.fetchDiffSince).not.toHaveBeenCalled();
+      expect(slack.chat.postMessage.mock.calls.map(c => c[0].text).join('\n')).not.toContain('Follow-up on my review');
+    });
+  });
+
   it('kill switch WATCHTOWER_PR_REVIEW_ORCHESTRATED=0 restores the classic 3-lens fan-out', async () => {
     vi.stubEnv('WATCHTOWER_PR_REVIEW_ORCHESTRATED', '0');
     const slack = makeSlack([`review ${WEB_PR}`]);
@@ -1029,27 +1344,98 @@ describe('agenticPrReview', () => {
     expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'agentic.pr_review.verify.inconclusive' }));
   });
 
-  it('severity gate: non-blocking findings are not verified', async () => {
-    const slack = makeSlack([`review ${WEB_PR}`]);
-    const runAgent = routedRunAgent({
-      reviewer: agentOk([
-        { role: 'reviewer', severity: 'medium', category: 'bug', message: 'edge case', file: 'src/a.ts', line: 2 },
-      ]),
+  describe('which findings are checked and where they are posted (issue #441)', () => {
+    const finding = (severity: string, n: number, role = 'reviewer') => ({
+      role,
+      severity,
+      category: 'bug',
+      message: `${severity} finding ${n}`,
+      file: 'src/a.ts',
+      line: n,
     });
-    const deps = makeDeps({ runAgent });
+    const review = async (runAgent: any, extraDeps: Record<string, unknown> = {}) => {
+      const slack = makeSlack([`review ${WEB_PR}`]);
+      const deps = makeDeps({ runAgent, ...extraDeps });
+      const result = await runAgenticPrReview({
+        task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+        config,
+        slack: slack as any,
+        store: emptyStore,
+        deps: deps as any,
+      });
+      const texts = slack.chat.postMessage.mock.calls.map(c => c[0].text as string);
+      return { result, deps, texts, outcome: (result.result as any).outcomes[0] };
+    };
 
-    const result = await runAgenticPrReview({
-      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
-      config,
-      slack: slack as any,
-      store: emptyStore,
-      deps: deps as any,
+    it('does not verify low and info findings: they are not posted inline, so they are not worth a run', async () => {
+      const runAgent = routedRunAgent({ reviewer: agentOk([finding('low', 2), finding('info', 3)]) });
+
+      const { outcome } = await review(runAgent);
+
+      expect(verifierCalls(runAgent)).toBe(0);
+      expect(outcome.totalFindings).toBe(2);
     });
 
-    expect(result.status).toBe('SUCCESS');
-    expect(verifierCalls(runAgent)).toBe(0);
-    const outcomes = (result.result as any).outcomes;
-    expect(outcomes[0].totalFindings).toBe(1);
+    it('gives a medium finding one verifier vote and keeps it when confirmed', async () => {
+      const runAgent = routedRunAgent({ reviewer: agentOk([finding('medium', 2)]) });
+
+      const { outcome } = await review(runAgent);
+
+      expect(verifierCalls(runAgent)).toBe(1);
+      expect(outcome.totalFindings).toBe(1);
+    });
+
+    it('drops a medium finding on that one refute, with no adjudication', async () => {
+      // The five false positives an author listed from one batch were all of this kind.
+      const runAgent = routedRunAgent({
+        reviewer: agentOk([finding('medium', 2), finding('low', 3)]),
+        verifier: () => agentVerify('refuted'),
+      });
+
+      const { outcome } = await review(runAgent);
+
+      expect(verifierCalls(runAgent)).toBe(1);
+      expect(outcome.totalFindings).toBe(1); // the low one
+    });
+
+    it('posts at most ten inline, worst first, and lists the rest in the review body', async () => {
+      const findings = [
+        ...Array.from({ length: 5 }, (_, i) => finding('low', 40 + i)),
+        ...Array.from({ length: 12 }, (_, i) => finding('medium', 20 + i)),
+        finding('high', 2, 'security'),
+      ];
+      const runAgent = routedRunAgent({
+        reviewer: agentOk(findings.filter(f => f.role === 'reviewer')),
+        security: agentOk(findings.filter(f => f.role === 'security')),
+      });
+
+      const { deps, texts } = await review(runAgent);
+
+      const submitted = deps.submitReview.mock.calls[0][0];
+      const inline = submitted.findingsByRole.flatMap((r: any) => r.findings);
+      expect(inline).toHaveLength(10);
+      expect(inline.filter((f: any) => f.severity === 'high')).toHaveLength(1);
+      expect(inline.filter((f: any) => f.severity === 'medium')).toHaveLength(9);
+      expect(inline.some((f: any) => f.severity === 'low')).toBe(false);
+      // The other three mediums and the five lows: in the body, once, and counted.
+      expect(submitted.findingsInBody).toBe(8);
+      expect(submitted.summary).toContain('Lower-priority findings (not posted inline):');
+      expect(submitted.summary).toContain('`src/a.ts:44` — low finding 44');
+      expect(submitted.summary.match(/- \[REVIEWER - MEDIUM\]/g)).toHaveLength(3);
+      expect(texts.join('\n')).toContain('8 lower-priority listed in the review summary');
+    });
+
+    it('posts no inline comments when nothing reaches medium, and says that is why', async () => {
+      const runAgent = routedRunAgent({ reviewer: agentOk([finding('low', 2), finding('low', 3)]) });
+      const submitOk = { ...SUBMIT_OK, attemptedComments: 0, commentsPosted: 0, submissionMode: 'summary_only' };
+
+      const { deps, texts } = await review(runAgent, { submitReview: vi.fn().mockResolvedValue(submitOk) });
+
+      const submitted = deps.submitReview.mock.calls[0][0];
+      expect(submitted.findingsByRole.flatMap((r: any) => r.findings)).toEqual([]);
+      expect(submitted.findingsInBody).toBe(2);
+      expect(texts.join('\n')).toContain('2 findings identified, none above low severity');
+    });
   });
 
   it('critical findings get a best-of-3 majority vote and drop on ≥2 refutes', async () => {
@@ -1264,5 +1650,120 @@ describe('agenticPrReview', () => {
 
     expect(result.status).toBe('CANCELLED');
     expect(slack.chat.postMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe('agenticPrReview — merged or closed PRs are not reviewed (issue #447)', () => {
+  const merged = { state: 'merged', at: '2026-10-06T09:12:00Z' };
+  const posted = (slack: any) => slack.chat.postMessage.mock.calls.map((c: any[]) => c[0].text as string);
+
+  async function review(text: string, deps: ReturnType<typeof makeDeps>, threadTexts: string[] = [text]) {
+    const slack = makeSlack(threadTexts);
+    const logStep = vi.fn();
+    const result = await runAgenticPrReview({
+      task: makeTask(text),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      logStep,
+      deps: deps as any,
+    });
+    return { result, slack, logStep };
+  }
+
+  it('does not review a merged PR, says when it merged, and offers a post-merge review', async () => {
+    const deps = makeDeps({ fetchState: vi.fn().mockResolvedValue(merged) });
+    const { result, slack, logStep } = await review(`<@UBOT1> review ${API_PR}`, deps);
+
+    expect(deps.runAgent).not.toHaveBeenCalled();
+    expect(deps.submitReview).not.toHaveBeenCalled();
+    expect(result.status).toBe('SKIPPED');
+    expect(result.slackPosted).toBe(true);
+    const reply = posted(slack)[0];
+    expect(reply).toContain('`newton-api#5781` is already merged (2026-10-06)');
+    expect(reply).toContain(`post-merge review ${API_PR}`);
+    expect(reply).toContain('@ me with the question');
+    expect(posted(slack).join(' ')).not.toContain('PR review in progress');
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'agentic.pr_review.guard.not_open' }));
+  });
+
+  it('does not review a question about a merged PR either (the issue #447 run)', async () => {
+    const deps = makeDeps({ fetchState: vi.fn().mockResolvedValue(merged) });
+    const { result } = await review(`<@UBOT1> is ${API_PR} merged and deployed to production?`, deps);
+
+    expect(deps.submitReview).not.toHaveBeenCalled();
+    expect(result.status).toBe('SKIPPED');
+  });
+
+  it('says a closed PR was closed without merging', async () => {
+    const deps = makeDeps({ fetchState: vi.fn().mockResolvedValue({ state: 'closed' }) });
+    const { slack } = await review(`<@UBOT1> review ${WEB_PR}`, deps);
+
+    expect(deps.submitReview).not.toHaveBeenCalled();
+    expect(posted(slack)[0]).toContain('`newton-web#8652` is closed without merging');
+  });
+
+  it('reviews a merged PR when a post-merge review is asked for, and drops "before merge"', async () => {
+    const runAgent = routedRunAgent({
+      orchestrator: agentOk([
+        { role: 'reviewer', severity: 'high', category: 'bug', message: 'null deref', file: 'src/a.ts', line: 2 },
+      ]),
+    });
+    const deps = makeDeps({ fetchState: vi.fn().mockResolvedValue(merged), runAgent });
+    const { result, slack } = await review(`<@UBOT1> post-merge review ${API_PR}`, deps);
+
+    expect(deps.submitReview).toHaveBeenCalledTimes(1);
+    expect(result.status).toBe('SUCCESS');
+    const all = posted(slack).join('\n');
+    expect(all).toContain('this PR is already merged, so they need a follow-up');
+    expect(all).not.toContain('please address before merge');
+  });
+
+  it('reviews as before when GitHub cannot say what state the PR is in', async () => {
+    const deps = makeDeps({ fetchState: vi.fn().mockRejectedValue(new Error('ETIMEDOUT')) });
+    const { result } = await review(`<@UBOT1> review ${API_PR}`, deps);
+
+    expect(deps.submitReview).toHaveBeenCalledTimes(1);
+    expect(result.status).toBe('SUCCESS');
+  });
+
+  it('in a batch, reviews the open PR and names the merged one', async () => {
+    const fetchState = vi.fn(async ({ prContext }: any) => (prContext.url === API_PR ? merged : { state: 'open' }));
+    const deps = makeDeps({ fetchState });
+    const { result, slack } = await review(`<@UBOT1> review ${API_PR} and ${WEB_PR}`, deps);
+
+    expect(deps.submitReview).toHaveBeenCalledTimes(1);
+    expect(deps.submitReview.mock.calls[0][0]).toMatchObject({ repo: 'newton-web', pullNumber: 8652 });
+    expect(posted(slack)[0]).toContain('`newton-api#5781` is already merged');
+    expect(result.status).toBe('SUCCESS');
+  });
+});
+
+describe('agenticPrReview — a cancelled review is not a failed one (issue #438)', () => {
+  it('returns CANCELLED for a single PR stopped mid-review, and posts nothing after the cancel', async () => {
+    const controller = new AbortController();
+    // Every agent dies with the abort.
+    const runAgent = vi.fn().mockImplementation(async () => {
+      controller.abort();
+      return agentDead();
+    });
+    const deps = makeDeps({ runAgent });
+    const slack = makeSlack([`please review ${API_PR}`]);
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${API_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+      signal: controller.signal,
+    });
+
+    expect(result.status).toBe('CANCELLED');
+    expect(deps.submitReview).not.toHaveBeenCalled();
+    const postedAfterCancel = slack.chat.postMessage.mock.calls
+      .map((c: any[]) => c[0].text as string)
+      .filter((text: string) => !text.includes('PR review in progress'));
+    expect(postedAfterCancel).toEqual([]);
   });
 });

@@ -1,8 +1,25 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
-import { claudeCodeBackend, stripPlanHarnessMeta } from '../src/backends/claudeCodeBackend.js';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import {
+  claudeCodeBackend,
+  NO_TOOLS_ARGS,
+  stripPlanHarnessMeta,
+  PROCESS_KILL_DENY_RULES,
+} from '../src/backends/claudeCodeBackend.js';
+import { __personalSkills } from '../src/backends/personalSkills.js';
+
+// buildArgs denies the host user's personal skills (personalSkills.test.ts).
+// Point it at an empty home here so these tests see the same arguments on
+// every machine.
+const realPersonalHome = __personalSkills.home;
+beforeAll(() => {
+  __personalSkills.home = () => '/nonexistent-watchtower-test-home';
+});
+afterAll(() => {
+  __personalSkills.home = realPersonalHome;
+});
 
 describe('claudeCodeBackend.parseOutput', () => {
   it('unwraps Claude Code wrapper and extracts inner structured JSON', () => {
@@ -429,6 +446,94 @@ describe('claudeCodeBackend.buildArgs', () => {
     expect(args[idx + 1]).toBe('plan');
   });
 
+  it('passes images by path + --add-dir, never the nonexistent --image flag', () => {
+    const imagePaths = ['/tmp/slack-a/F1-shot.png', '/tmp/slack-a/F2-shot.png', '/tmp/slack-b/F3-shot.png'];
+    const args = claudeCodeBackend.buildArgs({ ...baseRequest, planMode: true, imagePaths }, '/tmp/out.json');
+    // The installed CLI exits with "unknown option '--image'".
+    expect(args).not.toContain('--image');
+    const prompt = args[args.indexOf('-p') + 1];
+    expect(prompt.startsWith('hello')).toBe(true);
+    for (const p of imagePaths) expect(prompt).toContain(`- ${p}`);
+    expect(prompt).toContain('Read tool');
+    // One --add-dir with each image dir once; variadic, so it must follow the prompt.
+    const addDir = args.indexOf('--add-dir');
+    expect(addDir).toBeGreaterThan(args.indexOf('-p') + 1);
+    expect(args.slice(addDir + 1, addDir + 3)).toEqual(['/tmp/slack-a', '/tmp/slack-b']);
+    expect(args.filter(a => a === '--add-dir')).toHaveLength(1);
+  });
+
+  // Issue #443: text-only calls ran with 441 tools, 18 MCP servers and 76 skills.
+  describe('noTools', () => {
+    const args = () => claudeCodeBackend.buildArgs({ ...baseRequest, noTools: true }, '/tmp/out.json');
+
+    it('needs no kill-by-name rule: a text-only call has no Bash to deny', () => {
+      expect(args()).not.toContain('--disallowedTools');
+    });
+
+    it('removes built-in tools, every MCP server, skills, hooks and plugins', () => {
+      const built = args();
+      expect(built).toEqual(expect.arrayContaining(NO_TOOLS_ARGS));
+      expect(built[built.indexOf('--tools') + 1]).toBe('');
+      expect(built).toContain('--strict-mcp-config');
+      expect(built[built.indexOf('--mcp-config') + 1]).toBe('{"mcpServers":{}}');
+      expect(built).toContain('--disable-slash-commands');
+      expect(built).toContain('--safe-mode');
+    });
+
+    it('does not bypass permissions: there is nothing left to permit', () => {
+      const built = args();
+      expect(built).not.toContain('--dangerously-skip-permissions');
+      expect(built).not.toContain('--permission-mode');
+    });
+
+    it('keeps the variadic flags from swallowing what follows them', () => {
+      const built = claudeCodeBackend.buildArgs(
+        { ...baseRequest, noTools: true, model: 'claude-haiku-5-5', reasoningEffort: 'low' },
+        '/tmp/out.json',
+      );
+      // `--tools <tools...>` and `--mcp-config <configs...>` take every following non-flag argument.
+      expect(built[built.indexOf('--tools') + 2].startsWith('--')).toBe(true);
+      expect(built[built.indexOf('--mcp-config') + 2].startsWith('--')).toBe(true);
+      // The prompt is still the first positional, and the model is still passed.
+      expect(built.slice(0, 2)).toEqual(['-p', 'hello']);
+      expect(built[built.indexOf('--model') + 1]).toBe('claude-haiku-5-5');
+    });
+
+    it('ignores MCP servers on the request: no tools means none', () => {
+      const built = claudeCodeBackend.buildArgs(
+        {
+          ...baseRequest,
+          noTools: true,
+          mcpServers: { metabase: { type: 'http', url: 'https://metabase.example/mcp' } },
+        },
+        '/tmp/out.json',
+      );
+      expect(built.filter(arg => arg === '--mcp-config')).toHaveLength(1);
+      expect(built.join(' ')).not.toContain('metabase.example');
+    });
+
+    it('leaves a run that does work its tools and its bypass', () => {
+      const built = claudeCodeBackend.buildArgs(baseRequest, '/tmp/out.json');
+      expect(built).toContain('--dangerously-skip-permissions');
+      expect(built).not.toContain('--tools');
+      expect(built).not.toContain('--safe-mode');
+    });
+  });
+
+  it('leaves the prompt and args alone when there are no images', () => {
+    const args = claudeCodeBackend.buildArgs({ ...baseRequest, imagePaths: [] }, '/tmp/out.json');
+    expect(args[args.indexOf('-p') + 1]).toBe('hello');
+    expect(args).not.toContain('--add-dir');
+  });
+
+  it('adds image paths to a resumed run too', () => {
+    const args = claudeCodeBackend.buildArgs(
+      { ...baseRequest, resumeSessionId: 'sess-1', imagePaths: ['/tmp/slack-a/F1-shot.png'] },
+      '/tmp/out.json',
+    );
+    expect(args[args.indexOf('-p') + 1]).toContain('- /tmp/slack-a/F1-shot.png');
+  });
+
   it('marks plain-text output from an error envelope as status error, not success (issue #342)', () => {
     const wrapper = JSON.stringify({
       type: 'result',
@@ -478,15 +583,50 @@ describe('claudeCodeBackend MCP + env wiring (scoped investigation)', () => {
     expect(args).toContain('--strict-mcp-config');
   });
 
-  it('omits MCP flags when no mcpServers are provided', () => {
+  // Issue #443: with no MCP flags a run loaded every server the host user
+  // has, their plugins' servers and their claude.ai connectors.
+  it('loads no MCP server at all when none is named', () => {
     const args = claudeCodeBackend.buildArgs(baseRequest, '/tmp/out.json');
-    expect(args).not.toContain('--mcp-config');
-    expect(args).not.toContain('--strict-mcp-config');
+    const idx = args.indexOf('--mcp-config');
+    expect(JSON.parse(args[idx + 1])).toEqual({ mcpServers: {} });
+    // `--mcp-config` is variadic: a flag has to follow the JSON.
+    expect(args[idx + 2]).toBe('--strict-mcp-config');
   });
 
-  it('omits MCP flags for an empty mcpServers object', () => {
+  it('treats an empty list the same way', () => {
     const args = claudeCodeBackend.buildArgs({ ...baseRequest, mcpServers: {} }, '/tmp/out.json');
-    expect(args).not.toContain('--mcp-config');
+    expect(JSON.parse(args[args.indexOf('--mcp-config') + 1])).toEqual({ mcpServers: {} });
+    expect(args).toContain('--strict-mcp-config');
+  });
+
+  it('is strict in plan mode and on a resumed run too', () => {
+    for (const extra of [{ planMode: true }, { resumeSessionId: 'sess-1' }]) {
+      const args = claudeCodeBackend.buildArgs({ ...baseRequest, ...extra }, '/tmp/out.json');
+      expect(args).toContain('--strict-mcp-config');
+    }
+  });
+
+  it('passes a stdio server through with its command, args and env', () => {
+    const server = {
+      type: 'stdio' as const,
+      command: 'uvx',
+      args: ['--from', 'pkg', 'serve'],
+      env: { BASE_URL: 'https://x' },
+    };
+    const args = claudeCodeBackend.buildArgs({ ...baseRequest, mcpServers: { admin: server } }, '/tmp/out.json');
+    expect(JSON.parse(args[args.indexOf('--mcp-config') + 1])).toEqual({ mcpServers: { admin: server } });
+  });
+
+  it("adds a run's own deny rules after the ones every run gets", () => {
+    const args = claudeCodeBackend.buildArgs(
+      { ...baseRequest, disallowedTools: ['mcp__metabase__update_*', 'mcp__metabase__create_*'] },
+      '/tmp/out.json',
+    );
+    const start = args.indexOf('--disallowedTools');
+    const end = args.findIndex((arg, i) => i > start && arg.startsWith('--'));
+    const rules = args.slice(start + 1, end === -1 ? undefined : end);
+    expect(rules).toContain('Bash(pkill:*)');
+    expect(rules.slice(-2)).toEqual(['mcp__metabase__update_*', 'mcp__metabase__create_*']);
   });
 
   it('passes HOME (and USER) in buildEnv so the MCP OAuth keychain resolves', () => {
@@ -498,12 +638,47 @@ describe('claudeCodeBackend MCP + env wiring (scoped investigation)', () => {
       const env = claudeCodeBackend.buildEnv(baseRequest, '/usr/bin');
       expect(env.HOME).toBe('/Users/tester');
       expect(env.USER).toBe('tester');
-      expect(env.PATH).toBe('/usr/bin');
+      expect(env.PATH.split(':')).toContain('/usr/bin');
     } finally {
       if (prevHome === undefined) delete process.env.HOME;
       else process.env.HOME = prevHome;
       if (prevUser === undefined) delete process.env.USER;
       else process.env.USER = prevUser;
     }
+  });
+
+  it('gives agents the toolchain PATH, not the bare PATH a GUI-launched app inherits (issue #444)', () => {
+    const dirs = claudeCodeBackend.buildEnv(baseRequest, '/usr/bin:/bin:/custom/tools').PATH.split(':');
+    // Homebrew (gh) and the sidecar's own Node directory (node, npm, npx).
+    expect(dirs).toContain('/opt/homebrew/bin');
+    expect(dirs).toContain('/usr/local/bin');
+    expect(dirs).toContain(path.dirname(process.execPath));
+    // Whatever was already there is kept.
+    expect(dirs).toContain('/custom/tools');
+    expect(new Set(dirs).size).toBe(dirs.length);
+  });
+});
+
+describe('claudeCodeBackend.buildArgs denies killing by name (issue #445)', () => {
+  const request = { cwd: '/tmp/wt-no-such-repo', prompt: 'hello' };
+
+  it.each([
+    ['a working agent', {}],
+    ['the planner', { planMode: true }],
+    ['a resumed session', { resumeSessionId: 'sess-1' }],
+  ])('passes the pkill and killall deny rules to %s', (_name, extra) => {
+    const args = claudeCodeBackend.buildArgs({ ...request, ...extra }, '/tmp/out.json');
+    const at = args.indexOf('--disallowedTools');
+
+    expect(at).toBeGreaterThan(-1);
+    expect(args.slice(at + 1, at + 3)).toEqual(['Bash(pkill:*)', 'Bash(killall:*)']);
+    // Variadic: the rules end the argument list, or a flag follows them. The prompt is never after them.
+    const next = args.slice(at + 1).find(arg => !arg.startsWith('Bash(') && !arg.startsWith('Skill('));
+    expect(next === undefined || next.startsWith('--')).toBe(true);
+    expect(args.indexOf('hello')).toBeLessThan(at);
+  });
+
+  it('exports exactly the two rules probed against the CLI', () => {
+    expect(PROCESS_KILL_DENY_RULES).toEqual(['Bash(pkill:*)', 'Bash(killall:*)']);
   });
 });

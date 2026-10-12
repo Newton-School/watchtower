@@ -11,6 +11,7 @@ import type {
 } from '../types/contracts.js';
 import type { AgentBackend, AgentBackendId } from '../backends/types.js';
 import { getBackend } from '../backends/registry.js';
+import { currentConnectors } from '../backends/connectors.js';
 import { computeCostUsd } from '../pricing/modelPrices.js';
 import { agentCallContext } from '../state/runContext.js';
 import { createStreamDecoder } from './streamEvents.js';
@@ -199,6 +200,57 @@ export function detectUsageLimit(text: string): { resetsAtText?: string } | unde
   return { resetsAtText: resetsAtText && resetsAtText.length > 0 ? resetsAtText : undefined };
 }
 
+/** Exit codes a process reports when it handles a fatal signal itself: 128 + the signal number. */
+const SIGNAL_EXIT_CODES: Record<number, string> = { 129: 'SIGHUP', 130: 'SIGINT', 137: 'SIGKILL', 143: 'SIGTERM' };
+
+/**
+ * Whether a process ended because something signalled it. The caller rules
+ * out its own timeout and cancel first; what is left came from outside. The
+ * CLI catches SIGTERM and exits 143, so the exit code counts as well as the
+ * signal the OS reports.
+ */
+export function detectExternalKill(
+  exitCode: number | null,
+  signal: string | undefined,
+): { signal: string } | undefined {
+  if (signal) return { signal };
+  if (exitCode !== null && SIGNAL_EXIT_CODES[exitCode]) return { signal: SIGNAL_EXIT_CODES[exitCode] };
+  return undefined;
+}
+
+/** The CLI's whole final message is its own error line: `API Error: …`, bare or inside the result envelope. */
+const API_ERROR_RESULT_RE = /(?:^\s*|"result"\s*:\s*")(API Error:[^"\n]{0,300})/;
+/** The envelope's own flag that the result is an error, not an answer. */
+const ENVELOPE_IS_ERROR_RE = /"is_error"\s*:\s*true/;
+/** The envelope's own statement of why the run ended (CLI 2.1.x). */
+const TERMINAL_API_ERROR_RE = /"terminal_reason"\s*:\s*"api_error"/;
+/** A network failure named in the final message of a run that failed. */
+const NETWORK_FAILURE_RE =
+  /\b(?:ENOTFOUND|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ETIMEDOUT)\b|No response from API|Can'?t reach the API server/i;
+
+/**
+ * Classify a run that died on the connection to the model API (issue #439).
+ * The CLI reports it as ordinary output ("API Error: Can't reach the API
+ * server — check your internet or DNS (ENOTFOUND)"), so without this the text
+ * is taken for the agent's answer: it was posted as a plan for approval.
+ *
+ * The CLI saying so itself (`"terminal_reason":"api_error"`) is enough on any
+ * run. Otherwise, on a failed run, a final message that opens with
+ * `API Error:` or names a network failure is enough; on a run that exited
+ * cleanly, the result must also be flagged as an error, so an agent whose
+ * answer happens to open with "API Error:" is never mistaken for a dead
+ * connection.
+ */
+export function detectApiError(text: string, opts: { failedRun: boolean }): { detail: string } | undefined {
+  if (!text) return undefined;
+  const asResult = API_ERROR_RESULT_RE.exec(text);
+  if (TERMINAL_API_ERROR_RE.test(text)) return { detail: asResult ? asResult[1].trim() : 'api_error' };
+  if (asResult && (opts.failedRun || ENVELOPE_IS_ERROR_RE.test(text))) return { detail: asResult[1].trim() };
+  if (!opts.failedRun) return undefined;
+  const network = NETWORK_FAILURE_RE.exec(text);
+  return network ? { detail: network[0] } : undefined;
+}
+
 export function parseCodexStructuredOutput(raw: string): ParsedCodexOutput {
   const attempts: Array<'direct' | 'fenced_block' | 'first_object'> = [];
   const preview = previewOutput(raw);
@@ -244,7 +296,24 @@ export function parseCodexStructuredOutput(raw: string): ParsedCodexOutput {
   };
 }
 
-export async function runAgent(request: CodexRunRequest, backend: AgentBackend): Promise<CodexRunResult> {
+/**
+ * Fill in the connectors a run gets when the caller did not name any: the
+ * list its workflow set, or none. Text-only calls have no tools to connect.
+ */
+export function withWorkflowConnectors(request: CodexRunRequest): CodexRunRequest {
+  if (request.noTools || request.mcpServers) {
+    return request;
+  }
+  const connectors = currentConnectors();
+  return {
+    ...request,
+    mcpServers: connectors.mcpServers,
+    disallowedTools: [...(request.disallowedTools ?? []), ...connectors.disallowedTools],
+  };
+}
+
+export async function runAgent(rawRequest: CodexRunRequest, backend: AgentBackend): Promise<CodexRunResult> {
+  const request = withWorkflowConnectors(rawRequest);
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), `watchtower-${backend.id}-`));
   const outputPath = path.join(tempDir, 'final-message.txt');
 
@@ -262,6 +331,7 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
       reasoningEffort: request.reasoningEffort ?? 'default',
       githubTokenInjected: Boolean(request.githubToken),
       executable,
+      ...(request.noTools ? {} : { connectors: Object.keys(request.mcpServers ?? {}) }),
     },
   });
 
@@ -271,6 +341,7 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
 
   let timedOut = false;
   let cancelled = false;
+  let closeSignal: string | undefined;
   const modelUsed = request.model ?? backend.defaultModel();
   const spawnedAt = Date.now();
   const child = spawn(executable, args, {
@@ -378,7 +449,10 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
   try {
     const childDone = new Promise<number | null>((resolve, reject) => {
       child.on('error', reject);
-      child.on('close', code => resolve(code));
+      child.on('close', (code, signal) => {
+        closeSignal = signal ?? undefined;
+        resolve(code);
+      });
     });
 
     const exitCode = request.timeoutMs
@@ -390,6 +464,9 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
             level: 'ERROR',
             data: {
               timeoutMs: request.timeoutMs,
+              // Wall-clock time since spawn. A timer cannot fire while the host
+              // sleeps, so this can be far past timeoutMs (issue #440).
+              elapsedMs: Date.now() - spawnedAt,
             },
           });
           child.kill('SIGKILL');
@@ -504,11 +581,37 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
       }
     }
 
-    const ok = !timedOut && !cancelled && exitCode === 0;
+    const exitedCleanly = !timedOut && !cancelled && exitCode === 0;
 
     // Classify limit hits on failed runs so callers can pause/retry at the
     // stated reset instead of burning retries on doomed spawns (issue #342).
-    const usageLimit = !ok && !timedOut && !cancelled ? detectUsageLimit(lastMessage) : undefined;
+    const usageLimit = !exitedCleanly && !timedOut && !cancelled ? detectUsageLimit(lastMessage) : undefined;
+    // A run that died on the connection is not the agent's output, whatever
+    // the exit code: callers retry it instead of reading it (issue #439).
+    const apiError =
+      !usageLimit && !timedOut && !cancelled ? detectApiError(lastMessage, { failedRun: !exitedCleanly }) : undefined;
+    if (apiError) {
+      request.onLog?.({
+        stage: 'agent.api_error',
+        message: `${backend.displayName} could not reach the model API: ${apiError.detail}`,
+        level: 'WARN',
+        data: { detail: apiError.detail, exitCode },
+      });
+    }
+    // Stopped by a signal nobody here sent: another process killed it. The
+    // dead reviewer of one job was read as "Reviewer rejected" when a coder in
+    // a different job ran `pkill` (issue #445).
+    const externalKill =
+      !usageLimit && !apiError && !timedOut && !cancelled ? detectExternalKill(exitCode, closeSignal) : undefined;
+    if (externalKill) {
+      request.onLog?.({
+        stage: 'agent.killed',
+        message: `${backend.displayName} was killed from outside (${externalKill.signal}); not by a timeout or a cancel.`,
+        level: 'WARN',
+        data: { exitCode, signal: externalKill.signal },
+      });
+    }
+    const ok = exitedCleanly && !apiError;
     if (usageLimit) {
       request.onLog?.({
         stage: 'agent.usage_limit',
@@ -551,6 +654,8 @@ export async function runAgent(request: CodexRunRequest, backend: AgentBackend):
       lastMessage,
       parsedJson,
       ...(usageLimit ? { errorKind: 'USAGE_LIMIT' as const, limitResetsAtText: usageLimit.resetsAtText } : {}),
+      ...(apiError ? { errorKind: 'API_ERROR' as const, apiErrorDetail: apiError.detail } : {}),
+      ...(externalKill ? { errorKind: 'EXTERNAL_KILL' as const, killSignal: externalKill.signal } : {}),
       durationMs,
       usage,
       costUsd,

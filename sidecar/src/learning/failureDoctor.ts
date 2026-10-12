@@ -11,6 +11,13 @@ export function diagnoseFailure(input: {
   message: string;
   logs: WorkflowStepLog[];
 }): FailureDiagnosis | undefined {
+  // A cancelled run is not a failure to diagnose. Its log data (a "timeoutMs"
+  // field is enough) used to match the generic timeout rule below, so an
+  // owner's cancel was reported as WORKFLOW_TIMEOUT (issue #438).
+  if (input.logs.some(entry => entry.stage === 'agent.cancelled' || entry.stage === 'job.cancelled')) {
+    return undefined;
+  }
+
   const haystack = `${input.message}\n${input.logs
     .map(entry => `${entry.stage} ${entry.message} ${JSON.stringify(entry.data ?? {})}`)
     .join('\n')}`.toLowerCase();
@@ -59,6 +66,42 @@ export function diagnoseFailure(input: {
         'Rebuild sidecar dependencies against the active Node version.',
         'Prefer one Node runtime path for packaged execution.',
         'Reinstall the latest Watchtower build after rebuild.',
+      ],
+    };
+  }
+
+  // The run ended because the model API could not be reached and retrying did
+  // not help. Matched on the stages that end a run that way, not on any
+  // `agent.api_error` line: a drop that a retry recovered from is not why a
+  // later failure happened. Ahead of the timeout rules, which used to claim
+  // these (a "timeoutMs" field in the log data is enough for them, issue #439).
+  const endedOnLostConnection = input.logs.some(
+    entry =>
+      entry.stage === 'pipeline.api_error' ||
+      (entry.stage === 'implementation.planner.failed' && entry.data?.errorKind === 'API_ERROR'),
+  );
+  if (endedOnLostConnection || input.message.toLowerCase().includes('lost my connection to the model')) {
+    return {
+      errorKind: 'MODEL_API_UNREACHABLE',
+      summary: 'The model API could not be reached (network drop or the host asleep), and the retries did not recover.',
+      actions: [
+        "Check the host's network and that it was awake at the time.",
+        'Re-mention miniOG in the thread to run the task again; work already committed is still on its branch.',
+        'If this recurs, keep the host awake while jobs run or move the sidecar to an always-on machine.',
+      ],
+    };
+  }
+
+  // The run ended because an agent's process was killed from outside, twice.
+  // Exit 143 without a cancel is the signature (issue #445).
+  if (input.logs.some(entry => entry.stage === 'pipeline.killed') || /killed from outside/.test(input.message)) {
+    return {
+      errorKind: 'AGENT_KILLED_EXTERNALLY',
+      summary: "An agent's process was killed by something other than miniOG, and the retry was killed too.",
+      actions: [
+        'Look for what signalled it: another job cleaning up by name (`pkill`, `killall`), or the host shutting down.',
+        'Re-mention miniOG in the thread to run the task again; work already committed is still on its branch.',
+        'The kill is not a review or verification verdict; nothing about the change was judged.',
       ],
     };
   }

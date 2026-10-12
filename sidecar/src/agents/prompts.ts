@@ -12,9 +12,21 @@ function serializePreviousSteps(ctx: AgentContext): string {
     .join('\n\n');
 }
 
+/**
+ * Every agent runs as the same OS user as every other job's agents. One
+ * coder's `pkill -f "next dev" -s 0` killed the agents of two other jobs: on
+ * macOS `-s` and `0` are two more patterns, not "my session" (issue #445).
+ */
+export const PROCESS_HYGIENE_RULE =
+  'Other jobs run on this machine as the same user. Stop only processes you started, and only by PID (`kill <pid>`): ' +
+  'when you start a dev server or any background process, note its PID then and stop that PID before you finish. ' +
+  "Never use `pkill`, `killall` or `kill -1`: they stop other jobs' agents too, and are blocked.";
+
 function policyBlock(ctx: AgentContext): string {
-  if (!ctx.policyPack) return 'No explicit policy pack assigned.';
-  return [`Active policy pack: ${ctx.policyPack.packName}`, ...ctx.policyPack.rules.map(r => `- ${r}`)].join('\n');
+  const pack = ctx.policyPack
+    ? [`Active policy pack: ${ctx.policyPack.packName}`, ...ctx.policyPack.rules.map(r => `- ${r}`)].join('\n')
+    : 'No explicit policy pack assigned.';
+  return `${pack}\nProcesses: ${PROCESS_HYGIENE_RULE}`;
 }
 
 /** The approved plan the coder/reviewer/verifier all read off the planner step. */
@@ -67,6 +79,7 @@ IMPORTANT: "requiresCodeChanges" rules:
 - The user's explicit request takes priority. If they say "I want to…", "add…", "implement…", "fix…", "block…", "create…", "change…", or "update…" — that is an implementation request and requiresCodeChanges MUST be true.
 - Set to false for purely informational requests (explain, describe, list, check status, answer a question) where NO file changes are needed.
 - Set to false for operational/lifecycle actions that do NOT modify source code: merge PR, close PR, deploy, run tests, restart service, check CI status, approve PR, assign reviewers.
+- A deploy, release or rollback ask is never executed by this pipeline. Still set false for it; it is redirected to the deploy command, which asks for confirmation.
 - The key distinction: if the user wants to CHANGE source code files → true. If the user wants to perform a git/GitHub/infrastructure action on existing code → false.
 
 CLARIFICATION (\`clarificationNeeded\`):
@@ -103,11 +116,18 @@ ${ctx.threadContext}
 ${ctx.prContext ? `PR context: ${ctx.prContext.url} (${ctx.prContext.owner}/${ctx.prContext.repo}#${ctx.prContext.number})` : ''}
 
 What the plan must contain (markdown):
+- FIRST, a block for the person who approves this plan. They are not the coder, often did not write the request, and will decide in about a minute. Use exactly this heading and these five lines, in plain words with no code and no file paths except under "Where":
+  ## For the approver
+  - What changes: <one sentence, in terms of what a user of the product will see or get>
+  - Where: <the page, screen or area; at most three>
+  - Behaviour change: <the single word "none" if nothing will behave differently; otherwise what will behave differently once this ships, in one or two sentences. A changed default, limit, condition or rule is a behaviour change: say what the new value means for a real user, not just what it is>
+  - Assumptions to confirm: <the single word "none", or only what would change the result if you guessed wrong or could not see it (a screenshot you could not open, which of two pages was meant, a value you picked). Do not restate the request here>
+  - Risk: <low, medium or high>
 - A short summary of the user's intent.
-- The concrete files you expect to touch, with brief rationale per file.
+- A section headed exactly \`## Files to change\`: one bullet per file you will edit or create, as a backticked repo-relative path and a few words on why. ONLY files this change edits. Files you only read, files that must not be touched, globs, URLs and branch names do not belong in this section.
 - An ordered list of implementation steps.
 - A scope tag on its own line, exactly one of: \`Scope: small\`, \`Scope: medium\`, or \`Scope: large\`. Treat anything under ~50 lines across 1–2 files as small; multi-file feature work as medium; cross-cutting refactors or new subsystems as large. Coder agent uses this to decide whether to include tests in the PR.
-- A code-changes tag on its own line, exactly one of: \`Requires code changes: yes\` or \`Requires code changes: no\`. Set \`no\` ONLY for purely informational requests (explain, describe, list, check status, answer a question) or operational/lifecycle actions that do NOT modify source (merge PR, close PR, deploy, run tests, restart service). For ANY implementation, feature, fix, change, or modification of source files set \`yes\`; when in doubt, \`yes\`.
+- A code-changes tag on its own line, exactly one of: \`Requires code changes: yes\` or \`Requires code changes: no\`. Set \`no\` ONLY for purely informational requests (explain, describe, list, check status, answer a question) or operational/lifecycle actions that do NOT modify source (merge PR, close PR, deploy, run tests, restart service; a deploy, release or rollback ask is not executed by this pipeline, it is redirected to the deploy command). For ANY implementation, feature, fix, change, or modification of source files set \`yes\`; when in doubt, \`yes\`.
 - Anything the coder MUST avoid (existing patterns, deprecated APIs, owner conventions).
 
 Use the read tools (grep, file reads) to ground every claim — do not guess at file paths or function signatures. If the task is genuinely ambiguous and you cannot safely pick a direction, say so at the top of the plan with a short clarifying question; otherwise commit to a direction.
@@ -235,6 +255,7 @@ Your role: Audit the code changes for security vulnerabilities and compliance is
 
 Workflow: ${ctx.workflowIntent}
 Repository: ${ctx.repoPath}
+Processes: ${PROCESS_HYGIENE_RULE}
 
 Previous agent results:
 ${serializePreviousSteps(ctx)}
@@ -268,6 +289,7 @@ Your role: Analyze code changes for performance issues and optimization opportun
 
 Workflow: ${ctx.workflowIntent}
 Repository: ${ctx.repoPath}
+Processes: ${PROCESS_HYGIENE_RULE}
 
 Previous agent results:
 ${serializePreviousSteps(ctx)}

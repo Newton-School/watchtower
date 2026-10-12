@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { createPullRequest } from './createPr.js';
+import { toolchainEnv } from '../backends/codexBackend.js';
 import { logger } from '../logging/logger.js';
 import { sanitizeForBranch, buildSlackThreadLink } from '../workflows/shared/workflowUtils.js';
 import { git, hasUncommittedChanges, getDefaultBranch, hasCommitsAheadOfBase } from '../workspaces/gitState.js';
@@ -65,6 +66,7 @@ async function existingPrUrl(cwd: string): Promise<string | undefined> {
       cwd,
       timeout: 15_000,
       maxBuffer: 1024 * 1024,
+      env: toolchainEnv(),
     });
     const prUrl = stdout.trim();
     return prUrl || undefined;

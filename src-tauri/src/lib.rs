@@ -4204,6 +4204,12 @@ async fn spawn_sidecar_once(
         .arg(entry)
         .current_dir(sidecar_root)
         .env("WATCHTOWER_DB_PATH", db_path)
+        // Lets the sidecar stamp jobs with the build that handled them (issue #450).
+        .env("WATCHTOWER_APP_VERSION", env!("CARGO_PKG_VERSION"))
+        .env(
+            "WATCHTOWER_GIT_SHA",
+            option_env!("WATCHTOWER_GIT_SHA").unwrap_or("unknown"),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

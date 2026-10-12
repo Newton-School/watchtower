@@ -1,5 +1,6 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
-import { submitPrReview } from '../src/github/submitPrReview.js';
+import { __reviewHttp, submitPrReview } from '../src/github/submitPrReview.js';
 import type { AgentFinding } from '../src/agents/types.js';
 
 const originalFetch = globalThis.fetch;
@@ -12,6 +13,49 @@ describe('submitPrReview', () => {
   afterEach(() => {
     globalThis.fetch = originalFetch;
   });
+
+  /**
+   * Stands in for GitHub. POSTs are answered in order from `posts` (a Response,
+   * or an Error to throw). GETs of the reviews list return `reviews` (or fail
+   * when it is 'down'), and a review's comments list has `reviewComments` items.
+   */
+  function github(options: {
+    posts: Array<Response | Error>;
+    reviews?: Array<Record<string, unknown>> | 'down';
+    reviewComments?: number;
+    reviewsLink?: string;
+  }) {
+    const seen: Array<{ method: string; url: string; body: any; signal?: AbortSignal }> = [];
+    const queue = [...options.posts];
+    vi.mocked(globalThis.fetch).mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      seen.push({
+        method,
+        url,
+        body: init?.body ? JSON.parse(init.body as string) : undefined,
+        signal: init?.signal ?? undefined,
+      });
+      if (method === 'POST') {
+        const next = queue.shift();
+        if (!next) throw new Error('unexpected POST');
+        if (next instanceof Error) throw next;
+        return next;
+      }
+      if (/\/reviews\/\d+\/comments/.test(url)) {
+        return new Response(JSON.stringify(Array.from({ length: options.reviewComments ?? 0 }, (_, id) => ({ id }))));
+      }
+      if (options.reviews === 'down') return new Response('Server Error', { status: 500 });
+      return new Response(JSON.stringify(options.reviews ?? []), {
+        headers: options.reviewsLink && !/[?&]page=/.test(url) ? { link: options.reviewsLink } : {},
+      });
+    });
+    return {
+      all: () => seen,
+      posts: () => seen.filter(call => call.method === 'POST'),
+      gets: () => seen.filter(call => call.method === 'GET'),
+    };
+  }
 
   const baseFinding = (severity: AgentFinding['severity'], file?: string, line?: number): AgentFinding => ({
     severity,
@@ -97,6 +141,24 @@ describe('submitPrReview', () => {
 
     expect(result.event).toBe('APPROVE');
     expect(result.submissionMode).toBe('summary_only');
+  });
+
+  it('submits COMMENT, not APPROVE, when the only findings are the ones written into the body (issue #441)', async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(new Response('{}', { status: 200 }));
+
+    const result = await submitPrReview({
+      owner: 'Newton-School',
+      repo: 'newton-web',
+      pullNumber: 123,
+      commitId: 'abc123',
+      findingsByRole: [{ role: 'reviewer', findings: [] }],
+      findingsInBody: 4,
+      summary: 'Four low findings, listed here.',
+      githubToken: 'ghp_test',
+    });
+
+    expect(result.event).toBe('COMMENT');
+    expect(JSON.parse(vi.mocked(globalThis.fetch).mock.calls[0][1]?.body as string).event).toBe('COMMENT');
   });
 
   it('excludes findings without file/line from inline comments and posts file-only as file-level', async () => {
@@ -233,13 +295,17 @@ describe('submitPrReview', () => {
     expect(retryBody.comments).toHaveLength(0);
   });
 
-  it('retries the body-only fallback once after a transient 5xx, then succeeds', async () => {
+  it('retries the body-only fallback once after a transient 5xx, once GitHub confirms it did not land', async () => {
     vi.useFakeTimers();
     try {
-      vi.mocked(globalThis.fetch)
-        .mockResolvedValueOnce(new Response('Validation Failed', { status: 422 })) // initial with comments
-        .mockResolvedValueOnce(new Response('Bad Gateway', { status: 502 })) // body-only #1 transient
-        .mockResolvedValueOnce(new Response('{}', { status: 200 })); // body-only #2 succeeds
+      const calls = github({
+        posts: [
+          new Response('Validation Failed', { status: 422 }), // with inline comments: refused
+          new Response('Bad Gateway', { status: 502 }), // body-only #1: transient
+          new Response('{}', { status: 200 }), // body-only #2
+        ],
+        reviews: [],
+      });
 
       const promise = submitPrReview({
         owner: 'Newton-School',
@@ -258,13 +324,12 @@ describe('submitPrReview', () => {
       expect(result.submitted).toBe(true);
       expect(result.submissionMode).toBe('summary_only');
       expect(result.fallbackReason).toBe('github_rejected_comments');
-      expect(globalThis.fetch).toHaveBeenCalledTimes(3);
-
+      expect(calls.posts()).toHaveLength(3);
+      // The 502 was checked against the PR before the second body-only POST.
+      expect(calls.gets()).toHaveLength(1);
       // Both body-only calls should have empty comments.
-      const retry1Body = JSON.parse(vi.mocked(globalThis.fetch).mock.calls[1][1]?.body as string);
-      const retry2Body = JSON.parse(vi.mocked(globalThis.fetch).mock.calls[2][1]?.body as string);
-      expect(retry1Body.comments).toHaveLength(0);
-      expect(retry2Body.comments).toHaveLength(0);
+      expect(calls.posts()[1].body.comments).toHaveLength(0);
+      expect(calls.posts()[2].body.comments).toHaveLength(0);
     } finally {
       vi.useRealTimers();
     }
@@ -355,6 +420,187 @@ describe('submitPrReview', () => {
 
     expect(result.submitted).toBe(false);
     expect(result.submissionMode).toBe('skipped');
+  });
+
+  describe('a review POST that fails on our side (issue #449)', () => {
+    const SUMMARY = '## miniOG review\n\n20 findings.';
+    const request = (extra: Record<string, unknown> = {}) => ({
+      owner: 'Newton-School',
+      repo: 'newton-web',
+      pullNumber: 9295,
+      commitId: 'head123',
+      findingsByRole: [{ role: 'reviewer', findings: [baseFinding('high', 'src/a.ts', 4)] }],
+      summary: SUMMARY,
+      githubToken: 'ghp_test',
+      ...extra,
+    });
+    const ourReview = (extra: Record<string, unknown> = {}) => ({
+      id: 777,
+      commit_id: 'head123',
+      body: SUMMARY,
+      state: 'COMMENTED',
+      submitted_at: new Date().toISOString(),
+      ...extra,
+    });
+    const saved = { ...__reviewHttp };
+    beforeEach(() => vi.useFakeTimers({ toFake: ['setTimeout'] }));
+    afterEach(() => {
+      vi.useRealTimers();
+      Object.assign(__reviewHttp, saved);
+    });
+    const run = async (params: ReturnType<typeof request>) => {
+      const promise = submitPrReview(params);
+      await vi.advanceTimersByTimeAsync(5000);
+      return promise;
+    };
+
+    it('finds the review on the PR after the response was lost, and does not post it again', async () => {
+      // The incident: on GitHub one second after it was sent, with 16 inline
+      // comments; the client gave up five minutes later and said "skipped".
+      const calls = github({ posts: [new TypeError('fetch failed')], reviews: [ourReview()], reviewComments: 16 });
+      const logStep = vi.fn();
+
+      const result = await run(request({ logStep }));
+
+      expect(result).toMatchObject({ submitted: true, commentsPosted: 16, submissionMode: 'inline' });
+      expect(result.failureReason).toBeUndefined();
+      expect(calls.posts()).toHaveLength(1);
+      expect(logStep).toHaveBeenCalledWith(
+        expect.objectContaining({ stage: 'pr_review.github_review.landed_after_error' }),
+      );
+    });
+
+    it('finds it after a 5xx too', async () => {
+      const calls = github({
+        posts: [new Response('Bad Gateway', { status: 502 })],
+        reviews: [ourReview()],
+        reviewComments: 1,
+      });
+
+      const result = await run(request());
+
+      expect(result).toMatchObject({ submitted: true, commentsPosted: 1 });
+      expect(calls.posts()).toHaveLength(1);
+    });
+
+    it('posts again, once, when GitHub confirms the review is not there', async () => {
+      const calls = github({
+        posts: [new TypeError('fetch failed'), new Response('{}', { status: 200 })],
+        reviews: [],
+      });
+
+      const result = await run(request());
+
+      expect(result).toMatchObject({ submitted: true, commentsPosted: 1, submissionMode: 'inline' });
+      expect(calls.posts()).toHaveLength(2);
+      // The retry carries the inline comments: a failed connection is not a refused comment.
+      expect(calls.posts()[1].body.comments).toHaveLength(1);
+    });
+
+    it('does not take another review for ours: a different commit, a different body, or an old one', async () => {
+      const calls = github({
+        posts: [new TypeError('fetch failed'), new Response('{}', { status: 200 })],
+        reviews: [
+          ourReview({ id: 1, commit_id: 'older-head' }),
+          ourReview({ id: 2, body: 'someone else said this' }),
+          ourReview({ id: 3, submitted_at: new Date(Date.now() - 3_600_000).toISOString() }),
+        ],
+      });
+
+      const result = await run(request());
+
+      expect(calls.posts()).toHaveLength(2);
+      expect(result.submitted).toBe(true);
+    });
+
+    it('never retries blind: if GitHub cannot be asked, it says it could not confirm', async () => {
+      const calls = github({ posts: [new TypeError('fetch failed')], reviews: 'down' });
+      const logStep = vi.fn();
+
+      const result = await run(request({ logStep }));
+
+      expect(result).toMatchObject({
+        submitted: false,
+        submissionMode: 'skipped',
+        unconfirmed: true,
+        failureReason: 'network error (fetch failed)',
+      });
+      expect(calls.posts()).toHaveLength(1);
+      expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'pr_review.github_review.unconfirmed' }));
+    });
+
+    it('reports why when the retry fails as well, and that nothing is on the PR', async () => {
+      const calls = github({
+        posts: [new Response('Bad Gateway', { status: 502 }), new Response('Bad Gateway', { status: 502 })],
+        reviews: [],
+      });
+
+      const result = await run(request());
+
+      expect(result).toMatchObject({ submitted: false, failureReason: 'HTTP 502' });
+      expect(result.unconfirmed).toBeUndefined();
+      expect(calls.posts()).toHaveLength(2);
+    });
+
+    it('gives up on a POST after its timeout instead of waiting out the runtime default', async () => {
+      vi.useRealTimers();
+      __reviewHttp.postTimeoutMs = 40;
+      const seen: AbortSignal[] = [];
+      vi.mocked(globalThis.fetch).mockImplementation((_input, init) => {
+        if (init?.method !== 'POST') return Promise.resolve(new Response('[]'));
+        seen.push(init.signal as AbortSignal);
+        // Never answers: only the caller's own timeout ends this.
+        return new Promise((_resolve, reject) => {
+          init.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+        });
+      });
+      const startedAt = Date.now();
+
+      const result = await submitPrReview(request());
+
+      expect(seen[0]).toBeInstanceOf(AbortSignal);
+      expect(result.submitted).toBe(false);
+      expect(result.failureReason).toMatch(/^timed out after/);
+      // Two attempts of 40 ms and one 1.5 s pause: seconds, not minutes.
+      expect(Date.now() - startedAt).toBeLessThan(5000);
+    });
+
+    it('treats a rate limit as not applied: no check, one retry', async () => {
+      const calls = github({
+        posts: [new Response('slow down', { status: 429 }), new Response('{}', { status: 200 })],
+      });
+
+      const result = await run(request());
+
+      expect(result.submitted).toBe(true);
+      expect(calls.gets()).toHaveLength(0);
+      expect(calls.posts()).toHaveLength(2);
+    });
+
+    it('looks on the last page of a long review list, where the newest reviews are', async () => {
+      const last = 'https://api.github.com/repos/Newton-School/newton-web/pulls/9295/reviews?per_page=100&page=3';
+      const calls = github({
+        posts: [new TypeError('fetch failed')],
+        reviews: [ourReview()],
+        reviewsLink: `<${last}>; rel="last"`,
+      });
+
+      const result = await run(request());
+
+      expect(result.submitted).toBe(true);
+      expect(calls.gets().map(call => call.url)).toContain(last);
+    });
+
+    it('still falls back to the body alone when GitHub refuses the comments, without asking whether it landed', async () => {
+      const calls = github({
+        posts: [new Response('Validation Failed', { status: 422 }), new Response('{}', { status: 200 })],
+      });
+
+      const result = await run(request());
+
+      expect(result).toMatchObject({ submitted: true, submissionMode: 'summary_only', commentsPosted: 0 });
+      expect(calls.gets()).toHaveLength(0);
+    });
   });
 
   describe('with prDiff pre-validation', () => {

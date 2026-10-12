@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { normalizePlannerOutput } from '../src/agents/normalizePlannerOutput.js';
+import {
+  normalizePlannerOutput,
+  extractFilesToChange,
+  isNone,
+  parseApproverSummary,
+  planWithoutApproverParts,
+} from '../src/agents/normalizePlannerOutput.js';
 
 describe('normalizePlannerOutput', () => {
   describe('codex backend (structured JSON)', () => {
@@ -202,5 +208,153 @@ describe('normalizePlannerOutput', () => {
       const result = normalizePlannerOutput('# Just markdown\n- bullet', 'claude-code');
       expect(result.planMarkdown).toContain('Just markdown');
     });
+  });
+});
+
+describe('a plan written for its approver (issue #437)', () => {
+  const PLAN = [
+    '# Remove "Final admissions cycle for 2026" from the NST home page',
+    '',
+    '## For the approver',
+    '- What changes: The yellow "Final admissions cycle for 2026" line under the hero heading disappears.',
+    '- Where: /newton-school-of-technology-nst/home',
+    '- Behaviour change: none',
+    '- Assumptions to confirm: none',
+    '- Risk: low',
+    '',
+    '## Context',
+    'The line lives in `content.ts` and is rendered by `sections/hero.tsx`. `../nsat/page` reuses the hero.',
+    'Do not touch `worker/**`. Branch from `origin/main`.',
+    '',
+    '## Files to change',
+    '- `src/features/nst-home/content.ts` — drop the string',
+    '- `src/features/nst-home/sections/hero.tsx` — stop rendering the empty line',
+    '- `src/features/nst-home/CLAUDE.md` — changelog entry',
+    '',
+    '## Steps',
+    '1. Remove `finalCycleNote` from `content.ts`.',
+    '',
+    'Scope: small',
+    'Requires code changes: yes',
+  ].join('\n');
+
+  it('reads the five approver lines', () => {
+    expect(parseApproverSummary(PLAN)).toEqual({
+      whatChanges: 'The yellow "Final admissions cycle for 2026" line under the hero heading disappears.',
+      where: '/newton-school-of-technology-nst/home',
+      behaviourChange: 'none',
+      assumptions: 'none',
+      risk: 'low',
+    });
+  });
+
+  it('reads them in the forms a model writes them: bold labels, American spelling, no heading', () => {
+    const summary = parseApproverSummary(
+      [
+        '**What changes:** Proctor breach defaults go from 3 to 0.',
+        '**Where:** TMS exam form',
+        '**Behavior change:** An exam now ends on the very first flagged breach.',
+        '**Risk:** High — changes exam outcomes',
+      ].join('\n'),
+    );
+
+    expect(summary).toMatchObject({
+      whatChanges: 'Proctor breach defaults go from 3 to 0.',
+      behaviourChange: 'An exam now ends on the very first flagged breach.',
+      assumptions: 'none',
+      risk: 'high',
+    });
+  });
+
+  it('finds no summary in a plan that has none, or whose block is not at the top', () => {
+    expect(parseApproverSummary('# Plan\n\n1. Edit `a.ts`\n\nScope: small')).toBeNull();
+    expect(parseApproverSummary('- What changes: only this line')).toBeNull();
+    const buried = `${Array.from({ length: 60 }, (_, i) => `line ${i}`).join('\n')}\n- What changes: x\n- Behaviour change: y`;
+    expect(parseApproverSummary(buried)).toBeNull();
+  });
+
+  it('counts only the files under "Files to change"', () => {
+    expect(extractFilesToChange(PLAN)).toEqual([
+      'src/features/nst-home/content.ts',
+      'src/features/nst-home/sections/hero.tsx',
+      'src/features/nst-home/CLAUDE.md',
+    ]);
+    const normalized = normalizePlannerOutput({ summary: PLAN }, 'claude-code');
+    expect(normalized.affectedFiles).toHaveLength(3);
+    expect(normalized.approverSummary?.risk).toBe('low');
+  });
+
+  it('accepts the other headings planners use for that section, and stops at the next heading', () => {
+    const plan = '## Files to touch\n- `a.ts` why\n- `b/c.tsx` (see `d.ts` for the pattern)\n### Steps\n- edit `e.ts`';
+    expect(extractFilesToChange(plan)).toEqual(['a.ts', 'b/c.tsx']);
+    expect(extractFilesToChange('## Steps\n- edit `e.ts`')).toBeUndefined();
+  });
+
+  it('without that section, no longer counts refs, globs, URL paths, extensionless paths or build output', () => {
+    // The tokens listed under one real plan as "affected files" (thread 1789976700.997519).
+    const noisy = [
+      'Edit `src/features/nst-entrance/sections/hero.tsx` and `page.tsx`.',
+      'See `../nsat/page` and `../coding-nsat/page`. Leave `content/*.ts` and `worker/**` alone.',
+      'Branch off `origin/main` as `fix/nst-entrance-copy`. Check `/newton-school-of-technology-nst/home` and `out/index.html`.',
+    ].join('\n');
+
+    expect(normalizePlannerOutput({ summary: noisy }, 'claude-code').affectedFiles).toEqual([
+      'src/features/nst-entrance/sections/hero.tsx',
+      'page.tsx',
+    ]);
+  });
+
+  it('removes the approver block and the files section from the detail, and nothing else', () => {
+    const detail = planWithoutApproverParts(PLAN);
+
+    expect(detail).not.toContain('For the approver');
+    expect(detail).not.toContain('What changes:');
+    expect(detail).not.toContain('## Files to change');
+    expect(detail).not.toContain('changelog entry');
+    expect(detail).toContain('# Remove "Final admissions cycle for 2026" from the NST home page');
+    expect(detail).toContain('## Context');
+    expect(detail).toContain('1. Remove `finalCycleNote` from `content.ts`.');
+    expect(detail).toContain('Scope: small');
+  });
+
+  it('knows the ways of saying there is nothing to report', () => {
+    for (const value of ['none', 'None.', 'no', 'N/A', '-', '']) expect(isNone(value)).toBe(true);
+    for (const value of ['none of the pages change, but the default does', 'An exam ends on the first flag']) {
+      expect(isNone(value)).toBe(false);
+    }
+  });
+
+  it('reads "none" followed by an explanation as none, which is how a planner really writes it', () => {
+    // Verbatim from the first live plan with the approver block.
+    expect(
+      isNone(
+        'none. The line is an HTML comment, so it does not render on GitHub or anywhere in the product, and no application code is touched.',
+      ),
+    ).toBe(true);
+    for (const value of [
+      'None — documentation only.',
+      'none (copy change only)',
+      'Nothing. Same behaviour as before.',
+    ]) {
+      expect(isNone(value)).toBe(true);
+    }
+  });
+
+  it('does not let a leading "none" hide a change that follows it', () => {
+    for (const value of [
+      'none, but the default becomes 0, so an exam ends on the first breach',
+      'None; however existing drafts will show the new value.',
+      'none except for exams created after this ships',
+      'nothing changes for students unless the flag is on',
+      'no longer sends the reminder email',
+    ]) {
+      expect(isNone(value)).toBe(false);
+    }
+  });
+
+  it('has no approver summary on the JSON planner path', () => {
+    expect(
+      normalizePlannerOutput({ plan: ['x'], affectedFiles: ['a.ts'], scope: 'small' }, 'codex').approverSummary,
+    ).toBeNull();
   });
 });

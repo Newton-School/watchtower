@@ -3,7 +3,8 @@ import os from 'node:os';
 import path, { delimiter as pathDelimiter } from 'node:path';
 import type { AgentBackend, AgentRunRequest, ParseOutputOptions, ParsedBackendOutput } from './types.js';
 import type { TokenUsage } from '../types/contracts.js';
-import { parseStructuredOutput } from './codexBackend.js';
+import { buildCodexPath, parseStructuredOutput } from './codexBackend.js';
+import { personalSkillDenyRules } from './personalSkills.js';
 
 function asFiniteNumber(value: unknown): number | undefined {
   if (typeof value !== 'number') return undefined;
@@ -174,6 +175,35 @@ function resolveClaudeCodeBinary(): string {
   return 'claude';
 }
 
+/**
+ * Commands that kill by name rather than by PID. Agents share one OS user, so
+ * these reach other jobs' agents and the owner's own processes (issue #445).
+ * Deny rules hold under `--dangerously-skip-permissions`, and match a command
+ * anywhere in a compound line (`a; pkill -f x; b` is refused whole).
+ */
+export const PROCESS_KILL_DENY_RULES = ['Bash(pkill:*)', 'Bash(killall:*)'];
+
+/**
+ * Flags for a text-in, text-out call (`noTools`). `--tools` and `--mcp-config`
+ * are variadic, so each must be followed by another flag, never a positional.
+ */
+export const NO_TOOLS_ARGS = [
+  '--safe-mode',
+  '--tools',
+  '',
+  '--strict-mcp-config',
+  '--mcp-config',
+  JSON.stringify({ mcpServers: {} }),
+  '--disable-slash-commands',
+];
+
+/** Name downloaded thread images and PDFs in the prompt so the agent opens them with Read. */
+export function withImageReadInstructions(prompt: string, imagePaths: string[] | undefined): string {
+  if (!imagePaths || imagePaths.length === 0) return prompt;
+  const list = imagePaths.map(p => `- ${p}`).join('\n');
+  return `${prompt}\n\nFiles attached in the Slack thread (images, PDFs) — open each one with the Read tool before answering:\n${list}`;
+}
+
 export const claudeCodeBackend: AgentBackend = {
   id: 'claude-code',
   displayName: 'Claude Code (Anthropic)',
@@ -198,10 +228,11 @@ export const claudeCodeBackend: AgentBackend = {
 
   buildArgs(request: AgentRunRequest, _outputPath: string): string[] {
     const args: string[] = [];
+    const prompt = withImageReadInstructions(request.prompt, request.imagePaths);
     if (request.resumeSessionId) {
-      args.push('--resume', request.resumeSessionId, '-p', request.prompt);
+      args.push('--resume', request.resumeSessionId, '-p', prompt);
     } else {
-      args.push('-p', request.prompt);
+      args.push('-p', prompt);
     }
     // `stream-json` (which requires `--verbose` under `--print`) emits one JSON
     // event per line as the run progresses instead of a single blob at exit.
@@ -212,10 +243,30 @@ export const claudeCodeBackend: AgentBackend = {
     // `--dangerously-skip-permissions` is equivalent to `--permission-mode bypassPermissions`
     // and silently wins over `--permission-mode plan`, so passing both leaves the model
     // without the ExitPlanMode tool. Choose one or the other.
-    if (request.planMode) {
+    if (request.noTools) {
+      // A call that only returns text gets nothing to act with (issue #443).
+      // Each flag removes what the others leave in: `--tools ""` the built-in
+      // tools; strict MCP with an empty config every MCP server, the account's
+      // connectors included; `--disable-slash-commands` the skills;
+      // `--safe-mode` hooks, plugins and CLAUDE.md. No bypass flag: there is
+      // nothing left to permit. Measured on CLI 2.1.296: 441 tools, 18 MCP
+      // servers and 76 skills become 0, 0 and 0.
+      args.push(...NO_TOOLS_ARGS);
+    } else if (request.planMode) {
       args.push('--permission-mode', 'plan');
     } else {
       args.push('--dangerously-skip-permissions');
+    }
+    // An agent that does work keeps its tools, but not the host user's
+    // personal skills and commands (issue #443). `--disallowedTools` is
+    // variadic, so it stays ahead of the flags below.
+    if (!request.noTools) {
+      args.push(
+        '--disallowedTools',
+        ...PROCESS_KILL_DENY_RULES,
+        ...personalSkillDenyRules(request.cwd),
+        ...(request.disallowedTools ?? []),
+      );
     }
     if (request.sessionId) {
       args.push('--session-id', request.sessionId);
@@ -226,20 +277,25 @@ export const claudeCodeBackend: AgentBackend = {
     if (request.reasoningEffort) {
       args.push('--effort', request.reasoningEffort);
     }
-    if (request.imagePaths) {
-      for (const imagePath of request.imagePaths) {
-        args.push('--image', imagePath);
-      }
+    // The CLI has no `--image` flag (it exits with "unknown option '--image'"),
+    // so images go in by path: the prompt names them (see
+    // withImageReadInstructions) and `--add-dir` lets the Read tool open them
+    // from outside the repo, in plan mode too. `--add-dir` is variadic, so it
+    // must stay after the `-p` prompt positional.
+    const imageDirs = [...new Set((request.imagePaths ?? []).map(p => path.dirname(p)))];
+    if (imageDirs.length > 0) {
+      args.push('--add-dir', ...imageDirs);
     }
-    // Expose only the requested MCP servers (issue: scoped investigation
-    // reaching Metabase). `--strict-mcp-config` makes the headless run ignore
-    // the user's global/project MCP config and load ONLY these — so a bug
-    // investigation can't accidentally pull in unrelated servers. Inline JSON
-    // avoids a temp file. `--dangerously-skip-permissions` (set above in
-    // non-plan mode) auto-allows the MCP tools; OAuth HTTP servers reuse the
-    // CLI's Keychain-cached token, which requires HOME in buildEnv.
-    if (request.mcpServers && Object.keys(request.mcpServers).length > 0) {
-      args.push('--mcp-config', JSON.stringify({ mcpServers: request.mcpServers }), '--strict-mcp-config');
+    // A run that uses tools loads ONLY the MCP servers named for it, and none
+    // when nothing is named (issue #443). `--strict-mcp-config` makes the CLI
+    // ignore the host user's global and project MCP config, their plugins'
+    // servers and their claude.ai connectors; without it every agent had all
+    // of them. Inline JSON avoids a temp file. `--dangerously-skip-permissions`
+    // (set above in non-plan mode) auto-allows the listed servers' tools;
+    // OAuth HTTP servers reuse the CLI's Keychain-cached token, which requires
+    // HOME in buildEnv. `--mcp-config` is variadic, so a flag must follow it.
+    if (!request.noTools) {
+      args.push('--mcp-config', JSON.stringify({ mcpServers: request.mcpServers ?? {} }), '--strict-mcp-config');
     }
     // Claude Code writes JSON to stdout when --output-format json is set.
     // The generic runner captures stdout and falls back to it when the
@@ -249,7 +305,9 @@ export const claudeCodeBackend: AgentBackend = {
 
   buildEnv(request: AgentRunRequest, basePath: string): Record<string, string> {
     const env: Record<string, string> = {};
-    env.PATH = basePath;
+    // Same toolchain PATH the codex backend gets. Without it agents cannot
+    // find gh, node or npm and re-export PATH in every Bash call (issue #444).
+    env.PATH = buildCodexPath(basePath);
     // HOME (and USER) are required for Claude Code to find its config and the
     // Keychain/credentials store where MCP OAuth tokens live — without HOME an
     // HTTP/OAuth MCP server (e.g. Metabase) silently fails to connect in the

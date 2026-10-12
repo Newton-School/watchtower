@@ -1,11 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildAgenticPrReviewPrompt, buildLensPrompt } from '../src/agentic/prReviewAgent.js';
 import { buildOrchestratorPrompt } from '../src/agentic/prReviewOrchestrator.js';
-import {
-  CONVERSATIONAL_SYSTEM_PROMPT,
-  informationalSystemPrompt,
-  qaSystemPrompt,
-} from '../src/agentic/agenticEntry.js';
+import { conversationalSystemPrompt, informationalSystemPrompt, qaSystemPrompt } from '../src/agentic/agenticEntry.js';
 import { STE_REPLY_STYLE_BLOCK, STE_REVIEW_TEXT_RULE } from '../src/codex/replyStyle.js';
 import type { AppConfig } from '../src/types/contracts.js';
 
@@ -46,7 +42,7 @@ describe('agentic Slack prompts use ASD-STE100', () => {
 
   it.each([
     ['informational', informationalSystemPrompt(config)],
-    ['conversational', CONVERSATIONAL_SYSTEM_PROMPT],
+    ['conversational', conversationalSystemPrompt()],
     ['web-QA', qaSystemPrompt('http://localhost:3123')],
   ])('%s prompt includes the STE reply block', (_name, prompt) => {
     expect(prompt).toContain(STE_REPLY_STYLE_BLOCK);

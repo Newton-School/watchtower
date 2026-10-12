@@ -60,4 +60,12 @@ export interface PipelineResult {
   needsInputQuestion?: string;
   /** Verbatim reset clause when finalStatus === 'usage-limit' (issue #342). */
   usageLimitResetsAt?: string;
+  /**
+   * Set when the run stopped because a step was interrupted and retrying did
+   * not help: the model API could not be reached (issue #439), or the agent's
+   * process was killed from outside (issue #445). `finalStatus` is then
+   * 'failed', but nothing an agent produced was judged: the step never
+   * completed.
+   */
+  interrupted?: { kind: 'connection_lost' | 'killed'; role: AgentRole; retries: number };
 }

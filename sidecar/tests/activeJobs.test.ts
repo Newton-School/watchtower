@@ -1,5 +1,13 @@
 import { describe, expect, it, beforeEach } from 'vitest';
-import { registerActiveJob, unregisterActiveJob, cancelJob, getActiveJobIds } from '../src/state/activeJobs.js';
+import {
+  registerActiveJob,
+  unregisterActiveJob,
+  cancelJob,
+  getActiveJobIds,
+  takeCancelReason,
+  activeJobIdForThread,
+  activeJobForThread,
+} from '../src/state/activeJobs.js';
 
 describe('activeJobs', () => {
   beforeEach(() => {
@@ -45,5 +53,107 @@ describe('activeJobs', () => {
   it('returns false when no job matches', () => {
     const result = cancelJob('nonexistent');
     expect(result).toBe(false);
+  });
+
+  it('remembers why a job was cancelled, once, for its finalizer (issue #438)', () => {
+    registerActiveJob('job-ui', new AbortController());
+    cancelJob('job-ui', { source: 'ui', message: 'Cancelled from Watchtower UI.' });
+
+    expect(takeCancelReason('job-ui')).toEqual({ source: 'ui', message: 'Cancelled from Watchtower UI.' });
+    expect(takeCancelReason('job-ui')).toBeUndefined();
+  });
+
+  it('stores the reason under the full id when cancelled by prefix', () => {
+    registerActiveJob('abcdef-9999-full', new AbortController());
+    cancelJob('abcdef', { source: 'source_deleted', message: 'Source message deleted by author.' });
+
+    expect(takeCancelReason('abcdef-9999-full')?.source).toBe('source_deleted');
+  });
+
+  it('has the reason in place by the time abort listeners run', () => {
+    const controller = new AbortController();
+    registerActiveJob('job-listener', controller);
+    let seen: string | undefined;
+    controller.signal.addEventListener('abort', () => {
+      seen = takeCancelReason('job-listener')?.source;
+    });
+
+    cancelJob('job-listener', { source: 'ui', message: 'x' });
+    expect(seen).toBe('ui');
+  });
+
+  it('keeps no reason for a job that was not running', () => {
+    expect(cancelJob('never-registered', { source: 'ui', message: 'x' })).toBe(false);
+    expect(takeCancelReason('never-registered')).toBeUndefined();
+  });
+});
+
+// Issue #261: the same-thread lock used to be "a RUNNING row updated in the
+// last 45 minutes", and lapsed under any job that ran longer.
+describe('activeJobIdForThread — the same-thread lock', () => {
+  const thread = { channelId: 'C1', threadTs: '1791000000.000100' };
+
+  it('holds the thread from register to unregister, however long the job runs', () => {
+    registerActiveJob('job-long', new AbortController(), thread);
+    expect(activeJobIdForThread('C1', '1791000000.000100')).toBe('job-long');
+
+    unregisterActiveJob('job-long');
+    expect(activeJobIdForThread('C1', '1791000000.000100')).toBeUndefined();
+  });
+
+  it('keeps the thread locked after a cancel, until the job has finished cleaning up', () => {
+    registerActiveJob('job-cancelling', new AbortController(), thread);
+    cancelJob('job-cancelling', { source: 'ui', message: 'Cancelled from Watchtower UI.' });
+
+    // No longer cancellable, but still the owner of the thread and its worktree.
+    expect(getActiveJobIds()).not.toContain('job-cancelling');
+    expect(activeJobIdForThread('C1', '1791000000.000100')).toBe('job-cancelling');
+
+    unregisterActiveJob('job-cancelling');
+    expect(activeJobIdForThread('C1', '1791000000.000100')).toBeUndefined();
+  });
+
+  it('does not lock another thread, or the same thread ts in another channel', () => {
+    registerActiveJob('job-a', new AbortController(), thread);
+
+    expect(activeJobIdForThread('C1', '1791000999.000100')).toBeUndefined();
+    expect(activeJobIdForThread('C2', '1791000000.000100')).toBeUndefined();
+    unregisterActiveJob('job-a');
+  });
+
+  it('is empty in a fresh process: a RUNNING row left by a previous one locks nothing', () => {
+    expect(activeJobIdForThread('C9', '1791000000.000100')).toBeUndefined();
+  });
+
+  it('does not lock a thread for a job registered without one', () => {
+    registerActiveJob('job-no-thread', new AbortController());
+    expect(activeJobIdForThread('C1', '1791000000.000100')).toBeUndefined();
+    unregisterActiveJob('job-no-thread');
+  });
+});
+
+describe('activeJobForThread — who may stop the job (issue #435)', () => {
+  it('returns the job and who asked for it', () => {
+    registerActiveJob('job-req', new AbortController(), { channelId: 'C1', threadTs: '5.5', requestedBy: 'UREQ' });
+    expect(activeJobForThread('C1', '5.5')).toEqual({ jobId: 'job-req', requestedBy: 'UREQ' });
+    unregisterActiveJob('job-req');
+  });
+
+  it('still names the job while it is stopping, so a second stop is recognised', () => {
+    registerActiveJob('job-stopping', new AbortController(), { channelId: 'C1', threadTs: '6.6', requestedBy: 'UREQ' });
+    expect(cancelJob('job-stopping', { source: 'slack_stop', message: 'Stopped from Slack by <@UREQ>.' })).toBe(true);
+
+    expect(activeJobForThread('C1', '6.6')?.jobId).toBe('job-stopping');
+    // The controller is gone, which is how the handler knows not to reply twice.
+    expect(cancelJob('job-stopping', { source: 'slack_stop', message: 'again' })).toBe(false);
+    expect(takeCancelReason('job-stopping')).toEqual({
+      source: 'slack_stop',
+      message: 'Stopped from Slack by <@UREQ>.',
+    });
+    unregisterActiveJob('job-stopping');
+  });
+
+  it('is undefined for a thread with no job', () => {
+    expect(activeJobForThread('C1', '7.7')).toBeUndefined();
   });
 });
