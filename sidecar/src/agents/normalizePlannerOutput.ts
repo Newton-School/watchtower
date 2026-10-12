@@ -237,9 +237,22 @@ export function parseApproverSummary(markdown: string): ApproverSummary | null {
   };
 }
 
-/** Whether an approver-block value says there is nothing to report. */
+const NONE_LEAD_RE = /^(?:none|nothing|no|n\/a|na)(?=$|[.!,;:]|\s*[—–(-])/i;
+/** Words that take a leading "none" back: "none, but the default becomes 0". */
+const NONE_TAKEN_BACK_RE = /\b(?:but|however|except|although|though|unless|other than|apart from|aside from)\b/i;
+
+/**
+ * Whether an approver-block value says there is nothing to report.
+ *
+ * Planners rarely write a bare "none". The first live plan said "none. The
+ * line is an HTML comment, so it does not render…", which a whole-value match
+ * read as a behaviour change. So a value that leads with "none" and goes on
+ * to explain counts as none, unless it then takes it back.
+ */
 export function isNone(value: string): boolean {
-  return /^(none|no|nothing|n\/a|na|-)?[.!]?$/i.test(value.trim());
+  const text = value.trim();
+  if (text === '' || text === '-') return true;
+  return NONE_LEAD_RE.test(text) && !NONE_TAKEN_BACK_RE.test(text);
 }
 
 /**

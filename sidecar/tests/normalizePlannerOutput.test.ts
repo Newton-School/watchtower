@@ -324,6 +324,34 @@ describe('a plan written for its approver (issue #437)', () => {
     }
   });
 
+  it('reads "none" followed by an explanation as none, which is how a planner really writes it', () => {
+    // Verbatim from the first live plan with the approver block.
+    expect(
+      isNone(
+        'none. The line is an HTML comment, so it does not render on GitHub or anywhere in the product, and no application code is touched.',
+      ),
+    ).toBe(true);
+    for (const value of [
+      'None — documentation only.',
+      'none (copy change only)',
+      'Nothing. Same behaviour as before.',
+    ]) {
+      expect(isNone(value)).toBe(true);
+    }
+  });
+
+  it('does not let a leading "none" hide a change that follows it', () => {
+    for (const value of [
+      'none, but the default becomes 0, so an exam ends on the first breach',
+      'None; however existing drafts will show the new value.',
+      'none except for exams created after this ships',
+      'nothing changes for students unless the flag is on',
+      'no longer sends the reminder email',
+    ]) {
+      expect(isNone(value)).toBe(false);
+    }
+  });
+
   it('has no approver summary on the JSON planner path', () => {
     expect(
       normalizePlannerOutput({ plan: ['x'], affectedFiles: ['a.ts'], scope: 'small' }, 'codex').approverSummary,

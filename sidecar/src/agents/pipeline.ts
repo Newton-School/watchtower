@@ -197,8 +197,9 @@ export function formatPlanMessage(
     header,
     `*What changes:* ${summary.whatChanges}`,
     ...(summary.where ? [`*Where:* ${summary.where}`] : []),
-    `*Behaviour change:* ${changesBehaviour ? `:warning: ${summary.behaviourChange}` : 'none'}`,
-    `*Assumptions to confirm:* ${assumed ? summary.assumptions : 'none'}`,
+    // "none" keeps whatever the planner added to it ("none. It is only a comment.").
+    `*Behaviour change:* ${changesBehaviour ? ':warning: ' : ''}${summary.behaviourChange.trim() || 'none'}`,
+    `*Assumptions to confirm:* ${summary.assumptions.trim() || 'none'}`,
   ];
   if (requesterId && (changesBehaviour || assumed)) {
     const what = [changesBehaviour ? 'the behaviour change' : '', assumed ? 'the assumptions' : '']

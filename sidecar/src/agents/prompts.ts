@@ -120,8 +120,8 @@ What the plan must contain (markdown):
   ## For the approver
   - What changes: <one sentence, in terms of what a user of the product will see or get>
   - Where: <the page, screen or area; at most three>
-  - Behaviour change: <"none", or what will behave differently once this ships, in one or two sentences. A changed default, limit, condition or rule is a behaviour change: say what the new value means for a real user, not just what it is>
-  - Assumptions to confirm: <"none", or anything you had to assume or could not see (a screenshot you could not open, which of two pages was meant, a value you picked)>
+  - Behaviour change: <the single word "none" if nothing will behave differently; otherwise what will behave differently once this ships, in one or two sentences. A changed default, limit, condition or rule is a behaviour change: say what the new value means for a real user, not just what it is>
+  - Assumptions to confirm: <the single word "none", or only what would change the result if you guessed wrong or could not see it (a screenshot you could not open, which of two pages was meant, a value you picked). Do not restate the request here>
   - Risk: <low, medium or high>
 - A short summary of the user's intent.
 - A section headed exactly \`## Files to change\`: one bullet per file you will edit or create, as a backticked repo-relative path and a few words on why. ONLY files this change edits. Files you only read, files that must not be touched, globs, URLs and branch names do not belong in this section.
