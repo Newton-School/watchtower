@@ -4,6 +4,7 @@ import {
   formatSlackReviewSummary,
   normalizePrReviewAgentOutput,
   splitAgenticOutputByRole,
+  formatUnpostedFindings,
 } from '../src/github/prReviewSupport.js';
 import type { SubmitPrReviewResult } from '../src/github/submitPrReview.js';
 import type { CodexRunResult } from '../src/types/contracts.js';
@@ -296,5 +297,78 @@ describe('prReviewSupport', () => {
     expect(summary).toContain('1 finding(s) could not be attached inline and are listed below.');
     expect(summary).toContain('[REVIEWER - MEDIUM] Needs a line reference before it can be attached.');
     expect(summary).toContain('[REVIEWER NOTE] Mention the legacy avatar flow in the summary.');
+  });
+});
+
+describe('what the thread is told when a review is not on the PR (issue #449)', () => {
+  const PR = 'https://github.com/Newton-School/newton-web/pull/9295';
+  const finding = (severity: string, message: string, file?: string, line?: number) =>
+    ({ severity, category: 'x', message, file, line }) as never;
+  const skipped = {
+    submitted: false,
+    event: 'COMMENT' as const,
+    attemptedComments: 16,
+    commentsPosted: 0,
+    droppedOutsideDiff: 0,
+    fileLevelAttempted: 0,
+    fileLevelPosted: 0,
+    submissionMode: 'skipped' as const,
+  };
+  const outputs = [{ role: 'reviewer', findings: [finding('high', 'A', 'a.ts', 1)], summaryNotes: [] }] as never;
+
+  it('names the failure instead of calling it skipped', () => {
+    const summary = formatSlackReviewSummary(outputs, PR, { ...skipped, failureReason: 'timed out after 30s' });
+
+    expect(summary).toContain("1 findings identified, but I couldn't post the review to GitHub (timed out after 30s)");
+    expect(summary).not.toContain('was skipped');
+  });
+
+  it('says so when it cannot tell whether the review is there', () => {
+    const summary = formatSlackReviewSummary(outputs, PR, { ...skipped, failureReason: 'HTTP 502', unconfirmed: true });
+
+    expect(summary).toContain('I could not confirm whether the review reached GitHub (HTTP 502)');
+    expect(summary).toContain('check the PR before asking again');
+  });
+
+  it('keeps the existing wording for a missing token and for a plain skip', () => {
+    expect(formatSlackReviewSummary(outputs, PR, { ...skipped, fallbackReason: 'no_token' })).toContain(
+      'GitHub review submission was skipped (no GitHub token — nothing was posted to the PR)',
+    );
+    expect(formatSlackReviewSummary(outputs, PR, skipped)).toContain('but GitHub review submission was skipped');
+  });
+
+  it('reads correctly when there was nothing to report either', () => {
+    const none = [{ role: 'reviewer', findings: [], summaryNotes: [] }] as never;
+
+    expect(formatSlackReviewSummary(none, PR, { ...skipped, failureReason: 'HTTP 502' })).toContain(
+      "No actionable findings. I couldn't post the review to GitHub (HTTP 502).",
+    );
+  });
+
+  it('lists unposted findings worst first, with where they are', () => {
+    const text = formatUnpostedFindings([
+      finding('low', 'Rename x', 'a.ts', 3),
+      finding('critical', 'SQL injection', 'db.py', 40),
+      finding('medium', 'No file here'),
+    ]);
+
+    expect(text.split('\n')).toEqual([
+      'The review is not on the PR, so here is what it found:',
+      '• [CRITICAL] db.py:40 — SQL injection',
+      '• [MEDIUM] No file here',
+      '• [LOW] a.ts:3 — Rename x',
+    ]);
+  });
+
+  it('caps the list and shortens long findings, and says how many are left out', () => {
+    const many = Array.from({ length: 20 }, (_, i) =>
+      finding('medium', `Finding ${i} ${'x'.repeat(400)}`, 'a.ts', i + 1),
+    );
+    const lines = formatUnpostedFindings(many).split('\n');
+
+    expect(lines).toHaveLength(17);
+    expect(lines[16]).toBe('… and 5 more that are not shown here.');
+    expect(lines[1].length).toBeLessThan(290);
+    expect(formatUnpostedFindings([])).toBe('');
   });
 });

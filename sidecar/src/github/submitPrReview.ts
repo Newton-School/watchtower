@@ -6,10 +6,6 @@ import { hasFileInDiff, isAnchorInDiff, parseDiffHunks, type HunkIndex } from '.
 const TRANSIENT_RETRY_DELAY_MS = 1500;
 const ERROR_BODY_LOG_LIMIT = 1000;
 
-function isTransientStatus(status: number): boolean {
-  return status >= 500 || status === 429;
-}
-
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -52,16 +48,121 @@ function logGithubThrew(
   });
 }
 
+/**
+ * How long a call to GitHub may take. The review POST used to be a bare
+ * `fetch`: when a response was lost it waited out the runtime's default, five
+ * minutes, with the review already on the PR (issue #449).
+ */
+export const __reviewHttp = { postTimeoutMs: 30_000, readTimeoutMs: 15_000 };
+
+function githubHeaders(githubToken: string): Record<string, string> {
+  return {
+    Accept: 'application/vnd.github+json',
+    Authorization: `Bearer ${githubToken}`,
+    'Content-Type': 'application/json',
+  };
+}
+
 async function postReviewOnce(url: string, githubToken: string, payload: unknown): Promise<Response> {
   return fetch(url, {
     method: 'POST',
-    headers: {
-      Accept: 'application/vnd.github+json',
-      Authorization: `Bearer ${githubToken}`,
-      'Content-Type': 'application/json',
-    },
+    headers: githubHeaders(githubToken),
     body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(__reviewHttp.postTimeoutMs),
   });
+}
+
+async function githubGet(url: string, githubToken: string): Promise<Response> {
+  return fetch(url, {
+    method: 'GET',
+    headers: githubHeaders(githubToken),
+    signal: AbortSignal.timeout(__reviewHttp.readTimeoutMs),
+  });
+}
+
+/** A failed call in words for a person: "timed out after 30s", "HTTP 502", "network error (fetch failed)". */
+function describeFailure(error: unknown): string {
+  const name = error instanceof Error ? error.name : '';
+  if (name === 'TimeoutError' || name === 'AbortError') {
+    return `timed out after ${Math.round(__reviewHttp.postTimeoutMs / 1000)}s`;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return `network error (${message})`;
+}
+
+const normalizeBody = (text: unknown): string => (typeof text === 'string' ? text.replace(/\r\n/g, '\n').trim() : '');
+
+/** A review's clock may differ from ours; anything submitted this long before the attempt is not it. */
+const LANDED_CLOCK_SKEW_MS = 120_000;
+
+type LandedCheck = { found: true; reviewId: number; commentsPosted: number } | { found: false } | { found: 'unknown' };
+
+/**
+ * Asks GitHub whether the review we just tried to post is on the PR.
+ *
+ * A timeout, a dropped connection or a 5xx says nothing about whether the
+ * POST was applied: the review that was reported as "skipped" had been on the
+ * PR for five minutes, with 16 inline comments. It is recognised by what we
+ * sent: the same commit, the same body, submitted since the attempt began.
+ * `unknown` means the question itself could not be answered, and the caller
+ * must not retry on that: a blind retry posts the review twice.
+ */
+async function findLandedReview(params: {
+  owner: string;
+  repo: string;
+  pullNumber: number;
+  commitId: string;
+  summary: string;
+  githubToken: string;
+  attemptStartedAtMs: number;
+}): Promise<LandedCheck> {
+  const { owner, repo, pullNumber, commitId, summary, githubToken, attemptStartedAtMs } = params;
+  const base = `https://api.github.com/repos/${owner}/${repo}/pulls/${pullNumber}/reviews`;
+  try {
+    const reviews: Array<Record<string, unknown>> = [];
+    const first = await githubGet(`${base}?per_page=100`, githubToken);
+    if (!first.ok) return { found: 'unknown' };
+    const firstPage: unknown = await first.json();
+    if (!Array.isArray(firstPage)) return { found: 'unknown' };
+    reviews.push(...(firstPage as Array<Record<string, unknown>>));
+    // Reviews are listed oldest first: on a long-lived PR ours is on the last page.
+    const lastPage = /<([^>]+)>;\s*rel="last"/.exec(first.headers.get('link') ?? '')?.[1];
+    if (lastPage) {
+      const last = await githubGet(lastPage, githubToken);
+      if (!last.ok) return { found: 'unknown' };
+      const lastItems: unknown = await last.json();
+      if (!Array.isArray(lastItems)) return { found: 'unknown' };
+      reviews.push(...(lastItems as Array<Record<string, unknown>>));
+    }
+
+    const wanted = normalizeBody(summary);
+    const ours = reviews
+      .filter(review => {
+        const submittedAt = Date.parse(String(review.submitted_at ?? ''));
+        return (
+          review.commit_id === commitId &&
+          normalizeBody(review.body) === wanted &&
+          Number.isFinite(submittedAt) &&
+          submittedAt >= attemptStartedAtMs - LANDED_CLOCK_SKEW_MS
+        );
+      })
+      .pop();
+    if (!ours || typeof ours.id !== 'number') return { found: false };
+
+    // How many of the inline comments it carries. A failure here does not
+    // un-land the review; it only leaves the count unknown.
+    let commentsPosted = 0;
+    try {
+      const comments = await githubGet(`${base}/${ours.id}/comments?per_page=100`, githubToken);
+      const items: unknown = comments.ok ? await comments.json() : [];
+      commentsPosted = Array.isArray(items) ? items.length : 0;
+    } catch {
+      commentsPosted = 0;
+    }
+    return { found: true, reviewId: ours.id, commentsPosted };
+  } catch {
+    return { found: 'unknown' };
+  }
 }
 
 interface PrReviewComment {
@@ -93,6 +194,17 @@ export interface SubmitPrReviewResult {
   fileLevelPosted: number;
   submissionMode: PrReviewSubmissionMode;
   fallbackReason?: PrReviewFallbackReason;
+  /**
+   * When nothing was posted because the call to GitHub failed: why, in words
+   * for the thread ("timed out after 30s", "HTTP 502"). Absent when GitHub
+   * refused the review or there was nothing to send it with.
+   */
+  failureReason?: string;
+  /**
+   * The POST failed and GitHub could not be asked whether the review exists.
+   * It may be on the PR. Nothing was retried, so that it cannot be there twice.
+   */
+  unconfirmed?: boolean;
 }
 
 function determineReviewEvent(findings: AgentFinding[]): ReviewEvent {
@@ -180,17 +292,14 @@ async function postFileLevelComments(params: {
     try {
       const response = await fetch(url, {
         method: 'POST',
-        headers: {
-          Accept: 'application/vnd.github+json',
-          Authorization: `Bearer ${githubToken}`,
-          'Content-Type': 'application/json',
-        },
+        headers: githubHeaders(githubToken),
         body: JSON.stringify({
           commit_id: commitId,
           path: f.path,
           body: f.body,
           subject_type: 'file',
         }),
+        signal: AbortSignal.timeout(__reviewHttp.postTimeoutMs),
       });
       if (response.ok) {
         posted++;
@@ -268,74 +377,96 @@ export async function submitPrReview(params: {
   const fullPayload = { commit_id: commitId, event, body: summary, comments: inlineComments };
   const bodyOnlyPayload = { commit_id: commitId, event, body: summary, comments: [] };
 
-  try {
-    const response = await postReviewOnce(url, githubToken, fullPayload);
+  /**
+   * One POST, and what it left behind. A deterministic refusal (4xx) created
+   * nothing. A timeout, a dropped connection or a 5xx may have: GitHub is
+   * asked before anything is retried or reported (issue #449).
+   */
+  type PostAttempt =
+    | { kind: 'accepted' }
+    | { kind: 'landed'; commentsPosted: number }
+    | { kind: 'rejected' }
+    | { kind: 'not_landed'; reason: string }
+    | { kind: 'unknown'; reason: string };
 
-    if (!response.ok) {
+  const attemptPost = async (payload: unknown, labels: { rejected: string; threw: string }): Promise<PostAttempt> => {
+    const attemptStartedAtMs = Date.now();
+    let response: Response | undefined;
+    let reason: string;
+    try {
+      response = await postReviewOnce(url, githubToken, payload);
+      if (response.ok) return { kind: 'accepted' };
       const errorBody = await response.text().catch(() => '');
-      logGithubRejection(logStep, 'review POST with inline comments', response.status, errorBody, errorContext);
-
-      // Last-resort retry: drop inline comments entirely. This only kicks
-      // in when pre-validation wasn't enough (e.g., diff drift because a
-      // new commit landed between agents running and us POSTing). We try
-      // body-only once, then once more after a short backoff if the second
-      // attempt hits a transient 5xx / 429 — those have killed reviews in
-      // the wild even though the inline-comment rejection was deterministic.
-      if (inlineComments.length > 0) {
-        let retryResponse = await postReviewOnce(url, githubToken, bodyOnlyPayload);
-
-        if (!retryResponse.ok && isTransientStatus(retryResponse.status)) {
-          const retryErrorBody = await retryResponse.text().catch(() => '');
-          logGithubRejection(
-            logStep,
-            'body-only retry #1 (transient, will retry)',
-            retryResponse.status,
-            retryErrorBody,
-            errorContext,
-          );
-          await delay(TRANSIENT_RETRY_DELAY_MS);
-          retryResponse = await postReviewOnce(url, githubToken, bodyOnlyPayload);
-        }
-
-        if (retryResponse.ok) {
-          const fileLevel = await postFileLevelComments({
-            owner,
-            repo,
-            pullNumber,
-            commitId,
-            findings: fileLevelFindings,
-            githubToken,
-          });
-          return {
-            submitted: true,
-            event,
-            attemptedComments,
-            commentsPosted: 0,
-            droppedOutsideDiff,
-            fileLevelAttempted: fileLevel.attempted,
-            fileLevelPosted: fileLevel.posted,
-            submissionMode: 'summary_only',
-            fallbackReason: 'github_rejected_comments',
-          };
-        }
-
-        const finalRetryBody = await retryResponse.text().catch(() => '');
-        logGithubRejection(logStep, 'body-only retry (final)', retryResponse.status, finalRetryBody, errorContext);
-      }
-
-      return {
-        submitted: false,
-        event,
-        attemptedComments,
-        commentsPosted: 0,
-        droppedOutsideDiff,
-        fileLevelAttempted: fileLevelFindings.length,
-        fileLevelPosted: 0,
-        submissionMode: 'skipped',
-        fallbackReason: inlineComments.length > 0 ? 'github_rejected_comments' : missingLocationFallback,
-      };
+      logGithubRejection(logStep, labels.rejected, response.status, errorBody, errorContext);
+      // Rate limited: refused before anything was processed.
+      if (response.status === 429) return { kind: 'not_landed', reason: 'rate limited (HTTP 429)' };
+      if (response.status < 500) return { kind: 'rejected' };
+      reason = `HTTP ${response.status}`;
+    } catch (error) {
+      logGithubThrew(logStep, labels.threw, error, errorContext);
+      reason = describeFailure(error);
     }
 
+    const landed = await findLandedReview({
+      owner,
+      repo,
+      pullNumber,
+      commitId,
+      summary,
+      githubToken,
+      attemptStartedAtMs,
+    });
+    if (landed.found === true) {
+      logStep?.({
+        level: 'WARN',
+        stage: 'pr_review.github_review.landed_after_error',
+        message: `The review POST failed here (${reason}) but the review is on the PR, with ${landed.commentsPosted} inline comment(s).`,
+        data: { reason, reviewId: landed.reviewId, commentsPosted: landed.commentsPosted, ...errorContext },
+      });
+      return { kind: 'landed', commentsPosted: landed.commentsPosted };
+    }
+    if (landed.found === 'unknown') {
+      logStep?.({
+        level: 'WARN',
+        stage: 'pr_review.github_review.unconfirmed',
+        message: `The review POST failed (${reason}) and GitHub could not be asked whether it landed — not retrying, so it cannot be posted twice.`,
+        data: { reason, ...errorContext },
+      });
+      return { kind: 'unknown', reason };
+    }
+    return { kind: 'not_landed', reason };
+  };
+
+  /** A POST that failed and is confirmed absent is tried once more. Nothing else is. */
+  const postWithOneRetry = async (
+    payload: unknown,
+    labels: { rejected: string; threw: string },
+  ): Promise<PostAttempt> => {
+    const first = await attemptPost(payload, labels);
+    if (first.kind !== 'not_landed') return first;
+    await delay(TRANSIENT_RETRY_DELAY_MS);
+    return attemptPost(payload, { rejected: `${labels.rejected} (retry)`, threw: `${labels.threw} (retry)` });
+  };
+
+  const notPosted = (attempt: PostAttempt, fallbackReason?: PrReviewFallbackReason): SubmitPrReviewResult => ({
+    submitted: false,
+    event,
+    attemptedComments,
+    commentsPosted: 0,
+    droppedOutsideDiff,
+    fileLevelAttempted: fileLevelFindings.length,
+    fileLevelPosted: 0,
+    submissionMode: 'skipped',
+    fallbackReason,
+    ...(attempt.kind === 'not_landed' || attempt.kind === 'unknown' ? { failureReason: attempt.reason } : {}),
+    ...(attempt.kind === 'unknown' ? { unconfirmed: true } : {}),
+  });
+
+  const posted = async (
+    commentsPosted: number,
+    mode: PrReviewSubmissionMode,
+    fallbackReason?: PrReviewFallbackReason,
+  ): Promise<SubmitPrReviewResult> => {
     const fileLevel = await postFileLevelComments({
       owner,
       repo,
@@ -344,30 +475,44 @@ export async function submitPrReview(params: {
       findings: fileLevelFindings,
       githubToken,
     });
-
     return {
       submitted: true,
       event,
       attemptedComments,
-      commentsPosted: inlineComments.length,
+      commentsPosted,
       droppedOutsideDiff,
       fileLevelAttempted: fileLevel.attempted,
       fileLevelPosted: fileLevel.posted,
-      submissionMode: inlineComments.length > 0 ? 'inline' : 'summary_only',
-      fallbackReason: missingLocationFallback,
+      submissionMode: mode,
+      fallbackReason,
     };
-  } catch (error) {
-    logGithubThrew(logStep, 'review POST', error, errorContext);
-    return {
-      submitted: false,
-      event,
-      attemptedComments,
-      commentsPosted: 0,
-      droppedOutsideDiff,
-      fileLevelAttempted: fileLevelFindings.length,
-      fileLevelPosted: 0,
-      submissionMode: 'skipped',
-      fallbackReason: missingLocationFallback,
-    };
+  };
+
+  const full = await postWithOneRetry(fullPayload, {
+    rejected: 'review POST with inline comments',
+    threw: 'review POST',
+  });
+  if (full.kind === 'accepted' || full.kind === 'landed') {
+    const commentsPosted = full.kind === 'accepted' ? inlineComments.length : full.commentsPosted;
+    return posted(commentsPosted, commentsPosted > 0 ? 'inline' : 'summary_only', missingLocationFallback);
   }
+  if (full.kind !== 'rejected') {
+    return notPosted(full, missingLocationFallback);
+  }
+
+  // GitHub refused the batch, which it does whole when one comment's anchor is
+  // bad. Last resort: drop the inline comments and post the body alone. This
+  // only kicks in when pre-validation wasn't enough (e.g. diff drift because a
+  // new commit landed between the agents running and this POST).
+  if (inlineComments.length === 0) {
+    return notPosted(full, missingLocationFallback);
+  }
+  const bodyOnly = await postWithOneRetry(bodyOnlyPayload, {
+    rejected: 'body-only retry',
+    threw: 'body-only review POST',
+  });
+  if (bodyOnly.kind === 'accepted' || bodyOnly.kind === 'landed') {
+    return posted(0, 'summary_only', 'github_rejected_comments');
+  }
+  return notPosted(bodyOnly, 'github_rejected_comments');
 }

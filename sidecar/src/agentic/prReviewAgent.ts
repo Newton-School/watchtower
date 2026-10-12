@@ -34,6 +34,7 @@ import {
   splitAgenticOutputByRole,
   PR_REVIEW_ROLES,
   NO_NEW_CHANGES_TEXT,
+  formatUnpostedFindings,
 } from '../github/prReviewSupport.js';
 import type {
   NormalizedPrReviewAgentOutput,
@@ -1555,6 +1556,9 @@ export async function reviewSinglePr(params: {
   const hasBlockingFindings = blockingFindings.length > 0;
   const baseSummary = formatSlackReviewSummary(normalizedOutputs, prContext.url, reviewResult, appliedSkills);
   const summaryParts = [baseSummary];
+  // False when the submission failed or was skipped: then the thread is the
+  // only place the findings can be read (issue #449).
+  const reviewOnPr = Boolean(reviewResult?.submitted);
   if (hasBlockingFindings) {
     // "Before merge" is meaningless on a PR that has already shipped (issue #447).
     summaryParts.push(
@@ -1562,14 +1566,21 @@ export async function reviewSinglePr(params: {
         ? `⚠️ ${blockingFindings.length} blocking-severity finding(s) — this PR is already ${prState}, so they need a follow-up.`
         : `⚠️ ${blockingFindings.length} blocking-severity finding(s) — please address before merge.`,
     );
-    const preview = blockingFindings
-      .slice(0, 3)
-      .map(
-        f =>
-          `• [${f.severity.toUpperCase()}] ${f.file ? `${f.file}${typeof f.line === 'number' ? `:${f.line}` : ''} — ` : ''}${f.message}`,
-      );
-    if (blockingFindings.length > 3) preview.push(`… and ${blockingFindings.length - 3} more on the PR.`);
-    summaryParts.push(preview.join('\n'));
+    // Normally a preview of three: the rest are on the PR. When the review is
+    // not on the PR, the full list follows below instead.
+    if (reviewOnPr) {
+      const preview = blockingFindings
+        .slice(0, 3)
+        .map(
+          f =>
+            `• [${f.severity.toUpperCase()}] ${f.file ? `${f.file}${typeof f.line === 'number' ? `:${f.line}` : ''} — ` : ''}${f.message}`,
+        );
+      if (blockingFindings.length > 3) preview.push(`… and ${blockingFindings.length - 3} more on the PR.`);
+      summaryParts.push(preview.join('\n'));
+    }
+  }
+  if (!reviewOnPr && allFindings.length > 0) {
+    summaryParts.push(formatUnpostedFindings(allFindings));
   }
   if (buildGateFailed) {
     summaryParts.push('🔴 npm ci/build FAILED for this PR under its own lockfile — details in the review.');
