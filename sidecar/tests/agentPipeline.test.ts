@@ -1,6 +1,11 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { runAgentPipeline, waitForApproval } from '../src/agents/pipeline.js';
+import {
+  buildCoderFollowUpQuestion,
+  buildCoderNoDiffQuestion,
+  runAgentPipeline,
+  waitForApproval,
+} from '../src/agents/pipeline.js';
 import { runCodex } from '../src/codex/runCodex.js';
 import { __infraRetry } from '../src/codex/infraRetry.js';
 import { fetchThreadContext } from '../src/slack/threadContext.js';
@@ -656,7 +661,11 @@ describe('agentPipeline', () => {
 
     expect(result.finalStatus).toBe('needs-input');
     expect(result.needsInputQuestion).toBeDefined();
-    expect(result.needsInputQuestion).toContain('error text');
+    // It says what was checked (the repository), quotes the coder's own account,
+    // and does not claim that nothing was touched (issue #432).
+    expect(result.needsInputQuestion).toContain('nothing changed in the repository');
+    expect(result.needsInputQuestion).toContain('> I totally wrote code (hallucinated to pass old guard).');
+    expect(result.needsInputQuestion).not.toContain("haven't touched");
     // Reviewer should NOT have run — feedback loop short-circuited
     expect(result.steps.map(s => s.role)).toEqual(['planner', 'coder']);
   });
@@ -840,6 +849,9 @@ describe('agentPipeline', () => {
     expect(coderSteps[1].findings.some(f => f.category === 'coder-empty-output')).toBe(true);
     expect(result.finalStatus).toBe('needs-input');
     expect(result.needsInputQuestion).toBeDefined();
+    // The retry's own account is what gets quoted, not the first run's (issue #432).
+    expect(result.needsInputQuestion).toContain('> Retry said it fixed but did not');
+    expect(result.needsInputQuestion).not.toContain("haven't touched");
   });
 
   describe('approved plan reaches the agents (#413)', () => {
@@ -1118,6 +1130,59 @@ vi.mock('../src/slack/threadContext.js', () => ({
   fetchThreadContext: vi.fn(),
   assertThreadParentExists: vi.fn().mockResolvedValue(true),
 }));
+
+describe('what the thread is told when the coder leaves no diff (issue #432)', () => {
+  const PLAN = '# Fix Metabase dashboard 674 — restrict Dyte recording coverage to real course topic classes';
+  const REPORT =
+    'Updated all 7 cards on dashboard 674 and its description.\nBefore: 1,204 sessions counted. After: 987 (topic classes only).';
+
+  it('quotes the coder own account of what it did, line by line', () => {
+    const question = buildCoderNoDiffQuestion(PLAN, ['video_sessions/models.py'], REPORT);
+
+    expect(question).toContain('This is what it says it did:');
+    expect(question).toContain('> Updated all 7 cards on dashboard 674 and its description.');
+    expect(question).toContain('> Before: 1,204 sessions counted. After: 987 (topic classes only).');
+  });
+
+  it('says only what was checked, and never that nothing was touched', () => {
+    const question = buildCoderNoDiffQuestion(PLAN, [], REPORT);
+
+    expect(question.startsWith('The coder finished, but nothing changed in the repository')).toBe(true);
+    expect(question).toContain('it may already be in place. Check it before you ask me to do it again.');
+    expect(question).not.toContain("haven't touched");
+    expect(question).not.toContain('hallucinat');
+  });
+
+  it('admits it cannot tell when the coder gave no account', () => {
+    const question = buildCoderNoDiffQuestion(PLAN, [], '   ');
+
+    expect(question).toContain('It gave no account of what it did');
+    expect(question).toContain('cannot tell you whether anything outside the repository changed');
+    expect(question).not.toContain('This is what it says it did');
+  });
+
+  it('keeps a long report to a readable length', () => {
+    const question = buildCoderNoDiffQuestion('', [], 'x'.repeat(5000));
+
+    expect(question).toContain(`> ${'x'.repeat(900)}…`);
+    expect(question.length).toBeLessThan(1500);
+  });
+
+  it('still shows the plan and the planned files, and how to go on', () => {
+    const question = buildCoderNoDiffQuestion(PLAN, ['a.py', 'b.py', 'c.py', 'd.py'], REPORT);
+
+    expect(question).toContain(`The plan opened with: _${PLAN}_`);
+    expect(question).toContain('Planned files: `a.py, b.py, c.py` …');
+    expect(question).toContain('or say "cancel" to stop.');
+  });
+
+  it('no longer claims untouched files when the coder could not pin a change down either', () => {
+    const question = buildCoderFollowUpQuestion(makeContext(), PLAN, []);
+
+    expect(question.startsWith("I couldn't pin down a concrete change from the info I have.")).toBe(true);
+    expect(question).not.toContain("haven't touched");
+  });
+});
 
 describe('agentPipeline and a dropped connection (issue #439)', () => {
   const savedRetry = { ...__infraRetry };
