@@ -251,6 +251,68 @@ describe('refreshSharedRepoToDefaultBranch', () => {
     expect(await git(repo, ['rev-parse', 'HEAD'])).toBe(commitC);
     expect(fs.existsSync(path.join(repo, 'local.txt'))).toBe(true);
     expect(state?.branch).toBe('main');
+    // And it says so: one behind, because of local commits (issue #446).
+    expect(state).toMatchObject({ upstream: 'origin/main', behind: 1, staleReason: 'diverged' });
+  });
+
+  describe('reports where the clone ended up (issue #446)', () => {
+    const advanceOrigin = async (times = 1) => {
+      for (let i = 0; i < times; i++) {
+        await writeFile(path.join(seed, 'file.txt'), `B${i}\n`);
+        await git(seed, ['commit', '-aqm', `commit B${i}`]);
+      }
+      await git(seed, ['push', '-q', 'origin', 'main']);
+    };
+
+    it('reports a current clone as zero behind, with no reason to distrust it', async () => {
+      await advanceOrigin();
+
+      const state = await refreshSharedRepoToDefaultBranch(repo);
+
+      expect(state).toMatchObject({ branch: 'main', upstream: 'origin/main', behind: 0 });
+      expect(state?.staleReason).toBeUndefined();
+    });
+
+    it('reports a clone stuck behind uncommitted changes: how far, why, and which files', async () => {
+      // The incident: two edited tracked files, so every fast-forward was refused for four months.
+      await writeFile(path.join(repo, 'file.txt'), 'local edit, never committed\n');
+      const before = await git(repo, ['rev-parse', 'HEAD']);
+      await advanceOrigin(3);
+
+      const state = await refreshSharedRepoToDefaultBranch(repo);
+
+      expect(await git(repo, ['rev-parse', 'HEAD'])).toBe(before);
+      expect(fs.readFileSync(path.join(repo, 'file.txt'), 'utf8')).toBe('local edit, never committed\n');
+      expect(state).toMatchObject({
+        branch: 'main',
+        upstream: 'origin/main',
+        behind: 3,
+        staleReason: 'dirty_tree',
+        dirtyFiles: ['file.txt'],
+      });
+      // The fetch still worked, so the current code is readable from origin's ref.
+      expect(await git(repo, ['show', 'origin/main:file.txt'])).toBe('B2');
+    });
+
+    it('reports a clone left on another branch', async () => {
+      await git(repo, ['switch', '-q', '-c', 'feature/x']);
+      await writeFile(path.join(repo, 'feature.txt'), 'wip\n');
+      await git(repo, ['add', '.']);
+      await git(repo, ['commit', '-qm', 'wip']);
+      await advanceOrigin();
+
+      const state = await refreshSharedRepoToDefaultBranch(repo);
+
+      expect(state).toMatchObject({ branch: 'feature/x', behind: 1, staleReason: 'other_branch' });
+    });
+
+    it('reports a failed fetch instead of passing off the last one as fresh', async () => {
+      await git(repo, ['remote', 'set-url', 'origin', path.join(os.tmpdir(), 'wt-no-such-remote')]);
+
+      const state = await refreshSharedRepoToDefaultBranch(repo);
+
+      expect(state).toMatchObject({ branch: 'main', staleReason: 'fetch_failed' });
+    });
   });
 
   it('is a non-throwing no-op for a directory that is not a git repo', async () => {

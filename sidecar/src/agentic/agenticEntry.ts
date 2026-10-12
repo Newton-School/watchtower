@@ -15,6 +15,7 @@ import { assembleConversationRecall } from '../conversation/conversationRecall.j
 import { fetchThreadContext } from '../slack/threadContext.js';
 import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
 import { refreshSharedRepoToDefaultBranch } from '../workspaces/workspaceManager.js';
+import { buildStaleCheckoutBlock, describeRepoRefresh } from '../workspaces/staleCheckout.js';
 import { getBackend } from '../backends/registry.js';
 import { extractQaTargetUrl } from '../router/intentParser.js';
 import { parseScreenshotManifest, uploadScreenshots } from '../slack/imageUploader.js';
@@ -347,14 +348,32 @@ export async function runAgenticEntry(params: RunAgenticEntryParams): Promise<Wo
   // (e.g. "feature X isn't implemented" the day after the PR adding it merged).
   // Conversational replies don't read code, so we skip the fetch cost there.
   if (mode === 'informational') {
+    const refreshed: Array<{ name: string; state: Awaited<ReturnType<typeof refreshSharedRepoToDefaultBranch>> }> = [];
     for (const { path: repoPath } of enabledRepoPaths(config)) {
       const state = await refreshSharedRepoToDefaultBranch(repoPath);
+      const name = path.basename(repoPath);
+      refreshed.push({ name, state });
+      // Says what happened, not what was attempted: a clone that could not be
+      // updated is a WARN with how far behind it is and why (issue #446).
+      const { message, level } = describeRepoRefresh(name, state);
       logStep?.({
         stage: 'agentic.repo_refresh',
-        message: `Refreshed ${path.basename(repoPath)} to ${state?.branch ?? 'unknown'} @ ${state?.head ?? 'unknown'}.`,
-        data: { repoPath, branch: state?.branch, head: state?.head },
+        message,
+        level,
+        data: {
+          repoPath,
+          branch: state?.branch,
+          head: state?.head,
+          upstream: state?.upstream,
+          behind: state?.behind,
+          staleReason: state?.staleReason,
+          dirtyFiles: state?.dirtyFiles,
+        },
       });
     }
+    // A stale clone still has origin's refs: point the agent at those.
+    const staleBlock = buildStaleCheckoutBlock(refreshed);
+    if (staleBlock) systemPrompt = `${systemPrompt}\n\n${staleBlock}`;
   }
 
   const cwd = config.miniOgRepoRoot ?? config.repoPaths.newtonWeb;
