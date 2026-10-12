@@ -743,3 +743,20 @@ describe('review asks that tag the owner, while the tool-router decides (issue #
     expect(seed(`<@UBOT1> review and merge ${link}`, false)).toBe('IMPLEMENTATION');
   });
 });
+
+describe('the line miniOG offers for deferred PRs routes as a review (issue #442)', () => {
+  const thread = [9155, 9156, 9157, 9158, 9159, 9160].map(n => `https://github.com/Newton-School/newton-web/pull/${n}`);
+
+  it.each([true, false])('with the router deciding: %s', routerDecides => {
+    const task = normalizeTask(
+      { ...baseEvent, userId: 'U123', text: '<@UBOT1> review #9158 #9159 #9160' },
+      config,
+      thread,
+      {
+        routerDecides,
+      },
+    );
+
+    expect(task.intent).toBe('PR_REVIEW');
+  });
+});
