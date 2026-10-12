@@ -943,7 +943,9 @@ export function buildCoderFollowUpQuestion(
   const preview = trimmed.length > 200 ? `${trimmed.slice(0, 200).trim()}…` : trimmed;
   const filePreview = planAffectedFiles.slice(0, 3).join(', ');
 
-  const lines = ["I couldn't pin down a concrete change from the info I have, so I haven't touched any files."];
+  // Says what is known and no more. This used to add "so I haven't touched
+  // any files", which nothing here had checked (issue #432).
+  const lines = ["I couldn't pin down a concrete change from the info I have."];
   if (preview) {
     lines.push(`The plan opened with: _${preview}_`);
   }
@@ -958,6 +960,61 @@ export function buildCoderFollowUpQuestion(
     'Reply in this thread with any of the above and I\'ll pick it up from there — or say "cancel" to stop.',
   );
   void ctx;
+  return lines.join('\n');
+}
+
+/** How much of the coder's own account is quoted back. A before/after report fits; a transcript does not. */
+const CODER_REPORT_QUOTE_CHARS = 900;
+
+/**
+ * Asked when the coder says it finished and the repository shows no change.
+ *
+ * A clean worktree is not proof that nothing happened: the work may have been
+ * outside the repo. A coder that had just updated seven Metabase cards in
+ * production, and written a before/after report, was answered with "I haven't
+ * touched any files"; its report was thrown away and the requester never
+ * learned the dashboard had changed (issue #432).
+ *
+ * So this states only what was checked (the repository), quotes what the
+ * coder said it did, and tells the requester to look before asking again.
+ */
+export function buildCoderNoDiffQuestion(
+  planMarkdown: string,
+  planAffectedFiles: string[],
+  coderSummary: string,
+): string {
+  const report = coderSummary.trim();
+  const quoted = (
+    report.length > CODER_REPORT_QUOTE_CHARS ? `${report.slice(0, CODER_REPORT_QUOTE_CHARS).trim()}…` : report
+  )
+    .split('\n')
+    .map(line => `> ${line}`)
+    .join('\n');
+  const plan = planMarkdown.trim();
+  const planPreview = plan.length > 200 ? `${plan.slice(0, 200).trim()}…` : plan;
+  const filePreview = planAffectedFiles.slice(0, 3).join(', ');
+
+  const lines = ['The coder finished, but nothing changed in the repository: no commit and no edited file.'];
+  if (report) {
+    lines.push(
+      'This is what it says it did:',
+      quoted,
+      'If that describes work outside the repository (a dashboard, a setting, a record), it may already be in place. Check it before you ask me to do it again.',
+    );
+  } else {
+    lines.push(
+      'It gave no account of what it did, so I cannot tell you whether anything outside the repository changed.',
+    );
+  }
+  if (planPreview) {
+    lines.push(`The plan opened with: _${planPreview}_`);
+  }
+  if (filePreview) {
+    lines.push(`Planned files: \`${filePreview}\`${planAffectedFiles.length > 3 ? ' …' : ''}`);
+  }
+  lines.push(
+    'If a code change is still needed, tell me the specific change and where it should land, and I\'ll pick it up from there — or say "cancel" to stop.',
+  );
   return lines.join('\n');
 }
 
@@ -1255,7 +1312,7 @@ export async function runAgentPipeline(params: {
             severity: 'critical',
             category: 'coder-empty-output',
             message:
-              'Coder reported success but the worktree has no new commits, no uncommitted changes, and HEAD has not moved. Likely a hallucinated response with no actual tool use.',
+              'Coder reported success but the worktree has no new commits, no uncommitted changes, and HEAD has not moved. Either nothing was done, or the work was done outside the repository.',
             suggestion:
               'Gather missing context (error text, failing request, explicit file scope) and re-run with concrete targets.',
           });
@@ -1272,10 +1329,10 @@ export async function runAgentPipeline(params: {
             },
           });
           pendingNeedsInput = true;
-          needsInputQuestion = buildCoderFollowUpQuestion(
-            ctx,
+          needsInputQuestion = buildCoderNoDiffQuestion(
             plannerNormalized?.planMarkdown ?? '',
             plannerNormalized?.affectedFiles ?? [],
+            typeof output.summary === 'string' ? output.summary : '',
           );
         } else {
           output.filesChanged = changes.filesChanged;
@@ -1526,10 +1583,10 @@ export async function runAgentPipeline(params: {
                 data: { retryLoops },
               });
               pendingNeedsInput = true;
-              needsInputQuestion = buildCoderFollowUpQuestion(
-                ctx,
+              needsInputQuestion = buildCoderNoDiffQuestion(
                 plannerNormalized?.planMarkdown ?? '',
                 plannerNormalized?.affectedFiles ?? [],
+                typeof coderOutput.summary === 'string' ? coderOutput.summary : '',
               );
             } else {
               coderOutput.filesChanged = changes.filesChanged;
