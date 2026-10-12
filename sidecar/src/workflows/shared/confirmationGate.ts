@@ -1,3 +1,4 @@
+import { jobSlots } from '../../runtime/jobSlots.js';
 import type { WebClient } from '@slack/web-api';
 import { fetchThreadRepliesSince, type ThreadMessage } from '../../slack/threadContext.js';
 import type { WorkflowStepLogger } from '../../types/contracts.js';
@@ -53,7 +54,17 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-export async function waitForExactConfirmation(params: {
+/** Waits for the exact confirmation phrase. The job's slot is free while it waits (issue #434). */
+export function waitForExactConfirmation(
+  params: Parameters<typeof pollForExactConfirmation>[0],
+): Promise<ConfirmationResult> {
+  return jobSlots.whileWaitingOnHuman(() => pollForExactConfirmation(params), {
+    signal: params.signal,
+    logStep: params.logStep,
+  });
+}
+
+async function pollForExactConfirmation(params: {
   slack: WebClient;
   channelId: string;
   threadTs: string;

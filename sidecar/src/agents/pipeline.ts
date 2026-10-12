@@ -9,6 +9,7 @@ import { buildPromptForRole } from './prompts.js';
 import { lightweightProfile, profileForAgentRole } from '../codex/modelProfiles.js';
 import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
 import { isInterruption, runWithInfraRetry, type InterruptionKind } from '../codex/infraRetry.js';
+import { jobSlots } from '../runtime/jobSlots.js';
 import {
   isNone,
   normalizePlannerOutput,
@@ -344,7 +345,15 @@ Return strict JSON:
   }
 }
 
-export async function waitForApproval(params: {
+/** Waits for a plan to be approved. The job's slot is free while it waits (issue #434). */
+export function waitForApproval(params: Parameters<typeof pollForApproval>[0]): Promise<ApprovalResult> {
+  return jobSlots.whileWaitingOnHuman(() => pollForApproval(params), {
+    signal: params.signal,
+    logStep: params.logStep,
+  });
+}
+
+async function pollForApproval(params: {
   slack: WebClient;
   channelId: string;
   threadTs: string;
@@ -716,7 +725,15 @@ Return strict JSON:
  * `waitForApproval`: 5-second polling loop, ignores non-admin replies, nudges
  * non-admins who try to answer. Returns the resolved repo or 'cancelled'.
  */
-export async function waitForRepoChoice(params: {
+/** Waits for someone to say which repo. The job's slot is free while it waits (issue #434). */
+export function waitForRepoChoice(params: Parameters<typeof pollForRepoChoice>[0]): Promise<RepoChoiceResult> {
+  return jobSlots.whileWaitingOnHuman(() => pollForRepoChoice(params), {
+    signal: params.signal,
+    logStep: params.logStep,
+  });
+}
+
+async function pollForRepoChoice(params: {
   slack: WebClient;
   channelId: string;
   threadTs: string;
@@ -908,7 +925,12 @@ export async function waitForRepoChoice(params: {
 
 export type ClarificationResult = { answer: string; answererId: string };
 
-export async function waitForClarification(params: {
+/** Waits for an answer to the planner's question. The job's slot is free while it waits (issue #434). */
+export function waitForClarification(params: Parameters<typeof pollForClarification>[0]): Promise<ClarificationResult> {
+  return jobSlots.whileWaitingOnHuman(() => pollForClarification(params), { logStep: params.logStep });
+}
+
+async function pollForClarification(params: {
   slack: WebClient;
   channelId: string;
   threadTs: string;
