@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   buildGithubReviewSummary,
   formatSlackReviewSummary,
@@ -8,6 +8,7 @@ import {
   formatUnpostedFindings,
   MAX_INLINE_COMMENTS,
   planReviewPosting,
+  fetchDiffSince,
 } from '../src/github/prReviewSupport.js';
 import type { SubmitPrReviewResult } from '../src/github/submitPrReview.js';
 import type { CodexRunResult } from '../src/types/contracts.js';
@@ -463,5 +464,48 @@ describe('planReviewPosting: what goes on the diff and what goes in the body (is
 
     expect(summary).toContain('3 findings identified; 1 inline posted; 2 lower-priority listed in the review summary');
     expect(summary).not.toContain('without an anchor');
+  });
+});
+
+describe('follow-up review support (issue #451)', () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+  const pr = { url: 'https://github.com/o/r/pull/7', owner: 'o', repo: 'r', number: 7 };
+
+  it('asks GitHub for the diff between the earlier reviewed commit and the head', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('diff --git a/x b/x'));
+    globalThis.fetch = fetchMock as never;
+
+    const diff = await fetchDiffSince({ prContext: pr, baseSha: 'old111', headSha: 'new222', githubToken: 'ghp_x' });
+
+    expect(diff).toBe('diff --git a/x b/x');
+    expect(fetchMock.mock.calls[0][0]).toBe('https://api.github.com/repos/o/r/compare/old111...new222');
+    expect(fetchMock.mock.calls[0][1].headers).toMatchObject({
+      Accept: 'application/vnd.github.diff',
+      Authorization: 'Bearer ghp_x',
+    });
+  });
+
+  it('returns nothing when GitHub cannot produce it, as after a force-push', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response('Not Found', { status: 404 })) as never;
+    expect(await fetchDiffSince({ prContext: pr, baseSha: 'gone', headSha: 'new' })).toBeUndefined();
+
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error('network')) as never;
+    expect(await fetchDiffSince({ prContext: pr, baseSha: 'old', headSha: 'new' })).toBeUndefined();
+  });
+
+  it('puts the follow-up line first in the review body', () => {
+    const outputs = [
+      { role: 'reviewer', findings: [], attachableFindings: [], unattachableFindings: [], summaryNotes: [] },
+    ];
+    const line =
+      'Follow-up on my review at abc1234: of its 2 findings, 2 addressed, 0 still open; 0 new in the code changed since.';
+
+    const body = buildGithubReviewSummary(outputs as never, undefined, undefined, line);
+
+    expect(body.startsWith(`${line}\n\n`)).toBe(true);
+    expect(body).toContain('no actionable findings');
   });
 });
