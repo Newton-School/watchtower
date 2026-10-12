@@ -577,7 +577,76 @@ function buildSummaryOnlyFinding(role: string, finding: AgentFinding): string {
   return `- [${role.toUpperCase()} - ${finding.severity.toUpperCase()}] ${finding.message}${suggestion}`;
 }
 
-export function buildGithubReviewSummary(outputs: NormalizedPrReviewAgentOutput[], appliedSkills?: string[]): string {
+/** Worst first. */
+const SEVERITY_ORDER: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
+
+/** Inline comments one review may carry. Past this, a review is a wall nobody reads. */
+export const MAX_INLINE_COMMENTS = 10;
+const INLINE_FLOOR_RANK = SEVERITY_ORDER.medium;
+
+/**
+ * Which findings become comments on the diff and which are listed in the
+ * review body (issue #441).
+ *
+ * Every finding used to be its own inline comment: a median of 11 per PR, 65%
+ * of them low or info. Authors faced a wall and stopped reading it, which
+ * buried the high-severity findings the review exists for.
+ *
+ * Inline: line-mapped findings of medium severity and above, worst first, at
+ * most MAX_INLINE_COMMENTS. Collapsed: every other line-mapped finding (lows,
+ * infos, and mediums past the cap), listed once in the review body. Findings
+ * with no line were already listed there and are not part of the plan.
+ */
+export interface ReviewPostingPlan {
+  /** What to hand to the GitHub submission, by role. */
+  toSubmit: Array<{ role: string; findings: AgentFinding[] }>;
+  /** Line-mapped findings that are listed in the body instead of posted inline. */
+  collapsed: Array<{ role: string; finding: AgentFinding }>;
+  /** How many inline comments the plan asks for. */
+  inlineCount: number;
+}
+
+export function planReviewPosting(outputs: NormalizedPrReviewAgentOutput[]): ReviewPostingPlan {
+  const rank = (finding: AgentFinding): number => SEVERITY_ORDER[finding.severity] ?? 9;
+  const lineMapped = outputs.flatMap(output =>
+    output.attachableFindings.map(finding => ({ role: output.role, finding })),
+  );
+  const eligible = lineMapped
+    .filter(item => rank(item.finding) <= INLINE_FLOOR_RANK)
+    .sort((a, b) => rank(a.finding) - rank(b.finding));
+  const inline = new Set(eligible.slice(0, MAX_INLINE_COMMENTS).map(item => item.finding));
+  const collapsed = lineMapped
+    .filter(item => !inline.has(item.finding))
+    .sort((a, b) => rank(a.finding) - rank(b.finding));
+
+  return {
+    toSubmit: outputs.map(output => ({
+      role: output.role,
+      findings: [
+        ...output.attachableFindings.filter(finding => inline.has(finding)),
+        // A finding on a file but no line is posted as a file-level comment,
+        // under the same severity floor.
+        ...output.unattachableFindings.filter(finding => rank(finding) <= INLINE_FLOOR_RANK),
+      ],
+    })),
+    collapsed,
+    inlineCount: inline.size,
+  };
+}
+
+function buildCollapsedFinding(role: string, finding: AgentFinding): string {
+  const where = finding.file
+    ? `\`${finding.file}${typeof finding.line === 'number' ? `:${finding.line}` : ''}\` — `
+    : '';
+  const suggestion = finding.suggestion ? ` Suggestion: ${finding.suggestion}` : '';
+  return `- [${role.toUpperCase()} - ${finding.severity.toUpperCase()}] ${where}${finding.message}${suggestion}`;
+}
+
+export function buildGithubReviewSummary(
+  outputs: NormalizedPrReviewAgentOutput[],
+  appliedSkills?: string[],
+  plan?: ReviewPostingPlan,
+): string {
   const allFindings = outputs.flatMap(output => output.findings);
   const attachableFindings = outputs.flatMap(output => output.attachableFindings);
   const unattachableFindings = outputs.flatMap(output =>
@@ -602,8 +671,16 @@ export function buildGithubReviewSummary(outputs: NormalizedPrReviewAgentOutput[
     lines.push('Watchtower review complete - no line-attachable findings were identified.');
   }
 
-  if (attachableFindings.length > 0) {
-    lines.push(`${attachableFindings.length} inline comment(s) were prepared from line-mapped findings.`);
+  const inlineCount = plan ? plan.inlineCount : attachableFindings.length;
+  if (inlineCount > 0) {
+    lines.push(
+      plan
+        ? `${inlineCount} of them, of medium severity or above, are inline comments on the diff.`
+        : `${inlineCount} inline comment(s) were prepared from line-mapped findings.`,
+    );
+  }
+  if (plan && plan.collapsed.length > 0) {
+    lines.push(`${plan.collapsed.length} lower-priority finding(s) are listed below instead of inline.`);
   }
   if (unattachableFindings.length > 0) {
     lines.push(`${unattachableFindings.length} finding(s) could not be attached inline and are listed below.`);
@@ -619,6 +696,13 @@ export function buildGithubReviewSummary(outputs: NormalizedPrReviewAgentOutput[
     }
     for (const { role, note } of summaryNotes) {
       lines.push(`- [${role.toUpperCase()} NOTE] ${note}`);
+    }
+  }
+
+  if (plan && plan.collapsed.length > 0) {
+    lines.push('', 'Lower-priority findings (not posted inline):');
+    for (const { role, finding } of plan.collapsed) {
+      lines.push(buildCollapsedFinding(role, finding));
     }
   }
 
@@ -643,7 +727,6 @@ function notPostedClause(reviewResult: SubmitPrReviewResult | undefined): string
 
 /** How many findings the Slack message carries when the PR carries none of them. */
 const UNPOSTED_FINDINGS_IN_SLACK = 15;
-const SEVERITY_ORDER: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
 
 /**
  * The findings themselves, for the thread, when the review could not be put
@@ -668,6 +751,8 @@ export function formatSlackReviewSummary(
   prUrl: string,
   reviewResult?: SubmitPrReviewResult,
   appliedSkills?: string[],
+  /** Line-mapped findings listed in the review body instead of inline (issue #441). */
+  collapsedCount = 0,
 ): string {
   const skillsSuffix =
     appliedSkills && appliedSkills.length > 0
@@ -713,10 +798,11 @@ export function formatSlackReviewSummary(
   if (reviewResult.droppedOutsideDiff > 0) {
     dropReasons.push(`${reviewResult.droppedOutsideDiff} outside the PR diff`);
   }
-  const unplaced = totalFindings - totalPlaced - reviewResult.droppedOutsideDiff;
+  const unplaced = totalFindings - totalPlaced - reviewResult.droppedOutsideDiff - collapsedCount;
   if (unplaced > 0) {
     dropReasons.push(`${unplaced} without an anchor`);
   }
+  const collapsedClause = collapsedCount > 0 ? `; ${collapsedCount} lower-priority listed in the review summary` : '';
 
   if (totalPlaced === 0) {
     // Every finding was dropped because its anchor fell outside the diff — the
@@ -726,12 +812,16 @@ export function formatSlackReviewSummary(
       return `*PR Review Complete* - ⚠️ all ${totalFindings} finding(s) fell outside the PR diff and could NOT be posted inline; only the review summary was posted${breakdown} ${verdict}\n${prUrl}${skillsSuffix}`;
     }
     const reason = dropReasons.length > 0 ? ` — ${dropReasons.join(', ')}` : '';
-    return `*PR Review Complete* - ${totalFindings} findings identified; review summary posted, no inline comments attached${reason}${breakdown} ${verdict}\n${prUrl}${skillsSuffix}`;
+    // Nothing reached medium severity: no inline comments is the intended result, not a failure.
+    if (collapsedCount > 0 && dropReasons.length === 0) {
+      return `*PR Review Complete* - ${totalFindings} findings identified, none above low severity; they are listed in the review summary, not inline${breakdown} ${verdict}\n${prUrl}${skillsSuffix}`;
+    }
+    return `*PR Review Complete* - ${totalFindings} findings identified; review summary posted, no inline comments attached${reason}${collapsedClause}${breakdown} ${verdict}\n${prUrl}${skillsSuffix}`;
   }
 
   const placed = placedParts.join(' + ') + ' posted';
   const droppedClause = dropReasons.length > 0 ? `; ${dropReasons.join(', ')} dropped` : '';
-  return `*PR Review Complete* - ${totalFindings} findings identified; ${placed}${droppedClause}${breakdown} ${verdict}\n${prUrl}${skillsSuffix}`;
+  return `*PR Review Complete* - ${totalFindings} findings identified; ${placed}${collapsedClause}${droppedClause}${breakdown} ${verdict}\n${prUrl}${skillsSuffix}`;
 }
 
 export const NO_NEW_CHANGES_TEXT =

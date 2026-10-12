@@ -35,6 +35,7 @@ import {
   PR_REVIEW_ROLES,
   NO_NEW_CHANGES_TEXT,
   formatUnpostedFindings,
+  planReviewPosting,
 } from '../github/prReviewSupport.js';
 import type {
   NormalizedPrReviewAgentOutput,
@@ -253,9 +254,12 @@ const LENS_DIRECTIVE: Record<PrReviewRole, string> = {
     'N+1 queries, unbounded loops/recursion, memory leaks, unnecessary re-renders, heavy imports, missing indexes or pagination, sync blocking in async paths — changed code only',
 };
 
-/** Only blocking-severity findings (these drive the ⚠️ Slack warning and the
- * REQUEST_CHANGES signal) go through adversarial verification. */
-const VERIFY_FLOOR_RANK = SEVERITY_RANK.high;
+/** Findings of this severity and above go through adversarial verification
+ * before they are posted. It used to be `high`: over a month 31 findings were
+ * checked and 686 medium, low and info findings were posted as they came, and
+ * an author listed five false positives from one batch (issue #441). Mediums
+ * are the ones posted inline, so they are checked too. */
+const VERIFY_FLOOR_RANK = SEVERITY_RANK.medium;
 /** Hard cap on verifier CLI runs per PR so a finding-heavy PR can't spawn dozens
  * of subprocesses. Budgeted by WORST-CASE run cost (a critical spends 3 votes,
  * a high spends up to 2 — primary + adjudication of a refute), so the true
@@ -284,9 +288,10 @@ function verifierProfile(tier: VerifierTier): { model: string; reasoningEffort: 
 }
 
 /** Worst-case verifier CLI runs a finding can spend: critical → 3 votes,
- * everything else → primary + possible adjudication. */
+ * high → primary + possible adjudication, medium → one primary vote. */
 function verificationCost(finding: AgentFinding): number {
-  return finding.severity === 'critical' ? 3 : 2;
+  if (finding.severity === 'critical') return 3;
+  return finding.severity === 'medium' ? 1 : 2;
 }
 
 /** Prompt-marker substrings — exported so tests route fake agents by marker
@@ -598,6 +603,12 @@ async function verifyOneFinding(params: {
   signal?: AbortSignal;
 }): Promise<{ verdict: 'confirmed' | 'refuted'; severityOverride?: AgentFinding['severity']; inconclusive: boolean }> {
   const { finding, logStep } = params;
+  // A medium does not drive the blocking warning, so one light-tier vote
+  // decides it: cheap enough to run on every medium, and a wrong refute costs
+  // one comment, not a missed blocker.
+  if (finding.severity === 'medium') {
+    return runVerifier({ ...params, tier: 'primary' });
+  }
   if (finding.severity !== 'critical') {
     const primary = await runVerifier({ ...params, tier: 'primary' });
     if (primary.verdict === 'confirmed') return primary;
@@ -641,9 +652,12 @@ async function verifyFindings(params: {
   logStep?: WorkflowStepLogger;
   signal?: AbortSignal;
 }): Promise<Array<AgentFinding & { lens: PrReviewRole }>> {
-  const { candidates, logStep, signal } = params;
-  // Fill the verifier-run budget greedily (criticals cost 3, others 1) so the
-  // total subprocess count never exceeds MAX_VERIFICATIONS for any severity mix.
+  const { logStep, signal } = params;
+  // Worst first, so that when the budget runs out it is mediums, never
+  // blockers, that pass through unverified.
+  const candidates = [...params.candidates].sort((a, b) => severityRank(b.severity) - severityRank(a.severity));
+  // Fill the verifier-run budget greedily (criticals cost 3, highs 2, mediums 1)
+  // so the total subprocess count never exceeds MAX_VERIFICATIONS for any mix.
   const toVerify: Array<AgentFinding & { lens: PrReviewRole }> = [];
   const overflow: Array<AgentFinding & { lens: PrReviewRole }> = [];
   let budget = MAX_VERIFICATIONS;
@@ -661,7 +675,7 @@ async function verifyFindings(params: {
     logStep?.({
       stage: 'agentic.pr_review.verify.capped',
       level: 'WARN',
-      message: `Verification budget (${MAX_VERIFICATIONS} runs) reached; ${overflow.length} of ${candidates.length} blocking finding(s) pass through unverified.`,
+      message: `Verification budget (${MAX_VERIFICATIONS} runs) reached; ${overflow.length} of ${candidates.length} finding(s) pass through unverified.`,
       data: { cap: MAX_VERIFICATIONS, total: candidates.length, unverified: overflow.length },
     });
   }
@@ -838,14 +852,14 @@ async function runMultiAgentReview(params: {
   const beforeDedupe = collected.length;
   const deduped = dedupeFindings(collected);
 
-  // Phase 3: adversarially verify blocking-severity findings only.
+  // Phase 3: adversarially verify findings of medium severity and above.
   const blocking = deduped.filter(f => severityRank(f.severity) >= VERIFY_FLOOR_RANK);
   const nonBlocking = deduped.filter(f => severityRank(f.severity) < VERIFY_FLOOR_RANK);
   let finalFindings = deduped;
   if (blocking.length > 0) {
     logStep?.({
       stage: 'agentic.pr_review.verify.start',
-      message: `Verifying ${blocking.length} blocking finding(s).`,
+      message: `Verifying ${blocking.length} finding(s) of medium severity or above.`,
       data: { prUrl, candidates: blocking.length },
     });
     const survivors = await verifyFindings({
@@ -1062,15 +1076,15 @@ async function runOrchestratedReview(params: {
   const beforeDedupe = collected.length;
   const deduped = dedupeFindings(collected);
 
-  // Adversarially verify blocking-severity findings (orchestrator and lens
-  // findings alike — the safety net applies to the skills-led review too).
+  // Adversarially verify findings of medium severity and above (orchestrator
+  // and lens findings alike — the safety net applies to the skills-led review too).
   const blocking = deduped.filter(f => severityRank(f.severity) >= VERIFY_FLOOR_RANK);
   const nonBlocking = deduped.filter(f => severityRank(f.severity) < VERIFY_FLOOR_RANK);
   let finalFindings = deduped;
   if (blocking.length > 0) {
     logStep?.({
       stage: 'agentic.pr_review.verify.start',
-      message: `Verifying ${blocking.length} blocking finding(s).`,
+      message: `Verifying ${blocking.length} finding(s) of medium severity or above.`,
       data: { prUrl, candidates: blocking.length },
     });
     const survivors = await verifyFindings({
@@ -1520,6 +1534,9 @@ export async function reviewSinglePr(params: {
 
   // 7. Submit the formal GitHub review through the hunk-validating path —
   //    the ONLY GitHub write path; the agent itself is forbidden from posting.
+  //    Inline comments are for medium severity and above, at most ten; the
+  //    rest of the line-mapped findings are listed once in the body (#441).
+  const postingPlan = planReviewPosting(normalizedOutputs);
   let reviewResult: SubmitPrReviewResult | undefined;
   if (prHeadSha) {
     reviewResult = await deps.submitReview({
@@ -1527,8 +1544,9 @@ export async function reviewSinglePr(params: {
       repo: prContext.repo,
       pullNumber: prContext.number,
       commitId: prHeadSha,
-      findingsByRole: normalizedOutputs.map(output => ({ role: output.role, findings: output.findings })),
-      summary: buildGithubReviewSummary(normalizedOutputs, appliedSkills),
+      findingsByRole: postingPlan.toSubmit,
+      findingsInBody: allFindings.length - postingPlan.toSubmit.reduce((sum, r) => sum + r.findings.length, 0),
+      summary: buildGithubReviewSummary(normalizedOutputs, appliedSkills, postingPlan),
       githubToken,
       prDiff: diffResult.diff,
       logStep,
@@ -1554,7 +1572,13 @@ export async function reviewSinglePr(params: {
   //    a degraded run says so — silent degradation was quality gap #5.
   const blockingFindings = allFindings.filter(f => f.severity === 'critical' || f.severity === 'high');
   const hasBlockingFindings = blockingFindings.length > 0;
-  const baseSummary = formatSlackReviewSummary(normalizedOutputs, prContext.url, reviewResult, appliedSkills);
+  const baseSummary = formatSlackReviewSummary(
+    normalizedOutputs,
+    prContext.url,
+    reviewResult,
+    appliedSkills,
+    postingPlan.collapsed.length,
+  );
   const summaryParts = [baseSummary];
   // False when the submission failed or was skipped: then the thread is the
   // only place the findings can be read (issue #449).

@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { describe, expect, it } from 'vitest';
 import {
   buildGithubReviewSummary,
@@ -5,6 +6,8 @@ import {
   normalizePrReviewAgentOutput,
   splitAgenticOutputByRole,
   formatUnpostedFindings,
+  MAX_INLINE_COMMENTS,
+  planReviewPosting,
 } from '../src/github/prReviewSupport.js';
 import type { SubmitPrReviewResult } from '../src/github/submitPrReview.js';
 import type { CodexRunResult } from '../src/types/contracts.js';
@@ -370,5 +373,95 @@ describe('what the thread is told when a review is not on the PR (issue #449)', 
     expect(lines[16]).toBe('… and 5 more that are not shown here.');
     expect(lines[1].length).toBeLessThan(290);
     expect(formatUnpostedFindings([])).toBe('');
+  });
+});
+
+describe('planReviewPosting: what goes on the diff and what goes in the body (issue #441)', () => {
+  const f = (severity: string, line?: number, file: string | undefined = 'src/a.ts') =>
+    ({ severity, category: 'x', message: `${severity} at ${line ?? 'file'}`, file, line }) as never;
+  const output = (role: string, findings: any[]) =>
+    ({
+      role,
+      findings,
+      attachableFindings: findings.filter(x => x.file && typeof x.line === 'number'),
+      unattachableFindings: findings.filter(x => !(x.file && typeof x.line === 'number')),
+      summaryNotes: [],
+      invalidFindings: 0,
+    }) as never;
+
+  it('posts medium and above inline, and collapses low and info', () => {
+    const plan = planReviewPosting([output('reviewer', [f('low', 1), f('medium', 2), f('info', 3), f('high', 4)])]);
+
+    expect(plan.inlineCount).toBe(2);
+    expect(plan.toSubmit[0].findings.map((x: any) => x.severity)).toEqual(['medium', 'high']);
+    expect(plan.collapsed.map(c => c.finding.severity)).toEqual(['low', 'info']);
+  });
+
+  it('caps inline comments, keeping the worst, across every role', () => {
+    const plan = planReviewPosting([
+      output(
+        'reviewer',
+        Array.from({ length: 14 }, (_, i) => f('medium', i + 1)),
+      ),
+      output('security', [f('critical', 50), f('high', 51)]),
+    ]);
+
+    expect(plan.inlineCount).toBe(MAX_INLINE_COMMENTS);
+    const submitted = plan.toSubmit.flatMap(r => r.findings as any[]);
+    expect(submitted.filter(x => x.severity === 'critical' || x.severity === 'high')).toHaveLength(2);
+    expect(submitted.filter(x => x.severity === 'medium')).toHaveLength(8);
+    // The six mediums past the cap are not lost: they are in the body.
+    expect(plan.collapsed).toHaveLength(6);
+    expect(plan.collapsed.every(c => c.finding.severity === 'medium')).toBe(true);
+  });
+
+  it('holds file-level findings to the same floor, and leaves line-less ones out of the collapsed list', () => {
+    const plan = planReviewPosting([
+      output('reviewer', [f('high', undefined), f('low', undefined), f('medium', undefined, undefined)]),
+    ]);
+
+    // The body already lists findings with no line; they are not listed twice.
+    expect(plan.collapsed).toEqual([]);
+    expect(plan.toSubmit[0].findings.map((x: any) => x.severity)).toEqual(['high', 'medium']);
+    expect(plan.inlineCount).toBe(0);
+  });
+
+  it('writes the collapsed findings into the review body, once, with where they are', () => {
+    const outputs = [output('reviewer', [f('high', 4), f('low', 9), f('info', 12)])];
+    const body = buildGithubReviewSummary(outputs, undefined, planReviewPosting(outputs));
+
+    expect(body).toContain('Watchtower found 3 issue(s) in this PR.');
+    expect(body).toContain('1 of them, of medium severity or above, are inline comments on the diff.');
+    expect(body).toContain('2 lower-priority finding(s) are listed below instead of inline.');
+    expect(body).toContain('Lower-priority findings (not posted inline):');
+    expect(body).toContain('- [REVIEWER - LOW] `src/a.ts:9` — low at 9');
+    expect(body).toContain('- [REVIEWER - INFO] `src/a.ts:12` — info at 12');
+    expect(body).not.toContain('high at 4');
+  });
+
+  it('leaves the body as it was when no plan is given', () => {
+    const outputs = [output('reviewer', [f('low', 9)])];
+
+    expect(buildGithubReviewSummary(outputs)).toContain('1 inline comment(s) were prepared from line-mapped findings.');
+    expect(buildGithubReviewSummary(outputs)).not.toContain('Lower-priority');
+  });
+
+  it('counts collapsed findings in the Slack line instead of calling them dropped', () => {
+    const outputs = [output('reviewer', [f('high', 4), f('low', 9), f('info', 12)])];
+    const posted = {
+      submitted: true,
+      event: 'COMMENT' as const,
+      attemptedComments: 1,
+      commentsPosted: 1,
+      droppedOutsideDiff: 0,
+      fileLevelAttempted: 0,
+      fileLevelPosted: 0,
+      submissionMode: 'inline' as const,
+    };
+
+    const summary = formatSlackReviewSummary(outputs, 'https://github.com/o/r/pull/1', posted, undefined, 2);
+
+    expect(summary).toContain('3 findings identified; 1 inline posted; 2 lower-priority listed in the review summary');
+    expect(summary).not.toContain('without an anchor');
   });
 });
