@@ -16,9 +16,12 @@ const base = {
 
 const JSON_RULE = '- Your final message must be ONLY this JSON object';
 
+const PRIOR_BLOCK = 'PRIOR REVIEW — "message" starting "Still open: " or "Regressed: ".';
+
 function reviewPrompts(): Array<[string, string]> {
   return [
     ['single-agent', buildAgenticPrReviewPrompt(base)],
+    ['follow-up single-agent', buildAgenticPrReviewPrompt({ ...base, priorReviewBlock: PRIOR_BLOCK })],
     ['lens', buildLensPrompt({ ...base, lens: 'security' })],
     ['orchestrator', buildOrchestratorPrompt({ ...base, skills: [], backendId: 'claude-code', forceDiffOnly: true })],
   ];
@@ -26,14 +29,29 @@ function reviewPrompts(): Array<[string, string]> {
 
 describe('PR review prompts use ASD-STE100 for comment text', () => {
   it.each(reviewPrompts())('%s prompt includes the STE review rule after the JSON output rule', (_name, prompt) => {
-    expect(prompt).toContain(STE_REVIEW_TEXT_RULE);
-    expect(prompt.indexOf(STE_REVIEW_TEXT_RULE)).toBeGreaterThan(prompt.indexOf(JSON_RULE));
+    const jsonIndex = prompt.indexOf(JSON_RULE);
+    expect(jsonIndex).toBeGreaterThanOrEqual(0);
+    expect(prompt.indexOf(STE_REVIEW_TEXT_RULE)).toBeGreaterThan(jsonIndex);
   });
 
-  it('review rule leaves out the reply-only layout rules', () => {
-    expect(STE_REVIEW_TEXT_RULE).not.toContain('Lead with the answer');
-    expect(STE_REVIEW_TEXT_RULE).not.toContain('Use bullet lists');
-    expect(STE_REVIEW_TEXT_RULE).toContain('Never copy secrets');
+  it.each(reviewPrompts())('%s prompt has no reply-only layout rules and redacts secrets', (_name, prompt) => {
+    expect(prompt).not.toContain('Lead with the answer');
+    expect(prompt).not.toContain('Use bullet lists');
+    expect(prompt).toContain('[redacted]');
+  });
+
+  it.each(reviewPrompts())('%s prompt keeps suggestions on one line without code fences', (_name, prompt) => {
+    expect(prompt).toContain('Write each "suggestion" on one line.');
+    expect(prompt).toContain('Do not use code fences or line breaks.');
+  });
+
+  it('follow-up review keeps the prefixes that reReview matches', () => {
+    const prompt = buildAgenticPrReviewPrompt({ ...base, priorReviewBlock: PRIOR_BLOCK });
+    expect(prompt).toContain(PRIOR_BLOCK);
+    for (const prefix of ['"Still open: "', '"Regressed: "', '"Addressed since last review: "']) {
+      expect(prompt).toContain(prefix);
+    }
+    expect(prompt).toContain('keep that prefix exactly');
   });
 });
 
@@ -48,7 +66,9 @@ describe('agentic Slack prompts use ASD-STE100', () => {
     expect(prompt).toContain(STE_REPLY_STYLE_BLOCK);
   });
 
-  it('reply block redacts secrets in error text', () => {
-    expect(STE_REPLY_STYLE_BLOCK).toContain('[redacted]');
+  it('informational prompt redacts secrets but keeps file paths', () => {
+    const prompt = informationalSystemPrompt(config);
+    expect(prompt).toContain('[redacted]');
+    expect(prompt).toContain('Never change a file path.');
   });
 });

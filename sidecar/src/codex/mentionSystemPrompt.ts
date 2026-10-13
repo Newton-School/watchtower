@@ -1,5 +1,5 @@
 import type { DossierRole, NormalizedTask, PersonalityMode, WorkflowIntent } from '../types/contracts.js';
-import { STE_REPLY_STYLE_BLOCK } from './replyStyle.js';
+import { STE_CORE_STYLE_BLOCK, STE_REPLY_STYLE_BLOCK } from './replyStyle.js';
 
 type MentionPromptWorkflow = Exclude<WorkflowIntent, 'DEV_ASSIST'>;
 
@@ -65,9 +65,31 @@ export function buildMentionSystemPrompt(params: {
     );
   }
 
-  lines.push('', STE_REPLY_STYLE_BLOCK);
+  const styleBlock = styleBlockFor(workflow);
+  if (styleBlock) {
+    lines.push('', styleBlock);
+  }
 
   return lines.join('\n');
+}
+
+/**
+ * The STE variant that fits how each workflow posts the model's text:
+ * - UNKNOWN posts only the first sentence of a reply of at most 24 words, so it gets none.
+ * - IMPLEMENTATION and INVESTIGATION text goes through JSON fields, `sanitizeOwnerSummary`
+ *   (drops "-" lines) or single-line Slack emphasis, so it gets the sentence rules only.
+ * - Other workflows post the reply as written and get the full block.
+ */
+function styleBlockFor(workflow: MentionPromptWorkflow): string | undefined {
+  switch (workflow) {
+    case 'UNKNOWN':
+      return undefined;
+    case 'IMPLEMENTATION':
+    case 'INVESTIGATION':
+      return STE_CORE_STYLE_BLOCK;
+    default:
+      return STE_REPLY_STYLE_BLOCK;
+  }
 }
 
 function toneLineFor(mode: PersonalityMode): string {
@@ -77,7 +99,7 @@ function toneLineFor(mode: PersonalityMode): string {
     case 'technical':
       return '- Tone preference: technical. Lean on code blocks, file paths, and concrete identifiers.';
     case 'casual':
-      return '- Tone preference: casual. A short friendly opening line is fine. Keep the STE writing rules.';
+      return '- Tone preference: casual. A short friendly opening line is fine.';
     default:
       return '- Use plain, natural wording.';
   }
