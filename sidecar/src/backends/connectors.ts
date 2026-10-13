@@ -16,7 +16,7 @@ import type { AppConfig, McpServerConfig } from '../types/contracts.js';
  * Now a run that uses tools starts with none (`--strict-mcp-config` with an
  * explicit list), and a workflow names what it keeps:
  *
- *   lookup             Metabase, read-only
+ *   lookup             Metabase and OpenPanel, read-only
  *   code_change        Figma
  *   code_change_admin  Figma + the Newton admin server, upload tools only
  *
@@ -43,6 +43,10 @@ interface ConnectorSpec {
   serverName: string;
   /** Tool-name patterns (after `mcp__<serverName>__`) no run may use. */
   denyTools: string[];
+  /** How the limit reads in a sentence: "read-only", "upload only". */
+  limit?: string;
+  /** What it is for, said to an agent that has it. */
+  about: string;
   resolve(config: AppConfig): McpServerConfig | undefined;
 }
 
@@ -123,12 +127,25 @@ const CONNECTORS: Record<string, ConnectorSpec> = {
   metabase: {
     serverName: 'metabase',
     denyTools: ['create_*', 'update_*', 'delete_*', 'archive_*'],
+    limit: 'read-only',
+    about:
+      'the database, for questions the code cannot answer: counts, a specific record, whether data is what the code expects',
     resolve: config => (config.metabaseMcpUrl ? { type: 'http', url: config.metabaseMcpUrl } : undefined),
+  },
+  // Product analytics, for "how many", "which events fire", "is this page
+  // getting traffic". Every tool it has today reads; the patterns keep it so.
+  openpanel: {
+    serverName: 'openpanel',
+    denyTools: ['create_*', 'update_*', 'delete_*'],
+    limit: 'read-only',
+    about: 'product analytics: events and their properties, funnels, page and traffic numbers',
+    resolve: () => userServer('openpanel'),
   },
   // Designs, for a change that implements one.
   figma: {
     serverName: 'figma',
     denyTools: [],
+    about: 'designs, for a change that implements one',
     resolve: () => userServer('figma'),
   },
   // Uploading an asset a change needs (a developer image). Only `login` and
@@ -137,6 +154,8 @@ const CONNECTORS: Record<string, ConnectorSpec> = {
   // plugin gives it, so the tool names agents and repo skills know stay the same.
   'newton-admin': {
     serverName: 'plugin_newton-admin-mcp_newton-admin',
+    limit: 'upload only',
+    about: 'uploading an asset a change needs',
     denyTools: [
       'admin_lookup',
       'create_*',
@@ -155,7 +174,7 @@ const CONNECTORS: Record<string, ConnectorSpec> = {
 
 export const CONNECTOR_POLICY: Record<ConnectorProfile, string[]> = {
   none: [],
-  lookup: ['metabase'],
+  lookup: ['metabase', 'openpanel'],
   code_change: ['figma'],
   code_change_admin: ['figma', 'newton-admin'],
 };
@@ -187,12 +206,32 @@ export function describeConnectorPolicy(config: AppConfig): string[] {
   const lines = PROFILE_LABELS.map(([profile, label]) => {
     const { unavailable } = connectorsFor(profile, config);
     const names = CONNECTOR_POLICY[profile].map(name => {
-      const note = name === 'metabase' ? ' (read-only)' : name === 'newton-admin' ? ' (upload only)' : '';
-      return `${name}${note}${unavailable.includes(name) ? ' [not set up on this host]' : ''}`;
+      const limit = CONNECTORS[name].limit;
+      return `${name}${limit ? ` (${limit})` : ''}${unavailable.includes(name) ? ' [not set up on this host]' : ''}`;
     });
     return `${label}: ${names.join(', ') || 'none'}`;
   });
   return [...lines, 'every other run: none'];
+}
+
+/**
+ * What a run is told about the connectors it was given, or undefined when it
+ * has none. Said out loud because an agent used to find a database by
+ * rummaging through every connector the host user had, and because a server
+ * can be configured and still not signed in to.
+ */
+export function connectorPromptBlock(connectors: RunConnectors): string | undefined {
+  const given = Object.values(CONNECTORS).filter(spec => spec.serverName in connectors.mcpServers);
+  if (given.length === 0) return undefined;
+  const lines = given.map(
+    spec => `- \`mcp__${spec.serverName}__*\`${spec.limit ? ` (${spec.limit})` : ''}: ${spec.about}.`,
+  );
+  return [
+    'Connectors you have in this run:',
+    ...lines,
+    "- If a connector's tools are not available in this session, say plainly that you could not reach it. Never estimate a number you could not query.",
+    '- You have no other connectors: no Slack search, no Drive, no mail. If the answer needs one, say so instead of looking for a way around it.',
+  ].join('\n');
 }
 
 const storage = new AsyncLocalStorage<RunConnectors>();

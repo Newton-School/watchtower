@@ -106,6 +106,11 @@ export async function runInvestigationWorkflow(params: {
   // of the host user's connectors by omission (issue #443).
   const connectors = getActiveBackendId() === 'claude-code' ? connectorsFor('lookup', config) : NO_CONNECTORS;
   const useMetabase = 'metabase' in connectors.mcpServers;
+  const analyticsNote =
+    'openpanel' in connectors.mcpServers
+      ? `
+- An OpenPanel MCP server is connected (tools named \`mcp__openpanel__*\`) for read-only product analytics: events and their properties, funnels, page and traffic numbers. Use it when the symptom is about tracking or traffic; if its tools are unavailable, say so in \`summary\`.`
+      : '';
   logStep?.({
     stage: useMetabase ? 'investigation.metabase.enabled' : 'investigation.metabase.skipped',
     message: useMetabase
@@ -135,14 +140,14 @@ export async function runInvestigationWorkflow(params: {
 - If the Metabase tools are unavailable (not connected), proceed with the two repos and explicitly note in \`requiresMoreInfo\`/\`summary\` that the data layer was not inspected.`
             : `
 - No database access is available this run; investigate the repos only and note in \`summary\` if a data-layer check would help confirm the diagnosis.`
-        }
+        }${analyticsNote}
 - Read-only mode: Read, Grep, Glob, read-only git/bash (git log, git show, git blame, git diff)${useMetabase ? ', and read-only Metabase queries' : ''}. Do NOT invoke Edit, Write, any worktree-mutating bash, or any mutating MCP tool.`
       : `- Working directory: ${repoPath}${repoName ? ` (${repoName})` : ''}${marketingScopeNote}${
           useMetabase
             ? `
 - A Metabase MCP server is connected (tools named \`mcp__metabase__*\`) for read-only database checks, when the code alone cannot settle whether the data is wrong. If its tools are unavailable, say in \`summary\` that the data layer was not inspected.`
             : ''
-        }
+        }${analyticsNote}
 - Read-only mode: you may use Read, Grep, Glob, and read-only git/bash (git log, git show, git blame, git diff)${useMetabase ? ', and read-only Metabase queries' : ''}. Do NOT invoke Edit, Write, any bash command that mutates the worktree, or any mutating MCP tool.`;
 
   const investigatorPrompt = `${recallBlock}${`
