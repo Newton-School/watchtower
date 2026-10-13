@@ -11,7 +11,6 @@ import { shouldResumeFromReaction } from './router/investigationResumeGate.js';
 import { loadConfigFromDb, readAgentBackend, readSettingsForAlert, MiniOgRepoRootViolationError } from './config.js';
 import { setActiveBackend } from './codex/runCodex.js';
 import { diagnoseFailure } from './learning/failureDoctor.js';
-import { applyLearning } from './learning/selfLearning.js';
 import {
   failLaunchpadWorkflow,
   finalizeLaunchpadWorkflowResult,
@@ -27,7 +26,6 @@ import { agentCallContext } from './state/runContext.js';
 import { detectMention, normalizeTask } from './router/intentParser.js';
 import { isRouteQuestionExpired } from './router/routeClarify.js';
 import { jobSlots } from './runtime/jobSlots.js';
-import { readToolRouterMode } from './router/toolRouter.js';
 import { decidePausedResume } from './router/pausedResume.js';
 import { classifyProduct } from './router/productClassifier.js';
 import { routeTask } from './router/taskRouter.js';
@@ -42,7 +40,6 @@ import { cleanupStaleWorkspaces, cleanupThreadWorkspaces } from './workspaces/wo
 import { configureVaultWriter, shutdownVaultWriter } from './vault/vaultWriter.js';
 import { configureVaultWatcher, shutdownVaultWatcher } from './vault/vaultWatcher.js';
 import { startProfileSynthesizerScheduler, stopProfileSynthesizerScheduler } from './learning/profileSynthesizer.js';
-import { loadWorkflowTemplates } from './workflows/registry.js';
 import { narrateStep } from './slack/statusNarrator.js';
 import { fetchThreadContext } from './slack/threadContext.js';
 import { createThreadStatus, type ThreadStatus } from './slack/threadStatus.js';
@@ -65,7 +62,6 @@ import type { AccessGroupKey, SlackEventEnvelope, SlackReactionEvent, WorkflowSt
 
 assertMacOS();
 loadPolicies();
-loadWorkflowTemplates();
 
 const dbPath = process.env.WATCHTOWER_DB_PATH ?? path.resolve(process.cwd(), 'watchtower.db');
 
@@ -951,7 +947,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
   const threadTexts = threadMessages.map(message => message.text);
   logger.info({ eventId: event.eventId, messages: threadMessages.length }, 'thread context fetched for intake');
   let task = {
-    ...normalizeTask(event, config, threadTexts, { routerDecides: readToolRouterMode(store) === 'on' }),
+    ...normalizeTask(event, config, threadTexts),
     threadMessages,
   };
 
@@ -1055,21 +1051,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     return;
   }
 
-  const learning = applyLearning({ task, config, store });
-  const routedTask = learning.intent === task.intent ? task : { ...task, intent: learning.intent };
-
-  logger.info(
-    {
-      eventId: event.eventId,
-      originalIntent: task.intent,
-      routedIntent: routedTask.intent,
-      correctionApplied: learning.correctionApplied,
-      learningNotes: learning.notes,
-    },
-    'learning engine evaluated task',
-  );
-
-  const key = dedupeKey(event, routedTask.intent);
+  const key = dedupeKey(event, task.intent);
   store.recordEvent(event.eventId, event.channelId, event.threadTs);
 
   const jobId = uuidv4();
@@ -1077,17 +1059,14 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     id: jobId,
     eventId: event.eventId,
     dedupeKey: key,
-    workflow: routedTask.intent,
+    workflow: task.intent,
     channelId: event.channelId,
     threadTs: event.threadTs,
     payload: {
       text: event.text,
       requestUserId: event.userId,
       mentionType: task.mentionType,
-      intent: routedTask.intent,
-      originalIntent: task.intent,
-      correctionApplied: learning.correctionApplied,
-      learningNotes: learning.notes,
+      intent: task.intent,
       eventTs: event.eventTs,
       ingestSource: event.ingestSource ?? 'socket',
       launchpadRequestId: event.launchpadRequestId ?? null,
@@ -1120,7 +1099,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     const payload = {
       jobId,
       eventId: event.eventId,
-      workflow: routedTask.intent,
+      workflow: task.intent,
       stage: step.stage,
       ...(step.data ? { data: step.data } : {}),
     };
@@ -1185,10 +1164,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     data: {
       dedupeKey: key,
       mentionType: task.mentionType,
-      intent: routedTask.intent,
-      originalIntent: task.intent,
-      correctionApplied: learning.correctionApplied,
-      learningNotes: learning.notes,
+      intent: task.intent,
       threadMessages: threadMessages.length,
       ingestSource: event.ingestSource ?? 'socket',
       launchpadRequestId: event.launchpadRequestId ?? null,
@@ -1272,7 +1248,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
 
         const workflowResult = await agentCallContext.run({ jobId, store }, () =>
           routeTask({
-            task: routedTask,
+            task,
             config,
             slack: eventClient,
             store,
@@ -1303,7 +1279,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
         const diagnosis =
           result.status === 'FAILED' && !hasPrInResult
             ? diagnoseFailure({
-                workflow: routedTask.intent,
+                workflow: task.intent,
                 message: result.message,
                 logs: stepLogs,
               })
@@ -1332,7 +1308,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
         // Persist the workflow that actually ran (post-router reclassification)
         // so dashboard surfaces show the right label without disturbing
         // jobs.workflow (which pauseResume uses for resume detection).
-        const executedWorkflow = result.workflow !== routedTask.intent ? result.workflow : undefined;
+        const executedWorkflow = result.workflow !== task.intent ? result.workflow : undefined;
         if (result.status === 'SUCCESS') {
           store.markJob(jobId, 'SUCCESS', { result: result.result, executedWorkflow });
         } else if (result.status === 'PAUSED') {
@@ -1368,7 +1344,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
             userId: event.userId,
           });
           const repoName = typeof result.result?.repoName === 'string' ? result.result.repoName : undefined;
-          const productKey = isMemoryWorthyWorkflow(routedTask.intent)
+          const productKey = isMemoryWorthyWorkflow(task.intent)
             ? (classifyProduct([event.text ?? '', result.message ?? '', JSON.stringify(result.result ?? {})])
                 .selected ?? undefined)
             : undefined;
@@ -1377,22 +1353,21 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
             eventId: event.eventId,
             channelId: event.channelId,
             userId: event.userId,
-            workflow: routedTask.intent,
+            workflow: task.intent,
             intent: task.intent,
             status: result.status,
-            correctionApplied: learning.correctionApplied,
             errorKind: diagnosis?.errorKind,
             personalityMode,
             repo: repoName,
             product: productKey,
           });
-          if (isMemoryWorthyWorkflow(routedTask.intent) && result.message) {
+          if (isMemoryWorthyWorkflow(task.intent) && result.message) {
             const prUrl =
               typeof result.result?.prUrl === 'string' && result.result.prUrl ? result.result.prUrl : undefined;
             store.dossierStore().recordMemory({
               userId: event.userId,
               jobId,
-              workflow: routedTask.intent,
+              workflow: task.intent,
               status: result.status,
               repo: repoName,
               prUrl,
@@ -1484,7 +1459,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
 
     const errorMessage = `Workflow failed after retries: ${String(lastError)}`;
     const diagnosis = diagnoseFailure({
-      workflow: routedTask.intent,
+      workflow: task.intent,
       message: errorMessage,
       logs: stepLogs,
     });
@@ -1545,7 +1520,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
         channelId: event.channelId,
         userId: event.userId,
       });
-      const productKey = isMemoryWorthyWorkflow(routedTask.intent)
+      const productKey = isMemoryWorthyWorkflow(task.intent)
         ? (classifyProduct([event.text ?? '', errorMessage ?? '']).selected ?? undefined)
         : undefined;
       store.recordLearningSignal({
@@ -1553,19 +1528,18 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
         eventId: event.eventId,
         channelId: event.channelId,
         userId: event.userId,
-        workflow: routedTask.intent,
+        workflow: task.intent,
         intent: task.intent,
         status: 'FAILED',
-        correctionApplied: learning.correctionApplied,
         errorKind: diagnosis?.errorKind,
         personalityMode,
         product: productKey,
       });
-      if (isMemoryWorthyWorkflow(routedTask.intent) && errorMessage) {
+      if (isMemoryWorthyWorkflow(task.intent) && errorMessage) {
         store.dossierStore().recordMemory({
           userId: event.userId,
           jobId,
-          workflow: routedTask.intent,
+          workflow: task.intent,
           status: 'FAILED',
           product: productKey,
           summary: `Failed: ${errorMessage.slice(0, 280)}`,
@@ -1589,7 +1563,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
       return;
     }
     const diagnosis = diagnoseFailure({
-      workflow: routedTask.intent,
+      workflow: task.intent,
       message: errorMessage,
       logs: stepLogs,
     });
@@ -1628,7 +1602,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
         channelId: event.channelId,
         userId: event.userId,
       });
-      const productKey = isMemoryWorthyWorkflow(routedTask.intent)
+      const productKey = isMemoryWorthyWorkflow(task.intent)
         ? (classifyProduct([event.text ?? '', errorMessage ?? '']).selected ?? undefined)
         : undefined;
       store.recordLearningSignal({
@@ -1636,19 +1610,18 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
         eventId: event.eventId,
         channelId: event.channelId,
         userId: event.userId,
-        workflow: routedTask.intent,
+        workflow: task.intent,
         intent: task.intent,
         status: 'FAILED',
-        correctionApplied: learning.correctionApplied,
         errorKind: diagnosis?.errorKind,
         personalityMode,
         product: productKey,
       });
-      if (isMemoryWorthyWorkflow(routedTask.intent) && errorMessage) {
+      if (isMemoryWorthyWorkflow(task.intent) && errorMessage) {
         store.dossierStore().recordMemory({
           userId: event.userId,
           jobId,
-          workflow: routedTask.intent,
+          workflow: task.intent,
           status: 'FAILED',
           product: productKey,
           summary: `Failed: ${errorMessage.slice(0, 280)}`,

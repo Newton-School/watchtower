@@ -1,8 +1,6 @@
-import path from 'node:path';
 import type { WebClient } from '@slack/web-api';
 import type {
   AppConfig,
-  CodexRunRequest,
   DossierRole,
   NormalizedTask,
   WorkflowIntent,
@@ -25,27 +23,26 @@ import { runInvestigationWorkflow } from '../workflows/investigationWorkflow.js'
 import { runAgenticEntry } from '../agentic/agenticEntry.js';
 import { runAgenticPrReview } from '../agentic/agenticPrReview.js';
 import { runUnknownTaskWorkflow } from '../workflows/unknownTaskWorkflow.js';
-import { getWorkflowTemplates } from '../workflows/registry.js';
-import { matchWorkflowTemplate } from '../workflows/matcher.js';
-import { renderPromptTemplate } from '../workflows/renderer.js';
-import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
-import { highReasoningProfile } from '../codex/modelProfiles.js';
-import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
-import { classifyWorkflowIntent, type IntentClassification } from './classifyIntent.js';
-import { addressingOf, startRouterShadow, type LegacyDecidedBy, type RouterClassification } from './routerShadow.js';
+import {
+  addressingOf,
+  failedClassification,
+  startRouterShadow,
+  type LegacyDecidedBy,
+  type RouterClassification,
+} from './routerShadow.js';
 import { askRequester, decideClarify, giveUpOnClarify, type ClarifyAction } from './routeClarify.js';
 import { cancelledResult } from '../workflows/shared/cancelState.js';
 import { looksLikeFixAffirmation } from './resumeIntentParser.js';
 
-// Confidence threshold below which the router refuses to honor a classifier
-// override that drops the required access tier. RCA on Slack thread
-// p1779086230428739 (2026-05-18) caught a 0.60-confidence
-// IMPLEMENTATION → CONVERSATIONAL reclassification of a bare "yes"; the
-// conversational workflow then hallucinated a "fix done" reply. Typical
-// successful classifications run 0.85+, so 0.75 is a conservative floor.
+import { isPresencePing } from '../workflows/shared/workflowUtils.js';
+
+// Confidence below which a decision is not acted on as given when it would
+// drop the access tier of the default seed and could claim work was done. RCA
+// on Slack thread p1779086230428739 (2026-05-18) caught a 0.60-confidence
+// read of a bare "yes" as chat; the conversational workflow then hallucinated
+// a "fix done" reply. Typical decisions run 0.85+, so 0.75 is a conservative
+// floor. (The name is from the intent classifier this floor first guarded.)
 export const CLASSIFIER_CONFIDENCE_FLOOR = 0.75;
-import { formatThreadContextForClassifier, isPresencePing } from '../workflows/shared/workflowUtils.js';
-import { formatDossierForPrompt } from '../state/dossierStore.js';
 
 type WorkflowRunnerContext = {
   task: NormalizedTask;
@@ -112,43 +109,6 @@ export const ROUTER_FAILED_REPLY =
 /** Intents routeTask can start a workflow for. */
 export const ROUTED_INTENTS = Object.keys(WORKFLOW_RUNNERS) as WorkflowIntent[];
 
-/** The intent classifier's call, as it ran before the tool-router could stand in for it. */
-async function classifyWithLegacyClassifier(params: {
-  task: NormalizedTask;
-  userMessage: string;
-  store: JobStore;
-  logStep?: WorkflowStepLogger;
-  signal?: AbortSignal;
-}): Promise<IntentClassification> {
-  const { task, userMessage, store, logStep, signal } = params;
-  // Pass mentionType so the classifier knows if this is a direct @miniOG mention
-  // or an indirect @theOG mention (owner-mention triggers should be filtered for relevance).
-  const hasPrUrl = Boolean(task.prContext);
-  let userDossierSummary: string | undefined;
-  try {
-    const dossier = store.dossierStore().getDossier(task.event.userId);
-    if (dossier.profile || dossier.affinity.length > 0) {
-      userDossierSummary = formatDossierForPrompt(dossier);
-    }
-  } catch (err) {
-    logStep?.({
-      stage: 'router.classify.dossier_lookup_failed',
-      level: 'WARN',
-      message: 'Failed to assemble dossier summary for classifier; continuing without it.',
-      data: { error: (err as Error).message },
-    });
-  }
-  return classifyWorkflowIntent({
-    userMessage,
-    threadContext: formatThreadContextForClassifier(task),
-    hasPrUrl,
-    mentionType: task.mentionType,
-    userDossierSummary,
-    logStep,
-    signal,
-  });
-}
-
 export async function routeTask(params: {
   task: NormalizedTask;
   config: AppConfig;
@@ -187,27 +147,24 @@ export async function routeTask(params: {
     }
   }
 
-  // Presence pings: cheap regex check, skip the AI classifier entirely.
+  // Mentions stripped: what the presence-ping check and the router read.
   const userMessage = (task.event.text ?? '')
     .replace(/<@[^>]+>/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 
-  // The tool-router's one call for this message (issue #456). In shadow mode it
-  // only logs what it would have done and nothing here waits for it. In `on`
-  // mode its decision is used below where the classifier's was, and nowhere else.
-  const routerShadow = startRouterShadow({ task, userMessage, store, logStep, signal });
+  // The tool-router's one call for this message (issue #456). Its decision is
+  // used below wherever a keyword gate has not already settled the workflow;
+  // for a gate-decided message nothing waits for it and it is only logged.
+  const routerShadow = startRouterShadow({ task, userMessage, logStep, signal });
   let legacyDecidedBy: LegacyDecidedBy = 'gate';
-  let decider = 'AI classifier';
   let routerCouldNotDecide = false;
-  let routerDecision: RouterClassification | undefined;
   let clarify: ClarifyAction = { kind: 'run' };
 
-  // PR_REVIEW can only be seeded pre-classifier by the deterministic gate
-  // (isPrReviewRequest in intentParser.ts) — nothing else produces it before
-  // this point. Skip the AI classifier entirely so a "review <PR URL>"
-  // message routes identically whether the classifier CLI is healthy or
-  // down (issue #334, bug B).
+  // PR_REVIEW can only be seeded before this point by the deterministic gate
+  // (isPrReviewRequest in intentParser.ts). It does not wait for the router,
+  // so a "review <PR URL>" message routes identically whether the model CLI
+  // is healthy or down (issue #334, bug B).
   if (task.intent === 'PR_REVIEW') {
     logStep?.({
       stage: 'router.pr_review.deterministic',
@@ -216,9 +173,10 @@ export async function routeTask(params: {
     });
   }
 
+  // The seeds a keyword gate or exact syntax settles by itself. (A deploy is
+  // no longer one of them: only the router, with code's agreement, starts one.)
   if (
     task.intent !== 'DEV_ASSIST' &&
-    task.intent !== 'DEPLOY' &&
     task.intent !== 'MINIOG_DOSSIER' &&
     task.intent !== 'PR_REVIEW' &&
     task.intent !== 'WEBAPP_QA'
@@ -232,12 +190,12 @@ export async function routeTask(params: {
     ) {
       // Resume gate: investigationWorkflow prompts the user to reply with
       // "yes, fix it" to continue from saved findings, but a bare affirmation
-      // gets classified as CONVERSATIONAL by the AI classifier — see RCA on
-      // Slack thread p1779086230428739 (2026-05-18). When the message is an
-      // anchored affirmation AND investigation_findings exist for this thread,
-      // force IMPLEMENTATION (or OWNER_AUTOPILOT for owners) and skip the
-      // classifier. implementationWorkflow.ts already consumes those findings
-      // via investigationStore.getForThread.
+      // reads as chat to a model — see RCA on Slack thread p1779086230428739
+      // (2026-05-18). When the message is an anchored affirmation AND
+      // investigation_findings exist for this thread, force IMPLEMENTATION
+      // (or OWNER_AUTOPILOT for owners) without asking the router.
+      // implementationWorkflow.ts already consumes those findings via
+      // investigationStore.getForThread.
       resolvedIntent = task.isOwnerAuthor ? 'OWNER_AUTOPILOT' : 'IMPLEMENTATION';
       legacyDecidedBy = 'resume_gate';
       logStep?.({
@@ -247,25 +205,17 @@ export async function routeTask(params: {
         data: { userMessage, threadTs: task.event.threadTs, resolvedIntent },
       });
     } else {
-      // For all other intents, use AI to decide: the tool-router when it is on,
-      // the intent classifier otherwise. Both return the same shape, and
-      // everything below this call treats them identically.
-      let classification: IntentClassification;
-      if (routerShadow?.decides) {
-        legacyDecidedBy = 'router';
-        decider = 'Router';
-        const decided = await routerShadow.asClassification();
-        // An owner mention the router could not read stays unanswered, as before.
-        routerCouldNotDecide = decided.failed && decided.intent !== 'NONE';
-        routerDecision = decided;
-        classification = decided;
-      } else {
-        legacyDecidedBy = 'classifier';
-        classification = await classifyWithLegacyClassifier({ task, userMessage, store, logStep, signal });
-      }
+      // Everything else is the tool-router's to decide. (It is always started
+      // for a message that reaches here; the fallback keeps the types honest.)
+      legacyDecidedBy = 'router';
+      const classification: RouterClassification = routerShadow
+        ? await routerShadow.asClassification()
+        : failedClassification(addressingOf(task));
+      // An owner mention the router could not read stays unanswered.
+      routerCouldNotDecide = classification.failed && classification.intent !== 'NONE';
       classificationReasoning = classification.reasoning;
 
-      // Confidence floor on DANGEROUS classifier downgrades. RCA (Slack thread
+      // Confidence floor on DANGEROUS downgrades. RCA (Slack thread
       // p1779086230428739, 2026-05-18) showed a 0.60-confidence
       // IMPLEMENTATION → CONVERSATIONAL reclassification of a bare "yes" — the
       // conversational workflow then hallucinated a "fix done" reply and the
@@ -296,19 +246,18 @@ export async function routeTask(params: {
       const holdOverride =
         classification.intent !== task.intent && accessDropping && proposedCanClaimCompletion && lowConfidence;
 
-      // Where the router decided, a decision that should not be acted on as
-      // given becomes one question to the requester, instead of the keyword
-      // seed (the floor hold below) or a guess (issue #431).
-      if (routerDecision?.tool && !routerDecision.failed) {
+      // A decision that should not be acted on as given becomes one question
+      // to the requester, instead of the keyword seed or a guess (issue #431).
+      if (classification.tool && !classification.failed) {
         clarify = decideClarify({
-          tool: routerDecision.tool,
-          confidence: routerDecision.confidence,
-          question: routerDecision.question,
+          tool: classification.tool,
+          confidence: classification.confidence,
+          question: classification.question,
           addressing: addressingOf(task),
           answering: Boolean(task.clarification),
           heldByFloor: holdOverride,
           confidenceFloor: CLASSIFIER_CONFIDENCE_FLOOR,
-          deployAllowed: routerDecision.deployAllowed,
+          deployAllowed: classification.deployAllowed,
         });
       }
 
@@ -317,17 +266,17 @@ export async function routeTask(params: {
           stage: 'router.clarify.decided',
           message:
             clarify.kind === 'ask'
-              ? `Not acting on the router's ${routerDecision?.tool} (${clarify.reason}) — asking the requester instead.`
+              ? `Not acting on the router's ${classification.tool} (${clarify.reason}) — asking the requester instead.`
               : clarify.kind === 'give_up'
                 ? `The reply to the question is still unclear (${clarify.reason}) — not asking twice.`
                 : 'The reply to the question asks for nothing — staying silent.',
           data: {
             action: clarify.kind,
-            tool: routerDecision?.tool,
-            confidence: routerDecision?.confidence,
+            tool: classification.tool,
+            confidence: classification.confidence,
             seedIntent: task.intent,
             answering: Boolean(task.clarification),
-            reasoning: routerDecision?.reasoning,
+            reasoning: classification.reasoning,
           },
         });
         // Nothing runs, so the access check below is made at the lowest tier.
@@ -339,20 +288,22 @@ export async function routeTask(params: {
             : clarify.kind === 'ask' && clarify.reason === 'owner_mention_change'
               ? classification.intent
               : 'INFORMATIONAL';
-      } else if (holdOverride && routerDecision?.tool && !routerDecision.failed) {
+      } else if (holdOverride) {
         // The router was unsure and the message was not addressed to miniOG (a
         // direct address became a question above). The floor used to keep the
         // keyword seed here, and every mention is seeded as a change request:
         // a message that names miniOG in passing started the change pipeline.
         // Nobody asked miniOG for anything it is sure of, so nothing runs
-        // (issue #448).
+        // (issue #448). A failed call never lands here: its fallback is a
+        // lookup or silence, neither of which the floor holds.
         logStep?.({
           stage: 'router.unsure_in_passing',
           message:
-            `Router proposed ${routerDecision.tool} at confidence=${classification.confidence.toFixed(2)} ` +
-            `(below ${CLASSIFIER_CONFIDENCE_FLOOR.toFixed(2)}) for a message not addressed to miniOG — staying silent.`,
+            `Router proposed ${classification.tool ?? classification.intent} at ` +
+            `confidence=${classification.confidence.toFixed(2)} (below ${CLASSIFIER_CONFIDENCE_FLOOR.toFixed(2)}) ` +
+            'for a message not addressed to miniOG — staying silent.',
           data: {
-            tool: routerDecision.tool,
+            tool: classification.tool,
             confidence: classification.confidence,
             seedIntent: task.intent,
             addressing: addressingOf(task),
@@ -360,31 +311,11 @@ export async function routeTask(params: {
           },
         });
         resolvedIntent = 'NONE';
-      } else if (holdOverride) {
-        logStep?.({
-          stage: 'router.classify.low_confidence_hold',
-          level: 'WARN',
-          message:
-            `${decider} proposed ${task.intent} → ${classification.intent} at ` +
-            `confidence=${classification.confidence.toFixed(2)} (below ${CLASSIFIER_CONFIDENCE_FLOOR.toFixed(2)}); ` +
-            `proposed workflow is ${proposedSideEffect} (can act on / imply completion of work) and drops access ` +
-            `from ${originalRequiredLevel} to ${proposedRequiredLevel}. Holding original intent.`,
-          data: {
-            originalIntent: task.intent,
-            classifiedIntent: classification.intent,
-            confidence: classification.confidence,
-            originalRequiredLevel,
-            proposedRequiredLevel,
-            proposedSideEffect,
-            reasoning: classification.reasoning,
-          },
-        });
-        resolvedIntent = task.intent;
       } else {
         if (classification.intent !== task.intent) {
           logStep?.({
             stage: 'router.classify.override',
-            message: `${decider} resolved intent: ${task.intent} → ${classification.intent} (confidence=${classification.confidence.toFixed(2)}).`,
+            message: `Router resolved intent: ${task.intent} → ${classification.intent} (confidence=${classification.confidence.toFixed(2)}).`,
             data: {
               originalIntent: task.intent,
               classifiedIntent: classification.intent,
@@ -424,7 +355,7 @@ export async function routeTask(params: {
       message:
         clarify.kind === 'silent'
           ? 'The reply to the question asked for nothing — staying silent.'
-          : `${decider} returned NONE — staying silent for this human-to-human conversation.`,
+          : 'Router returned NONE — staying silent for this human-to-human conversation.',
       data: { reasoning: classificationReasoning },
     });
     return {
@@ -565,80 +496,5 @@ export async function routeTask(params: {
     return runWorkflow({ task: routedTask, config, slack, store, jobId, logStep, signal });
   }
 
-  // Check file-based workflow templates before falling through to unknown
-  const templates = getWorkflowTemplates();
-  if (templates.length > 0) {
-    const matched = matchWorkflowTemplate(task.event.text, templates);
-    if (matched) {
-      logStep?.({
-        stage: 'router.template_matched',
-        message: `Matched file-based workflow template: ${matched.name}`,
-        data: { templateName: matched.name },
-      });
-
-      return runTemplateWorkflow({ task: routedTask, config, slack, template: matched, logStep, signal });
-    }
-  }
-
   return runUnknownTaskWorkflow({ task: routedTask, config, slack, logStep });
-}
-
-async function runTemplateWorkflow(params: {
-  task: NormalizedTask;
-  config: AppConfig;
-  slack: WebClient;
-  template: ReturnType<typeof getWorkflowTemplates>[number];
-  logStep?: WorkflowStepLogger;
-  signal?: AbortSignal;
-}): Promise<WorkflowResult> {
-  const { task, config, slack, template, logStep, signal } = params;
-
-  const prompt = renderPromptTemplate(template.promptTemplate, task, config);
-  // Keep the historical cwd: host-authored templates may assume they run
-  // inside the newton-web clone (relative paths, bare npm/git commands).
-  // Templates that target another repo reference it via the absolute
-  // {{repo_api}} / {{repo_marketing}} vars, which don't depend on cwd.
-  const cwd = config.repoPaths.newtonWeb;
-
-  await slack.chat
-    .postMessage({
-      channel: task.event.channelId,
-      thread_ts: task.event.threadTs,
-      text: `Running workflow: ${template.name}`,
-    })
-    .catch(() => {});
-
-  const githubToken = await resolveGithubTokenForCodex();
-  const request: CodexRunRequest = {
-    cwd,
-    prompt,
-    outputSchemaPath: path.resolve(process.cwd(), 'schemas/owner-autopilot-result.schema.json'),
-    githubToken,
-    ...highReasoningProfile(getActiveBackendId()),
-    onLog: logStep,
-    signal,
-  };
-
-  const result = await runCodex(request);
-
-  const summary = result.parsedJson?.summary
-    ? String(result.parsedJson.summary)
-    : result.lastMessage || 'Workflow completed.';
-
-  await slack.chat
-    .postMessage({
-      channel: task.event.channelId,
-      thread_ts: task.event.threadTs,
-      text: summary,
-    })
-    .catch(() => {});
-
-  return {
-    workflow: 'IMPLEMENTATION',
-    status: result.ok ? 'SUCCESS' : 'FAILED',
-    message: summary,
-    notifyDesktop: false,
-    slackPosted: true,
-    result: result.parsedJson ?? {},
-  };
 }

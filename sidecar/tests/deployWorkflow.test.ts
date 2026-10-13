@@ -112,20 +112,16 @@ describe('isDeployRequest', () => {
   });
 });
 
-describe('normalizeTask routes DEPLOY deterministically', () => {
-  it('routes "deploy newton-web to prod" as DEPLOY', () => {
-    const task = normalizeTask({ ...baseEvent, text: '<@UBOT1> deploy newton-web to prod' }, config, []);
-    expect(task.intent).toBe('DEPLOY');
-  });
-
-  it('routes "deploy to production" as DEPLOY', () => {
-    const task = normalizeTask({ ...baseEvent, text: '<@UBOT1> deploy to production' }, config, []);
-    expect(task.intent).toBe('DEPLOY');
-  });
-
-  it('routes "ship prod" as DEPLOY', () => {
-    const task = normalizeTask({ ...baseEvent, text: '<@UBOT1> ship prod' }, config, []);
-    expect(task.intent).toBe('DEPLOY');
+// The deploy keywords used to seed the DEPLOY workflow from normalizeTask. They
+// no longer start anything (issue #428): the tool-router reads the message, and
+// a deploy starts only when it says so and code finds the target at the head of
+// it. What is left here is the keyword classification the router is hinted
+// with and the deploy workflow re-derives its target from.
+describe('normalizeTask never seeds DEPLOY; the keywords only classify a target', () => {
+  it.each(['deploy newton-web to prod', 'deploy to production', 'ship prod'])('"%s" is deploy-shaped', ask => {
+    const text = `<@UBOT1> ${ask}`;
+    expect(classifyDeployTarget(text)).toBe('newton-web');
+    expect(normalizeTask({ ...baseEvent, text }, config, []).intent).not.toBe('DEPLOY');
   });
 
   it('does not route "fix the deploy script" as DEPLOY', () => {
@@ -141,9 +137,9 @@ describe('normalizeTask routes DEPLOY deterministically', () => {
     expect(task.intent).not.toBe('DEPLOY');
   });
 
-  it('still routes a direct message as DEPLOY', () => {
+  it('does not seed DEPLOY for a direct message either', () => {
     const task = normalizeTask({ ...baseEvent, text: 'deploy newton-web to prod', channelType: 'im' }, config, []);
-    expect(task.intent).toBe('DEPLOY');
+    expect(task.intent).not.toBe('DEPLOY');
   });
 
   it('does not let a newton-web PR link name the deploy target (issue #428)', () => {
@@ -190,11 +186,11 @@ describe('marketing deploy gating', () => {
     }
   });
 
-  it('ambiguous frontend targets WITH a prod token stay in the DEPLOY flow but pin no repo', () => {
+  it('ambiguous frontend targets WITH a prod token are deploy-shaped but pin no repo', () => {
     // "landing page" / "homepage" / "NSAT|NST pages" describe screens in both
     // frontends — a prod deploy must not be guessed from them, but the ask is
-    // still deploy-shaped: only the deterministic gate can produce DEPLOY, so
-    // these must not leak into the implementation pipeline.
+    // still deploy-shaped: the router is hinted, and the deploy workflow
+    // resolves 'ambiguous' with config.
     for (const text of [
       '<@UBOT1> ship the landing pages to production',
       '<@UBOT1> deploy the landing page changes to prod',
@@ -207,7 +203,7 @@ describe('marketing deploy gating', () => {
       expect(isDeployRequest(text)).toBe(false);
       expect(isMarketingDeployRequest(text)).toBe(false);
       const task = normalizeTask({ ...baseEvent, text }, config, []);
-      expect(task.intent).toBe('DEPLOY');
+      expect(task.intent).not.toBe('DEPLOY');
     }
   });
 
@@ -235,9 +231,10 @@ describe('marketing deploy gating', () => {
     expect(isMarketingDeployRequest('<@UBOT1> the marketing page is broken')).toBe(false);
   });
 
-  it('routes marketing deploy asks to DEPLOY deterministically', () => {
-    const task = normalizeTask({ ...baseEvent, text: '<@UBOT1> deploy the marketing site to prod' }, config, []);
-    expect(task.intent).toBe('DEPLOY');
+  it('classifies a marketing deploy ask as marketing, and seeds nothing from it', () => {
+    const text = '<@UBOT1> deploy the marketing site to prod';
+    expect(classifyDeployTarget(text)).toBe('newton-marketing-web');
+    expect(normalizeTask({ ...baseEvent, text }, config, []).intent).not.toBe('DEPLOY');
   });
 });
 

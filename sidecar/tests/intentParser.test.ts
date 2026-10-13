@@ -537,11 +537,10 @@ describe('intentParser', () => {
   });
 });
 
-describe('the review gate while the tool-router decides (issue #447)', () => {
+describe('the review gate fires only on its explicit forms (issue #447)', () => {
   const PR = 'https://github.com/Newton-School/newton-api/pull/6436';
   const slackPr = `<${PR}|github.com/Newton-School/newton-api/pull/6436>`;
-  const seed = (text: string, userId = 'U123') =>
-    normalizeTask({ ...baseEvent, userId, text }, config, [], { routerDecides: true }).intent;
+  const seed = (text: string, userId = 'U123') => normalizeTask({ ...baseEvent, userId, text }, config, []).intent;
 
   it('still fires on a review verb with the PR link', () => {
     expect(seed(`<@UBOT1> review ${PR}`)).toBe('PR_REVIEW');
@@ -582,23 +581,15 @@ describe('the review gate while the tool-router decides (issue #447)', () => {
   });
 
   it('leaves the thread-URL tier as it was', () => {
-    const intent = normalizeTask(
-      { ...baseEvent, userId: 'U123', text: '<@UBOT1> review the frontend PR' },
-      config,
-      [PR],
-      {
-        routerDecides: true,
-      },
-    ).intent;
+    const intent = normalizeTask({ ...baseEvent, userId: 'U123', text: '<@UBOT1> review the frontend PR' }, config, [
+      PR,
+    ]).intent;
     expect(intent).toBe('PR_REVIEW');
   });
 
-  it('changes nothing unless asked: without the option a question with a PR link is still a review', () => {
-    expect(normalizeTask({ ...baseEvent, userId: 'U123', text: `<@UBOT1> is ${PR} live yet?` }, config).intent).toBe(
-      'PR_REVIEW',
-    );
-    expect(isPrReviewRequest(`is ${PR} live yet?`)).toBe(true);
-    expect(isPrReviewRequest(`is ${PR} live yet?`, [], { explicitOnly: true })).toBe(false);
+  it('is the only form of the gate: "no change verb" beside a PR link is not a review ask', () => {
+    expect(isPrReviewRequest(`is ${PR} live yet?`)).toBe(false);
+    expect(isPrReviewRequest(`review ${PR}`)).toBe(true);
   });
 });
 
@@ -658,26 +649,19 @@ describe('a mention made in passing (issue #448)', () => {
     expect(direct).not.toHaveProperty('mentionReference');
   });
 
-  it('fires no keyword gate while the tool-router decides: the router reads it first', () => {
+  it('fires no keyword gate: the router reads it first', () => {
     const text = `<@UOWNER1> I've resolved <@UBOT1>'s comments, please review ${PR}`;
-    const task = (options?: { routerDecides: boolean }) =>
-      normalizeTask({ ...baseEvent, userId: 'U123', text }, config, [], options);
 
-    expect(task({ routerDecides: true }).intent).toBe('IMPLEMENTATION');
-    // Without the router deciding nothing changes: the review gate still fires.
-    expect(task().intent).toBe('PR_REVIEW');
-    expect(task({ routerDecides: false }).intent).toBe('PR_REVIEW');
+    expect(normalizeTask({ ...baseEvent, userId: 'U123', text }, config, []).intent).toBe('IMPLEMENTATION');
   });
 
-  it('never seeds a deploy from keywords while the tool-router decides (issue #428)', () => {
-    const seed = (text: string, routerDecides: boolean) =>
-      normalizeTask({ ...baseEvent, userId: 'U123', text }, config, [], { routerDecides }).intent;
+  it('never seeds a deploy from keywords (issue #428)', () => {
+    const seed = (text: string) => normalizeTask({ ...baseEvent, userId: 'U123', text }, config, []).intent;
 
     // The router reads it first, and code checks its answer: the keywords are only a hint.
-    expect(seed('<@UBOT1> deploy newton-web to production', true)).toBe('IMPLEMENTATION');
-    expect(seed('<@UOWNER1> can you deploy newton-web to production? cc <@UBOT1>', true)).toBe('IMPLEMENTATION');
-    // Without the router deciding, the keyword gate is as it was.
-    expect(seed('<@UBOT1> deploy newton-web to production', false)).toBe('DEPLOY');
+    expect(seed('<@UBOT1> deploy newton-web to production')).toBe('IMPLEMENTATION');
+    expect(seed('<@UOWNER1> can you deploy newton-web to production? cc <@UBOT1>')).toBe('IMPLEMENTATION');
+    expect(seed('<@UBOT1> ship prod')).toBe('IMPLEMENTATION');
   });
 });
 
@@ -706,12 +690,12 @@ describe('leadingDeployTarget (issue #428)', () => {
   });
 });
 
-describe('review asks that tag the owner, while the tool-router decides (issue #430)', () => {
+describe('review asks that tag the owner (issue #430)', () => {
   const PR = 'https://github.com/Newton-School/newton-web/pull/9210';
   const link = `<${PR}|github.com/Newton-School/newton-web/pull/9210>`;
   const CORE_DEV = '<!subteam^S02HXP05ZNJ>';
-  const seed = (text: string, routerDecides = true, threadTexts: string[] = []) =>
-    normalizeTask({ ...baseEvent, userId: 'U123', text }, config, threadTexts, { routerDecides }).intent;
+  const seed = (text: string, threadTexts: string[] = []) =>
+    normalizeTask({ ...baseEvent, userId: 'U123', text }, config, threadTexts).intent;
 
   it('seeds a review for the sentences that were reviewed, sent to the change pipeline or ignored at random', () => {
     expect(seed(`${CORE_DEV} <@UOWNER1> Please review, approve, merge. ${link}`)).toBe('PR_REVIEW');
@@ -730,31 +714,23 @@ describe('review asks that tag the owner, while the tool-router decides (issue #
     expect(seed(`<@UOWNER1> is ${link} live yet?`)).toBe('UNKNOWN');
     expect(seed(`<@UOWNER1> please merge on priority ${link}`)).toBe('UNKNOWN');
     // The link has to be in the message itself: no thread tier for a message written to a person.
-    expect(seed('<@UOWNER1> please review', true, [PR])).toBe('UNKNOWN');
+    expect(seed('<@UOWNER1> please review', [PR])).toBe('UNKNOWN');
   });
 
   it('counts "review and merge" as a review ask for a direct mention too', () => {
     expect(seed(`<@UBOT1> review and merge ${link}`)).toBe('PR_REVIEW');
     expect(seed(`<@UBOT1> please review & approve <${PR}>`)).toBe('PR_REVIEW');
   });
-
-  it('changes nothing unless the router decides', () => {
-    expect(seed(`${CORE_DEV} <@UOWNER1> please review ${link}`, false)).toBe('UNKNOWN');
-    expect(seed(`<@UBOT1> review and merge ${link}`, false)).toBe('IMPLEMENTATION');
-  });
 });
 
 describe('the line miniOG offers for deferred PRs routes as a review (issue #442)', () => {
   const thread = [9155, 9156, 9157, 9158, 9159, 9160].map(n => `https://github.com/Newton-School/newton-web/pull/${n}`);
 
-  it.each([true, false])('with the router deciding: %s', routerDecides => {
+  it('by the thread tier of the review gate', () => {
     const task = normalizeTask(
       { ...baseEvent, userId: 'U123', text: '<@UBOT1> review #9158 #9159 #9160' },
       config,
       thread,
-      {
-        routerDecides,
-      },
     );
 
     expect(task.intent).toBe('PR_REVIEW');

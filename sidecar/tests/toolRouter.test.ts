@@ -5,7 +5,6 @@ import {
   mayDeploy,
   outcomeToLegacyIntent,
   parseRouterDecision,
-  readToolRouterMode,
   type RouterFacts,
   type RouterOutcome,
 } from '../src/router/toolRouter.js';
@@ -274,8 +273,21 @@ describe('buildRouterFacts', () => {
     );
   });
 
-  it('passes a gate match as a hint and marks an owner mention', () => {
-    expect(buildRouterFacts(task({ intent: 'DEPLOY' }), 'm').hints).toEqual(['deploy keywords matched']);
+  it('passes a gate match and the deploy keywords as hints, and marks an owner mention', () => {
+    expect(buildRouterFacts(task({ intent: 'PR_REVIEW' }), 'm').hints).toEqual(['review gate matched']);
+    // The deploy keywords seed nothing any more; the router is told they were there.
+    const event = {
+      eventId: 'e',
+      channelId: 'C',
+      threadTs: '1.1',
+      eventTs: '1.1',
+      userId: 'U',
+      text: '<@UBOT1> deploy newton-web to production',
+      rawEvent: {},
+    };
+    expect(buildRouterFacts(task({ event }), 'deploy newton-web to production').hints).toEqual([
+      'deploy keywords matched',
+    ]);
     expect(buildRouterFacts(task({ mentionType: 'owner' }), 'm')).toMatchObject({
       addressing: 'owner_mention',
       hints: [],
@@ -286,26 +298,6 @@ describe('buildRouterFacts', () => {
     const clarification = { question: 'What should I check?', askedText: 'check now' };
     expect(buildRouterFacts(task({ clarification }), 'the login redirect').answering).toEqual(clarification);
     expect(buildRouterFacts(task(), 'm')).not.toHaveProperty('answering');
-  });
-});
-
-describe('readToolRouterMode', () => {
-  it('defaults to shadow, and reads legacy and on from the store', () => {
-    expect(readToolRouterMode(undefined)).toBe('shadow');
-    expect(readToolRouterMode({})).toBe('shadow');
-    expect(readToolRouterMode({ getState: () => 'legacy' })).toBe('legacy');
-    expect(readToolRouterMode({ getState: () => 'on' })).toBe('on');
-    expect(readToolRouterMode({ getState: () => 'nonsense' })).toBe('shadow');
-  });
-
-  it('falls back to shadow when the store throws', () => {
-    expect(
-      readToolRouterMode({
-        getState: () => {
-          throw new Error('db closed');
-        },
-      }),
-    ).toBe('shadow');
   });
 });
 
