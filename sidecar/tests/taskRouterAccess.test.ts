@@ -1299,6 +1299,34 @@ describe('routeTask lets the tool-router decide when it is on (issue #456)', () 
       expect(failed.result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
       expect(failed.slack.chat.postMessage).not.toHaveBeenCalled();
     });
+
+    // A message that mentions miniOG in passing is seeded as a change request
+    // like any other mention. When the router's read of it was unsure, the
+    // confidence floor kept that seed, and the change pipeline started on a
+    // message written to someone else.
+    it.each([
+      ['chat', 0.6],
+      ['review_pr', 0.6],
+    ])('never falls back to the change pipeline when the router is unsure (%s at %s)', async (tool, confidence) => {
+      routerSays(tool, confidence);
+
+      const { result, slack, logStep } = await route(text, inPassing, { config: makeConfig('enforce') });
+
+      expect(runImplementationWorkflow).not.toHaveBeenCalled();
+      expect(runAgenticPrReview).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
+      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+      expect(stageLog(logStep, 'router.classify.low_confidence_hold')).toBeUndefined();
+      expect(stageLog(logStep, 'router.unsure_in_passing').data).toMatchObject({ tool, confidence });
+    });
+
+    it('still acts on a confident decision', async () => {
+      routerSays('review_pr', 0.9);
+
+      const { result } = await route(text, inPassing, { config: makeConfig('enforce') });
+
+      expect(result.workflow).toBe('PR_REVIEW');
+    });
   });
 
   it('leaves the keyword gates deciding: a gate-seeded review runs and the router is only shadowed', async () => {

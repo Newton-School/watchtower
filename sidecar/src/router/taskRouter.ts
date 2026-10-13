@@ -339,6 +339,27 @@ export async function routeTask(params: {
             : clarify.kind === 'ask' && clarify.reason === 'owner_mention_change'
               ? classification.intent
               : 'INFORMATIONAL';
+      } else if (holdOverride && routerDecision?.tool && !routerDecision.failed) {
+        // The router was unsure and the message was not addressed to miniOG (a
+        // direct address became a question above). The floor used to keep the
+        // keyword seed here, and every mention is seeded as a change request:
+        // a message that names miniOG in passing started the change pipeline.
+        // Nobody asked miniOG for anything it is sure of, so nothing runs
+        // (issue #448).
+        logStep?.({
+          stage: 'router.unsure_in_passing',
+          message:
+            `Router proposed ${routerDecision.tool} at confidence=${classification.confidence.toFixed(2)} ` +
+            `(below ${CLASSIFIER_CONFIDENCE_FLOOR.toFixed(2)}) for a message not addressed to miniOG — staying silent.`,
+          data: {
+            tool: routerDecision.tool,
+            confidence: classification.confidence,
+            seedIntent: task.intent,
+            addressing: addressingOf(task),
+            reasoning: classification.reasoning,
+          },
+        });
+        resolvedIntent = 'NONE';
       } else if (holdOverride) {
         logStep?.({
           stage: 'router.classify.low_confidence_hold',
