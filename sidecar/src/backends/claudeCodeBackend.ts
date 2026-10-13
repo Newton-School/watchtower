@@ -197,6 +197,25 @@ export const NO_TOOLS_ARGS = [
   '--disable-slash-commands',
 ];
 
+/**
+ * The value for `--mcp-config`: a file beside the run's output when there are
+ * servers to name, inline JSON when there are none. A server URL can carry a
+ * credential in its query string, and a command line is readable by every
+ * process on the machine; the run's temp directory is private and is removed
+ * with the run. Falls back to inline JSON if the file cannot be written.
+ */
+export function mcpConfigArg(servers: NonNullable<AgentRunRequest['mcpServers']>, outputPath: string): string {
+  const json = JSON.stringify({ mcpServers: servers });
+  if (Object.keys(servers).length === 0) return json;
+  try {
+    const file = path.join(path.dirname(outputPath), 'mcp-servers.json');
+    fsSync.writeFileSync(file, json, { mode: 0o600 });
+    return file;
+  } catch {
+    return json;
+  }
+}
+
 /** Name downloaded thread images and PDFs in the prompt so the agent opens them with Read. */
 export function withImageReadInstructions(prompt: string, imagePaths: string[] | undefined): string {
   if (!imagePaths || imagePaths.length === 0) return prompt;
@@ -226,7 +245,7 @@ export const claudeCodeBackend: AgentBackend = {
     return true;
   },
 
-  buildArgs(request: AgentRunRequest, _outputPath: string): string[] {
+  buildArgs(request: AgentRunRequest, outputPath: string): string[] {
     const args: string[] = [];
     const prompt = withImageReadInstructions(request.prompt, request.imagePaths);
     if (request.resumeSessionId) {
@@ -290,12 +309,12 @@ export const claudeCodeBackend: AgentBackend = {
     // when nothing is named (issue #443). `--strict-mcp-config` makes the CLI
     // ignore the host user's global and project MCP config, their plugins'
     // servers and their claude.ai connectors; without it every agent had all
-    // of them. Inline JSON avoids a temp file. `--dangerously-skip-permissions`
+    // of them. `--dangerously-skip-permissions`
     // (set above in non-plan mode) auto-allows the listed servers' tools;
     // OAuth HTTP servers reuse the CLI's Keychain-cached token, which requires
     // HOME in buildEnv. `--mcp-config` is variadic, so a flag must follow it.
     if (!request.noTools) {
-      args.push('--mcp-config', JSON.stringify({ mcpServers: request.mcpServers ?? {} }), '--strict-mcp-config');
+      args.push('--mcp-config', mcpConfigArg(request.mcpServers ?? {}, outputPath), '--strict-mcp-config');
     }
     // Claude Code writes JSON to stdout when --output-format json is set.
     // The generic runner captures stdout and falls back to it when the

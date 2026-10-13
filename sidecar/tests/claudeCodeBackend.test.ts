@@ -4,6 +4,7 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   claudeCodeBackend,
+  mcpConfigArg,
   NO_TOOLS_ARGS,
   stripPlanHarnessMeta,
   PROCESS_KILL_DENY_RULES,
@@ -570,16 +571,32 @@ describe('claudeCodeBackend MCP + env wiring (scoped investigation)', () => {
     prompt: 'investigate',
   } as Parameters<typeof claudeCodeBackend.buildArgs>[0];
 
-  it('emits --mcp-config + --strict-mcp-config when mcpServers is set', () => {
+  // A server URL can carry a credential in its query string; a command line
+  // is readable by every process on the machine.
+  it('names the servers in a private file beside the run output, not on the command line', () => {
+    const runDir = fs.mkdtempSync(path.join(os.tmpdir(), 'watchtower-backend-test-'));
+    const servers = { openpanel: { type: 'http' as const, url: 'https://op.example/mcp?token=s3cret' } };
+    try {
+      const args = claudeCodeBackend.buildArgs({ ...baseRequest, mcpServers: servers }, path.join(runDir, 'out.json'));
+      const file = args[args.indexOf('--mcp-config') + 1];
+
+      expect(file).toBe(path.join(runDir, 'mcp-servers.json'));
+      expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual({ mcpServers: servers });
+      expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+      expect(args.join(' ')).not.toContain('s3cret');
+      expect(args[args.indexOf('--mcp-config') + 2]).toBe('--strict-mcp-config');
+    } finally {
+      fs.rmSync(runDir, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to inline JSON when the file cannot be written', () => {
+    const servers = { metabase: { type: 'http' as const, url: 'https://mb/api/mcp' } };
     const args = claudeCodeBackend.buildArgs(
-      { ...baseRequest, mcpServers: { metabase: { type: 'http', url: 'https://mb/api/mcp' } } },
-      '/tmp/out.json',
+      { ...baseRequest, mcpServers: servers },
+      '/nonexistent-watchtower-dir/out.json',
     );
-    const idx = args.indexOf('--mcp-config');
-    expect(idx).toBeGreaterThanOrEqual(0);
-    expect(JSON.parse(args[idx + 1])).toEqual({
-      mcpServers: { metabase: { type: 'http', url: 'https://mb/api/mcp' } },
-    });
+    expect(JSON.parse(args[args.indexOf('--mcp-config') + 1])).toEqual({ mcpServers: servers });
     expect(args).toContain('--strict-mcp-config');
   });
 
@@ -613,8 +630,9 @@ describe('claudeCodeBackend MCP + env wiring (scoped investigation)', () => {
       args: ['--from', 'pkg', 'serve'],
       env: { BASE_URL: 'https://x' },
     };
-    const args = claudeCodeBackend.buildArgs({ ...baseRequest, mcpServers: { admin: server } }, '/tmp/out.json');
-    expect(JSON.parse(args[args.indexOf('--mcp-config') + 1])).toEqual({ mcpServers: { admin: server } });
+    expect(JSON.parse(mcpConfigArg({ admin: server }, '/nonexistent-watchtower-dir/out.json'))).toEqual({
+      mcpServers: { admin: server },
+    });
   });
 
   it("adds a run's own deny rules after the ones every run gets", () => {

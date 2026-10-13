@@ -4,6 +4,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   __connectors,
+  connectorPromptBlock,
   connectorsFor,
   currentConnectors,
   describeConnectorPolicy,
@@ -74,14 +75,20 @@ describe('connectorsFor', () => {
     expect(connectorsFor('none', config)).toEqual({ mcpServers: {}, disallowedTools: [], unavailable: [] });
   });
 
-  it('gives a lookup Metabase, with everything that changes it denied', () => {
+  it('gives a lookup the database and product analytics, with everything that changes them denied', () => {
     expect(connectorsFor('lookup', config)).toEqual({
-      mcpServers: { metabase: { type: 'http', url: 'https://metabase.example/api/mcp' } },
+      mcpServers: {
+        metabase: { type: 'http', url: 'https://metabase.example/api/mcp' },
+        openpanel: { type: 'http', url: 'https://openpanel.example/mcp' },
+      },
       disallowedTools: [
         'mcp__metabase__create_*',
         'mcp__metabase__update_*',
         'mcp__metabase__delete_*',
         'mcp__metabase__archive_*',
+        'mcp__openpanel__create_*',
+        'mcp__openpanel__update_*',
+        'mcp__openpanel__delete_*',
       ],
       unavailable: [],
     });
@@ -129,11 +136,13 @@ describe('connectorsFor', () => {
     expect(removed.filter(tool => !denied(tool))).toEqual([]);
   });
 
-  it('never hands out a server the policy does not name', () => {
+  it('never hands out a server the policy does not name for that kind of run', () => {
     for (const profile of ['none', 'lookup', 'code_change', 'code_change_admin'] as const) {
       const names = Object.keys(connectorsFor(profile, config).mcpServers);
-      expect(names).not.toContain('openpanel');
+      // The host has Grafana; no agent gets it.
       expect(names).not.toContain('newton-grafana-prod');
+      // Analytics is for lookups, not for a run that changes code.
+      if (profile !== 'lookup') expect(names).not.toContain('openpanel');
     }
   });
 
@@ -144,7 +153,7 @@ describe('connectorsFor', () => {
     expect(connectorsFor('lookup', noMetabase)).toEqual({
       mcpServers: {},
       disallowedTools: [],
-      unavailable: ['metabase'],
+      unavailable: ['metabase', 'openpanel'],
     });
     expect(connectorsFor('code_change_admin', config)).toEqual({
       mcpServers: {},
@@ -155,11 +164,44 @@ describe('connectorsFor', () => {
 
   it('describes the policy for an agent asked what it can reach', () => {
     expect(describeConnectorPolicy(noMetabase)).toEqual([
-      'lookups and investigations: metabase (read-only) [not set up on this host]',
+      'lookups and investigations: metabase (read-only) [not set up on this host], openpanel (read-only)',
       'code changes: figma',
       'code changes for an admin: figma, newton-admin (upload only)',
       'every other run: none',
     ]);
+  });
+});
+
+describe('connectorPromptBlock', () => {
+  it('says nothing to a run without connectors', () => {
+    expect(connectorPromptBlock(NO_CONNECTORS)).toBeUndefined();
+  });
+
+  it('names what the run has, what to do when it is out of reach, and that there is nothing else', () => {
+    const block = connectorPromptBlock({
+      mcpServers: {
+        metabase: { type: 'http', url: 'https://metabase.example/api/mcp' },
+        openpanel: { type: 'http', url: 'https://openpanel.example/mcp' },
+      },
+      disallowedTools: [],
+      unavailable: [],
+    });
+
+    expect(block).toContain('- `mcp__metabase__*` (read-only): the database');
+    expect(block).toContain('- `mcp__openpanel__*` (read-only): product analytics');
+    expect(block).toContain('say plainly that you could not reach it');
+    expect(block).toContain('You have no other connectors');
+  });
+
+  it('lists only the connectors this run was given', () => {
+    const block = connectorPromptBlock({
+      mcpServers: { openpanel: { type: 'http', url: 'https://openpanel.example/mcp' } },
+      disallowedTools: [],
+      unavailable: ['metabase'],
+    });
+
+    expect(block).toContain('mcp__openpanel__*');
+    expect(block).not.toContain('mcp__metabase__*');
   });
 });
 

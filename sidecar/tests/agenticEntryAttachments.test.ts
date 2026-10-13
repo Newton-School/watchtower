@@ -6,7 +6,7 @@ import type { WebClient } from '@slack/web-api';
 import { runAgenticEntry } from '../src/agentic/agenticEntry.js';
 import { runClaudeAgentic } from '../src/agentic/runClaude.js';
 import { botScopes } from '../src/slack/botScopes.js';
-import { currentConnectors } from '../src/backends/connectors.js';
+import { __connectors, currentConnectors } from '../src/backends/connectors.js';
 import { JobStore } from '../src/state/jobStore.js';
 import type { AppConfig, NormalizedTask, NormalizedThreadMessage } from '../src/types/contracts.js';
 
@@ -290,15 +290,39 @@ describe('runAgenticEntry and connectors', () => {
     await connectorsSeenBy('informational', 'how many students enrolled last week?');
     const prompt = vi.mocked(runClaudeAgentic).mock.calls[0][0].systemPrompt;
 
-    expect(prompt).toContain('tools named `mcp__metabase__*`');
-    expect(prompt).toContain('say plainly that you could not reach the database');
+    expect(prompt).toContain('`mcp__metabase__*` (read-only): the database');
+    expect(prompt).toContain('say plainly that you could not reach it');
     expect(prompt).toContain('You have no other connectors');
+    expect(prompt).not.toContain('mcp__openpanel__');
   });
 
   it('says nothing about a database to a chat reply', async () => {
     await connectorsSeenBy('conversational', 'thanks!');
 
     expect(vi.mocked(runClaudeAgentic).mock.calls[0][0].systemPrompt).not.toContain('mcp__metabase__');
+  });
+
+  it('adds OpenPanel when the host has it, and tells the lookup so', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'watchtower-agentic-home-'));
+    const realHome = __connectors.home;
+    __connectors.home = () => home;
+    fs.writeFileSync(
+      path.join(home, '.claude.json'),
+      JSON.stringify({ mcpServers: { openpanel: { type: 'http', url: 'https://openpanel.example/mcp?token=t' } } }),
+    );
+    try {
+      const seen = await connectorsSeenBy('informational', 'how many signups came from the banner last week?');
+      const prompt = vi.mocked(runClaudeAgentic).mock.calls[0][0].systemPrompt;
+
+      expect(Object.keys(seen?.mcpServers ?? {})).toEqual(['metabase', 'openpanel']);
+      expect(seen?.disallowedTools).toContain('mcp__openpanel__update_*');
+      expect(prompt).toContain('`mcp__openpanel__*` (read-only): product analytics');
+      // The URL, which can carry a credential, is never put in the prompt.
+      expect(prompt).not.toContain('openpanel.example');
+    } finally {
+      __connectors.home = realHome;
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it('gives a chat reply and a QA run none', async () => {
