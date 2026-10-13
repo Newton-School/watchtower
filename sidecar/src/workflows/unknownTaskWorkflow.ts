@@ -123,24 +123,11 @@ function normalizeReply(reply: string): string {
     .filter(Boolean)
     .filter(sentence => !HUMOR_MARKER_PATTERN.test(sentence));
 
-  if (plainSentences.length > 0) {
-    candidate = plainSentences.join(' ');
+  const text = plainSentences.length > 0 ? plainSentences.join(' ') : candidate;
+  if (wasQuestion && !/[.?!]$/.test(text)) {
+    return `${text}?`;
   }
-
-  const questionMatch = candidate.match(/^[^?]*\?/);
-  if (questionMatch && !HUMOR_MARKER_PATTERN.test(questionMatch[0])) {
-    return questionMatch[0].trim();
-  }
-
-  const sentenceMatch = candidate.match(/^[^.?!]*[.?!]?/);
-  const fallback = (sentenceMatch?.[0] ?? candidate).trim();
-  if (!fallback) {
-    return '';
-  }
-  if (wasQuestion && !fallback.endsWith('?')) {
-    return `${fallback}?`;
-  }
-  return fallback;
+  return text;
 }
 
 function sanitizeReply(reply: string | undefined, userId: string, track: UnknownReplyTrack): string {

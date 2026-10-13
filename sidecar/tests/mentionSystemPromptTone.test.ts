@@ -57,18 +57,13 @@ describe('mentionSystemPrompt STE writing style', () => {
     }
   });
 
-  it('gives JSON and cleaned-summary workflows the sentence rules only', () => {
-    for (const workflow of ['IMPLEMENTATION', 'INVESTIGATION'] as const) {
+  it('gives JSON, cleaned-summary and one-line workflows the sentence rules only', () => {
+    for (const workflow of ['IMPLEMENTATION', 'INVESTIGATION', 'UNKNOWN'] as const) {
       const prompt = buildMentionSystemPrompt({ task: makeTask(), workflow });
       expect(prompt).toContain(STE_CORE_STYLE_BLOCK);
       expect(prompt).not.toContain('Use bullet lists');
       expect(prompt).not.toContain('One topic per paragraph');
     }
-  });
-
-  it('leaves the STE rules out of the one-sentence UNKNOWN reply', () => {
-    const prompt = buildMentionSystemPrompt({ task: makeTask(), workflow: 'UNKNOWN' });
-    expect(prompt).not.toContain('ASD-STE100');
   });
 
   it('puts the STE block after the role guidance, at the end of the prompt', () => {

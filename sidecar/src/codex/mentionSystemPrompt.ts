@@ -65,31 +65,10 @@ export function buildMentionSystemPrompt(params: {
     );
   }
 
-  const styleBlock = styleBlockFor(workflow);
-  if (styleBlock) {
-    lines.push('', styleBlock);
-  }
+  const sentenceRulesOnly = workflow === 'IMPLEMENTATION' || workflow === 'INVESTIGATION' || workflow === 'UNKNOWN';
+  lines.push('', sentenceRulesOnly ? STE_CORE_STYLE_BLOCK : STE_REPLY_STYLE_BLOCK);
 
   return lines.join('\n');
-}
-
-/**
- * The STE variant that fits how each workflow posts the model's text:
- * - UNKNOWN posts only the first sentence of a reply of at most 24 words, so it gets none.
- * - IMPLEMENTATION and INVESTIGATION text goes through JSON fields, `sanitizeOwnerSummary`
- *   (drops "-" lines) or single-line Slack emphasis, so it gets the sentence rules only.
- * - Other workflows post the reply as written and get the full block.
- */
-function styleBlockFor(workflow: MentionPromptWorkflow): string | undefined {
-  switch (workflow) {
-    case 'UNKNOWN':
-      return undefined;
-    case 'IMPLEMENTATION':
-    case 'INVESTIGATION':
-      return STE_CORE_STYLE_BLOCK;
-    default:
-      return STE_REPLY_STYLE_BLOCK;
-  }
 }
 
 function toneLineFor(mode: PersonalityMode): string {
