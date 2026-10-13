@@ -1,12 +1,10 @@
 import type { NormalizedTask, WorkflowIntent, WorkflowStepLogger } from '../types/contracts.js';
 import { formatThreadContextForClassifier, isPresencePing } from '../workflows/shared/workflowUtils.js';
-import type { IntentClassification } from './classifyIntent.js';
 import { classifyDeployTarget, leadingDeployTarget } from './intentParser.js';
 import {
   decideTool,
   mayDeploy,
   outcomeToLegacyIntent,
-  readToolRouterMode,
   type RouterFacts,
   type RouterOutcome,
   type RouterTool,
@@ -15,27 +13,32 @@ import {
 /**
  * The tool-router's one call per routed mention (issue #456).
  *
- * In `shadow` mode it runs beside the legacy path and logs what it would have
- * done, without deciding anything: the log is the evidence for handing each
- * decision over. That call is detached. Nothing waits for it, its failure is
- * invisible to the job, and its result may land in the job's log after the
- * job has finished.
+ * It decides what a message asks for wherever a keyword gate did not. The
+ * gates that remain (an explicit review ask, a QA ask, the exact-syntax
+ * commands) still settle their workflow from the wording alone; for a
+ * gate-decided message the same call runs detached and only logs what the
+ * router would have chosen beside what the gate chose (`router.shadow`).
+ * Nothing waits for that call, and its result may land in the job's log
+ * after the job has finished. That log is the evidence for handing a gate
+ * over.
  *
- * In `on` mode the same call stands in for the intent classifier, and only
- * for it: a message a keyword gate already decided is still only shadowed.
+ * The file and several names here date from when the router ran beside an
+ * intent classifier (`shadow`) before replacing it (`on`). The classifier and
+ * the mode switch are gone; the names and the log fields were kept so rows
+ * written before and after read the same.
  */
 
 /** What settled the workflow that ran. */
-export type LegacyDecidedBy = 'gate' | 'resume_gate' | 'classifier' | 'router';
+export type LegacyDecidedBy = 'gate' | 'resume_gate' | 'router';
 
 /** Seeds reached by exact syntax; there is nothing for a router to decide. */
 const EXACT_SYNTAX_SEEDS = new Set<WorkflowIntent>(['DEV_ASSIST', 'MINIOG_DOSSIER']);
 
 const GATE_HINTS: Partial<Record<WorkflowIntent, string>> = {
-  DEPLOY: 'deploy keywords matched',
   PR_REVIEW: 'review gate matched',
   WEBAPP_QA: 'QA gate matched',
 };
+const DEPLOY_KEYWORDS_HINT = 'deploy keywords matched';
 
 /** How a message reached miniOG, in the router's terms. */
 export function addressingOf(
@@ -48,12 +51,12 @@ export function addressingOf(
 export function buildRouterFacts(task: NormalizedTask, userMessage: string): RouterFacts {
   const prs = task.prContexts ?? [];
   const inTrigger = prs.some(pr => pr.source === 'trigger');
-  // With the router on the deploy keywords no longer seed DEPLOY, so the hint
-  // is read from the message, as the gate read it. The target that can allow
-  // a deploy is held to more: the message has to lead with the ask.
+  // The deploy keywords do not seed a workflow; they are a hint, read from the
+  // message as the old gate read it. The target that can allow a deploy is
+  // held to more: the message has to lead with the ask.
   const text = task.event.text ?? '';
   const deployTarget = leadingDeployTarget(text) ?? undefined;
-  const hint = GATE_HINTS[task.intent] ?? (classifyDeployTarget(text) ? GATE_HINTS.DEPLOY : undefined);
+  const hint = GATE_HINTS[task.intent] ?? (classifyDeployTarget(text) ? DEPLOY_KEYWORDS_HINT : undefined);
   return {
     message: userMessage,
     addressing: addressingOf(task),
@@ -96,8 +99,11 @@ export function routerWouldRun(outcome: RouterOutcome): string {
 const sameWorkflow = (legacy: WorkflowIntent, router: string): boolean =>
   (legacy === 'OWNER_AUTOPILOT' ? 'IMPLEMENTATION' : legacy) === router;
 
-/** A router decision in the classifier's shape. */
-export interface RouterClassification extends IntentClassification {
+/** A router decision, mapped to the workflow intent it runs as. */
+export interface RouterClassification {
+  intent: WorkflowIntent;
+  confidence: number;
+  reasoning: string;
   /** The router could not decide, even on a second try. `intent` is then the low-risk fallback. */
   failed: boolean;
   /** What the router named, before it was mapped to an intent. Absent when it failed. */
@@ -109,12 +115,7 @@ export interface RouterClassification extends IntentClassification {
 }
 
 export interface RouterShadow {
-  /** True in `on` mode: the router's decision is used where the classifier's was. */
-  decides: boolean;
-  /**
-   * The router's decision in the shape the classifier returned, for the code
-   * that consumed a classification. Waits for the call; never rejects.
-   */
+  /** The router's decision as a workflow intent. Waits for the call; never rejects. */
   asClassification(): Promise<RouterClassification>;
   /**
    * Call once a workflow is settled on. Logs what the router said; returns at once.
@@ -124,69 +125,62 @@ export interface RouterShadow {
   compare(legacy: { intent: WorkflowIntent; decidedBy: LegacyDecidedBy; did?: string; ran?: string }): void;
 }
 
+/** The decision used when the router cannot be asked or fails twice: never more than a lookup. */
+export function failedClassification(addressing: RouterFacts['addressing']): RouterClassification {
+  const intent = outcomeToLegacyIntent({ ok: false, error: 'router unavailable', durationMs: 0 }, addressing);
+  return {
+    intent,
+    // A lookup for a direct ask, silence for anything else.
+    confidence: addressing === 'owner_mention' ? 0.5 : 0,
+    reasoning: `Router failed; using low-risk ${intent} fallback.`,
+    failed: true,
+  };
+}
+
 export function startRouterShadow(params: {
   task: NormalizedTask;
   userMessage: string;
-  store: { getState?: (key: string) => string | undefined } | undefined;
   logStep?: WorkflowStepLogger;
   signal?: AbortSignal;
   decide?: typeof decideTool;
 }): RouterShadow | undefined {
-  const { task, userMessage, store, logStep, signal } = params;
-  const mode = readToolRouterMode(store);
-  if (mode === 'legacy') return undefined;
-  const decides = mode === 'on';
-  // Shadowing with nowhere to log would be a call nobody reads.
-  if (!decides && !logStep) return undefined;
+  const { task, userMessage, logStep, signal } = params;
+  // Exact syntax and presence pings need no model to read them.
   if (EXACT_SYNTAX_SEEDS.has(task.intent) || isPresencePing(userMessage)) return undefined;
 
   const facts = buildRouterFacts(task, userMessage);
-  // A shadow call gets no logger: it must not move the Slack status line.
   const call = (): Promise<RouterOutcome> =>
-    (params.decide ?? decideTool)({
-      facts,
-      signal,
-      role: decides ? 'router' : 'router_shadow',
-      ...(decides ? { logStep } : {}),
-    }).catch((error): RouterOutcome => ({ ok: false, error: String(error), durationMs: 0 }));
-  // A deciding call gets one more try: a failure here used to become a silent
-  // lookup or silence (issue #440). A shadow call decides nothing, so it does not.
-  const pending = decides
-    ? call().then(first => {
-        if (first.ok || signal?.aborted) return first;
-        logStep?.({
-          stage: 'router.decision.retry',
-          message: 'Router call failed — trying once more.',
-          level: 'WARN',
-          data: { error: first.error, durationMs: first.durationMs },
-        });
-        return call();
-      })
-    : call();
+    (params.decide ?? decideTool)({ facts, signal, role: 'router', logStep }).catch(
+      (error): RouterOutcome => ({ ok: false, error: String(error), durationMs: 0 }),
+    );
+  // One more try: a failure here used to become a silent lookup or silence (issue #440).
+  const pending = call().then(first => {
+    if (first.ok || signal?.aborted) return first;
+    logStep?.({
+      stage: 'router.decision.retry',
+      message: 'Router call failed — trying once more.',
+      level: 'WARN',
+      data: { error: first.error, durationMs: first.durationMs },
+    });
+    return call();
+  });
 
   return {
-    decides,
     async asClassification() {
       const outcome = await pending;
       const deployAllowed = mayDeploy(facts);
-      const intent = outcomeToLegacyIntent(outcome, facts.addressing, { allowDeploy: deployAllowed });
       if (!outcome.ok) {
+        const fallback = failedClassification(facts.addressing);
         logStep?.({
           stage: 'router.decision.fallback',
-          message: `Router call failed twice — using ${intent} fallback.`,
+          message: `Router call failed twice — using ${fallback.intent} fallback.`,
           level: 'WARN',
           data: { error: outcome.error, durationMs: outcome.durationMs },
         });
-        // The classifier's own fallbacks: a lookup for a direct ask, silence for an owner mention.
-        return {
-          intent,
-          confidence: facts.addressing === 'owner_mention' ? 0.5 : 0,
-          reasoning: `Router failed; using low-risk ${intent} fallback.`,
-          failed: true,
-        };
+        return fallback;
       }
       return {
-        intent,
+        intent: outcomeToLegacyIntent(outcome, facts.addressing, { allowDeploy: deployAllowed }),
         confidence: outcome.decision.confidence,
         reasoning: outcome.decision.reason,
         failed: false,
@@ -206,16 +200,17 @@ export function startRouterShadow(params: {
             stage: routerDecided ? 'router.decision' : 'router.shadow',
             message: routerDecided
               ? `Router chose ${outcome.ok ? outcome.decision.tool : 'nothing (the call failed)'}; ${legacy.did ?? `running ${legacy.intent}`}.`
-              : `Router (shadow) would run ${wouldRun}; the legacy path ran ${legacy.intent} — ${agree ? 'agree' : 'differ'}.`,
+              : `Router (shadow) would run ${wouldRun}; the ${legacy.decidedBy === 'gate' ? 'keyword gate' : 'resume gate'} ran ${legacy.intent} — ${agree ? 'agree' : 'differ'}.`,
             level: 'INFO',
             data: {
-              mode,
+              // Constant since the mode switch was removed; kept so old and new rows filter alike.
+              mode: 'on',
               agree,
               legacySeed: task.intent,
               legacyIntent: legacy.intent,
               legacyDecidedBy: legacy.decidedBy,
               routerWouldRun: wouldRun,
-              // What the router would be allowed to run in place of the classifier today.
+              // The intent the router's choice maps to (a deploy only where code allows one).
               routerAsClassifier: outcomeToLegacyIntent(outcome, facts.addressing, { allowDeploy: mayDeploy(facts) }),
               ...(outcome.ok
                 ? {

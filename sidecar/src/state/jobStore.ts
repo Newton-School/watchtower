@@ -1383,38 +1383,6 @@ export class JobStore {
     };
   }
 
-  latestJobForThread(
-    channelId: string,
-    threadTs: string,
-  ): { workflow: WorkflowIntent; status: JobRecord['status']; updatedAt: string } | undefined {
-    const row = this.db
-      .prepare(
-        `SELECT workflow, status, updated_at
-         FROM jobs
-         WHERE channel_id = ?
-           AND thread_ts = ?
-         ORDER BY updated_at DESC
-         LIMIT 1`,
-      )
-      .get(channelId, threadTs) as
-      | {
-          workflow?: WorkflowIntent;
-          status?: JobRecord['status'];
-          updated_at?: string;
-        }
-      | undefined;
-
-    if (!row?.workflow || !row?.status || !row?.updated_at) {
-      return undefined;
-    }
-
-    return {
-      workflow: row.workflow,
-      status: row.status,
-      updatedAt: row.updated_at,
-    };
-  }
-
   /**
    * Find a PAUSED job in this thread that should be resumed by the next
    * @miniOG mention. The stale window is 24h since paused jobs can sit
@@ -1929,61 +1897,6 @@ export class JobStore {
       dataJson: row.data_json ?? undefined,
       createdAt: row.created_at,
     }));
-  }
-
-  saveIntentCorrection(input: {
-    channelId: string;
-    userId: string;
-    phraseKey: string;
-    correctedIntent: WorkflowIntent;
-  }): void {
-    const now = new Date().toISOString();
-    this.db
-      .prepare(
-        `INSERT INTO intent_corrections(
-           channel_id, user_id, phrase_key, corrected_intent, hits, created_at, updated_at
-         ) VALUES(?, ?, ?, ?, 1, ?, ?)
-         ON CONFLICT(channel_id, user_id, phrase_key) DO UPDATE SET
-           corrected_intent = excluded.corrected_intent,
-           hits = intent_corrections.hits + 1,
-           updated_at = excluded.updated_at`,
-      )
-      .run(input.channelId, input.userId, input.phraseKey, input.correctedIntent, now, now);
-  }
-
-  findIntentCorrection(input: { channelId: string; userId: string; phraseKey: string }): WorkflowIntent | undefined {
-    const exact = this.db
-      .prepare(
-        `SELECT corrected_intent
-         FROM intent_corrections
-         WHERE channel_id = ?
-           AND user_id = ?
-           AND phrase_key = ?
-         LIMIT 1`,
-      )
-      .get(input.channelId, input.userId, input.phraseKey) as { corrected_intent?: WorkflowIntent } | undefined;
-    if (exact?.corrected_intent) {
-      return exact.corrected_intent;
-    }
-
-    const stem = input.phraseKey.slice(0, 24);
-    if (!stem) {
-      return undefined;
-    }
-
-    const fuzzy = this.db
-      .prepare(
-        `SELECT corrected_intent
-         FROM intent_corrections
-         WHERE channel_id = ?
-           AND user_id = ?
-           AND phrase_key LIKE ?
-         ORDER BY hits DESC, updated_at DESC
-         LIMIT 1`,
-      )
-      .get(input.channelId, input.userId, `${stem}%`) as { corrected_intent?: WorkflowIntent } | undefined;
-
-    return fuzzy?.corrected_intent;
   }
 
   setPersonalityProfile(input: {
@@ -2980,7 +2893,8 @@ export class JobStore {
     workflow: WorkflowIntent;
     intent: WorkflowIntent;
     status: JobRecord['status'];
-    correctionApplied: boolean;
+    /** Always false since learned intent corrections were removed; the column is kept for the dossier. */
+    correctionApplied?: boolean;
     errorKind?: string;
     personalityMode?: PersonalityMode;
     repo?: string;

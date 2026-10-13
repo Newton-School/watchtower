@@ -13,7 +13,6 @@ import { formatJobTrace } from './shared/traceFormatter.js';
 import { parseDevAssistCommand } from '../router/devAssistParser.js';
 import { cancelJob, getActiveJobIds } from '../state/activeJobs.js';
 import { loadPolicies, getPolicySnapshot } from '../policies/evaluator.js';
-import { loadWorkflowTemplates, getWorkflowTemplates } from './registry.js';
 import type { JobStore } from '../state/jobStore.js';
 
 const HELP_TEXT = [
@@ -41,8 +40,6 @@ const HELP_TEXT = [
   '- `wt policy show` -> show current policy pack and active rules',
   '- `wt policy reload` -> reload markdown policy engine rules from .policies/',
   '- `wt incident on|off` -> enable/disable incident commander cadence in this channel',
-  '- `wt workflow list` -> list registered file-based workflow templates',
-  '- `wt workflow reload` -> reload workflow templates from .workflows/',
   '- `wt my queue [n]` -> show your prioritized pending work queue',
   '',
   'More commands are being added in the next updates.',
@@ -951,60 +948,6 @@ export async function runDevAssistWorkflow(params: {
       result: {
         command: 'INCIDENT_SET',
         enabled: command.enabled,
-      },
-    };
-  }
-
-  if (command.type === 'WORKFLOW_LIST') {
-    const templates = getWorkflowTemplates();
-    const text =
-      templates.length > 0
-        ? [
-            `Registered workflow templates (${templates.length}):`,
-            ...templates.map(
-              (t, i) =>
-                `${i + 1}. *${t.name}* — ${t.description || 'no description'} (triggers: ${t.triggers.join(', ') || 'none'})`,
-            ),
-          ].join('\n')
-        : 'No workflow templates registered. Add templates to `.workflows/` directory.';
-
-    await slack.chat.postMessage({
-      channel: task.event.channelId,
-      thread_ts: task.event.threadTs,
-      text,
-    });
-
-    return {
-      workflow: 'DEV_ASSIST',
-      status: 'SUCCESS',
-      message: 'Workflow templates listed.',
-      notifyDesktop: false,
-      slackPosted: true,
-      result: {
-        command: 'WORKFLOW_LIST',
-        count: templates.length,
-      },
-    };
-  }
-
-  if (command.type === 'WORKFLOW_RELOAD') {
-    loadWorkflowTemplates();
-    const templates = getWorkflowTemplates();
-    await slack.chat.postMessage({
-      channel: task.event.channelId,
-      thread_ts: task.event.threadTs,
-      text: `Workflow template registry reloaded. ${templates.length} template(s) loaded.`,
-    });
-
-    return {
-      workflow: 'DEV_ASSIST',
-      status: 'SUCCESS',
-      message: 'Workflow templates reloaded.',
-      notifyDesktop: false,
-      slackPosted: true,
-      result: {
-        command: 'WORKFLOW_RELOAD',
-        count: templates.length,
       },
     };
   }

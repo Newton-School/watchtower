@@ -289,32 +289,23 @@ export function isBarePrPaste(triggerText: string): boolean {
 }
 
 /**
- * Deterministic check: is the message asking for a PR review? Runs before
- * the AI classifier (pattern: isDeployRequest) so a message that carries
- * all its routing signal in plain text never depends on a CLI subprocess —
- * the issue #334 incident had "review <PR URL>" cascade into an
- * admin-clarify/cancel because the classifier call exited 1 (bug B).
+ * Deterministic check: is the message asking for a PR review? Runs before the
+ * tool-router (pattern: isWebappQaRequest) so a message that carries all its
+ * routing signal in plain text never depends on a CLI subprocess — the issue
+ * #334 incident had "review <PR URL>" cascade into an admin-clarify/cancel
+ * because a model call exited 1 (bug B).
  *
- * Tier 1 — a PR URL in the trigger message itself: fires when a review verb
- * is present, or when no conflicting change verb is present (so a bare URL
- * paste fires, but "fix the comments on <url>" falls through to the
- * classifier).
+ * Tier 1 — a PR URL in the trigger message itself: fires on its two
+ * unambiguous forms, a review verb with the URL, or a message that is
+ * nothing but mentions and PR links. A PR link with anything else around it
+ * (a question about the PR, a status update) is left to the tool-router: "no
+ * change verb" used to make it a review, and a PM's four questions about a
+ * merged PR got 13 inline review comments instead of answers (issue #447).
  * Tier 2 — review verb in the trigger, PR URL(s) elsewhere in the thread:
  * fires only when no conflicting change verb muddies the ask ("review and
- * fix X" is mixed intent — let the classifier decide).
- *
- * `explicitOnly` narrows Tier 1 to its two unambiguous forms: a review verb
- * with the URL, or a message that is nothing but mentions and PR links. A PR
- * link with anything else around it (a question about the PR, a status
- * update) is then left to the tool-router: "no change verb" used to make it
- * a review, and a PM's four questions about a merged PR got 13 inline review
- * comments instead of answers (issue #447).
+ * fix X" is mixed intent — let the router decide).
  */
-export function isPrReviewRequest(
-  triggerText: string,
-  threadTexts: string[] = [],
-  options: { explicitOnly?: boolean } = {},
-): boolean {
+export function isPrReviewRequest(triggerText: string, threadTexts: string[] = []): boolean {
   if (!triggerText) return false;
   const normalized = triggerText
     .replace(/<@[^>]+>/g, ' ')
@@ -322,21 +313,17 @@ export function isPrReviewRequest(
     .toLowerCase()
     .trim();
   // Slack delivers a link as <https://…> or <https://…|label>. The verb test
-  // looks for "review https://", so in explicit mode the brackets come off
-  // first: without the old "no change verb" fallback, "review <link>" would
-  // otherwise miss the gate it is the plainest case for.
-  const verbText = options.explicitOnly ? unwrapSlackLinks(normalized) : normalized;
-  // "Review and merge" asks for a review first, whatever follows it. Outside
-  // explicit mode "merge" is a conflicting verb and the classifier decided,
-  // which sent the same sentence to a review, to the change pipeline or to
+  // looks for "review https://", so the brackets come off first: "review
+  // <link>" is the plainest case for this gate.
+  const verbText = unwrapSlackLinks(normalized);
+  // "Review and merge" asks for a review first, whatever follows it. Left to
+  // a model, the same sentence went to a review, to the change pipeline or to
   // nothing on different days (issue #430).
-  const hasReviewVerb =
-    isReviewRequestVerb(verbText) || Boolean(options.explicitOnly && REVIEW_THEN_MERGE_RE.test(verbText));
+  const hasReviewVerb = isReviewRequestVerb(verbText) || REVIEW_THEN_MERGE_RE.test(verbText);
   const hasConflictingVerb = CONFLICTING_CHANGE_VERB_RE.test(normalized);
 
   if (GITHUB_PR_URL_TEST_RE.test(triggerText)) {
-    if (options.explicitOnly) return hasReviewVerb || isBarePrPaste(triggerText);
-    return hasReviewVerb || !hasConflictingVerb;
+    return hasReviewVerb || isBarePrPaste(triggerText);
   }
 
   if (hasReviewVerb && !hasConflictingVerb) {
@@ -509,11 +496,10 @@ function inferIntent(
   config: AppConfig,
   mention: MentionInfo,
   threadTexts: string[] = [],
-  options: NormalizeTaskOptions = {},
 ): { intent: WorkflowIntent; miniogSubcommand?: MiniogSubcommand } {
   // A keyword gate acts without a second opinion, so it needs a direct address.
-  // While the tool-router decides, a mention in passing is left to it (issue #448).
-  const directBotMention = mention.detected && mention.type === 'bot' && !(options.routerDecides && mention.reference);
+  // A mention in passing is left to the tool-router (issue #448).
+  const directBotMention = mention.detected && mention.type === 'bot' && !mention.reference;
   // Dossier subcommands (whoami / set-role / forget) take precedence over every other route
   // when the bot is mentioned. They are read-only or operator-self-edit commands and
   // must not bleed into the AI classifier.
@@ -532,28 +518,17 @@ function inferIntent(
     return { intent: 'DEV_ASSIST' };
   }
 
-  // Deterministic deploy detection — routed before the AI classifier, which
-  // cannot emit DEPLOY. Every deploy-shaped ask (newton-web, marketing, or
-  // ambiguous between the frontends) lands on the DEPLOY intent here;
-  // deployWorkflow re-derives the target the same way and resolves
-  // 'ambiguous' with config.
-  //
-  // Direct address only (an @miniOG mention or a DM). A message that merely
-  // tags the owner is a conversation between people; its wording must never
-  // start a production deploy (issue #428).
-  // While the tool-router decides, the keywords are only a hint to it: "Deploy
-  // order: …" in a review request for a newton-web PR used to start the
-  // production deploy workflow from here (issue #428).
-  if (directBotMention && !options.routerDecides && classifyDeployTarget(event.text ?? '') !== null) {
-    return { intent: 'DEPLOY' };
-  }
+  // No deploy gate. The wording used to seed the DEPLOY workflow from here,
+  // and "Deploy order: …" in a review request for a newton-web PR started the
+  // production deploy workflow (issue #428). A deploy now starts only when the
+  // tool-router reads the message as one and code finds the target at the
+  // head of it (`mayDeploy`); the keywords reach the router as a hint.
 
   // Deterministic PR-review detection — before the owner/default seeding so
-  // owners get it too. Seeding PR_REVIEW here (reviewer tier) skips the AI
-  // classifier in routeTask entirely: a "review <PR URL>" message routes
-  // identically whether the classifier CLI is healthy or down (issue #334
-  // bug B), and the access check evaluates reviewer tier directly with no
-  // override for the confidence guardrail to hold.
+  // owners get it too. Seeding PR_REVIEW here (reviewer tier) does not wait
+  // for the tool-router in routeTask: a "review <PR URL>" message routes
+  // identically whether the model CLI is healthy or down (issue #334 bug B),
+  // and the access check evaluates reviewer tier directly.
   // Deterministic webapp-QA-on-PR detection — MUST run before the PR-review
   // gate below, which fires on any PR URL without a conflicting verb. "test
   // this PR <url>" means "browser-test the PR's running code", not "code-review
@@ -564,7 +539,7 @@ function inferIntent(
     return { intent: 'WEBAPP_QA' };
   }
 
-  if (directBotMention && isPrReviewRequest(event.text ?? '', threadTexts, { explicitOnly: options.routerDecides })) {
+  if (directBotMention && isPrReviewRequest(event.text ?? '', threadTexts)) {
     return { intent: 'PR_REVIEW' };
   }
 
@@ -572,39 +547,34 @@ function inferIntent(
   // gets the same gate, in its explicit forms and with the link in the message
   // itself. Left to a model call, the same "please review <PR>" was reviewed,
   // sent to the change pipeline or ignored on different days (issue #430).
-  if (
-    options.routerDecides &&
-    mention.detected &&
-    mention.type === 'owner' &&
-    isPrReviewRequest(event.text ?? '', [], { explicitOnly: true })
-  ) {
+  if (mention.detected && mention.type === 'owner' && isPrReviewRequest(event.text ?? '')) {
     return { intent: 'PR_REVIEW' };
   }
 
   // Deterministic webapp-QA detection — before the owner/default seeding so
   // owners get it too. "QA the login flow on <url>" carries all its routing
-  // signal in plain text (a QA verb + a non-PR/Metabase URL), so it skips the
-  // AI classifier in routeTask and never misroutes to INVESTIGATION.
+  // signal in plain text (a QA verb + a non-PR/Metabase URL), so it does not
+  // wait for the tool-router in routeTask and never misroutes to INVESTIGATION.
   if (directBotMention && isWebappQaRequest(event.text ?? '')) {
     return { intent: 'WEBAPP_QA' };
   }
 
-  // Intent classification (PR_REVIEW, INFORMATIONAL, etc.) is handled by the
-  // AI classifier in routeTask. Here we set the pre-classifier default:
-  // - Owners: OWNER_AUTOPILOT (preserves owner-only relaxed prompt path in implementationWorkflow).
-  // - Non-owners: IMPLEMENTATION. Both intents map to the same required access level
-  //   (builder) and the same downstream workflow, but the IMPLEMENTATION label avoids
-  //   tagging non-owner jobs with an owner-implying name.
+  // What the message asks for is decided by the tool-router in routeTask. The
+  // seed set here is the label the job starts under and the access tier the
+  // router's decision is compared against (the confidence floor in routeTask):
+  // - Owners: OWNER_AUTOPILOT (preserves the owner-only relaxed prompt path in implementationWorkflow).
+  // - Non-owners: IMPLEMENTATION. Both map to the same required access level
+  //   (builder) and the same downstream workflow, but the IMPLEMENTATION label
+  //   avoids tagging non-owner jobs with an owner-implying name.
   //
-  // Exception — Metabase URLs from non-owners seed as INFORMATIONAL. RCA of
-  // Saksham's "explain this table" denial (2026-05-25 thread p1779707644097049)
-  // showed that seeding IMPLEMENTATION here forces the AI classifier to *drop*
-  // the tier (IMPLEMENTATION → INFORMATIONAL), which trips the access-drop
-  // confidence guardrail at `router.classify.low_confidence_hold` when the
-  // classifier lands below 0.75 confidence. Pre-seeding INFORMATIONAL avoids
-  // the drop entirely; the guardrail allows upward overrides at any confidence
-  // so a genuine "modify this Metabase query" request can still upgrade. Owners
-  // are unaffected (their access check is bypassed), so we keep OWNER_AUTOPILOT.
+  // Exception — Metabase URLs from non-owners seed as INFORMATIONAL. RCA of an
+  // "explain this table" denial (2026-05-25 thread p1779707644097049) showed
+  // that seeding IMPLEMENTATION forces the decision to *drop* the tier
+  // (IMPLEMENTATION → INFORMATIONAL), which tripped the access-drop confidence
+  // floor when the confidence came in below 0.75. Seeding INFORMATIONAL avoids
+  // the drop; upward overrides are allowed at any confidence, so a genuine
+  // "modify this Metabase query" request can still upgrade. Owners are
+  // unaffected (their access check is bypassed), so they keep OWNER_AUTOPILOT.
   if (mention.detected && mention.type === 'bot') {
     const isOwner = config.ownerSlackUserIds.includes(event.userId);
     if (isOwner) {
@@ -619,21 +589,10 @@ function inferIntent(
   return { intent: 'UNKNOWN' };
 }
 
-export interface NormalizeTaskOptions {
-  /**
-   * Set while the tool-router decides. The keyword gates then leave it what
-   * they cannot be sure of: the review gate fires only on an explicit review
-   * ask or a bare PR paste (issue #447), and no gate fires on a mention made
-   * in passing (issue #448).
-   */
-  routerDecides?: boolean;
-}
-
 export function normalizeTask(
   event: SlackEventEnvelope,
   config: AppConfig,
   threadTexts: string[] = [],
-  options: NormalizeTaskOptions = {},
 ): NormalizedTask {
   const mention = detectMention(event.text, config, event.channelType);
   const isOwnerAuthor = config.ownerSlackUserIds.includes(event.userId);
@@ -641,7 +600,7 @@ export function normalizeTask(
   const prContexts = extractAllPrContexts({ triggerText: event.text, threadTexts });
   const first = prContexts[0];
   const prContext = first ? { url: first.url, owner: first.owner, repo: first.repo, number: first.number } : undefined;
-  const inferred = inferIntent(event, config, mention, threadTexts, options);
+  const inferred = inferIntent(event, config, mention, threadTexts);
 
   return {
     event,

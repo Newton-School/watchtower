@@ -2,6 +2,8 @@
 
 **Date:** 2026-08-03 · **Live backend:** `claude-code` (`app_settings.agent_backend`) · **CLI:** `claude` 2.1.220
 
+> **Later change (2026-10).** The workflow-intent classifier this audit lists (`router/classifyIntent.ts`) no longer exists. The tool-router (`router/toolRouter.ts`, issue #456) makes that one call now; rows that cite the classifier are history.
+
 Every model and effort decision in the sidecar resolves through **one 24-line table**:
 `sidecar/src/codex/modelProfiles.ts`. There are exactly three claude-code values in it, and
 they set the model for all 40+ agent call sites in the system.

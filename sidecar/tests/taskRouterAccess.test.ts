@@ -9,7 +9,6 @@ const runDevAssistWorkflow = vi.fn();
 const runDeployWorkflow = vi.fn();
 const runAgenticEntry = vi.fn();
 const runUnknownTaskWorkflow = vi.fn();
-const classifyWorkflowIntent = vi.fn();
 const decideTool = vi.fn();
 
 vi.mock('../src/agentic/agenticPrReview.js', () => ({
@@ -40,24 +39,30 @@ vi.mock('../src/workflows/unknownTaskWorkflow.js', () => ({
   runUnknownTaskWorkflow,
 }));
 
-// The tool-router runs in shadow beside every routed mention (issue #456).
-// Stub its model call so no test can spawn the real CLI; keep the rest real.
+// The tool-router decides every routed mention a keyword gate has not (issue
+// #456). Stub its model call so no test can spawn the real CLI; keep the rest real.
 vi.mock('../src/router/toolRouter.js', async importOriginal => ({
   ...(await importOriginal<typeof import('../src/router/toolRouter.js')>()),
   decideTool,
 }));
 
-vi.mock('../src/router/classifyIntent.js', () => ({
-  classifyWorkflowIntent,
-}));
+/** The tool the router names for each workflow a test wants run. */
+const TOOL_FOR_INTENT = {
+  PR_REVIEW: 'review_pr',
+  IMPLEMENTATION: 'change_code',
+  INVESTIGATION: 'investigate',
+  INFORMATIONAL: 'answer',
+  CONVERSATIONAL: 'chat',
+} as const;
 
-vi.mock('../src/workflows/matcher.js', () => ({
-  matchWorkflowTemplate: vi.fn().mockReturnValue(undefined),
-}));
-
-vi.mock('../src/workflows/registry.js', () => ({
-  getWorkflowTemplates: vi.fn().mockReturnValue([]),
-}));
+/** Make the router read the message as a request for `intent`. */
+function routerPicks(intent: keyof typeof TOOL_FOR_INTENT, confidence = 0.91, reason = 'stubbed decision'): void {
+  decideTool.mockResolvedValue({
+    ok: true,
+    decision: { tool: TOOL_FOR_INTENT[intent], confidence, reason },
+    durationMs: 1,
+  });
+}
 
 vi.mock('../src/workflows/shared/workflowUtils.js', async () => {
   const actual = await vi.importActual('../src/workflows/shared/workflowUtils.js');
@@ -175,13 +180,8 @@ function makeSlack() {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  // Shadow router: by default it "fails", which must never matter to a job.
-  decideTool.mockResolvedValue({ ok: false, error: 'stubbed', durationMs: 0 });
-  classifyWorkflowIntent.mockResolvedValue({
-    intent: 'PR_REVIEW',
-    confidence: 0.91,
-    reasoning: 'review request',
-  });
+  // Unless a test says otherwise, the router reads the message as a review request.
+  routerPicks('PR_REVIEW', 0.91, 'review request');
   runAgenticPrReview.mockResolvedValue({
     workflow: 'PR_REVIEW',
     status: 'SUCCESS',
@@ -342,11 +342,7 @@ describe('routeTask access control', () => {
   it('allows DMs from users in a group with allowIm enabled', async () => {
     const config = makeConfig('audit');
     const slack = makeSlack();
-    classifyWorkflowIntent.mockResolvedValueOnce({
-      intent: 'CONVERSATIONAL',
-      confidence: 0.9,
-      reasoning: 'casual chat',
-    });
+    routerPicks('CONVERSATIONAL', 0.9, 'casual chat');
 
     const result = await routeTask({
       task: makeTask({
@@ -388,13 +384,19 @@ describe('routeTask access control', () => {
   it('blocks builders from deploy and lets the owner bypass', async () => {
     const config = makeConfig('enforce');
     const slack = makeSlack();
+    // A deploy starts only when the router reads one and code finds the target at the head of the message.
+    decideTool.mockResolvedValue({
+      ok: true,
+      decision: { tool: 'deploy', confidence: 0.95, reason: 'asks for a production deploy' },
+      durationMs: 1,
+    });
 
     const blocked = await routeTask({
       task: makeTask({
         userId: 'UBUILDER',
         channelId: 'C-BUILD',
-        text: '<@UBOT1> deploy prod',
-        intent: 'DEPLOY',
+        text: '<@UBOT1> deploy newton-web to production',
+        intent: 'IMPLEMENTATION',
       }),
       config,
       slack: slack as never,
@@ -409,8 +411,7 @@ describe('routeTask access control', () => {
       task: makeTask({
         userId: 'UOWNER1',
         channelId: 'C-UNLISTED',
-        text: '<@UBOT1> deploy prod',
-        intent: 'DEPLOY',
+        text: '<@UBOT1> deploy newton-web to production',
       }),
       config,
       slack: makeSlack() as never,
@@ -433,7 +434,9 @@ describe('routeTask investigation resume gate', () => {
     return { investigationStore, dossierStore, getForThread, getPersonalityMode: vi.fn().mockReturnValue('normal') };
   }
 
-  it('routes "yes" with pending findings to IMPLEMENTATION for non-owner (bypasses classifier)', async () => {
+  it('routes "yes" with pending findings to IMPLEMENTATION for non-owner (the gate decides, not the router)', async () => {
+    // The router would read a bare "yes" as chat; the gate does not wait for it.
+    routerPicks('CONVERSATIONAL', 0.95, 'just a yes');
     const config = makeConfig('enforce');
     const slack = makeSlack();
     const logStep = vi.fn();
@@ -454,7 +457,7 @@ describe('routeTask investigation resume gate', () => {
 
     expect(result.status).toBe('SUCCESS');
     expect(runImplementationWorkflow).toHaveBeenCalledOnce();
-    expect(classifyWorkflowIntent).not.toHaveBeenCalled();
+    expect(runAgenticEntry).not.toHaveBeenCalled();
     expect(store.getForThread).toHaveBeenCalledWith('111.22');
     expect(logStep).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -485,7 +488,6 @@ describe('routeTask investigation resume gate', () => {
 
     expect(result.status).toBe('SUCCESS');
     expect(runImplementationWorkflow).toHaveBeenCalledOnce();
-    expect(classifyWorkflowIntent).not.toHaveBeenCalled();
     expect(logStep).toHaveBeenCalledWith(
       expect.objectContaining({
         stage: 'router.investigation.resume_gate',
@@ -494,19 +496,15 @@ describe('routeTask investigation resume gate', () => {
     );
   });
 
-  it('falls through to the classifier when affirmation has no pending findings', async () => {
+  it('falls through to the router when affirmation has no pending findings', async () => {
     // No investigation_findings row for this thread — gate must not fire.
-    // Confidence ≥ 0.75 so the classifier confidence floor (D3) accepts the
-    // override; this test exists to verify the resume-gate path specifically.
+    // Confidence ≥ 0.75 so the confidence floor accepts the decision; this
+    // test exists to verify the resume-gate path specifically.
     const config = makeConfig('enforce');
     const slack = makeSlack();
     const logStep = vi.fn();
     const store = storeWithFindings(undefined);
-    classifyWorkflowIntent.mockResolvedValueOnce({
-      intent: 'CONVERSATIONAL',
-      confidence: 0.85,
-      reasoning: 'just a yes',
-    });
+    routerPicks('CONVERSATIONAL', 0.85, 'just a yes');
 
     const result = await routeTask({
       task: makeTask({
@@ -521,28 +519,24 @@ describe('routeTask investigation resume gate', () => {
       logStep,
     });
 
-    expect(classifyWorkflowIntent).toHaveBeenCalledOnce();
+    expect(decideTool).toHaveBeenCalledOnce();
     expect(runImplementationWorkflow).not.toHaveBeenCalled();
     expect(runAgenticEntry).toHaveBeenCalledOnce();
     expect(result.status).toBe('SUCCESS');
     expect(logStep).not.toHaveBeenCalledWith(expect.objectContaining({ stage: 'router.investigation.resume_gate' }));
   });
 
-  it('holds the original intent when a low-confidence classifier override drops the access tier', async () => {
+  it('neither chats nor keeps the keyword seed when a low-confidence decision would drop the access tier', async () => {
     // Regression for RCA Slack thread p1779086230428739 (2026-05-18). A bare
-    // "yes" tagged at miniOG used to get reclassified IMPLEMENTATION →
-    // CONVERSATIONAL at confidence 0.60 — the conversational workflow then
-    // hallucinated a "fix done" reply. The floor refuses the override when
-    // confidence < 0.75 AND the proposed intent requires a strictly lower
-    // access tier (CONVERSATIONAL → viewer, IMPLEMENTATION → builder).
+    // "yes" tagged at miniOG was read as chat at confidence 0.60 — the
+    // conversational workflow then hallucinated a "fix done" reply. The floor
+    // refuses a decision below 0.75 that drops the access tier and could claim
+    // completion. It used to run the keyword seed (the change pipeline)
+    // instead; now the requester is asked one question (issue #431).
     const config = makeConfig('enforce');
     const slack = makeSlack();
     const logStep = vi.fn();
-    classifyWorkflowIntent.mockResolvedValueOnce({
-      intent: 'CONVERSATIONAL',
-      confidence: 0.6,
-      reasoning: 'short message',
-    });
+    routerPicks('CONVERSATIONAL', 0.6, 'short message');
 
     const result = await routeTask({
       task: makeTask({
@@ -557,34 +551,23 @@ describe('routeTask investigation resume gate', () => {
       logStep,
     });
 
-    expect(classifyWorkflowIntent).toHaveBeenCalledOnce();
-    expect(runImplementationWorkflow).toHaveBeenCalledOnce(); // original intent honored
     expect(runAgenticEntry).not.toHaveBeenCalled();
-    expect(result.status).toBe('SUCCESS');
+    expect(runImplementationWorkflow).not.toHaveBeenCalled();
+    expect(result.status).toBe('PAUSED');
+    expect(slack.chat.postMessage.mock.calls[0][0].text).toContain('<@UBUILDER> ');
     expect(logStep).toHaveBeenCalledWith(
       expect.objectContaining({
-        stage: 'router.classify.low_confidence_hold',
-        level: 'WARN',
-        data: expect.objectContaining({
-          originalIntent: 'IMPLEMENTATION',
-          classifiedIntent: 'CONVERSATIONAL',
-          confidence: 0.6,
-          originalRequiredLevel: 'builder',
-          proposedRequiredLevel: 'viewer',
-        }),
+        stage: 'router.clarify.decided',
+        data: expect.objectContaining({ action: 'ask', tool: 'chat', confidence: 0.6, seedIntent: 'IMPLEMENTATION' }),
       }),
     );
   });
 
   it('accepts a high-confidence access-dropping override', async () => {
-    // 0.80 ≥ 0.75 floor — classifier judgment is trusted.
+    // 0.80 ≥ 0.75 floor — the decision is trusted.
     const config = makeConfig('enforce');
     const slack = makeSlack();
-    classifyWorkflowIntent.mockResolvedValueOnce({
-      intent: 'CONVERSATIONAL',
-      confidence: 0.8,
-      reasoning: 'clearly chat',
-    });
+    routerPicks('CONVERSATIONAL', 0.8, 'clearly chat');
 
     await routeTask({
       task: makeTask({
@@ -603,23 +586,20 @@ describe('routeTask investigation resume gate', () => {
     expect(runAgenticEntry).toHaveBeenCalledOnce();
   });
 
-  it('does not gate sideways/upward overrides regardless of confidence', async () => {
-    // INFORMATIONAL (viewer) → IMPLEMENTATION (builder) raises the tier; the
-    // floor only applies to access-dropping moves. A low-confidence upward
-    // shift is still acceptable because access checks still gate it.
+  it('does not hold an upward decision, whatever its confidence', async () => {
+    // INFORMATIONAL (viewer) → PR_REVIEW (reviewer) raises the tier; the floor
+    // only applies to access-dropping moves, because the access check still
+    // gates an upward one. (A low-confidence change_code is asked about
+    // instead: see "asking instead of guessing".)
     const config = makeConfig('enforce');
     const slack = makeSlack();
-    classifyWorkflowIntent.mockResolvedValueOnce({
-      intent: 'IMPLEMENTATION',
-      confidence: 0.5,
-      reasoning: 'might be a fix request',
-    });
+    routerPicks('PR_REVIEW', 0.5, 'might be a review request');
 
     await routeTask({
       task: makeTask({
-        userId: 'UBUILDER',
-        channelId: 'C-BUILD',
-        text: '<@UBOT1> please look into this',
+        userId: 'UREVIEW',
+        channelId: 'C-REVIEW',
+        text: '<@UBOT1> please look at this one',
         intent: 'INFORMATIONAL',
       }),
       config,
@@ -628,7 +608,7 @@ describe('routeTask investigation resume gate', () => {
       logStep: vi.fn(),
     });
 
-    expect(runImplementationWorkflow).toHaveBeenCalledOnce();
+    expect(runAgenticPrReview).toHaveBeenCalledOnce();
     expect(runAgenticEntry).not.toHaveBeenCalled();
   });
 
@@ -640,11 +620,7 @@ describe('routeTask investigation resume gate', () => {
     const config = makeConfig('enforce');
     const slack = makeSlack();
     const logStep = vi.fn();
-    classifyWorkflowIntent.mockResolvedValueOnce({
-      intent: 'INFORMATIONAL',
-      confidence: 0.72,
-      reasoning: 'this is a how-does-it-work question',
-    });
+    routerPicks('INFORMATIONAL', 0.72, 'this is a how-does-it-work question');
 
     await routeTask({
       task: makeTask({
@@ -662,7 +638,7 @@ describe('routeTask investigation resume gate', () => {
     expect(runImplementationWorkflow).not.toHaveBeenCalled();
     expect(runAgenticEntry).toHaveBeenCalledOnce();
     expect(runAgenticEntry).toHaveBeenCalledWith(expect.objectContaining({ mode: 'informational' }));
-    expect(logStep).not.toHaveBeenCalledWith(expect.objectContaining({ stage: 'router.classify.low_confidence_hold' }));
+    expect(slack.chat.postMessage).not.toHaveBeenCalled();
     expect(logStep).toHaveBeenCalledWith(
       expect.objectContaining({
         stage: 'router.classify.override',
@@ -681,11 +657,7 @@ describe('routeTask investigation resume gate', () => {
     const config = makeConfig('enforce');
     const slack = makeSlack();
     const logStep = vi.fn();
-    classifyWorkflowIntent.mockResolvedValueOnce({
-      intent: 'INVESTIGATION',
-      confidence: 0.72,
-      reasoning: 'reported odd behavior, no anchor — diagnose first',
-    });
+    routerPicks('INVESTIGATION', 0.72, 'reported odd behavior, no anchor — diagnose first');
 
     await routeTask({
       task: makeTask({
@@ -702,21 +674,17 @@ describe('routeTask investigation resume gate', () => {
 
     expect(runImplementationWorkflow).not.toHaveBeenCalled();
     expect(runInvestigationWorkflow).toHaveBeenCalledOnce();
-    expect(logStep).not.toHaveBeenCalledWith(expect.objectContaining({ stage: 'router.classify.low_confidence_hold' }));
+    expect(logStep).not.toHaveBeenCalledWith(expect.objectContaining({ stage: 'router.clarify.decided' }));
   });
 
-  it('falls through to the classifier when text is not an affirmation, even with pending findings', async () => {
-    // Findings exist but the message is not a "yes, fix it" — classifier still
-    // decides intent. This is the path for "actually wait" / "no, the bug is X".
-    // Confidence ≥ 0.75 so the D3 floor accepts the override.
+  it('falls through to the router when text is not an affirmation, even with pending findings', async () => {
+    // Findings exist but the message is not a "yes, fix it" — the router still
+    // decides. This is the path for "actually wait" / "no, the bug is X".
+    // Confidence ≥ 0.75 so the floor accepts the decision.
     const config = makeConfig('enforce');
     const slack = makeSlack();
     const store = storeWithFindings({ summary: 'prior RCA' });
-    classifyWorkflowIntent.mockResolvedValueOnce({
-      intent: 'CONVERSATIONAL',
-      confidence: 0.85,
-      reasoning: 'follow-up discussion',
-    });
+    routerPicks('CONVERSATIONAL', 0.85, 'follow-up discussion');
 
     await routeTask({
       task: makeTask({
@@ -731,15 +699,17 @@ describe('routeTask investigation resume gate', () => {
       logStep: vi.fn(),
     });
 
-    expect(classifyWorkflowIntent).toHaveBeenCalledOnce();
+    expect(decideTool).toHaveBeenCalledOnce();
     expect(runImplementationWorkflow).not.toHaveBeenCalled();
   });
 });
 
 describe('deterministic PR_REVIEW seed (issue #334 bug B)', () => {
-  it('skips the AI classifier and dispatches the review at reviewer tier', async () => {
+  it('does not wait for the router and dispatches the review at reviewer tier', async () => {
     const config = makeConfig('enforce');
     const logStep = vi.fn();
+    // A model call that never comes back: the review must not depend on it.
+    decideTool.mockReturnValue(new Promise(() => {}));
 
     const result = await routeTask({
       task: makeTask({
@@ -761,20 +731,19 @@ describe('deterministic PR_REVIEW seed (issue #334 bug B)', () => {
     });
 
     expect(result.status).toBe('SUCCESS');
-    expect(classifyWorkflowIntent).not.toHaveBeenCalled();
     expect(runAgenticPrReview).toHaveBeenCalledOnce();
     expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'router.pr_review.deterministic' }));
   });
 
-  it('routes the review even when the classifier CLI is dead (the incident failure mode)', async () => {
+  it('routes the review even when the model CLI is dead (the incident failure mode)', async () => {
     // 2026-06-11 incident: "Please review <newton-web URL>" hit a classifier
     // CLI exit-1, fell back to INFORMATIONAL@0.00, the access-drop guardrail
     // held IMPLEMENTATION, and the implementation workflow asked admins
     // "web or api?" about a message that named the repo in its URL. With the
-    // deterministic seed the classifier is never consulted, so its health is
+    // deterministic seed no model call decides this, so its health is
     // irrelevant.
     const config = makeConfig('enforce');
-    classifyWorkflowIntent.mockRejectedValue(new Error('CLI exited 1'));
+    decideTool.mockRejectedValue(new Error('CLI exited 1'));
 
     const result = await routeTask({
       task: makeTask({
@@ -796,7 +765,6 @@ describe('deterministic PR_REVIEW seed (issue #334 bug B)', () => {
     });
 
     expect(result.status).toBe('SUCCESS');
-    expect(classifyWorkflowIntent).not.toHaveBeenCalled();
     expect(runAgenticPrReview).toHaveBeenCalledOnce();
   });
 });
@@ -809,120 +777,58 @@ describe('routeTask and the tool registry (issue #456)', () => {
   });
 });
 
-describe('routeTask runs the tool-router in shadow (issue #456)', () => {
+describe('routeTask and a message a keyword gate decided (issue #456)', () => {
   const settle = () => new Promise(resolve => setTimeout(resolve, 0));
   const shadowLog = (logStep: ReturnType<typeof vi.fn>) =>
     logStep.mock.calls.map(call => call[0]).find(entry => entry.stage === 'router.shadow');
 
-  async function route(text: string, store: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) {
+  async function route(text: string, extra: Record<string, unknown> = {}) {
     const logStep = vi.fn();
     const result = await routeTask({
       task: makeTask({ userId: 'UOWNER1', channelId: 'C-VIEW', text, ...extra }),
       config: makeConfig('audit'),
       slack: makeSlack() as never,
-      store: store as never,
+      store: {} as never,
       logStep,
     });
     await settle();
     return { result, logStep };
   }
 
-  it('asks the router beside the classifier and logs whether they agree, without changing what runs', async () => {
-    classifyWorkflowIntent.mockResolvedValue({ intent: 'INFORMATIONAL', confidence: 0.9, reasoning: 'a question' });
-    decideTool.mockResolvedValue({
-      ok: true,
-      decision: { tool: 'answer', confidence: 0.93, reason: 'a question about the code' },
-      durationMs: 812,
-    });
-
-    const { result, logStep } = await route('<@UBOT1> how does the login redirect work?');
-
-    expect(result.workflow).toBe('INFORMATIONAL');
-    expect(decideTool).toHaveBeenCalledTimes(1);
-    expect(decideTool.mock.calls[0][0]).toMatchObject({
-      role: 'router_shadow',
-      facts: { message: 'how does the login redirect work?', addressing: 'direct', hints: [] },
-    });
-    // No onLog: the shadow call must not move the Slack status line.
-    expect(decideTool.mock.calls[0][0].logStep).toBeUndefined();
-    expect(shadowLog(logStep).data).toMatchObject({
-      agree: true,
-      legacyIntent: 'INFORMATIONAL',
-      legacyDecidedBy: 'classifier',
-      routerWouldRun: 'INFORMATIONAL',
-      tool: 'answer',
-      confidence: 0.93,
-      durationMs: 812,
-    });
-  });
-
-  it('records a disagreement and still runs what the legacy path chose', async () => {
-    classifyWorkflowIntent.mockResolvedValue({ intent: 'INFORMATIONAL', confidence: 0.9, reasoning: 'q' });
-    decideTool.mockResolvedValue({
-      ok: true,
-      decision: { tool: 'ask_user', confidence: 0.8, reason: 'nothing to act on', question: 'What should I look at?' },
-      durationMs: 5,
-    });
-
-    const { result, logStep } = await route('<@UBOT1> check now');
-
-    expect(result.workflow).toBe('INFORMATIONAL');
-    expect(runAgenticEntry).toHaveBeenCalledTimes(1);
-    expect(shadowLog(logStep).data).toMatchObject({
-      agree: false,
-      routerWouldRun: 'ASK_USER',
-      routerAsClassifier: 'INFORMATIONAL',
-      question: 'What should I look at?',
-    });
-  });
-
-  it('shadows a message the keyword gate decided, and says a gate decided it', async () => {
+  it('runs what the gate chose and logs what the router would have run beside it', async () => {
     decideTool.mockResolvedValue({
       ok: true,
       decision: { tool: 'answer', confidence: 0.9, reason: 'a question about a merged PR' },
       durationMs: 5,
     });
 
-    const { result, logStep } = await route('<@UBOT1> is this merged?', {}, { intent: 'PR_REVIEW' });
+    const { result, logStep } = await route('<@UBOT1> is this merged?', { intent: 'PR_REVIEW' });
 
     expect(result.workflow).toBe('PR_REVIEW');
-    expect(classifyWorkflowIntent).not.toHaveBeenCalled();
+    expect(runAgenticEntry).not.toHaveBeenCalled();
     expect(decideTool.mock.calls[0][0].facts.hints).toEqual(['review gate matched']);
-    expect(shadowLog(logStep).data).toMatchObject({
-      agree: false,
-      legacyIntent: 'PR_REVIEW',
-      legacyDecidedBy: 'gate',
-      routerWouldRun: 'INFORMATIONAL',
+    expect(shadowLog(logStep)).toMatchObject({
+      message: 'Router (shadow) would run INFORMATIONAL; the keyword gate ran PR_REVIEW — differ.',
+      data: { agree: false, legacyIntent: 'PR_REVIEW', legacyDecidedBy: 'gate', routerWouldRun: 'INFORMATIONAL' },
     });
   });
 
   it('is unaffected when the router fails or throws', async () => {
-    classifyWorkflowIntent.mockResolvedValue({ intent: 'INFORMATIONAL', confidence: 0.9, reasoning: 'q' });
     decideTool.mockRejectedValue(new Error('spawn failed'));
 
-    const { result, logStep } = await route('<@UBOT1> how does the login redirect work?');
+    const { result, logStep } = await route('<@UBOT1> review this', { intent: 'PR_REVIEW' });
 
-    expect(result.status).toBe('SUCCESS');
+    expect(result).toMatchObject({ workflow: 'PR_REVIEW', status: 'SUCCESS' });
     expect(shadowLog(logStep).data).toMatchObject({ agree: false, routerWouldRun: 'FAILED' });
-    // A shadow call decides nothing, so a failed one is not worth a second.
-    expect(decideTool).toHaveBeenCalledTimes(1);
-  });
-
-  it('does not run in legacy mode', async () => {
-    const store = { getState: (key: string) => (key === 'tool_router_mode' ? 'legacy' : undefined) };
-    const { logStep } = await route('<@UBOT1> how does the login redirect work?', store);
-
-    expect(decideTool).not.toHaveBeenCalled();
-    expect(shadowLog(logStep)).toBeUndefined();
   });
 
   it('skips exact-syntax commands, which leave nothing to decide', async () => {
-    await route('<@UBOT1> wt status', {}, { intent: 'DEV_ASSIST' });
+    await route('<@UBOT1> wt status', { intent: 'DEV_ASSIST' });
     expect(decideTool).not.toHaveBeenCalled();
   });
 });
 
-describe('routeTask lets the tool-router decide when it is on (issue #456)', () => {
+describe('routeTask lets the tool-router decide (issue #456)', () => {
   const settle = () => new Promise(resolve => setTimeout(resolve, 0));
   const stageLog = (logStep: ReturnType<typeof vi.fn>, stage: string) =>
     logStep.mock.calls.map(call => call[0]).find(entry => entry.stage === stage);
@@ -934,7 +840,7 @@ describe('routeTask lets the tool-router decide when it is on (issue #456)', () 
     });
 
   function onStore(extra: Record<string, unknown> = {}) {
-    return { getState: (key: string) => (key === 'tool_router_mode' ? 'on' : undefined), ...extra };
+    return { ...extra };
   }
 
   async function route(
@@ -971,15 +877,14 @@ describe('routeTask lets the tool-router decide when it is on (issue #456)', () 
     return { result, logStep, slack };
   }
 
-  it('uses the router where the classifier was, with one call and no classifier call', async () => {
+  it('decides with one router call', async () => {
     routerSays('answer', 0.93);
 
     const { result, logStep } = await route('<@UBOT1> how does the login redirect work?');
 
     expect(result.workflow).toBe('INFORMATIONAL');
-    expect(classifyWorkflowIntent).not.toHaveBeenCalled();
     expect(decideTool).toHaveBeenCalledTimes(1);
-    // The deciding call is the job's own: costed as the router and logged like the classifier's was.
+    // The deciding call is the job's own: costed as the router and logged in the job.
     expect(decideTool.mock.calls[0][0]).toMatchObject({ role: 'router', logStep });
     expect(stageLog(logStep, 'router.shadow')).toBeUndefined();
     expect(stageLog(logStep, 'router.decision')).toMatchObject({
@@ -1408,7 +1313,6 @@ describe('routeTask lets the tool-router decide when it is on (issue #456)', () 
       // The model was down for this one, which is the case #430 lost twice.
       expect(result.workflow).toBe('PR_REVIEW');
       expect(runAgenticPrReview).toHaveBeenCalledOnce();
-      expect(classifyWorkflowIntent).not.toHaveBeenCalled();
     });
 
     it('still reviews a PR posted with only its title, by the router', async () => {
@@ -1497,15 +1401,6 @@ describe('routeTask lets the tool-router decide when it is on (issue #456)', () 
     });
   });
 
-  it('leaves a gate-seeded deploy with the deploy gate', async () => {
-    routerSays('answer');
-
-    const { result } = await route('<@UBOT1> deploy newton-web to production', { intent: 'DEPLOY' });
-
-    expect(result.workflow).toBe('DEPLOY');
-    expect(runDeployWorkflow).toHaveBeenCalledOnce();
-  });
-
   it('leaves the "yes, fix it" resume gate ahead of the router', async () => {
     routerSays('chat', 0.99);
     const store = onStore({
@@ -1529,7 +1424,6 @@ describe('routeTask lets the tool-router decide when it is on (issue #456)', () 
     const { result } = await route('<@UBOT1> the dashboard looks off since morning', {}, { log: false });
 
     expect(result.workflow).toBe('INVESTIGATION');
-    expect(classifyWorkflowIntent).not.toHaveBeenCalled();
   });
 
   it('applies the access tiers to what the router chose', async () => {
