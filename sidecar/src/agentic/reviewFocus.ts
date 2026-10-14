@@ -25,10 +25,21 @@ const MIN_INSTRUCTION_CHARS = 15;
 
 export const FOCUS_PROMPT_MARKER = 'focus extractor';
 
-/** Trigger text minus Slack mentions and PR URLs — the verbatim instruction. */
+/**
+ * The footer the Claude Slack app appends ("*Sent using* <@Claude>"). It is
+ * not part of what the person asked: read as an instruction it became "review
+ * *Sent using*", and each lens wrote a note about it (issue #555).
+ */
+const SLACK_APP_FOOTER_RE = /\*sent using\*[\s\S]*$/i;
+
+export function withoutSlackAppFooter(text: string): string {
+  return text.replace(SLACK_APP_FOOTER_RE, '').trim();
+}
+
+/** Trigger text minus the app footer, Slack mentions and PR URLs — the verbatim instruction. */
 function deterministicInstruction(triggerText: string): string | undefined {
-  const stripped = triggerText
-    .replace(/<@[A-Z0-9]+>/g, ' ')
+  const stripped = withoutSlackAppFooter(triggerText)
+    .replace(/<@[A-Z0-9]+(?:\|[^>]*)?>/g, ' ')
     .replace(/<https?:\/\/[^>|\s]+(?:\|[^>]*)?>/g, ' ')
     .replace(/https?:\/\/\S+/g, ' ')
     .replace(/\s+/g, ' ')
@@ -62,7 +73,8 @@ export async function extractUserFocus(params: {
   logStep?: WorkflowStepLogger;
   signal?: AbortSignal;
 }): Promise<{ focusBlock: string }> {
-  const { triggerText, threadTexts, logStep, signal } = params;
+  const { threadTexts, logStep, signal } = params;
+  const triggerText = withoutSlackAppFooter(params.triggerText);
   const runAgent = params.runAgent ?? runCodex;
   const instruction = deterministicInstruction(triggerText);
 
