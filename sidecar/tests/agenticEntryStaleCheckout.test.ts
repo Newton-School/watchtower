@@ -13,6 +13,8 @@ import type { AppConfig, NormalizedTask } from '../src/types/contracts.js';
 vi.mock('../src/agentic/runClaude.js', () => ({ runClaudeAgentic: vi.fn() }));
 vi.mock('../src/github/githubAuth.js', () => ({ resolveGithubTokenForCodex: vi.fn(async () => undefined) }));
 vi.mock('../src/workspaces/workspaceManager.js', () => ({ refreshSharedRepoToDefaultBranch: vi.fn() }));
+// The lookup's own copy could not be set up, so it reads the shared clones (see lookupWorkspace.test.ts).
+vi.mock('../src/workspaces/lookupWorkspace.js', () => ({ createLookupWorkspace: vi.fn(async () => undefined) }));
 vi.mock('../src/backends/registry.js', () => ({ getBackend: () => ({ isAvailable: () => true }) }));
 vi.mock('../src/slack/imageUploader.js', () => ({
   parseScreenshotManifest: (reply: string) => ({ visibleText: reply, screenshots: [] }),
@@ -46,7 +48,7 @@ const task: NormalizedTask = {
 
 // Issue #446: a lookup clone 707 commits behind was logged as "Refreshed" and
 // read from disk, and the answer was "that param doesn't exist anywhere".
-describe('runAgenticEntry and a lookup clone that is behind origin', () => {
+describe('runAgenticEntry reading a shared clone that is behind origin', () => {
   let dbDir: string;
   let store: JobStore;
   let slack: WebClient;
