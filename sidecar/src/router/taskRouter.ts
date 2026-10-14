@@ -15,6 +15,15 @@ import {
   workflowSideEffect,
 } from '../access/control.js';
 import type { JobStore } from '../state/jobStore.js';
+import {
+  decideOwnerDelegation,
+  isOwnerTagDelegationEnabled,
+  isPureOwnerTag,
+  ownerInThread,
+  type OwnerDelegationDecision,
+} from '../access/ownerDelegation.js';
+import { resolveWorkspaceMembership, type WorkspaceMembership } from '../slack/workspaceMembership.js';
+import { fetchThreadRepliesSince } from '../slack/threadContext.js';
 import { runDevAssistWorkflow } from '../workflows/devAssistWorkflow.js';
 import { runMiniogDossierWorkflow } from '../workflows/miniogDossierWorkflow.js';
 import { runDeployWorkflow } from '../workflows/deployWorkflow.js';
@@ -102,6 +111,18 @@ function runImplementation({ task, config, slack, store, jobId, logStep, signal 
   });
 }
 
+/**
+ * A run where miniOG stays out of a conversation between people: nothing is
+ * posted, and intake leaves no reaction or status line (issue #398).
+ */
+function silentSkip(workflow: WorkflowIntent, message: string): WorkflowResult {
+  return { workflow, status: 'SKIPPED', message, notifyDesktop: false, slackPosted: false };
+}
+
+// conversations.replies returns at most 200 messages per page, oldest first:
+// a full intake page may be missing the newest replies, the owner's included.
+const THREAD_PAGE_LIMIT = 200;
+
 /** Posted when the tool-router fails twice on a direct mention, in place of a guess (issue #440). */
 export const ROUTER_FAILED_REPLY =
   "I couldn't work out what you're asking. That's a failure on my side, not your message — please send it again.";
@@ -117,10 +138,52 @@ export async function routeTask(params: {
   jobId?: string;
   logStep?: WorkflowStepLogger;
   signal?: AbortSignal;
+  /**
+   * Called once, right before miniOG says or runs anything. Intake holds back
+   * its reaction and status line for a message that only tags an owner until
+   * then, so a run that stays out of a conversation between people leaves no
+   * trace in it (issue #398).
+   */
+  onEngage?: () => Promise<void> | void;
+  /** Test seam. */
+  deps?: { resolveMembership?: (userId: string) => Promise<WorkspaceMembership> };
 }): Promise<WorkflowResult> {
-  const { task, config, slack, store, jobId, logStep, signal } = params;
+  const { task, config, slack, store, jobId, logStep, signal, onEngage, deps } = params;
   let resolvedIntent: WorkflowIntent = task.intent;
   let classificationReasoning: string | undefined;
+  let engaged = false;
+  const engage = async (): Promise<void> => {
+    if (engaged) return;
+    engaged = true;
+    await onEngage?.();
+  };
+  // A message that tags an owner and not miniOG is written to a person.
+  // miniOG handles it as the owner's assistant (issue #398).
+  const pureOwnerTag = isPureOwnerTag(task) && isOwnerTagDelegationEnabled();
+
+  // The owner is already in this thread, or answered before miniOG picked the
+  // tag up: the owner has it. Checked before the router so standing down
+  // costs no model call.
+  if (pureOwnerTag && !task.isOwnerAuthor) {
+    let thread = task.threadMessages ?? [];
+    let presence = ownerInThread(thread, task.event.eventTs, config.ownerSlackUserIds);
+    if (!presence.present && thread.length >= THREAD_PAGE_LIMIT) {
+      try {
+        thread = await fetchThreadRepliesSince(slack, task.event.channelId, task.event.threadTs, '0');
+        presence = ownerInThread(thread, task.event.eventTs, config.ownerSlackUserIds);
+      } catch {
+        // The page we have is the best evidence left.
+      }
+    }
+    if (presence.present) {
+      logStep?.({
+        stage: 'router.owner_tag.stand_down',
+        message: 'An owner has already posted in this thread — staying out of the owner tag.',
+        data: { ownerId: presence.ownerId, ownerMessageTs: presence.ts, tagTs: task.event.eventTs },
+      });
+      return silentSkip(task.intent, 'An owner is already in the thread — stood down.');
+    }
+  }
 
   // Resolve dossier-derived tone once at the router so every downstream
   // workflow that builds a mention system prompt can honor it without
@@ -333,7 +396,7 @@ export async function routeTask(params: {
     }
   }
 
-  const routedTask: NormalizedTask =
+  let routedTask: NormalizedTask =
     resolvedIntent !== task.intent || toneMode !== task.toneMode || dossierRole !== task.dossierRole
       ? { ...task, intent: resolvedIntent, toneMode, dossierRole }
       : task;
@@ -378,7 +441,55 @@ export async function routeTask(params: {
     requiredLevel,
   });
 
-  if (!accessDecision.allowed) {
+  // Owner-tag delegation (issue #398). The requester fails their own check
+  // but tagged an owner, or is answering a question miniOG asked on an
+  // owner's authority. A full member of the workspace gets the owner's
+  // authority; anyone else who only tagged a person gets silence, never an
+  // access error. A direct mention keeps its three deny reasons and copy.
+  let delegation: OwnerDelegationDecision = { kind: 'n/a' };
+  if (!accessDecision.allowed && (pureOwnerTag || task.inheritedDelegationOwnerId)) {
+    delegation = await decideOwnerDelegation({
+      task,
+      ownerIds: config.ownerSlackUserIds,
+      resolveMembership: deps?.resolveMembership ?? (userId => resolveWorkspaceMembership({ slack, userId })),
+    });
+  }
+  if (delegation.kind === 'delegate') {
+    routedTask = { ...routedTask, delegatedByOwnerId: delegation.ownerId };
+    logStep?.({
+      stage: 'access.owner_delegated',
+      message: `The requester lacks access on their own; handling it on <@${delegation.ownerId}>'s authority.`,
+      data: {
+        intent: resolvedIntent,
+        requiredLevel,
+        requesterUserId: task.event.userId,
+        ownerId: delegation.ownerId,
+        inherited: delegation.inherited,
+        requesterDenyReason: accessDecision.denyReason,
+        requesterGroups: accessDecision.userGroups,
+        channelId: task.event.channelId,
+      },
+    });
+  } else if (pureOwnerTag && !accessDecision.allowed) {
+    logStep?.({
+      stage: 'access.owner_tag.silent_deny',
+      message: 'Owner tag from someone the owner’s authority cannot be lent to — staying silent.',
+      data: {
+        intent: resolvedIntent,
+        requiredLevel,
+        requesterUserId: task.event.userId,
+        reason: delegation.kind === 'silent' ? delegation.reason : 'not_delegated',
+        requesterDenyReason: accessDecision.denyReason,
+        channelId: task.event.channelId,
+        channelType: task.event.channelType,
+      },
+    });
+    if (accessControl.mode === 'enforce') {
+      return silentSkip(resolvedIntent, 'Owner tag not delegated — stayed silent.');
+    }
+  }
+
+  if (!accessDecision.allowed && delegation.kind !== 'delegate') {
     const isDirectMessage = task.event.channelType === 'im' || task.event.channelType === 'mpim';
     const shouldBlock = accessControl.mode === 'enforce' || isDirectMessage;
     const stage =
@@ -412,6 +523,7 @@ export async function routeTask(params: {
 
     if (shouldBlock) {
       const denialText = accessDecision.reason ?? "Sorry, you're not on the access list. Please contact an admin.";
+      await engage();
 
       await slack.chat.postMessage({
         channel: task.event.channelId,
@@ -427,7 +539,7 @@ export async function routeTask(params: {
         slackPosted: true,
       };
     }
-  } else {
+  } else if (accessDecision.allowed) {
     logStep?.({
       stage: accessDecision.ownerBypass ? 'access.owner_bypass' : 'access.allowed',
       message: accessDecision.ownerBypass
@@ -458,6 +570,7 @@ export async function routeTask(params: {
       data: { seedIntent: task.intent, userMessage },
     });
     if (!signal?.aborted) {
+      await engage();
       await slack.chat.postMessage({
         channel: task.event.channelId,
         thread_ts: task.event.threadTs,
@@ -477,11 +590,12 @@ export async function routeTask(params: {
   // to one) a line saying so. After the access check, like the reply above.
   if (clarify.kind === 'ask' || clarify.kind === 'give_up') {
     if (signal?.aborted) return cancelledResult('UNKNOWN');
+    await engage();
     return clarify.kind === 'ask'
       ? askRequester({
           slack,
           store,
-          task,
+          task: routedTask,
           userMessage,
           question: clarify.question,
           reason: clarify.reason,
@@ -491,6 +605,7 @@ export async function routeTask(params: {
       : giveUpOnClarify({ slack, task, reason: clarify.reason, logStep });
   }
 
+  await engage();
   const runWorkflow = WORKFLOW_RUNNERS[resolvedIntent];
   if (runWorkflow) {
     return runWorkflow({ task: routedTask, config, slack, store, jobId, logStep, signal });

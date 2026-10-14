@@ -24,6 +24,7 @@ import { assertMacOS } from './platform.js';
 import { evaluatePolicy, loadPolicies } from './policies/evaluator.js';
 import { agentCallContext } from './state/runContext.js';
 import { detectMention, normalizeTask } from './router/intentParser.js';
+import { isOwnerTagDelegationEnabled } from './access/ownerDelegation.js';
 import { isRouteQuestionExpired } from './router/routeClarify.js';
 import { jobSlots } from './runtime/jobSlots.js';
 import { decidePausedResume } from './router/pausedResume.js';
@@ -939,8 +940,20 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
 
   const eventClient = buildEventAwareClient(client, event);
 
+  // A message that only tags an owner is written to a person. Until the
+  // router decides miniOG has something to say or do, it leaves no reaction
+  // and no status line on it (issue #398). A reply that answers a question
+  // miniOG asked is addressed to miniOG.
+  const quietUntilEngaged =
+    isOwnerTagDelegationEnabled() &&
+    !resumeDecision.resume &&
+    detectMention(event.text ?? '', config, event.channelType).type === 'owner';
+  let engaged = !quietUntilEngaged;
+
   // Add :eyes: reaction to signal processing has started
-  await addReaction(client, event.channelId, event.eventTs, 'eyes');
+  if (engaged) {
+    await addReaction(client, event.channelId, event.eventTs, 'eyes');
+  }
 
   logger.info({ eventId: event.eventId }, 'fetching thread context for intake');
   const threadMessages = await fetchThreadContext(eventClient, event.channelId, event.threadTs).catch(() => []);
@@ -966,6 +979,10 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
       // The reply to a question miniOG asked: the router reads the two together (issue #431).
       ...(resumeDecision.reason === 'route_clarify_answer' && routeQuestion
         ? { clarification: { question: routeQuestion.question, askedText: routeQuestion.askedText } }
+        : {}),
+      // A question asked on an owner's authority is answered on it too (issue #398).
+      ...(resumeDecision.reason === 'route_clarify_answer' && routeQuestion?.delegatedByOwnerId
+        ? { inheritedDelegationOwnerId: routeQuestion.delegatedByOwnerId }
         : {}),
     };
     store.markJob(resumeDecision.paused.id, 'SKIPPED', {
@@ -1136,7 +1153,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     // narration bug must never break logging or abort a job.
     try {
       const narrated = narrateStep(step);
-      if (narrated && status) {
+      if (narrated && status && engaged) {
         status.set(narrated.text);
         // Human-wait gates idle for hours; stop refreshing so the status
         // expires on its own instead of being pinned.
@@ -1156,7 +1173,14 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     threadTs: event.threadTs,
     logStep,
   });
-  status.set('is getting started…');
+  if (engaged) status.set('is getting started…');
+  // Called by the router right before miniOG says or runs anything.
+  const onEngage = async (): Promise<void> => {
+    if (engaged) return;
+    engaged = true;
+    await addReaction(client, event.channelId, event.eventTs, 'eyes');
+    status.set('is getting started…');
+  };
 
   logStep({
     stage: 'job.created',
@@ -1208,8 +1232,10 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     failLaunchpadWorkflow({ event, errorMessage: 'Cancelled.', store, logStep });
     store.markJob(jobId, 'CANCELLED', { errorMessage: cancelReason?.message ?? 'Cancelled.' });
     await postCancelNote(cancelReason?.source);
-    await removeReaction(client, event.channelId, event.eventTs, 'eyes');
-    await addReaction(client, event.channelId, event.eventTs, 'x');
+    if (engaged) {
+      await removeReaction(client, event.channelId, event.eventTs, 'eyes');
+      await addReaction(client, event.channelId, event.eventTs, 'x');
+    }
   };
 
   try {
@@ -1255,6 +1281,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
             jobId,
             logStep,
             signal: abortController.signal,
+            onEngage,
           }),
         );
         // An aborted run is cancelled, whatever the workflow made of its dead
@@ -1412,14 +1439,17 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
         // Swap :eyes: for outcome reaction. PAUSED gets a distinct emoji so a
         // glance at the thread tells you "parked, mention me to resume" rather
         // than the misleading :x: it used to share with cancelled/failed jobs.
-        await removeReaction(client, event.channelId, event.eventTs, 'eyes');
-        const outcomeReaction =
-          result.status === 'SUCCESS' || result.status === 'SKIPPED'
-            ? 'white_check_mark'
-            : result.status === 'PAUSED'
-              ? 'zzz'
-              : 'x';
-        await addReaction(client, event.channelId, event.eventTs, outcomeReaction);
+        // A conversation between people miniOG stayed out of gets nothing.
+        if (engaged) {
+          await removeReaction(client, event.channelId, event.eventTs, 'eyes');
+          const outcomeReaction =
+            result.status === 'SUCCESS' || result.status === 'SKIPPED'
+              ? 'white_check_mark'
+              : result.status === 'PAUSED'
+                ? 'zzz'
+                : 'x';
+          await addReaction(client, event.channelId, event.eventTs, outcomeReaction);
+        }
 
         return;
       } catch (error) {
@@ -1482,19 +1512,22 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
       },
     });
 
-    await eventClient.chat
-      .postMessage({
-        channel: event.channelId,
-        thread_ts: event.threadTs,
-        text: `${errorMessage}`,
-      })
-      .catch(() => {});
+    // Not into a conversation between people miniOG never spoke in.
+    if (engaged) {
+      await eventClient.chat
+        .postMessage({
+          channel: event.channelId,
+          thread_ts: event.threadTs,
+          text: `${errorMessage}`,
+        })
+        .catch(() => {});
 
-    logStep({
-      stage: 'job.failed.slack_posted',
-      message: 'Posted hard-failure message to Slack thread.',
-      level: 'ERROR',
-    });
+      logStep({
+        stage: 'job.failed.slack_posted',
+        message: 'Posted hard-failure message to Slack thread.',
+        level: 'ERROR',
+      });
+    }
 
     // Terminal failure — tear down the thread's worktrees (same rationale as
     // the success path); the next task starts fresh. Before unregister so the
@@ -1512,8 +1545,10 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     store.markJob(jobId, 'FAILED', { errorMessage });
 
     // Swap :eyes: for :x: on retry exhaustion
-    await removeReaction(client, event.channelId, event.eventTs, 'eyes');
-    await addReaction(client, event.channelId, event.eventTs, 'x');
+    if (engaged) {
+      await removeReaction(client, event.channelId, event.eventTs, 'eyes');
+      await addReaction(client, event.channelId, event.eventTs, 'x');
+    }
 
     try {
       const personalityMode = store.getPersonalityMode({
@@ -1594,8 +1629,10 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     store.markJob(jobId, 'FAILED', { errorMessage });
 
     // Swap :eyes: for :x: on unexpected failure
-    await removeReaction(client, event.channelId, event.eventTs, 'eyes');
-    await addReaction(client, event.channelId, event.eventTs, 'x');
+    if (engaged) {
+      await removeReaction(client, event.channelId, event.eventTs, 'eyes');
+      await addReaction(client, event.channelId, event.eventTs, 'x');
+    }
 
     try {
       const personalityMode = store.getPersonalityMode({

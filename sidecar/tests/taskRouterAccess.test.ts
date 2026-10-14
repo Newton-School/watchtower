@@ -846,7 +846,14 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
   async function route(
     text: string,
     task: Record<string, unknown> = {},
-    options: { store?: Record<string, unknown>; config?: AppConfig; log?: boolean; signal?: AbortSignal } = {},
+    options: {
+      store?: Record<string, unknown>;
+      config?: AppConfig;
+      log?: boolean;
+      signal?: AbortSignal;
+      onEngage?: () => void;
+      deps?: Parameters<typeof routeTask>[0]['deps'];
+    } = {},
   ) {
     const logStep = vi.fn();
     const slack = makeSlack();
@@ -854,11 +861,15 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
       mentionType = 'bot',
       mentionReference,
       clarification,
+      threadMessages,
+      inheritedDelegationOwnerId,
       ...input
     } = task as {
       mentionType?: 'bot' | 'owner';
       mentionReference?: boolean;
       clarification?: NormalizedTask['clarification'];
+      threadMessages?: NormalizedTask['threadMessages'];
+      inheritedDelegationOwnerId?: string;
     };
     const result = await routeTask({
       task: {
@@ -866,11 +877,15 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
         mentionType,
         ...(mentionReference ? { mentionReference } : {}),
         ...(clarification ? { clarification } : {}),
+        ...(threadMessages ? { threadMessages } : {}),
+        ...(inheritedDelegationOwnerId ? { inheritedDelegationOwnerId } : {}),
       },
       config: options.config ?? makeConfig('audit'),
       slack: slack as never,
       store: (options.store ?? onStore()) as never,
       signal: options.signal,
+      onEngage: options.onEngage,
+      deps: options.deps,
       ...(options.log === false ? {} : { logStep }),
     });
     await settle();
@@ -1250,6 +1265,157 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
     });
   });
 
+  // Issue #398. A builder asked, in a channel the builder group is not enabled
+  // in, "<@theOG> what is the name of this page?" and miniOG answered the
+  // message — written to the owner — with "I'm not enabled for this kind of
+  // request in this channel".
+  describe('an owner tag from someone without access of their own (issue #398)', () => {
+    const tagger = {
+      mentionType: 'owner' as const,
+      userId: 'UBUILDER',
+      channelId: 'C-ADMIN',
+      intent: 'UNKNOWN' as const,
+    };
+    const text = '<@UOWNER1>, what is the name of this page?';
+    const member = { resolveMembership: vi.fn(async () => ({ eligible: true as const, reason: 'member' as const })) };
+    const guest = { resolveMembership: vi.fn(async () => ({ eligible: false as const, reason: 'guest' as const })) };
+    const enforce = makeConfig('enforce');
+
+    it("runs on the owner's authority for a full member, and never posts an access error", async () => {
+      routerSays('answer', 0.9);
+      const onEngage = vi.fn();
+
+      const { result, logStep, slack } = await route(text, tagger, { config: enforce, deps: member, onEngage });
+
+      expect(result.workflow).toBe('INFORMATIONAL');
+      expect(runAgenticEntry).toHaveBeenCalledOnce();
+      // The work is still the tagger's: only the permission check is the owner's.
+      expect(runAgenticEntry.mock.calls[0][0].task).toMatchObject({
+        delegatedByOwnerId: 'UOWNER1',
+        isOwnerAuthor: false,
+        event: { userId: 'UBUILDER' },
+      });
+      expect(stageLog(logStep, 'access.owner_delegated').data).toMatchObject({
+        ownerId: 'UOWNER1',
+        requesterUserId: 'UBUILDER',
+        requesterDenyReason: 'CHANNEL_NOT_ENABLED',
+        inherited: false,
+      });
+      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+      expect(onEngage).toHaveBeenCalledOnce();
+    });
+
+    it('stays silent for someone the authority cannot be lent to, and leaves no trace', async () => {
+      routerSays('answer', 0.9);
+      const onEngage = vi.fn();
+
+      const { result, logStep, slack } = await route(text, tagger, { config: enforce, deps: guest, onEngage });
+
+      expect(result).toMatchObject({ status: 'SKIPPED', slackPosted: false });
+      expect(runAgenticEntry).not.toHaveBeenCalled();
+      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+      expect(onEngage).not.toHaveBeenCalled();
+      expect(stageLog(logStep, 'access.owner_tag.silent_deny').data).toMatchObject({ reason: 'guest' });
+    });
+
+    it('stands down without asking the router when the owner already posted in the thread', async () => {
+      const onEngage = vi.fn();
+      const threadMessages = [
+        { text: 'is this back button intended?', user: 'UBUILDER', ts: '111.10' },
+        { text: 'yes, by design', user: 'UOWNER1', ts: '111.15' },
+        { text, user: 'UBUILDER', ts: '111.22' },
+      ];
+
+      const { result, logStep, slack } = await route(
+        text,
+        { ...tagger, threadMessages },
+        { config: enforce, deps: member, onEngage },
+      );
+
+      expect(result).toMatchObject({ status: 'SKIPPED', slackPosted: false });
+      expect(decideTool).not.toHaveBeenCalled();
+      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+      expect(onEngage).not.toHaveBeenCalled();
+      expect(stageLog(logStep, 'router.owner_tag.stand_down').data).toMatchObject({ ownerId: 'UOWNER1' });
+    });
+
+    it('leaves no trace when the router reads it as a conversation between people', async () => {
+      routerSays('stay_silent', 0.9);
+      const onEngage = vi.fn();
+
+      const { result, slack } = await route(text, tagger, { config: enforce, deps: member, onEngage });
+
+      expect(result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
+      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+      expect(onEngage).not.toHaveBeenCalled();
+    });
+
+    it('asks before a change on the owner’s authority, and the answer keeps it', async () => {
+      routerSays('change_code', 0.9);
+      const asked = await route('<@UOWNER1> please remove this section from the page', tagger, {
+        config: enforce,
+        deps: member,
+      });
+
+      expect(asked.result.status).toBe('PAUSED');
+      expect(asked.slack.chat.postMessage.mock.calls[0][0].text).toContain('<@UBUILDER> ');
+      expect(stageLog(asked.logStep, 'router.clarify.asked').data).toMatchObject({
+        requesterId: 'UBUILDER',
+        delegatedByOwnerId: 'UOWNER1',
+      });
+
+      // The tagger answers "yes" in the thread: a reply to miniOG, checked on the same owner's authority.
+      vi.clearAllMocks();
+      routerSays('change_code', 0.9);
+      const answered = await route(
+        'yes',
+        {
+          userId: 'UBUILDER',
+          channelId: 'C-ADMIN',
+          intent: 'IMPLEMENTATION',
+          clarification: { question: 'Want me to pick this up?', askedText: 'please remove this section' },
+          inheritedDelegationOwnerId: 'UOWNER1',
+        },
+        { config: enforce, deps: member },
+      );
+
+      expect(runImplementationWorkflow).toHaveBeenCalledOnce();
+      expect(stageLog(answered.logStep, 'access.owner_delegated').data).toMatchObject({ inherited: true });
+      expect(answered.slack.chat.postMessage).not.toHaveBeenCalled();
+    });
+
+    it('does not change a direct mention: the same person gets the access error', async () => {
+      routerSays('answer', 0.9);
+      const onEngage = vi.fn();
+
+      const { result, slack } = await route(
+        '<@UBOT1> what is the name of this page?',
+        { ...tagger, mentionType: 'bot' },
+        {
+          config: enforce,
+          deps: member,
+          onEngage,
+        },
+      );
+
+      expect(result.status).toBe('SKIPPED');
+      expect(slack.chat.postMessage.mock.calls[0][0].text).toContain('not enabled for this kind of request');
+      expect(onEngage).toHaveBeenCalledOnce();
+    });
+
+    it('goes back to the access error with the switch off', async () => {
+      routerSays('answer', 0.9);
+      vi.stubEnv('WATCHTOWER_OWNER_TAG_DELEGATION', '0');
+      try {
+        const { slack } = await route(text, tagger, { config: enforce, deps: member });
+        expect(slack.chat.postMessage.mock.calls[0][0].text).toContain('not enabled for this kind of request');
+        expect(member.resolveMembership).not.toHaveBeenCalled();
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
+  });
+
   describe('a message that tags the owner (issue #430)', () => {
     const tagger = {
       mentionType: 'owner' as const,
@@ -1285,9 +1451,28 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
       expect(runImplementationWorkflow).toHaveBeenCalledOnce();
     });
 
-    it('does not ask someone who could not say yes: the access check comes first, at the change tier', async () => {
+    // The access check comes first, at the change tier. Someone who could not
+    // say yes on their own can on the owner's authority (issue #398); someone
+    // it cannot be lent to is not asked, and gets nothing.
+    it('asks a full member who lacks the change tier, on the owner’s authority', async () => {
+      routerSays('change_code', 0.92);
+      const member = vi.fn(async () => ({ eligible: true as const, reason: 'member' as const }));
+
+      const { result, slack } = await route(
+        CHANGE,
+        { ...tagger, userId: 'UVIEWER', channelId: 'C-VIEW' },
+        { config: makeConfig('enforce'), deps: { resolveMembership: member } },
+      );
+
+      expect(result.status).toBe('PAUSED');
+      expect(runImplementationWorkflow).not.toHaveBeenCalled();
+      expect(slack.chat.postMessage.mock.calls[0][0].text).toContain('Want me to pick');
+    });
+
+    it('does not ask, or answer, someone the owner’s authority cannot be lent to', async () => {
       routerSays('change_code', 0.92);
 
+      // No membership information at all (the lookup fails): fail closed.
       const { result, slack } = await route(
         CHANGE,
         { ...tagger, userId: 'UVIEWER', channelId: 'C-VIEW' },
@@ -1296,9 +1481,7 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
 
       expect(result.status).toBe('SKIPPED');
       expect(runImplementationWorkflow).not.toHaveBeenCalled();
-      expect(slack.chat.postMessage.mock.calls.some(call => String(call[0].text).includes('Want me to pick'))).toBe(
-        false,
-      );
+      expect(slack.chat.postMessage).not.toHaveBeenCalled();
     });
 
     it('runs a review the gate seeded without waiting on the router', async () => {

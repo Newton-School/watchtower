@@ -377,6 +377,17 @@ export interface NormalizedTask {
    * about an earlier message it could not act on (issue #431).
    */
   clarification?: { question: string; askedText: string };
+  /**
+   * Set by the router when this request runs on an owner's authority: the
+   * requester tagged the owner and fails their own access check (issue #398).
+   * Only permission checks read it; the requester stays who the work is for.
+   */
+  delegatedByOwnerId?: string;
+  /**
+   * Set at intake when this message answers a question miniOG asked on a
+   * delegated request: the answer is checked on the same owner's authority.
+   */
+  inheritedDelegationOwnerId?: string;
 }
 
 export interface RepoClassificationResult {
