@@ -66,23 +66,6 @@ describe('jobStore', () => {
     expect(jobSummary?.workflow).toBe('PR_REVIEW');
     expect(jobSummary?.status).toBe('SUCCESS');
 
-    const latest = store.latestJobForThread('C1', '123');
-    expect(latest?.workflow).toBe('PR_REVIEW');
-
-    store.saveIntentCorrection({
-      channelId: 'C1',
-      userId: 'U1',
-      phraseKey: 'review this pr again',
-      correctedIntent: 'PR_REVIEW',
-    });
-    expect(
-      store.findIntentCorrection({
-        channelId: 'C1',
-        userId: 'U1',
-        phraseKey: 'review this pr again',
-      }),
-    ).toBe('PR_REVIEW');
-
     store.setPersonalityProfile({
       scope: 'user',
       scopeId: 'U1',

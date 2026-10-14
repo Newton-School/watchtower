@@ -201,11 +201,12 @@ export async function decideTool(params: {
 }
 
 /**
- * The intent the legacy path would act on for a router outcome. This is the
- * parity mapping: it reproduces what the classifier could return and nothing
- * more, so the router can stand in for the classifier without changing what
- * runs. Decisions the classifier had no way to express (ask, unsupported,
- * deploy, QA) fall back exactly as an invalid classification did.
+ * The workflow intent a router outcome runs as. The name is from when the
+ * router stood in for an intent classifier and had to reproduce what that
+ * could return; the mapping is the same now that the classifier is gone.
+ * A decision with no workflow of its own (ask, unsupported, a deploy code
+ * does not allow, a failed call) falls back to the low-risk choice for how
+ * the message was addressed.
  */
 export function outcomeToLegacyIntent(
   outcome: RouterOutcome,
@@ -252,26 +253,4 @@ export function outcomeToLegacyIntent(
  */
 export function mayDeploy(facts: Pick<RouterFacts, 'addressing' | 'answering' | 'deployTarget'>): boolean {
   return facts.addressing === 'direct' && !facts.answering && Boolean(facts.deployTarget);
-}
-
-export type ToolRouterMode = 'legacy' | 'shadow' | 'on';
-
-/** `sidecar_state` key. Read per job, so it can be changed without a rebuild. */
-export const TOOL_ROUTER_MODE_KEY = 'tool_router_mode';
-
-/**
- * How the router takes part. `shadow` (the default) runs it beside the legacy
- * path and logs what it would have done; `legacy` turns it off; `on` lets it
- * decide where the intent classifier did.
- */
-export function readToolRouterMode(
-  store: { getState?: (key: string) => string | undefined } | undefined,
-): ToolRouterMode {
-  let raw: string | undefined;
-  try {
-    raw = typeof store?.getState === 'function' ? store.getState(TOOL_ROUTER_MODE_KEY) : undefined;
-  } catch {
-    raw = undefined;
-  }
-  return raw === 'legacy' || raw === 'on' ? raw : 'shadow';
 }

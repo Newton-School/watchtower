@@ -1,5 +1,9 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { __connectors } from '../src/backends/connectors.js';
 
 const runCodex = vi.fn();
 const getActiveBackendId = vi.fn(() => 'claude-code');
@@ -144,6 +148,35 @@ describe('runInvestigationWorkflow scope wiring', () => {
     expect(prompt).toMatch(/newton-web/);
     expect(prompt).toMatch(/newton-api/);
     expect(prompt).toMatch(/mcp__metabase__/);
+  });
+
+  it('gives an investigation OpenPanel too when the host has it, and says what it is for', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'watchtower-investigation-home-'));
+    const realHome = __connectors.home;
+    __connectors.home = () => home;
+    fs.writeFileSync(
+      path.join(home, '.claude.json'),
+      JSON.stringify({ mcpServers: { openpanel: { type: 'http', url: 'https://openpanel.example/mcp' } } }),
+    );
+    classifyInvestigationScope.mockResolvedValue({
+      scope: 'newton-web',
+      confidence: 0.9,
+      reasoning: 'ui',
+      method: 'llm',
+    });
+    try {
+      await runInvestigationWorkflow({
+        task: makeTask('the signup event stopped firing'),
+        config,
+        slack: slackStub() as any,
+      });
+
+      expect(Object.keys(runCodex.mock.calls[0][0].mcpServers)).toEqual(['metabase', 'openpanel']);
+      expect(runCodex.mock.calls[0][0].prompt as string).toContain('tools named `mcp__openpanel__*`');
+    } finally {
+      __connectors.home = realHome;
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it('marketing scope pins the marketing worktree and warns about Webflow path routing', async () => {

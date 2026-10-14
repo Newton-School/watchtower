@@ -28,7 +28,7 @@ import {
 import type { AttachmentLimits, UndeliveredAttachment } from '../slack/fileAttachments.js';
 import { buildUndeliveredFollowUp, INLINE_MAX_CHARS } from '../slack/attachmentFollowUp.js';
 import { botScopes } from '../slack/botScopes.js';
-import { connectorsFor, NO_CONNECTORS, withConnectors } from '../backends/connectors.js';
+import { connectorPromptBlock, connectorsFor, NO_CONNECTORS, withConnectors } from '../backends/connectors.js';
 import { collectThreadAttachments, filesForTrigger, type ThreadAttachments } from '../slack/threadAttachments.js';
 import type { SlackFileAttachment } from '../slack/imageDownloader.js';
 import { getActiveBackendId } from '../codex/runCodex.js';
@@ -251,6 +251,7 @@ const METABASE_LOOKUP_BLOCK = `Database questions:
 - You have no other connectors: no Slack search, no Drive, no analytics tools. If the answer needs one, say so instead of looking for a way around it.`;
 
 export function informationalSystemPrompt(config: AppConfig): string {
+function informationalSystemPrompt(config: AppConfig): string {
   return `You are miniOG, a Slack assistant. The user has asked an informational question — code lookup, "where is X", "how does Y work", documentation, table schemas, data sources.
 
 Your job:
@@ -471,11 +472,13 @@ export async function runAgenticEntry(params: RunAgenticEntryParams): Promise<Wo
     [task.event.text || '(empty message)', threadBlock, recallBlock].filter(Boolean).join('\n\n') +
     attached.promptSuffix;
 
-  // A lookup keeps one connector, Metabase read-only, for questions the code
-  // cannot answer. A chat reply keeps none (issue #443).
+  // A lookup keeps the read-only connectors for questions the code cannot
+  // answer: the database and product analytics. A chat reply keeps none
+  // (issue #443).
   const connectors = mode === 'informational' ? connectorsFor('lookup', config) : NO_CONNECTORS;
-  if ('metabase' in connectors.mcpServers) {
-    systemPrompt = `${systemPrompt}\n\n${METABASE_LOOKUP_BLOCK}`;
+  const connectorBlock = connectorPromptBlock(connectors);
+  if (connectorBlock) {
+    systemPrompt = `${systemPrompt}\n\n${connectorBlock}`;
   }
   const result = await withConnectors(connectors, () =>
     runClaudeAgentic({

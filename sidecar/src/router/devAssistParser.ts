@@ -22,9 +22,7 @@ export type DevAssistCommand =
   | { type: 'POLICY_SHOW' }
   | { type: 'POLICY_RELOAD' }
   | { type: 'INCIDENT_SET'; enabled: boolean }
-  | { type: 'MY_QUEUE'; limit: number }
-  | { type: 'WORKFLOW_LIST' }
-  | { type: 'WORKFLOW_RELOAD' };
+  | { type: 'MY_QUEUE'; limit: number };
 
 function stripMentions(text: string): string {
   return text
@@ -274,14 +272,6 @@ function parsePrefixedDevAssistCommand(body: string): DevAssistCommand | undefin
       type: 'INCIDENT_SET',
       enabled: incidentMatch[1].toLowerCase() === 'on',
     };
-  }
-
-  if (/^workflow\s+list\b/i.test(body)) {
-    return { type: 'WORKFLOW_LIST' };
-  }
-
-  if (/^workflow\s+reload\b/i.test(body)) {
-    return { type: 'WORKFLOW_RELOAD' };
   }
 
   const myQueueMatch = body.match(/^my\s+queue(?:\s+(\d+))?\b/i);

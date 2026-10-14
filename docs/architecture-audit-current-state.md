@@ -3,6 +3,8 @@
 > **Purpose.** Before we redesign the architecture, document what we have today and which parts keep breaking. Every "known failure" below links to the PR that tried to fix it, so we can see at a glance whether the fix landed at the right layer or just patched a symptom.
 >
 > This is a working doc — append, redirect, or rewrite as we learn more.
+>
+> **Update (2026-10).** The redesign this audit prepared for has started. `classifyIntent` (the LLM intent classifier), the learned intent corrections and the file-based workflow templates were deleted; the tool-router (`sidecar/src/router/toolRouter.ts`, issue #456) decides what a message asks for. The pipeline sketch below is the state before that.
 
 ---
 
