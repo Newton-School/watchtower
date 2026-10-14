@@ -13,6 +13,7 @@ import {
 import { runCodex } from '../src/codex/runCodex.js';
 import { __infraRetry, connectionLostReply } from '../src/codex/infraRetry.js';
 import { runAgenticEntry } from '../src/agentic/agenticEntry.js';
+import { refreshSharedRepoToDefaultBranch } from '../src/workspaces/workspaceManager.js';
 import { __connectors, currentConnectors } from '../src/backends/connectors.js';
 
 // Regression coverage for #348 RC2: when the planner concludes no code changes
@@ -45,6 +46,7 @@ vi.mock('../src/notify/desktopNotifier.js', () => ({
 
 vi.mock('../src/workspaces/workspaceManager.js', () => ({
   resolveWorkspace: vi.fn((repoPath: string) => repoPath),
+  refreshSharedRepoToDefaultBranch: vi.fn(async () => null),
 }));
 
 vi.mock('../src/slack/imageDownloader.js', () => ({
@@ -211,6 +213,42 @@ describe('implementationWorkflow — connectors by requester', () => {
 
   it('adds the admin upload server for an admin', async () => {
     expect(await plannerConnectors(true)).toEqual(['figma', 'plugin_newton-admin-mcp_newton-admin']);
+  });
+});
+
+// Issue #446: an owner's request plans from the shared clones. A planner told
+// nothing about a clone 700 commits behind described code that had changed.
+describe('implementationWorkflow — a planner on the shared clones', () => {
+  beforeEach(() => {
+    vi.mocked(runAgenticEntry).mockReset();
+    vi.mocked(runAgenticEntry).mockResolvedValue({
+      workflow: 'INFORMATIONAL',
+      status: 'SUCCESS',
+      message: 'answered',
+      notifyDesktop: false,
+      slackPosted: true,
+    });
+  });
+
+  it('is told which clone is behind origin and to read origin instead', async () => {
+    vi.mocked(refreshSharedRepoToDefaultBranch).mockImplementation(async (repoPath: string) =>
+      repoPath.endsWith('newton-web')
+        ? { branch: 'master', head: 'eae5d68bb', upstream: 'origin/master', behind: 731, staleReason: 'dirty_tree' }
+        : { branch: 'master', head: 'ac56c6935', upstream: 'origin/master', behind: 0 },
+    );
+    vi.mocked(runCodex).mockReset();
+    vi.mocked(runCodex).mockResolvedValue(plannerNoCodeResult());
+
+    await runImplementationWorkflow({
+      task: makeTask('<@UBOT1> add a retry to the playlist fetch', { byOwner: true }),
+      config,
+      slack: makeSlack() as unknown as import('@slack/web-api').WebClient,
+    });
+
+    const plannerPrompt = vi.mocked(runCodex).mock.calls[0][0].prompt;
+    expect(plannerPrompt).toContain('newton-web');
+    expect(plannerPrompt).toContain('origin/master');
+    expect(plannerPrompt).toMatch(/STALE/);
   });
 });
 
