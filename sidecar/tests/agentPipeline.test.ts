@@ -3,7 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   buildCoderFollowUpQuestion,
   buildCoderNoDiffQuestion,
+  formatPlanDetail,
   formatPlanMessage,
+  planNeedsRequesterConfirmation,
+  postPlanForApproval,
   runAgentPipeline,
   waitForApproval,
 } from '../src/agents/pipeline.js';
@@ -1207,8 +1210,9 @@ describe('formatPlanMessage: the plan as the approver sees it (issue #437)', () 
     expect(lines[2]).toBe('*Where:* TMS exam form');
     expect(lines[3]).toBe('*Behaviour change:* none');
     expect(lines[4]).toBe('*Assumptions to confirm:* none');
-    expect(message.indexOf('*Files to change:*')).toBeLessThan(message.indexOf('_Full plan, for the coder:_'));
-    expect(message).toContain('• `src/tms/exam-form/defaults.ts`');
+    expect(message).toContain('*Files to change:*\n• `src/tms/exam-form/defaults.ts`');
+    // The full plan is posted below it, as a file (postPlanForApproval).
+    expect(message).not.toContain('Change the four');
   });
 
   it('flags a behaviour change and asks the requester to confirm it, not only the approver', () => {
@@ -1224,7 +1228,7 @@ describe('formatPlanMessage: the plan as the approver sees it (issue #437)', () 
 
     expect(message).toContain('*Behaviour change:* :warning: An exam now ends on the very first flagged breach.');
     expect(message).toContain(
-      '<@UREQUESTER> please confirm the behaviour change above is what you want, before this is approved.',
+      '<@UREQUESTER> before I start, please confirm the behaviour change above is what you want: reply *yes*, or tell me what to change.',
     );
   });
 
@@ -1237,7 +1241,7 @@ describe('formatPlanMessage: the plan as the approver sees it (issue #437)', () 
       false,
       'UREQ',
     );
-    expect(assumed).toContain('<@UREQ> please confirm the assumptions above are what you want');
+    expect(assumed).toContain('<@UREQ> before I start, please confirm the assumptions above are what you want');
 
     const both = formatPlanMessage(
       block('Ends on first breach.', 'Picked the web form.'),
@@ -1279,12 +1283,11 @@ describe('formatPlanMessage: the plan as the approver sees it (issue #437)', () 
     const message = formatPlanMessage(block('none, but the default becomes 0'), FILES, 'small', REPO, false, 'UREQ');
 
     expect(message).toContain('*Behaviour change:* :warning: none, but the default becomes 0');
-    expect(message).toContain('<@UREQ> please confirm the behaviour change above is what you want');
+    expect(message).toContain('<@UREQ> before I start, please confirm the behaviour change above is what you want');
   });
 
   it('does not repeat the approver block or the file list inside the full plan', () => {
-    const message = formatPlanMessage(block('none'), FILES, 'small', REPO);
-    const detail = message.slice(message.indexOf('_Full plan, for the coder:_'));
+    const detail = formatPlanDetail(block('none'));
 
     expect(detail).toContain('1. Change the four `DEFAULT_*` constants from 3 to 0.');
     expect(detail).not.toContain('For the approver');
@@ -1311,6 +1314,85 @@ describe('formatPlanMessage: the plan as the approver sees it (issue #437)', () 
     expect(message).toContain('11 files to change');
     expect(message).toContain('• `src/f7.ts`\n• … and 3 more');
     expect(message).not.toContain('src/f8.ts');
+  });
+
+  it('keeps the approval message short: the 6,300-character plan from the incident becomes a summary', () => {
+    const longSteps = Array.from({ length: 60 }, (_, i) => `${i + 1}. Step ${i + 1} touches \`src/tms/x${i}.ts\`.`);
+    const plan = `${block('An exam now ends on the very first flagged breach.')}\n\n## Steps\n${longSteps.join('\n')}`;
+
+    const message = formatPlanMessage(plan, FILES, 'small', REPO, false, 'UREQ');
+
+    expect(plan.length).toBeGreaterThan(2_000);
+    expect(message.length).toBeLessThan(900);
+    expect(formatPlanDetail(plan)).toContain('60. Step 60');
+  });
+
+  it('asks the requester to confirm only when behaviour changes or something was assumed', () => {
+    expect(planNeedsRequesterConfirmation(block('none'))).toBe(false);
+    expect(planNeedsRequesterConfirmation(block('Ends on first breach.'))).toBe(true);
+    expect(planNeedsRequesterConfirmation(block('none', 'Picked the web form.'))).toBe(true);
+    // No approver block: nothing to confirm against, and the plan is posted whole.
+    expect(planNeedsRequesterConfirmation('# Plain\n\n1. Edit `a.ts`.')).toBe(false);
+    expect(formatPlanDetail('# Plain\n\n1. Edit `a.ts`.')).toBe('');
+  });
+
+  describe('postPlanForApproval', () => {
+    const slackWith = (upload: () => Promise<unknown>) =>
+      ({
+        chat: { postMessage: vi.fn().mockResolvedValue({ ok: true, ts: '300.00' }) },
+        filesUploadV2: vi.fn(upload),
+      }) as any;
+    const post = (slack: any, planMarkdown = block('none')) =>
+      postPlanForApproval({
+        slack,
+        channelId: 'C1',
+        threadTs: '100.00',
+        planMarkdown,
+        affectedFiles: FILES,
+        scope: 'small',
+        repoPath: REPO,
+      });
+
+    it('posts the summary, then the full plan below it as plan.md', async () => {
+      const slack = slackWith(async () => ({ ok: true }));
+
+      expect(await post(slack)).toBe('300.00');
+
+      expect(slack.chat.postMessage).toHaveBeenCalledTimes(1);
+      expect(slack.chat.postMessage.mock.calls[0][0].text).toContain('*What changes:*');
+      const upload = slack.filesUploadV2.mock.calls[0][0];
+      expect(upload).toMatchObject({ channel_id: 'C1', thread_ts: '100.00' });
+      expect(upload.file_uploads[0].filename).toBe('plan.md');
+      expect(upload.file_uploads[0].file.toString('utf8')).toContain('1. Change the four `DEFAULT_*` constants');
+    });
+
+    it('posts the full plan as a message when the upload fails', async () => {
+      const slack = slackWith(async () => {
+        throw new Error('missing_scope');
+      });
+
+      expect(await post(slack)).toBe('300.00');
+
+      expect(slack.chat.postMessage).toHaveBeenCalledTimes(2);
+      expect(slack.chat.postMessage.mock.calls[1][0].text).toMatch(/^_Full plan, for the coder:_\n/);
+    });
+
+    it('posts a plan with no approver block whole, with nothing below it', async () => {
+      const slack = slackWith(async () => ({ ok: true }));
+
+      await post(slack, '# Plain\n\n1. Edit `a.ts`.');
+
+      expect(slack.chat.postMessage.mock.calls[0][0].text).toContain('1. Edit `a.ts`.');
+      expect(slack.filesUploadV2).not.toHaveBeenCalled();
+    });
+
+    it('fails when the summary itself cannot be posted, so the caller can fail closed', async () => {
+      const slack = slackWith(async () => ({ ok: true }));
+      slack.chat.postMessage.mockRejectedValue(new Error('channel_not_found'));
+
+      await expect(post(slack)).rejects.toThrow('channel_not_found');
+      expect(slack.filesUploadV2).not.toHaveBeenCalled();
+    });
   });
 
   it('marks an executed plan at the end, whichever layout', () => {
@@ -1658,6 +1740,124 @@ describe('waitForApproval', () => {
 
       expect(texts()).toEqual(['<@UREQUESTER> Only admins can approve plans. Waiting for an admin to respond.']);
 
+      controller.abort();
+      await promise;
+    });
+  });
+
+  // Issue #437: a default changed to 0 was approved in 54 seconds by an admin,
+  // and meant the opposite of what the requester wanted.
+  describe('when the requester has to confirm the plan', () => {
+    const texts = () => mockSlack.chat.postMessage.mock.calls.map((call: any[]) => call[0].text as string);
+    const confirmRun = (overrides?: Partial<Parameters<typeof waitForApproval>[0]>) =>
+      runApproval({ requesterToConfirm: 'UREQUESTER', ...overrides });
+
+    it("holds an admin's yes until the requester confirms, and says who it is waiting for", async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'yes', user: 'UCOREDEV', ts: '200.00' }]);
+      let settled = false;
+      const promise = confirmRun().then(result => {
+        settled = true;
+        return result;
+      });
+      await vi.advanceTimersByTimeAsync(16_000);
+
+      expect(settled).toBe(false);
+      expect(texts()).toEqual([
+        'Thanks <@UCOREDEV>. <@UREQUESTER>, before I start: is the plan above what you want? Reply *yes*, or tell me what to change. (An admin can reply `approve without confirmation` to go ahead without that.)',
+      ]);
+
+      vi.mocked(fetchThreadContext).mockResolvedValue([
+        { text: 'yes', user: 'UCOREDEV', ts: '200.00' },
+        { text: 'yes', user: 'UREQUESTER', ts: '210.00' },
+      ]);
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect(await promise).toEqual({
+        outcome: 'approved',
+        userReply: 'yes',
+        approverId: 'UCOREDEV',
+        replyTs: '210.00',
+      });
+    });
+
+    it('starts on the admin yes when the requester confirmed first', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'correct', user: 'UREQUESTER', ts: '200.00' }]);
+      const promise = confirmRun();
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(texts()).toEqual(['Thanks <@UREQUESTER>. Waiting for an admin to approve.']);
+
+      vi.mocked(fetchThreadContext).mockResolvedValue([
+        { text: 'correct', user: 'UREQUESTER', ts: '200.00' },
+        { text: 'go', user: 'UCOREDEV', ts: '210.00' },
+      ]);
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect((await promise).outcome).toBe('approved');
+    });
+
+    it("revises the plan from the requester's correction", async () => {
+      vi.mocked(runCodex).mockResolvedValue({ ok: true, parsedJson: { intent: 'feedback' } } as any);
+      vi.mocked(fetchThreadContext).mockResolvedValue([
+        { text: 'no, any number of breaches should be allowed', user: 'UREQUESTER', ts: '200.00' },
+      ]);
+      const promise = confirmRun();
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect(await promise).toEqual({
+        outcome: 'feedback',
+        userReply: 'no, any number of breaches should be allowed',
+        approverId: 'UREQUESTER',
+        replyTs: '200.00',
+      });
+    });
+
+    it('asks a requester who only says no what they want instead', async () => {
+      vi.mocked(runCodex).mockResolvedValue({ ok: true, parsedJson: { intent: 'reject' } } as any);
+      vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'no', user: 'UREQUESTER', ts: '200.00' }]);
+      const controller = new AbortController();
+      const promise = confirmRun({ signal: controller.signal });
+      await vi.advanceTimersByTimeAsync(16_000);
+
+      expect(texts()).toEqual(["<@UREQUESTER> tell me what you want instead, and I'll revise the plan."]);
+      controller.abort();
+      expect((await promise).outcome).toBe('cancelled');
+    });
+
+    it('lets an admin go ahead without the requester, by exact phrase only', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([
+        { text: 'approve without confirmation', user: 'UCOREDEV', ts: '200.00' },
+      ]);
+
+      const promise = confirmRun();
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect(await promise).toMatchObject({ outcome: 'approved', approverId: 'UCOREDEV' });
+    });
+
+    it('needs nothing extra when the requester can approve: their yes is both', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'yes', user: 'UCOREDEV', ts: '200.00' }]);
+
+      const promise = runApproval({ requesterToConfirm: 'UCOREDEV' });
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect(await promise).toMatchObject({ outcome: 'approved' });
+      expect(texts()).toEqual([]);
+    });
+
+    it('reminds the requester, not the admins, once the plan is approved', async () => {
+      const MIN = 60_000;
+      vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'yes', user: 'UCOREDEV', ts: '200.00' }]);
+      const controller = new AbortController();
+      const promise = confirmRun({
+        reminders: { afterMs: [15 * MIN], text: '<!subteam^S1> the plan still needs a yes or no.' },
+        signal: controller.signal,
+      });
+      await vi.advanceTimersByTimeAsync(16 * MIN);
+
+      expect(texts()).toContain(
+        '<@UREQUESTER> the plan above is approved and waits only for you: reply *yes* if it is what you want, or tell me what to change.',
+      );
+      expect(texts()).not.toContain('<!subteam^S1> the plan still needs a yes or no.');
       controller.abort();
       await promise;
     });

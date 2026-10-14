@@ -156,12 +156,14 @@ const PLAN_MESSAGE_MAX_FILES = 8;
 /**
  * The plan as posted for approval (issue #437).
  *
- * When the planner wrote its approver block, the message opens with it: what
- * changes, where, whether behaviour changes, what was assumed, the risk, and
- * the files to change. The full plan follows, marked as detail. If behaviour
- * changes or something was assumed, the requester is asked to confirm it,
- * because the approver is usually someone else. A default changed to 0 was
- * approved in 54 seconds; it meant the opposite of what the requester wanted.
+ * When the planner wrote its approver block, the message is only that block:
+ * what changes, where, whether behaviour changes, what was assumed, the risk,
+ * and the files to change. The full plan goes below it as a file
+ * (`postPlanForApproval`): approvers read 8,000-character plans in a minute
+ * or not at all. `requesterId` is passed when the requester has to confirm
+ * the behaviour change or the assumptions before work starts, because the
+ * approver is usually someone else: a default changed to 0 was approved in 54
+ * seconds and meant the opposite of what the requester wanted.
  *
  * The header counts files the change edits. It used to count every
  * path-shaped token in the plan.
@@ -207,20 +209,83 @@ export function formatPlanMessage(
       .filter(Boolean)
       .join(' and ');
     block.push(
-      `<@${requesterId}> please confirm ${what} above ${assumed ? 'are' : 'is'} what you want, before this is approved.`,
+      `<@${requesterId}> before I start, please confirm ${what} above ${assumed ? 'are' : 'is'} what you want: reply *yes*, or tell me what to change.`,
     );
   }
-  const detail = planWithoutApproverParts(planMarkdown);
-  return [
-    block.join('\n'),
-    ...(filesSection ? [filesSection] : []),
-    ...(detail ? [`_Full plan, for the coder:_\n${detail}`] : []),
-  ]
-    .join('\n\n')
-    .concat(completedSuffix);
+  return [block.join('\n'), ...(filesSection ? [filesSection] : [])].join('\n\n').concat(completedSuffix);
+}
+
+/** The full plan, posted below the approver block. Empty when the plan has no block: it was posted whole. */
+export function formatPlanDetail(planMarkdown: string): string {
+  return parseApproverSummary(planMarkdown) ? planWithoutApproverParts(planMarkdown) : '';
+}
+
+/** The plan changes behaviour or rests on assumptions, so the requester has to confirm it (issue #437). */
+export function planNeedsRequesterConfirmation(planMarkdown: string): boolean {
+  const summary = parseApproverSummary(planMarkdown);
+  return Boolean(summary && (!isNone(summary.behaviourChange) || !isNone(summary.assumptions)));
+}
+
+/**
+ * Posts a plan for approval: the approver block as a message, and the full
+ * plan below it as a `plan.md` file, which Slack shows collapsed. When the
+ * upload fails, the full plan goes in as a message instead. Returns the ts of
+ * the block message; throws when that message could not be posted.
+ */
+export async function postPlanForApproval(params: {
+  slack: WebClient;
+  channelId: string;
+  threadTs: string;
+  planMarkdown: string;
+  affectedFiles: string[];
+  scope: string;
+  repoPath?: string;
+  /** Set only when the requester has to confirm (`planNeedsRequesterConfirmation`). */
+  requesterToConfirm?: string;
+  logStep?: WorkflowStepLogger;
+}): Promise<string | undefined> {
+  const { slack, channelId, threadTs, planMarkdown, logStep } = params;
+  const posted = await slack.chat.postMessage({
+    channel: channelId,
+    thread_ts: threadTs,
+    text: formatPlanMessage(
+      planMarkdown,
+      params.affectedFiles,
+      params.scope,
+      params.repoPath,
+      false,
+      params.requesterToConfirm,
+    ),
+  });
+  const ts = posted.ts ?? undefined;
+  const detail = formatPlanDetail(planMarkdown);
+  if (!detail) return ts;
+  try {
+    await slack.filesUploadV2({
+      channel_id: channelId,
+      thread_ts: threadTs,
+      file_uploads: [{ file: Buffer.from(detail, 'utf8'), filename: 'plan.md', title: 'Full plan (for the coder)' }],
+    });
+    logStep?.({ stage: 'plan.detail.posted', message: 'Posted the full plan as a file below the summary.' });
+  } catch (error) {
+    logStep?.({
+      stage: 'plan.detail.upload_failed',
+      level: 'WARN',
+      message: `Could not upload the full plan as a file; posting it as a message. ${String(error).slice(0, 200)}`,
+    });
+    await slack.chat
+      .postMessage({ channel: channelId, thread_ts: threadTs, text: `_Full plan, for the coder:_\n${detail}` })
+      .catch(() => {});
+  }
+  return ts;
 }
 
 const APPROVE_PATTERNS = /^(yes|go|proceed|do it|go ahead|ship it|lgtm)$/i;
+/** A requester confirming that the plan is what they want (issue #437). */
+const CONFIRM_PATTERNS =
+  /^(yes|yep|yeah|yup|correct|confirmed?|exactly|right|go|go ahead|proceed|do it|lgtm|looks good|that'?s (right|correct|it|what i want))[.!]*$/i;
+/** An approver going ahead without the requester's confirmation: exact phrase, never inferred. */
+const OVERRIDE_CONFIRMATION_RE = /^approve without (the requester'?s? )?confirmation[.!]*$/i;
 const REJECT_PATTERNS = /^(no|stop|cancel|abort|nevermind|never mind)\b/i;
 // Strict pause patterns: pause word must be the entire message (modulo punctuation).
 // "wait, that's wrong" / "wait, also include X" → feedback, not pause.
@@ -373,9 +438,46 @@ async function pollForApproval(params: {
   reminders?: { afterMs: number[]; text: string };
   /** Who can approve, as a Slack mention. Used once when someone who cannot approve says yes. */
   approverMention?: string;
+  /**
+   * The requester, when the plan changes behaviour or rests on assumptions
+   * and they are not an approver (issue #437). An approver's yes then waits
+   * for the requester's, and the requester may reply with what they want
+   * instead, which revises the plan. An approver can skip them with exactly
+   * "approve without confirmation".
+   */
+  requesterToConfirm?: string;
 }): Promise<ApprovalResult> {
   const { slack, channelId, threadTs, approverUserIds, approvalPromptTs, logStep, botUserId, signal } = params;
   const { reminders, approverMention } = params;
+  const requester =
+    params.requesterToConfirm && !approverUserIds.includes(params.requesterToConfirm)
+      ? params.requesterToConfirm
+      : undefined;
+  let requesterConfirmed = !requester;
+  /** The first approval, held until the requester confirms. */
+  let heldApproval: ApprovalResult | undefined;
+  const postedOnce = new Set<'held' | 'confirmed' | 'askWhat'>();
+  const postOnce = (key: 'held' | 'confirmed' | 'askWhat', text: string): void => {
+    if (postedOnce.has(key)) return;
+    postedOnce.add(key);
+    slack.chat.postMessage({ channel: channelId, thread_ts: threadTs, text }).catch(() => {});
+  };
+  /** An approver said yes: done, unless the requester still has to confirm. */
+  const approve = (result: ApprovalResult): ApprovalResult | undefined => {
+    if (requesterConfirmed) return result;
+    heldApproval ??= result;
+    if (!postedOnce.has('held')) {
+      logStep({
+        stage: 'pipeline.approval.awaiting_requester',
+        message: `<@${result.approverId}> approved; waiting for <@${requester}> to confirm the plan is what they want.`,
+      });
+    }
+    postOnce(
+      'held',
+      `Thanks <@${result.approverId}>. <@${requester}>, before I start: is the plan above what you want? Reply *yes*, or tell me what to change. (An admin can reply \`approve without confirmation\` to go ahead without that.)`,
+    );
+    return undefined;
+  };
   const waitStartedAt = Date.now();
   const reminderDelays = [...(reminders?.afterMs ?? [])].sort((a, b) => a - b);
   let remindersSent = 0;
@@ -407,12 +509,17 @@ async function pollForApproval(params: {
     while (due < reminderDelays.length && Date.now() - waitStartedAt >= reminderDelays[due]) due += 1;
     if (reminders && due > remindersSent) {
       remindersSent = due;
+      // Once approved, only the requester is holding the plan up: remind them, not the approvers.
+      const waitingOnRequester = Boolean(heldApproval) && !requesterConfirmed;
       logStep({
         stage: 'pipeline.approval.reminder',
-        message: `Reminded approvers (${remindersSent} of ${reminderDelays.length}).`,
+        message: `Reminded ${waitingOnRequester ? 'the requester' : 'approvers'} (${remindersSent} of ${reminderDelays.length}).`,
         data: { waitedMs: Date.now() - waitStartedAt },
       });
-      slack.chat.postMessage({ channel: channelId, thread_ts: threadTs, text: reminders.text }).catch(() => {});
+      const text = waitingOnRequester
+        ? `<@${requester}> the plan above is approved and waits only for you: reply *yes* if it is what you want, or tell me what to change.`
+        : reminders.text;
+      slack.chat.postMessage({ channel: channelId, thread_ts: threadTs, text }).catch(() => {});
     }
 
     let messages: Array<{ text: string; user: string; ts: string }>;
@@ -439,6 +546,56 @@ async function pollForApproval(params: {
           message: `<@${reply.user}> asked miniOG to wait: "${text}"`,
         });
         return { outcome: 'paused', userReply: text, approverId: reply.user, replyTs: reply.ts };
+      }
+
+      // The requester confirming, or saying what they want instead (issue #437).
+      if (requester && reply.user === requester) {
+        if (requesterConfirmed) continue;
+        let intent: ApprovalIntent | null = CONFIRM_PATTERNS.test(text) ? 'approve' : null;
+        if (!intent) {
+          if (classifiedTs.has(reply.ts)) continue;
+          intent = await classifyApprovalIntent(
+            text,
+            messages.slice(-6).map(m => m.text.trim()),
+            logStep,
+          );
+          if (intent === null) continue;
+          classifiedTs.add(reply.ts);
+        }
+        if (intent === 'approve') {
+          requesterConfirmed = true;
+          logStep({
+            stage: 'pipeline.approval.requester_confirmed',
+            message: `<@${reply.user}> confirmed the plan is what they want: "${text}"`,
+          });
+          if (heldApproval) {
+            return { ...heldApproval, replyTs: reply.ts > heldApproval.replyTs ? reply.ts : heldApproval.replyTs };
+          }
+          postOnce('confirmed', `Thanks <@${reply.user}>. Waiting for an admin to approve.`);
+          continue;
+        }
+        if (intent === 'feedback') {
+          logStep({
+            stage: 'pipeline.approval.feedback',
+            message: `The requester <@${reply.user}> asked for a change: "${text}"`,
+          });
+          return { outcome: 'feedback', userReply: text, approverId: reply.user, replyTs: reply.ts };
+        }
+        if (intent === 'pause') {
+          return { outcome: 'paused', userReply: text, approverId: reply.user, replyTs: reply.ts };
+        }
+        if (intent === 'reject') {
+          postOnce('askWhat', `<@${reply.user}> tell me what you want instead, and I'll revise the plan.`);
+        }
+        continue;
+      }
+
+      if (isApprover && OVERRIDE_CONFIRMATION_RE.test(text)) {
+        logStep({
+          stage: 'pipeline.approval.approved',
+          message: `Core-dev member <@${reply.user}> approved the plan without the requester's confirmation: "${text}"`,
+        });
+        return { outcome: 'approved', userReply: text, approverId: reply.user, replyTs: reply.ts };
       }
 
       if (APPROVE_PATTERNS.test(text)) {
@@ -470,7 +627,9 @@ async function pollForApproval(params: {
           stage: 'pipeline.approval.approved',
           message: `Core-dev member <@${reply.user}> approved the plan: "${text}"`,
         });
-        return { outcome: 'approved', userReply: text, approverId: reply.user, replyTs: reply.ts };
+        const approved = approve({ outcome: 'approved', userReply: text, approverId: reply.user, replyTs: reply.ts });
+        if (approved) return approved;
+        continue;
       }
 
       if (REJECT_PATTERNS.test(text)) {
@@ -511,7 +670,9 @@ async function pollForApproval(params: {
             stage: 'pipeline.approval.approved',
             message: `Core-dev member <@${reply.user}> approved the plan: "${text}"`,
           });
-          return { outcome: 'approved', userReply: text, approverId: reply.user, replyTs: reply.ts };
+          const approved = approve({ outcome: 'approved', userReply: text, approverId: reply.user, replyTs: reply.ts });
+          if (approved) return approved;
+          continue;
         }
         if (intent === 'feedback') {
           logStep({
@@ -1473,18 +1634,20 @@ export async function runAgentPipeline(params: {
       output.affectedFiles = plannerNormalized.affectedFiles;
 
       if (plannerNormalized.planMarkdown.length > 0) {
-        planMessageTs = await postSlackProgress({
-          slack,
-          ctx,
-          text: formatPlanMessage(
-            plannerNormalized.planMarkdown,
-            plannerNormalized.affectedFiles,
-            plannerNormalized.scope,
-            ctx.repoPath,
-            false,
-            ctx.task.event.userId,
-          ),
-        });
+        try {
+          planMessageTs = await postPlanForApproval({
+            slack,
+            channelId: ctx.task.event.channelId,
+            threadTs: ctx.task.event.threadTs,
+            planMarkdown: plannerNormalized.planMarkdown,
+            affectedFiles: plannerNormalized.affectedFiles,
+            scope: plannerNormalized.scope,
+            repoPath: ctx.repoPath,
+            logStep,
+          });
+        } catch {
+          // Non-fatal, as for any other progress post.
+        }
       }
 
       // Approval gate: wait for an admin to confirm the plan before proceeding
@@ -1534,7 +1697,6 @@ export async function runAgentPipeline(params: {
           plannerNormalized.scope,
           ctx.repoPath,
           true,
-          ctx.task.event.userId,
         ),
       });
     }

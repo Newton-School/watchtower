@@ -23,7 +23,8 @@ import { getBackend } from '../backends/registry.js';
 import type { AgentBackendId } from '../backends/types.js';
 import {
   runAgentPipeline,
-  formatPlanMessage,
+  planNeedsRequesterConfirmation,
+  postPlanForApproval,
   waitForApproval,
   buildApprovalMessage,
   coderDeclaredBlocked,
@@ -429,6 +430,8 @@ async function runApprovalLoop(input: {
   let overrideNextPromptTs: string | undefined;
 
   for (let iteration = iterationStart; iteration < MAX_FEEDBACK_ITERATIONS; iteration++) {
+    // Worked out for each version of the plan: a revision can add or remove a behaviour change.
+    const requesterToConfirm = requesterToConfirmFor(planMarkdown, config, task.event.userId);
     let approvalPromptTs: string | undefined;
     if (iteration === iterationStart && resumeApprovalPromptTs) {
       // Resuming: the prompt is already posted; the resume mention is the next reply we want to classify.
@@ -440,8 +443,8 @@ async function runApprovalLoop(input: {
     } else {
       const promptText =
         iteration === 0
-          ? 'Here\'s my plan. An admin needs to approve before I proceed:\n• "yes" or "go" — I\'ll start coding\n• "no" or "stop" — I\'ll cancel\n• Or reply with changes you\'d like and I\'ll adjust'
-          : 'Here\'s the revised plan. "yes" to proceed, "no" to cancel, or reply with more changes.';
+          ? `Here's my plan. ${requesterToConfirm ? 'I start once the requester confirms it is what they want and an admin approves' : 'An admin needs to approve before I proceed'}:\n• "yes" or "go" — I'll start coding\n• "no" or "stop" — I'll cancel\n• Or reply with changes you'd like and I'll adjust`
+          : `Here's the revised plan. "yes" to proceed, "no" to cancel, or reply with more changes.${requesterToConfirm ? ' I start once the requester confirms it and an admin approves.' : ''}`;
 
       try {
         const promptResult = await slack.chat.postMessage({
@@ -479,6 +482,7 @@ async function runApprovalLoop(input: {
         text: `${approverMention} <@${task.event.userId}>'s plan above still needs a yes or no.`,
       },
       approverMention,
+      requesterToConfirm,
     });
 
     if (approval.outcome === 'cancelled') {
@@ -549,6 +553,7 @@ async function runApprovalLoop(input: {
         logStep: logStep ?? (() => {}),
         botUserId: config.botUserId,
         signal,
+        requesterToConfirm,
       });
 
       if (followUp.outcome === 'cancelled') {
@@ -628,7 +633,7 @@ async function runApprovalLoop(input: {
       const feedbackPrompt = `You previously produced this plan:
 ${JSON.stringify(plannerOutput, null, 2)}
 
-The admin reviewed it and provided this feedback:
+It was reviewed, and this feedback came back (from an admin, or from the requester saying what they want):
 
 "${approval.userReply}"
 
@@ -747,12 +752,18 @@ Return the JSON now.`;
       // content. We also still update the original message so it reflects the
       // latest plan for anyone scrolling back.
       try {
-        const revisedPosted = await slack.chat.postMessage({
-          channel: task.event.channelId,
-          thread_ts: task.event.threadTs,
-          text: formatPlanMessage(planMarkdown, planAffectedFiles, planScope, pipelineCwd, false, task.event.userId),
+        const revisedTs = await postPlanForApproval({
+          slack,
+          channelId: task.event.channelId,
+          threadTs: task.event.threadTs,
+          planMarkdown,
+          affectedFiles: planAffectedFiles,
+          scope: planScope,
+          repoPath: pipelineCwd,
+          requesterToConfirm: requesterToConfirmFor(planMarkdown, config, task.event.userId),
+          logStep,
         });
-        planMessageTs = revisedPosted.ts ?? planMessageTs;
+        planMessageTs = revisedTs ?? planMessageTs;
       } catch {
         // Non-fatal
       }
@@ -761,6 +772,17 @@ Return the JSON now.`;
   }
 
   return { kind: 'exhausted' };
+}
+
+/**
+ * The requester, when they have to confirm the plan before work starts: it
+ * changes behaviour or rests on assumptions, and they cannot approve it
+ * themselves (issue #437). An admin requester's own yes covers both.
+ */
+function requesterToConfirmFor(planMarkdown: string, config: AppConfig, requesterId: string): string | undefined {
+  return planNeedsRequesterConfirmation(planMarkdown) && !getAdminUserIds(config).includes(requesterId)
+    ? requesterId
+    : undefined;
 }
 
 /** What the thread is told when the planner run itself failed. Never the run's own last line. */
@@ -1591,12 +1613,17 @@ Write your response as a ready-to-post Slack message describing what you did.
     let planPostError: unknown;
     if (planMarkdown.length > 0) {
       try {
-        const planResult = await slack.chat.postMessage({
-          channel: task.event.channelId,
-          thread_ts: task.event.threadTs,
-          text: formatPlanMessage(planMarkdown, planAffectedFiles, planScope, pipelineCwd, false, task.event.userId),
+        planMessageTs = await postPlanForApproval({
+          slack,
+          channelId: task.event.channelId,
+          threadTs: task.event.threadTs,
+          planMarkdown,
+          affectedFiles: planAffectedFiles,
+          scope: planScope,
+          repoPath: pipelineCwd,
+          requesterToConfirm: requesterToConfirmFor(planMarkdown, config, task.event.userId),
+          logStep,
         });
-        planMessageTs = planResult.ts ?? undefined;
       } catch (error) {
         planPostError = error;
       }
