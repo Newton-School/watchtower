@@ -196,6 +196,7 @@ export function formatPlanMessage(
 
   const changesBehaviour = !isNone(summary.behaviourChange);
   const assumed = !isNone(summary.assumptions);
+  const outside = !isNone(summary.outsideRepo);
   const block = [
     header,
     `*What changes:* ${summary.whatChanges}`,
@@ -203,13 +204,19 @@ export function formatPlanMessage(
     // "none" keeps whatever the planner added to it ("none. It is only a comment.").
     `*Behaviour change:* ${changesBehaviour ? ':warning: ' : ''}${summary.behaviourChange.trim() || 'none'}`,
     `*Assumptions to confirm:* ${summary.assumptions.trim() || 'none'}`,
+    // A write to another system rides on the same yes as the code, so the approver sees it (issue #432).
+    ...(outside ? [`*Outside the repo:* :warning: ${summary.outsideRepo.trim()}`] : []),
   ];
-  if (requesterId && (changesBehaviour || assumed)) {
-    const what = [changesBehaviour ? 'the behaviour change' : '', assumed ? 'the assumptions' : '']
-      .filter(Boolean)
-      .join(' and ');
+  if (requesterId && (changesBehaviour || assumed || outside)) {
+    const parts = [
+      changesBehaviour ? 'the behaviour change' : '',
+      assumed ? 'the assumptions' : '',
+      outside ? 'the changes outside the repo' : '',
+    ].filter(Boolean);
+    const what = parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}` : parts[0];
+    const plural = parts.length > 1 || assumed || outside;
     block.push(
-      `<@${requesterId}> before I start, please confirm ${what} above ${assumed ? 'are' : 'is'} what you want: reply *yes*, or tell me what to change.`,
+      `<@${requesterId}> before I start, please confirm ${what} above ${plural ? 'are' : 'is'} what you want: reply *yes*, or tell me what to change.`,
     );
   }
   return [block.join('\n'), ...(filesSection ? [filesSection] : [])].join('\n\n').concat(completedSuffix);
@@ -220,10 +227,18 @@ export function formatPlanDetail(planMarkdown: string): string {
   return parseApproverSummary(planMarkdown) ? planWithoutApproverParts(planMarkdown) : '';
 }
 
+/** The approved plan names changes outside the repository on its "Outside the repo" line (issue #432). */
+export function planListsOutsideChanges(planMarkdown: string): boolean {
+  const summary = parseApproverSummary(planMarkdown);
+  return Boolean(summary && !isNone(summary.outsideRepo));
+}
+
 /** The plan changes behaviour or rests on assumptions, so the requester has to confirm it (issue #437). */
 export function planNeedsRequesterConfirmation(planMarkdown: string): boolean {
   const summary = parseApproverSummary(planMarkdown);
-  return Boolean(summary && (!isNone(summary.behaviourChange) || !isNone(summary.assumptions)));
+  return Boolean(
+    summary && (!isNone(summary.behaviourChange) || !isNone(summary.assumptions) || !isNone(summary.outsideRepo)),
+  );
 }
 
 /**
@@ -1157,6 +1172,54 @@ export function buildApprovalMessage(feedbackRounds: number): string {
   const prefix = feedbackRounds > 0 ? `After ${feedbackRounds} revision${feedbackRounds > 1 ? 's' : ''}, plan` : 'Plan';
   return `${prefix} approved \u2014 I'll code it up, then review and verify.`;
 }
+/** A change the coder reports making outside the repository (issue #432). */
+export interface ExternalChange {
+  system: string;
+  target: string;
+  description: string;
+  verification: string;
+}
+
+/** The coder's `externalChanges`, keeping only entries that say what changed. */
+export function parseExternalChanges(output: Record<string, unknown>): ExternalChange[] {
+  if (!Array.isArray(output.externalChanges)) return [];
+  const text = (value: unknown): string => (typeof value === 'string' ? value.trim() : '');
+  return output.externalChanges
+    .filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === 'object')
+    .map(entry => ({
+      system: text(entry.system),
+      target: text(entry.target),
+      description: text(entry.description),
+      verification: text(entry.verification),
+    }))
+    .filter(change => change.description || change.target);
+}
+
+/** The thread's list of what changed outside the repository, and whether the approved plan said so. */
+export function formatExternalChanges(changes: ExternalChange[], notInPlan: boolean): string {
+  const lines = changes.map(change => {
+    const where = [change.system, change.target].filter(Boolean).join(', ');
+    const checked = change.verification ? ` Checked: ${change.verification}` : ' Not checked.';
+    return `• ${where ? `*${where}:* ` : ''}${change.description || 'changed'}${checked}`;
+  });
+  return [
+    '*Changed outside the repo:*',
+    ...lines,
+    ...(notInPlan ? [':warning: The approved plan did not list changes outside the repo.'] : []),
+  ].join('\n');
+}
+
+/** What the pipeline result says about changes outside the repository. Nothing when there were none. */
+function externalChangesResult(
+  coderStep: AgentStepResult | undefined,
+  externalOnly: boolean,
+  planMarkdown: string,
+): Pick<PipelineResult, 'externalChanges' | 'externalOnly' | 'externalNotInPlan'> {
+  const changes = coderStep ? parseExternalChanges(coderStep.output) : [];
+  if (changes.length === 0) return {};
+  return { externalChanges: changes, externalOnly, externalNotInPlan: !planListsOutsideChanges(planMarkdown) };
+}
+
 /** True when the coder's JSON explicitly declares it could not act (#413). */
 export function coderDeclaredBlocked(output: Record<string, unknown>): boolean {
   return typeof output.status === 'string' && output.status.trim().toLowerCase() === 'blocked';
@@ -1325,6 +1388,8 @@ export async function runAgentPipeline(params: {
   let needsInputQuestion: string | undefined;
   let usageLimitHit = false;
   let usageLimitResetsAt: string | undefined;
+  // The coder's whole change was outside the repository (issue #432).
+  let externalOnly = false;
   // Interruptions — a dropped connection (issue #439) or a process killed from
   // outside (issue #445): the time they cost is kept off the pipeline's clock,
   // and one that outlasts its retries stops the run. Neither is ever a verdict.
@@ -1555,7 +1620,21 @@ export async function runAgentPipeline(params: {
           repoPath: ctx.repoPath,
           baseSha: coderBaseSha,
         });
-        if (!changes.producedChanges) {
+        const external = parseExternalChanges(output);
+        const plannedOutsideRepo = planListsOutsideChanges(plannerNormalized?.planMarkdown ?? '');
+        if (!changes.producedChanges && external.length > 0) {
+          // The change was outside the repository, and the coder says what
+          // and how it checked it: nothing to review as a diff, no PR to
+          // open. Used to be failed as "a hallucinated response" while the
+          // dashboard had in fact been updated (issue #432).
+          externalOnly = true;
+          logStep({
+            stage: 'pipeline.agent.coder.external_only',
+            message: `Coder changed ${external.length} thing(s) outside the repository and nothing in it; skipping the diff review.`,
+            level: plannedOutsideRepo ? 'INFO' : 'WARN',
+            data: { external, inApprovedPlan: plannedOutsideRepo },
+          });
+        } else if (!changes.producedChanges) {
           status = 'failed';
           findings.push({
             severity: 'critical',
@@ -1613,6 +1692,9 @@ export async function runAgentPipeline(params: {
       level: status === 'failed' ? 'WARN' : 'INFO',
       data: { status, durationMs, findings: findings.length },
     });
+
+    // Nothing in the repository to review: the reviewer and verifier read diffs (issue #432).
+    if (externalOnly) break;
 
     const nextRole = i < agents.length - 1 ? agents[i + 1] : undefined;
     await postSlackProgress({
@@ -1946,5 +2028,6 @@ export async function runAgentPipeline(params: {
     needsInputQuestion,
     usageLimitResetsAt,
     ...(interrupted ? { interrupted } : {}),
+    ...externalChangesResult(latestByRole.get('coder'), externalOnly, plannerNormalized?.planMarkdown ?? ''),
   };
 }

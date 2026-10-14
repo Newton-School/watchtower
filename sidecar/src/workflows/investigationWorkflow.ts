@@ -181,6 +181,7 @@ Return strict JSON:
     { "file": string, "line": number, "snippet": string, "why": string }
   ],
   "recommendedFix": string,                 // conceptual fix sketch (not code) — what should change
+  "fixLocation": "repo" | "outside" | "none", // "repo": a code change in one of these repositories. "outside": the fix is somewhere else (a Metabase question or dashboard, an admin setting, data, another service) — say where in recommendedFix, and who can make it. "none": nothing needs fixing
   "confidence": "low" | "medium" | "high",
   "requiresMoreInfo": string | null,        // null if the hypothesis stands on its own; otherwise a specific ask
   "summary": string                         // one-line Slack summary of what you found
@@ -300,12 +301,16 @@ Return strict JSON:
     rootCauseHypothesis?: string;
     evidence?: Array<{ file?: string; line?: number; snippet?: string; why?: string }>;
     recommendedFix?: string;
+    fixLocation?: string;
     confidence?: 'low' | 'medium' | 'high';
     requiresMoreInfo?: string | null;
     summary?: string;
   };
 
   const message = formatInvestigationMessage(findings);
+  // Only a fix in the code is offered: anything else, if accepted, went into
+  // the change pipeline with no repo to change (issue #432).
+  const fixOutsideRepos = findings.fixLocation === 'outside';
 
   await slack.chat
     .postMessage({
@@ -316,7 +321,19 @@ Return strict JSON:
     .catch(() => {});
 
   let promptMessageTs: string | undefined;
-  if (findings.requiresMoreInfo) {
+  if (fixOutsideRepos && !findings.requiresMoreInfo) {
+    logStep?.({
+      stage: 'investigation.fix_outside_repos',
+      message: 'The recommended fix is outside the repositories; not offering to make it.',
+    });
+    await slack.chat
+      .postMessage({
+        channel: task.event.channelId,
+        thread_ts: task.event.threadTs,
+        text: 'This fix is not a code change, so I can’t make it from here: see *Recommended fix* for where it lives and who can change it.',
+      })
+      .catch(() => undefined);
+  } else if (findings.requiresMoreInfo) {
     const ack = await slack.chat
       .postMessage({
         channel: task.event.channelId,
@@ -343,7 +360,9 @@ Return strict JSON:
     promptMessageTs = typeof ack?.ts === 'string' ? ack.ts : undefined;
   }
 
-  if (investigationStore && jobId) {
+  // Not saved when the fix is outside the repositories: a saved investigation
+  // is what turns "yes, fix it" into the change pipeline.
+  if (investigationStore && jobId && !fixOutsideRepos) {
     try {
       investigationStore.save({
         threadTs: task.event.threadTs,

@@ -15,6 +15,8 @@ export interface ApproverSummary {
   behaviourChange: string;
   /** "none", or what the planner had to assume (a screenshot it could not see, a default it picked). */
   assumptions: string;
+  /** "none", or what the plan changes outside the repository: a Figma design, an upload through Newton admin (issue #432). */
+  outsideRepo: string;
   risk: 'low' | 'medium' | 'high' | null;
 }
 
@@ -201,7 +203,7 @@ export function extractFilesToChange(markdown: string): string[] | undefined {
 
 const APPROVER_HEADING_RE = /^#{1,6}\s*for\s+the\s+approver\b/i;
 const APPROVER_LINE_RE =
-  /^[\s>*-]*\**\s*(what changes|where|behaviou?r change|assumptions to confirm|risk)\s*\**\s*:\s*\**\s*(.*)$/i;
+  /^[\s>*-]*\**\s*(what changes|where|behaviou?r change|assumptions to confirm|outside the repo|risk)\s*\**\s*:\s*\**\s*(.*)$/i;
 /** The approver block is the plan's opening: lines this far down are something else. */
 const APPROVER_BLOCK_MAX_LINE = 40;
 
@@ -233,6 +235,7 @@ export function parseApproverSummary(markdown: string): ApproverSummary | null {
     where: byLabel.get('where') ?? '',
     behaviourChange,
     assumptions: byLabel.get('assumptions to confirm') || 'none',
+    outsideRepo: byLabel.get('outside the repo') || 'none',
     risk: risk ?? null,
   };
 }

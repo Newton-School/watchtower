@@ -238,12 +238,13 @@ describe('a plan written for its approver (issue #437)', () => {
     'Requires code changes: yes',
   ].join('\n');
 
-  it('reads the five approver lines', () => {
+  it('reads the approver lines; a plan written before "Outside the repo" changes nothing outside it (#432)', () => {
     expect(parseApproverSummary(PLAN)).toEqual({
       whatChanges: 'The yellow "Final admissions cycle for 2026" line under the hero heading disappears.',
       where: '/newton-school-of-technology-nst/home',
       behaviourChange: 'none',
       assumptions: 'none',
+      outsideRepo: 'none',
       risk: 'low',
     });
   });

@@ -90,6 +90,56 @@ describe('runInvestigationWorkflow thread images', () => {
     expect(runCodex.mock.calls[0][0].imagePaths).toEqual(['/tmp/slack-files/F1-image.png']);
   });
 
+  it('does not offer to fix what is not in the code, and keeps nothing a "yes, fix it" could resume (issue #432)', async () => {
+    runCodex.mockReset().mockResolvedValue({
+      ok: true,
+      exitCode: 0,
+      parsedJson: {
+        rootCauseHypothesis: 'The dashboard 674 cards count every class.',
+        evidence: [],
+        recommendedFix:
+          'Restrict the seven cards on Metabase dashboard 674 to topic classes; a Metabase editor can do it.',
+        fixLocation: 'outside',
+        confidence: 'high',
+        summary: 'The count is wrong in the Metabase cards, not in the code.',
+      },
+    });
+    const slack = slackStub();
+    const investigationStore = { save: vi.fn() } as any;
+
+    await runInvestigationWorkflow({
+      task: makeTask('the recording coverage dashboard counts the wrong classes'),
+      config,
+      slack: slack as any,
+      investigationStore,
+      jobId: 'job-1',
+    });
+
+    const texts = slack.chat.postMessage.mock.calls.map((call: any[]) => call[0].text as string);
+    expect(texts.some(text => text.includes('Want me to fix this?'))).toBe(false);
+    expect(texts).toContain(
+      'This fix is not a code change, so I can’t make it from here: see *Recommended fix* for where it lives and who can change it.',
+    );
+    expect(investigationStore.save).not.toHaveBeenCalled();
+  });
+
+  it('still offers a fix in the code', async () => {
+    const slack = slackStub();
+    const investigationStore = { save: vi.fn() } as any;
+
+    await runInvestigationWorkflow({
+      task: makeTask('button is misaligned'),
+      config,
+      slack: slack as any,
+      investigationStore,
+      jobId: 'job-1',
+    });
+
+    const texts = slack.chat.postMessage.mock.calls.map((call: any[]) => call[0].text as string);
+    expect(texts.some(text => text.startsWith('Want me to fix this?'))).toBe(true);
+    expect(investigationStore.save).toHaveBeenCalledTimes(1);
+  });
+
   it('investigates read-only, and tells the investigator so (issue #443)', async () => {
     await runInvestigationWorkflow({ task: makeTask('button is misaligned'), config, slack: slackStub() as any });
 
