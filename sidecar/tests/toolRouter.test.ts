@@ -49,6 +49,16 @@ describe('buildRouterPrompt', () => {
     }
   });
 
+  // Issue #451: "Fixed all reviews @miniOG" in a thread miniOG reviewed was read
+  // as unclear (ask_user, 0.6) instead of as a request to look again.
+  it('says whether miniOG already reviewed a pull request in the thread, and what that changes', () => {
+    expect(prompt).toContain('You already reviewed a pull request in this thread: no');
+    expect(buildRouterPrompt({ ...facts, reviewedPrInThread: true })).toContain(
+      'You already reviewed a pull request in this thread: yes',
+    );
+    expect(prompt).toContain('a message saying your review comments are fixed, addressed or resolved');
+  });
+
   it('does not offer the exact-syntax tools', () => {
     expect(prompt).not.toContain('- dev_assist:');
     expect(prompt).not.toContain('- dossier:');
@@ -252,6 +262,12 @@ describe('buildRouterFacts', () => {
       intent: 'IMPLEMENTATION',
       ...overrides,
     }) as never;
+
+  it('carries what the job store knows about an earlier review, and only when there was one', () => {
+    expect(buildRouterFacts(task({}), 'm', { reviewedPrInThread: true })).toMatchObject({ reviewedPrInThread: true });
+    expect(buildRouterFacts(task({}), 'm', { reviewedPrInThread: false })).not.toHaveProperty('reviewedPrInThread');
+    expect(buildRouterFacts(task({}), 'm')).not.toHaveProperty('reviewedPrInThread');
+  });
 
   it('separates a link in the message from one earlier in the thread', () => {
     const pr = { url: 'u', owner: 'o', repo: 'r', number: 1 };

@@ -48,7 +48,11 @@ export function addressingOf(
   return task.mentionReference ? 'reference' : 'direct';
 }
 
-export function buildRouterFacts(task: NormalizedTask, userMessage: string): RouterFacts {
+export function buildRouterFacts(
+  task: NormalizedTask,
+  userMessage: string,
+  thread: { reviewedPrInThread?: boolean } = {},
+): RouterFacts {
   const prs = task.prContexts ?? [];
   const inTrigger = prs.some(pr => pr.source === 'trigger');
   // The deploy keywords do not seed a workflow; they are a hint, read from the
@@ -63,6 +67,7 @@ export function buildRouterFacts(task: NormalizedTask, userMessage: string): Rou
     threadContext: formatThreadContextForClassifier(task),
     prUrlInTrigger: inTrigger,
     prUrlInThread: prs.some(pr => pr.source === 'thread') || (!inTrigger && Boolean(task.prContext)),
+    ...(thread.reviewedPrInThread ? { reviewedPrInThread: true } : {}),
     hints: hint ? [hint] : [],
     ...(task.clarification ? { answering: task.clarification } : {}),
     ...(deployTarget ? { deployTarget } : {}),
@@ -140,6 +145,8 @@ export function failedClassification(addressing: RouterFacts['addressing']): Rou
 export function startRouterShadow(params: {
   task: NormalizedTask;
   userMessage: string;
+  /** What the job store knows about this thread: miniOG reviewed a PR in it (issue #451). */
+  reviewedPrInThread?: boolean;
   logStep?: WorkflowStepLogger;
   signal?: AbortSignal;
   decide?: typeof decideTool;
@@ -148,7 +155,7 @@ export function startRouterShadow(params: {
   // Exact syntax and presence pings need no model to read them.
   if (EXACT_SYNTAX_SEEDS.has(task.intent) || isPresencePing(userMessage)) return undefined;
 
-  const facts = buildRouterFacts(task, userMessage);
+  const facts = buildRouterFacts(task, userMessage, { reviewedPrInThread: params.reviewedPrInThread });
   const call = (): Promise<RouterOutcome> =>
     (params.decide ?? decideTool)({ facts, signal, role: 'router', logStep }).catch(
       (error): RouterOutcome => ({ ok: false, error: String(error), durationMs: 0 }),

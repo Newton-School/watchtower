@@ -219,7 +219,15 @@ export async function routeTask(params: {
   // The tool-router's one call for this message (issue #456). Its decision is
   // used below wherever a keyword gate has not already settled the workflow;
   // for a gate-decided message nothing waits for it and it is only logged.
-  const routerShadow = startRouterShadow({ task, userMessage, logStep, signal });
+  // "Fixed all reviews" means "look again" only where miniOG already reviewed
+  // a PR, and the thread text may not say so (issue #451).
+  let reviewedPrInThread = false;
+  try {
+    reviewedPrInThread = Boolean(store.hasReviewedPrInThread?.(task.event.channelId, task.event.threadTs));
+  } catch {
+    // advisory: the router decides without it
+  }
+  const routerShadow = startRouterShadow({ task, userMessage, reviewedPrInThread, logStep, signal });
   let legacyDecidedBy: LegacyDecidedBy = 'gate';
   let routerCouldNotDecide = false;
   let clarify: ClarifyAction = { kind: 'run' };

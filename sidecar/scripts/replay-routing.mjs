@@ -28,12 +28,16 @@ const option = (name, fallback) => {
 
 const dbPath = option('db');
 if (!dbPath) {
-  console.error('usage: replay-routing.mjs --db <snapshot.db> [--limit N] [--all] [--concurrency 4]');
+  console.error('usage: replay-routing.mjs --db <snapshot.db> [--limit N] [--all] [--reviewed-only] [--concurrency 4] [--json out.json]');
   process.exit(2);
 }
 const limit = Number(option('limit', '0'));
 const concurrency = Math.max(1, Number(option('concurrency', '4')));
 const showAll = flag('all');
+// Only messages in threads where miniOG had already reviewed a PR (issue #451).
+const reviewedOnly = flag('reviewed-only');
+// Every decision, one object per job, for comparing two runs (a prompt change).
+const jsonOut = option('json');
 
 const PR_URL = /github\.com\/[^/\s>|]+\/[^/\s>|]+\/pull\/\d+/;
 const EXACT_SYNTAX = new Set(['DEV_ASSIST', 'MINIOG_DOSSIER']);
@@ -51,7 +55,7 @@ const legacyName = intent => (intent === 'OWNER_AUTOPILOT' ? 'IMPLEMENTATION' : 
 const db = new Database(dbPath, { readonly: true });
 const jobs = db
   .prepare(
-    `SELECT id, workflow, executed_workflow, status, channel_id, thread_ts, payload_json
+    `SELECT id, workflow, executed_workflow, status, channel_id, thread_ts, payload_json, created_at
      FROM jobs ORDER BY created_at ${limit > 0 ? `LIMIT ${limit}` : ''}`,
   )
   .all();
@@ -59,6 +63,13 @@ const threadBefore = db.prepare(
   `SELECT display_name, user_id, text FROM conversation_messages
    WHERE channel_id = ? AND thread_ts = ? AND deleted = 0 AND CAST(message_ts AS REAL) < CAST(? AS REAL)
    ORDER BY CAST(message_ts AS REAL) DESC LIMIT 6`,
+);
+// What the router is told as "you already reviewed a pull request in this thread" (issue #451).
+const reviewedBefore = db.prepare(
+  `SELECT 1 FROM jobs
+   WHERE COALESCE(executed_workflow, workflow) = 'PR_REVIEW' AND status IN ('SUCCESS', 'FAILED')
+     AND channel_id = ? AND thread_ts = ? AND result_json LIKE '%prHeadSha%' AND created_at < ?
+   LIMIT 1`,
 );
 const ranClassifier = db.prepare(
   `SELECT 1 FROM job_logs WHERE job_id = ? AND stage = 'router.classify.start' LIMIT 1`,
@@ -80,6 +91,8 @@ for (const job of jobs) {
     .filter(row => row.text?.trim())
     .map(row => `[${row.display_name || row.user_id}] ${row.text.length > 200 ? `${row.text.slice(0, 200)}…` : row.text}`)
     .join('\n');
+  const reviewedPrInThread = Boolean(reviewedBefore.get(job.channel_id, job.thread_ts, job.created_at));
+  if (reviewedOnly && !reviewedPrInThread) continue;
   cases.push({
     id: job.id.slice(0, 8),
     legacy: legacyName(job.executed_workflow ?? job.workflow),
@@ -94,6 +107,7 @@ for (const job of jobs) {
       threadContext: threadContext || undefined,
       prUrlInTrigger: PR_URL.test(String(payload.text ?? '')),
       prUrlInThread: PR_URL.test(threadContext),
+      ...(reviewedPrInThread ? { reviewedPrInThread: true } : {}),
       hints: GATE_HINTS[seed] ? [GATE_HINTS[seed]] : [],
     },
   });
@@ -115,6 +129,19 @@ await Promise.all(
     }
   }),
 );
+
+if (jsonOut) {
+  const fs = await import('node:fs');
+  const decisions = results.map(r => ({
+    id: r.id,
+    legacy: r.legacy,
+    router: r.router,
+    confidence: r.outcome.ok ? r.outcome.decision.confidence : null,
+    reviewedPrInThread: Boolean(r.facts.reviewedPrInThread),
+  }));
+  fs.writeFileSync(jsonOut, JSON.stringify(decisions));
+  console.error(`decisions written to ${jsonOut}`);
+}
 
 const short = text => (text.length > 90 ? `${text.slice(0, 90)}…` : text);
 const differ = results.filter(r => r.router !== r.legacy);

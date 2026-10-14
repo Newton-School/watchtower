@@ -2924,6 +2924,27 @@ export class JobStore {
       );
   }
 
+  /**
+   * Has miniOG reviewed a pull request in this thread? Only a review that
+   * recorded the head it read counts, as in findLatestReviewedPrHeadSha: a
+   * denied or failed attempt is no review. Read by the router (issue #451).
+   */
+  hasReviewedPrInThread(channelId: string, threadTs: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS hit
+         FROM jobs
+         WHERE COALESCE(executed_workflow, workflow) = 'PR_REVIEW'
+           AND status IN ('SUCCESS', 'FAILED')
+           AND channel_id = ?
+           AND thread_ts = ?
+           AND result_json LIKE '%prHeadSha%'
+         LIMIT 1`,
+      )
+      .get(channelId, threadTs) as { hit?: number } | undefined;
+    return Boolean(row?.hit);
+  }
+
   findLatestReviewedPrHeadSha(input: {
     channelId: string;
     threadTs: string;
