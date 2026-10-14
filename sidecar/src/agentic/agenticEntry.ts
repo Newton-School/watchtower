@@ -14,6 +14,7 @@ import { assembleConversationRecall } from '../conversation/conversationRecall.j
 import { fetchThreadContext } from '../slack/threadContext.js';
 import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
 import { refreshSharedClones } from '../workspaces/staleCheckout.js';
+import { createLookupWorkspace, type LookupWorkspace } from '../workspaces/lookupWorkspace.js';
 import { getBackend } from '../backends/registry.js';
 import { extractQaTargetUrl } from '../router/intentParser.js';
 import { parseScreenshotManifest, QA_LIMITS, uploadScreenshots } from '../slack/imageUploader.js';
@@ -334,8 +335,25 @@ SCREENSHOTS MANIFEST (required, the very last thing in your message): output a l
  * and conversationalWorkflow. Spawns Claude Code via runCodex (OAuth, no API
  * key needed) with a per-mode system prompt; the agent uses its native tools
  * to explore the repos; the final stdout is parsed and posted to Slack.
+ *
+ * A lookup reads its own copy of the repos at origin's head, removed once the
+ * reply and its files are posted (issue #446).
  */
 export async function runAgenticEntry(params: RunAgenticEntryParams): Promise<WorkflowResult> {
+  if (params.mode !== 'informational') return runAgenticTurn(params);
+  const workspace = await createLookupWorkspace({
+    config: params.config,
+    stage: 'agentic.repo_refresh',
+    logStep: params.logStep,
+  });
+  try {
+    return await runAgenticTurn(params, workspace);
+  } finally {
+    await workspace?.cleanup();
+  }
+}
+
+async function runAgenticTurn(params: RunAgenticEntryParams, workspace?: LookupWorkspace): Promise<WorkflowResult> {
   const { mode, task, config, slack, store, logStep, signal } = params;
 
   logStep?.({
@@ -370,18 +388,17 @@ export async function runAgenticEntry(params: RunAgenticEntryParams): Promise<Wo
 
   const githubToken = await resolveGithubTokenForCodex();
 
-  // Informational answers read the shared newton-web / newton-api clones
-  // directly (the cwd below is their parent, NOT an isolated worktree), so the
-  // clones must be fast-forwarded to origin first — otherwise a clone that has
-  // drifted behind origin yields answers that contradict freshly-merged code
-  // (e.g. "feature X isn't implemented" the day after the PR adding it merged).
-  // Conversational replies don't read code, so we skip the fetch cost there.
-  if (mode === 'informational') {
+  // Only when the lookup's own copy could not be set up does it read the
+  // shared clones in place. They are fast-forwarded first, and a clone that
+  // could not be is named so the agent reads origin instead: answers from a
+  // drifted clone contradicted freshly-merged code ("feature X isn't
+  // implemented" the day after it merged). Chat replies don't read code.
+  if (mode === 'informational' && !workspace) {
     const staleBlock = await refreshSharedClones({ config, stage: 'agentic.repo_refresh', logStep });
     if (staleBlock) systemPrompt = `${systemPrompt}\n\n${staleBlock}`;
   }
 
-  const cwd = config.miniOgRepoRoot ?? config.repoPaths.newtonWeb;
+  const cwd = workspace?.cwd ?? config.miniOgRepoRoot ?? config.repoPaths.newtonWeb;
 
   // The amnesia fix: give the agent the thread it is standing in, plus
   // cross-thread recall for "what did we decide about X" questions. Both are

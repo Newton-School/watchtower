@@ -39,6 +39,7 @@ import { startThreadSynthesizerScheduler, stopThreadSynthesizerScheduler } from 
 import { configureGithubPublisher, shutdownGithubPublisher } from './egress/githubPublisher.js';
 import { runConversationBackfill } from './conversation/threadBackfill.js';
 import { cleanupStaleWorkspaces, cleanupThreadWorkspaces } from './workspaces/workspaceManager.js';
+import { sweepLookupWorkspaces } from './workspaces/lookupWorkspace.js';
 import { configureVaultWriter, shutdownVaultWriter } from './vault/vaultWriter.js';
 import { configureVaultWatcher, shutdownVaultWatcher } from './vault/vaultWatcher.js';
 import { startProfileSynthesizerScheduler, stopProfileSynthesizerScheduler } from './learning/profileSynthesizer.js';
@@ -1690,6 +1691,9 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
 async function main(): Promise<void> {
   logger.info({ dbPath, maxConcurrentJobs: config.maxConcurrentJobs, ...sidecarBuild }, 'watchtower sidecar starting');
   await cleanupStaleWorkspaces();
+  // A lookup's copy of the repos left by a sidecar that stopped mid-lookup (issue #446).
+  const sweptLookups = await sweepLookupWorkspaces(config);
+  if (sweptLookups > 0) logger.info({ sweptLookups }, 'removed lookup workspaces left by an earlier run');
 
   // An older bundle starting after a newer one is how two builds ended up
   // serving the same Slack app (issue #450). The lock stops them overlapping;
