@@ -723,20 +723,44 @@ export function buildGithubReviewSummary(
     for (const { role, finding } of unattachableFindings) {
       lines.push(buildSummaryOnlyFinding(role, finding));
     }
-    for (const { role, note } of summaryNotes) {
+    const shownNotes = summaryNotes.slice(0, MAX_SUMMARY_NOTES);
+    for (const { role, note } of shownNotes) {
       lines.push(`- [${role.toUpperCase()} NOTE] ${note}`);
+    }
+    if (summaryNotes.length > shownNotes.length) {
+      lines.push(`- …and ${summaryNotes.length - shownNotes.length} more note(s) left out.`);
     }
   }
 
   if (plan && plan.collapsed.length > 0) {
     lines.push('', 'Lower-priority findings (not posted inline):');
+    // Highest severity first (planReviewPosting sorts them); stop at the
+    // budget and say how many were left out, rather than a 13k-character
+    // body on a 28-line PR (issue #555).
+    let used = lines.join('\n').length;
+    let shown = 0;
     for (const { role, finding } of plan.collapsed) {
-      lines.push(buildCollapsedFinding(role, finding));
+      const line = buildCollapsedFinding(role, finding);
+      if (shown > 0 && used + line.length + 1 > REVIEW_BODY_BUDGET_CHARS) break;
+      lines.push(line);
+      used += line.length + 1;
+      shown += 1;
+    }
+    if (shown < plan.collapsed.length) {
+      lines.push(
+        `- …and ${plan.collapsed.length - shown} more lower-priority finding(s) left out to keep this readable.`,
+      );
     }
   }
 
   return lines.join('\n');
 }
+
+/** Notes listed in a review body. The lenses are asked for two each at most; this holds the line. */
+export const MAX_SUMMARY_NOTES = 5;
+
+/** Length the lower-priority list stops at. GitHub allows 65k; a reader stops much sooner. */
+export const REVIEW_BODY_BUDGET_CHARS = 6_000;
 
 const capitalize = (text: string): string => text.charAt(0).toUpperCase() + text.slice(1);
 
@@ -827,11 +851,12 @@ export function formatSlackReviewSummary(
   if (reviewResult.droppedOutsideDiff > 0) {
     dropReasons.push(`${reviewResult.droppedOutsideDiff} outside the PR diff`);
   }
+  // A finding with no line to attach to is listed in the review body: it was
+  // posted, not dropped (issue #555).
   const unplaced = totalFindings - totalPlaced - reviewResult.droppedOutsideDiff - collapsedCount;
-  if (unplaced > 0) {
-    dropReasons.push(`${unplaced} without an anchor`);
-  }
-  const collapsedClause = collapsedCount > 0 ? `; ${collapsedCount} lower-priority listed in the review summary` : '';
+  const collapsedClause =
+    (collapsedCount > 0 ? `; ${collapsedCount} lower-priority listed in the review summary` : '') +
+    (unplaced > 0 ? `; ${unplaced} with no line to attach to listed in the review summary` : '');
 
   if (totalPlaced === 0) {
     // Every finding was dropped because its anchor fell outside the diff — the
@@ -842,7 +867,7 @@ export function formatSlackReviewSummary(
     }
     const reason = dropReasons.length > 0 ? ` — ${dropReasons.join(', ')}` : '';
     // Nothing reached medium severity: no inline comments is the intended result, not a failure.
-    if (collapsedCount > 0 && dropReasons.length === 0) {
+    if (collapsedCount > 0 && dropReasons.length === 0 && unplaced <= 0) {
       return `*PR Review Complete* - ${totalFindings} findings identified, none above low severity; they are listed in the review summary, not inline${breakdown} ${verdict}\n${prUrl}${skillsSuffix}`;
     }
     return `*PR Review Complete* - ${totalFindings} findings identified; review summary posted, no inline comments attached${reason}${collapsedClause}${breakdown} ${verdict}\n${prUrl}${skillsSuffix}`;

@@ -100,7 +100,9 @@ describe('prReviewSupport', () => {
     );
 
     expect(summary).toContain('1 findings identified; review summary posted, no inline comments attached');
-    expect(summary).toContain('1 without an anchor');
+    // Listed in the review body: posted, not dropped (issue #555).
+    expect(summary).toContain('1 with no line to attach to listed in the review summary');
+    expect(summary).not.toContain('dropped');
     expect(summary).not.toContain('comments posted on PR');
   });
 
@@ -178,7 +180,8 @@ describe('prReviewSupport', () => {
     );
 
     expect(summary).toContain('2 findings identified; 1 inline posted');
-    expect(summary).toContain('1 without an anchor dropped');
+    expect(summary).toContain('1 with no line to attach to listed in the review summary');
+    expect(summary).not.toContain('dropped');
   });
 
   it('formats Slack completion with inline + file-level + outside-diff counters', () => {

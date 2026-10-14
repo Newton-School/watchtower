@@ -132,7 +132,10 @@ export const SEVERITY_RUBRIC = `- Severity — calibrate against this rubric (we
 
 /** Pinned invariant: the agent never posts — submitPrReview is the sole GitHub write path. */
 export const NEVER_POST_RULE =
-  '- You must NOT post anything to GitHub or Slack. Do not run `gh`, `git push`, `curl`, or any network command — submission is handled for you.';
+  '- You must NOT post anything to GitHub or Slack. Do not run `gh`, `git push`, `curl`, or any network command — submission is handled for you.\n' +
+  // One review of a 28-line file carried 12 notes, most saying a check found
+  // nothing; the body ran to 13k characters (issue #555).
+  '- "summaryNotes" are read by the author: at most two of your own, each something they must know, besides any "Addressed since last review" records you are asked for. Never a note that a check found nothing, that a category does not apply, or how you calibrated severity.';
 
 export function buildAgenticPrReviewPrompt(params: {
   recallBlock: string;
@@ -775,32 +778,75 @@ async function verifyFindings(params: {
  * from the orchestrated lead review (skills-led) — they win severity ties. */
 type CollectedFinding = AgentFinding & { lens: PrReviewRole; viaOrchestrator?: boolean };
 
-/** Collapse cross-lens duplicates: same file:line:message (or, for
- * summary-level findings, same message). The higher-severity finding wins;
- * ties prefer the orchestrator's framing (skills lead), then break by lens
- * priority (security > reviewer > performance). */
-function dedupeFindings(findings: CollectedFinding[]): CollectedFinding[] {
-  const norm = (message: string) => message.toLowerCase().replace(/\s+/g, ' ').trim();
-  const keyOf = (f: CollectedFinding) =>
-    typeof f.line === 'number' && f.file ? `${f.file}:${f.line}:${norm(f.message)}` : `note:${norm(f.message)}`;
+/** Words that carry a finding's meaning: lowercased, code ticks and punctuation gone, short words dropped. */
+function findingWords(message: string): Set<string> {
+  return new Set(
+    message
+      .toLowerCase()
+      .replace(/[`'"()[\]{}.,:;!?]/g, ' ')
+      .split(/\s+/)
+      .filter(word => word.length >= 4),
+  );
+}
 
-  const byKey = new Map<string, CollectedFinding>();
+/** Share of words two messages have in common (Jaccard). */
+export function messageOverlap(a: string, b: string): number {
+  const left = findingWords(a);
+  const right = findingWords(b);
+  if (left.size === 0 || right.size === 0) return 0;
+  let shared = 0;
+  for (const word of left) if (right.has(word)) shared += 1;
+  return shared / (left.size + right.size - shared);
+}
+
+/** Findings on the same line this alike are one issue reported twice (issue #555). */
+export const DUPLICATE_OVERLAP = 0.5;
+/** One line apart they must be closer still: neighbouring lines often hold neighbouring problems. */
+export const ADJACENT_DUPLICATE_OVERLAP = 0.7;
+/** A message this short says too little to judge by its words; it has to match exactly. */
+const MIN_WORDS_FOR_FUZZY_MATCH = 6;
+
+/**
+ * Two findings are the same issue when they sit on the same file and line
+ * (or one line apart) and say mostly the same thing. Two lenses describe one
+ * problem in their own words, so an exact text match missed it: one review
+ * posted the same command-injection finding twice, worded differently. A
+ * finding with no line, or a short message, matches only the same text.
+ */
+export function isSameFinding(a: AgentFinding, b: AgentFinding): boolean {
+  const norm = (message: string) => message.toLowerCase().replace(/\s+/g, ' ').trim();
+  const located = typeof a.line === 'number' && typeof b.line === 'number' && Boolean(a.file) && a.file === b.file;
+  if (!located) {
+    return a.file === b.file && a.line === b.line && norm(a.message) === norm(b.message);
+  }
+  const distance = Math.abs((a.line as number) - (b.line as number));
+  if (distance > 1) return false;
+  if (norm(a.message) === norm(b.message)) return true;
+  if (Math.min(findingWords(a.message).size, findingWords(b.message).size) < MIN_WORDS_FOR_FUZZY_MATCH) return false;
+  return messageOverlap(a.message, b.message) >= (distance === 0 ? DUPLICATE_OVERLAP : ADJACENT_DUPLICATE_OVERLAP);
+}
+
+/** Collapse cross-lens duplicates (see isSameFinding). The higher-severity
+ * finding wins; ties prefer the orchestrator's framing (skills lead), then
+ * break by lens priority (security > reviewer > performance). */
+function dedupeFindings(findings: CollectedFinding[]): CollectedFinding[] {
+  const kept: CollectedFinding[] = [];
   for (const finding of findings) {
-    const key = keyOf(finding);
-    const existing = byKey.get(key);
-    if (!existing) {
-      byKey.set(key, finding);
+    const at = kept.findIndex(existing => isSameFinding(existing, finding));
+    if (at === -1) {
+      kept.push(finding);
       continue;
     }
+    const existing = kept[at];
     const sameSeverity = severityRank(finding.severity) === severityRank(existing.severity);
     const orchTiebreak =
       Number(Boolean(finding.viaOrchestrator)) > Number(Boolean(existing.viaOrchestrator)) ||
       (Boolean(finding.viaOrchestrator) === Boolean(existing.viaOrchestrator) &&
         LENS_PRIORITY[finding.lens] > LENS_PRIORITY[existing.lens]);
     const better = severityRank(finding.severity) > severityRank(existing.severity) || (sameSeverity && orchTiebreak);
-    if (better) byKey.set(key, finding);
+    if (better) kept[at] = finding;
   }
-  return [...byKey.values()];
+  return kept;
 }
 
 /**
