@@ -247,6 +247,8 @@ Review checklist:
 - Is the code clean, readable, and maintainable?
 - Are there any missing error handlers or boundary conditions?
 
+Set "approved": false when any finding is "medium" or higher, and "approved": true only when every finding is "low" or "info" (or there are none). The verifier holds the change to the same line, so approving with a medium finding open only fails the run later.
+
 Return strict JSON:
 {
   "approved": boolean,
@@ -348,8 +350,8 @@ ${serializePreviousSteps(ctx)}
 Verification checklist:
 1. Run the project's test suite and confirm tests pass
 2. PLAN CONFORMANCE: confirm the ACTUAL diff above fulfils the approved plan's intent — not just that some files changed. If the diff implements a different or narrower change than the approved plan, set "verified": false, "requirementsMet": false, and add a { "severity": "high", "category": "plan-mismatch", "message": "<plan vs diff>" } finding.
-3. Confirm reviewer and security findings were addressed (if any)
-4. Validate the PR is in a mergeable state
+3. Confirm the reviewer's and security agent's findings of severity "medium" or higher were addressed. "low" and "info" findings are informational: never a reason to set "verified": false.
+4. If a PR was opened, check it is in a mergeable state. No PR yet is not a reason to reject: miniOG opens it once you pass.
 5. Check that no regressions were introduced
 
 Return strict JSON:

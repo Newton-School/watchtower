@@ -74,4 +74,9 @@ export interface PipelineResult {
   externalOnly?: boolean;
   /** The coder changed something outside the repository that the approved plan did not list. */
   externalNotInPlan?: boolean;
+  /**
+   * The run's time budget ran out (issue #333). `lastCoderPassUnreviewed`: it
+   * ran out right after a coder pass, whose changes nobody reviewed again.
+   */
+  budgetExhausted?: { elapsedMs: number; limitMs: number; lastCoderPassUnreviewed: boolean };
 }

@@ -167,8 +167,9 @@ describe('failureDoctor', () => {
     expect(
       diagnoseFailure({ workflow: 'IMPLEMENTATION', message: 'Investigator produced no usable output.', logs }),
     ).toBeUndefined();
-    // The same logs without the cancel are what produced the wrong "timeout" diagnosis.
-    expect(diagnoseFailure({ workflow: 'IMPLEMENTATION', message: 'x', logs: logs.slice(0, 1) })?.errorKind).toBe(
+    // The same logs without the cancel used to read as a timeout too, off the
+    // config's "totalTimeoutMs"; since #333 a config field is not a timeout.
+    expect(diagnoseFailure({ workflow: 'IMPLEMENTATION', message: 'x', logs: logs.slice(0, 1) })?.errorKind).not.toBe(
       'WORKFLOW_TIMEOUT',
     );
   });

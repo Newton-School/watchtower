@@ -1390,6 +1390,7 @@ export async function runAgentPipeline(params: {
   let usageLimitResetsAt: string | undefined;
   // The coder's whole change was outside the repository (issue #432).
   let externalOnly = false;
+  let budgetExhausted: PipelineResult['budgetExhausted'];
   // Interruptions — a dropped connection (issue #439) or a process killed from
   // outside (issue #445): the time they cost is kept off the pipeline's clock,
   // and one that outlasts its retries stops the run. Neither is ever a verdict.
@@ -1471,12 +1472,16 @@ export async function runAgentPipeline(params: {
       // offline for an hour has not used an hour of its budget (issue #439).
       const elapsed = Date.now() - pipelineStart - infraWaitMs;
       if (elapsed >= totalTimeoutMs) {
+        // The budget is checked between steps, so it often runs out just
+        // after a coder pass: that pass's changes were never reviewed (issue #333).
+        const lastCoderPassUnreviewed = steps.length > 0 && steps[steps.length - 1].role === 'coder';
         logStep({
           stage: 'pipeline.timeout',
           message: 'Pipeline total timeout exceeded.',
           level: 'ERROR',
-          data: { elapsed, totalTimeoutMs },
+          data: { elapsed, totalTimeoutMs, lastCoderPassUnreviewed },
         });
+        budgetExhausted = { elapsedMs: elapsed, limitMs: totalTimeoutMs, lastCoderPassUnreviewed };
         aborted = true;
         break;
       }
@@ -2001,9 +2006,11 @@ export async function runAgentPipeline(params: {
             ? `Stopped after ${durationSec}s — I lost my connection to the model and retrying didn't bring it back.`
             : interrupted
               ? `Stopped after ${durationSec}s — the ${interrupted.role} was killed from outside, twice.`
-              : finalStatus === 'aborted'
-                ? `Finished in ${durationSec}s. Review flagged some concerns — see the summary below.`
-                : `Finished in ${durationSec}s with some issues flagged — details below.`;
+              : budgetExhausted
+                ? `Stopped after ${durationSec}s: this run's time limit ran out${budgetExhausted.lastCoderPassUnreviewed ? ' before the latest changes were reviewed again' : ''}.`
+                : finalStatus === 'aborted'
+                  ? `Stopped after ${durationSec}s: a check found a critical issue.`
+                  : `Finished in ${durationSec}s, but the checks did not pass.`;
   await postSlackProgress({ slack, ctx, text: finishText });
 
   if (store && jobId) {
@@ -2029,5 +2036,6 @@ export async function runAgentPipeline(params: {
     usageLimitResetsAt,
     ...(interrupted ? { interrupted } : {}),
     ...externalChangesResult(latestByRole.get('coder'), externalOnly, plannerNormalized?.planMarkdown ?? ''),
+    ...(budgetExhausted ? { budgetExhausted } : {}),
   };
 }
