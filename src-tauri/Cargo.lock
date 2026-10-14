@@ -4628,7 +4628,7 @@ dependencies = [
 
 [[package]]
 name = "watchtower"
-version = "0.6.136"
+version = "0.6.137"
 dependencies = [
  "base64 0.22.1",
  "chrono",
