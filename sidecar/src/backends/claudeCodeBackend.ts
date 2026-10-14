@@ -5,6 +5,7 @@ import type { AgentBackend, AgentRunRequest, ParseOutputOptions, ParsedBackendOu
 import type { TokenUsage } from '../types/contracts.js';
 import { buildCodexPath, parseStructuredOutput } from './codexBackend.js';
 import { personalSkillDenyRules } from './personalSkills.js';
+import { agentSandboxSettings, isAgentSandboxEnabled, sandboxReadDenyRules } from './agentSandbox.js';
 
 function asFiniteNumber(value: unknown): number | undefined {
   if (typeof value !== 'number') return undefined;
@@ -316,13 +317,20 @@ export const claudeCodeBackend: AgentBackend = {
     // An agent that does work keeps its tools, but not the host user's
     // personal skills and commands (issue #443). `--disallowedTools` is
     // variadic, so it stays ahead of the flags below.
+    // Shell commands run in the sandbox unless the run opts out (issue #445).
+    const sandboxed = !request.noTools && request.sandbox !== false && isAgentSandboxEnabled();
     if (!request.noTools) {
       args.push(
         '--disallowedTools',
         ...PROCESS_KILL_DENY_RULES,
         ...personalSkillDenyRules(request.cwd),
+        // The sandbox covers shell commands only; the Read tool is refused the same secrets by rule.
+        ...(sandboxed ? sandboxReadDenyRules() : []),
         ...(request.disallowedTools ?? []),
       );
+    }
+    if (sandboxed) {
+      args.push('--settings', JSON.stringify(agentSandboxSettings({ readOnly: Boolean(request.readOnly) })));
     }
     if (request.sessionId) {
       args.push('--session-id', request.sessionId);

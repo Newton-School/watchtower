@@ -460,6 +460,13 @@ export interface CodexRunRequest {
    * and a read-only sandbox would refuse the reply's attachments too.
    */
   readOnly?: boolean;
+  /**
+   * Run the agent's shell commands in Claude Code's sandbox (issue #445).
+   * On by default for every run with tools on the claude-code backend; set
+   * false only for runs the sandbox breaks (browser QA, deploys). See
+   * `agentSandbox.ts`. The Codex backend ignores this.
+   */
+  sandbox?: boolean;
 }
 
 export type McpServerConfig =

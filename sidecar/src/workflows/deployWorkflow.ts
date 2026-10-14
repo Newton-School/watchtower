@@ -299,6 +299,9 @@ export async function runDeployWorkflow(params: {
     prompt,
     githubToken,
     ...highReasoningProfile(getActiveBackendId()),
+    // A production deploy is not where to find out what the shell sandbox
+    // breaks (issue #445): it stays outside, as before.
+    sandbox: false,
     onLog: logStep,
     signal,
   });
