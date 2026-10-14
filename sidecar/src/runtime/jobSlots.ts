@@ -28,11 +28,26 @@ export class JobSlots {
   private readonly context = new AsyncLocalStorage<SlotHolder>();
   private max: () => number = () => Number.POSITIVE_INFINITY;
   private onFree: () => void = () => {};
+  private onActiveChange: (active: number) => void = () => {};
 
-  /** `max` is read on every decision, so a settings change applies at once. `onFree` restarts the queue. */
-  configure(options: { max: () => number; onFree: () => void }): void {
+  /**
+   * `max` is read on every decision, so a settings change applies at once.
+   * `onFree` restarts the queue. `onActiveChange` hears every change in the
+   * number of slots in use (the keep-awake follows it, issue #439).
+   */
+  configure(options: { max: () => number; onFree: () => void; onActiveChange?: (active: number) => void }): void {
     this.max = options.max;
     this.onFree = options.onFree;
+    this.onActiveChange = options.onActiveChange ?? (() => {});
+  }
+
+  private setRunning(next: number): void {
+    this.running = next;
+    try {
+      this.onActiveChange(next);
+    } catch {
+      // A listener's failure must never stop a job.
+    }
   }
 
   /** Slots in use by jobs that are doing something. */
@@ -51,7 +66,7 @@ export class JobSlots {
    */
   tryAcquire(): boolean {
     if (this.returning.length > 0 || this.running >= this.max()) return false;
-    this.running += 1;
+    this.setRunning(this.running + 1);
     return true;
   }
 
@@ -110,7 +125,7 @@ export class JobSlots {
 
   private takeBack(signal?: AbortSignal): Promise<void> {
     if (this.canTakeNow(signal)) {
-      this.running += 1;
+      this.setRunning(this.running + 1);
       return Promise.resolve();
     }
     return new Promise(resolve => {
@@ -122,7 +137,7 @@ export class JobSlots {
         const at = this.returning.indexOf(granted);
         if (at === -1) return; // already granted a slot
         this.returning.splice(at, 1);
-        this.running += 1;
+        this.setRunning(this.running + 1);
         resolve();
       };
       this.returning.push(granted);
@@ -131,14 +146,14 @@ export class JobSlots {
   }
 
   private free(): void {
-    this.running -= 1;
     const next = this.returning.shift();
     if (next) {
-      // Handed straight to a returning job: the slot never looks free to the queue.
-      this.running += 1;
+      // Handed straight to a returning job: the slot never looks free to the
+      // queue, and the number in use does not change.
       next();
       return;
     }
+    this.setRunning(this.running - 1);
     this.onFree();
   }
 }

@@ -27,6 +27,7 @@ import { detectMention, normalizeTask } from './router/intentParser.js';
 import { isOwnerTagDelegationEnabled } from './access/ownerDelegation.js';
 import { isRouteQuestionExpired } from './router/routeClarify.js';
 import { jobSlots } from './runtime/jobSlots.js';
+import { keepAwake } from './runtime/keepAwake.js';
 import { decidePausedResume } from './router/pausedResume.js';
 import { classifyProduct } from './router/productClassifier.js';
 import { routeTask } from './router/taskRouter.js';
@@ -149,6 +150,8 @@ const queue: Array<{ event: SlackEventEnvelope; client: WebClient }> = [];
 jobSlots.configure({
   max: () => config.maxConcurrentJobs,
   onFree: () => void processNext(),
+  // The Mac stays awake while any job holds a slot (issue #439).
+  onActiveChange: active => keepAwake.set(active > 0),
 });
 
 const OPS_FEED_INTERVAL_MS = 30 * 60 * 1000;
