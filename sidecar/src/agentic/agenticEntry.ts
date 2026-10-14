@@ -240,18 +240,7 @@ Example of a final message that attaches a file:
 ${manifestExample}`;
 }
 
-/**
- * The one connector a lookup keeps. Said out loud because the agent used to
- * find a database by rummaging through every connector the host user had, and
- * because the server can be configured and still not signed in to.
- */
-const METABASE_LOOKUP_BLOCK = `Database questions:
-- A Metabase server may be connected (tools named \`mcp__metabase__*\`) for questions the code cannot answer: counts, a specific record, whether data is what the code expects. Read and query only; you have no tools that change Metabase.
-- If those tools are not available in this session, say plainly that you could not reach the database. Never estimate a number you could not query.
-- You have no other connectors: no Slack search, no Drive, no analytics tools. If the answer needs one, say so instead of looking for a way around it.`;
-
 export function informationalSystemPrompt(config: AppConfig): string {
-function informationalSystemPrompt(config: AppConfig): string {
   return `You are miniOG, a Slack assistant. The user has asked an informational question — code lookup, "where is X", "how does Y work", documentation, table schemas, data sources.
 
 Your job:
