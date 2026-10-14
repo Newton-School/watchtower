@@ -40,6 +40,8 @@ export interface PendingRouteQuestion {
   askedAtMs: number;
   /** The message that prompted the question, mentions removed. */
   askedText: string;
+  /** The owner whose authority the question was asked on, when it was (issue #398). */
+  delegatedByOwnerId?: string;
 }
 
 export type ClarifyAction =
@@ -141,6 +143,7 @@ export function parsePendingRouteQuestion(data: unknown): PendingRouteQuestion |
     requesterId: record.requesterId,
     askedAtMs: record.askedAtMs,
     askedText: typeof record.askedText === 'string' ? record.askedText : '',
+    ...(typeof record.delegatedByOwnerId === 'string' ? { delegatedByOwnerId: record.delegatedByOwnerId } : {}),
   };
 }
 
@@ -177,6 +180,7 @@ export async function askRequester(params: {
     requesterId: userId,
     askedAtMs: params.nowMs ?? Date.now(),
     askedText: userMessage,
+    ...(task.delegatedByOwnerId ? { delegatedByOwnerId: task.delegatedByOwnerId } : {}),
   };
   logStep?.({
     stage: otherParked ? 'router.clarify.asked_unparked' : ROUTE_CLARIFY_STAGE,

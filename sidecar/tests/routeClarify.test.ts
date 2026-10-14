@@ -160,6 +160,15 @@ describe('a parked question', () => {
       expect(parsePendingRouteQuestion(bad)).toBeUndefined();
     }
   });
+
+  // Issue #398: a question asked on an owner's authority is answered on it.
+  it('reads back the owner a question was asked on behalf of, and only a real one', () => {
+    expect(parsePendingRouteQuestion({ ...pending, delegatedByOwnerId: 'UOWNER1' })).toEqual({
+      ...pending,
+      delegatedByOwnerId: 'UOWNER1',
+    });
+    expect(parsePendingRouteQuestion({ ...pending, delegatedByOwnerId: 7 })).toEqual(pending);
+  });
 });
 
 function makeTask(): NormalizedTask {
