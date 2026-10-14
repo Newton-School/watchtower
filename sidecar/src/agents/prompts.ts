@@ -116,12 +116,13 @@ ${ctx.threadContext}
 ${ctx.prContext ? `PR context: ${ctx.prContext.url} (${ctx.prContext.owner}/${ctx.prContext.repo}#${ctx.prContext.number})` : ''}
 
 What the plan must contain (markdown):
-- FIRST, a block for the person who approves this plan. They are not the coder, often did not write the request, and will decide in about a minute. Use exactly this heading and these five lines, in plain words with no code and no file paths except under "Where":
+- FIRST, a block for the person who approves this plan. They are not the coder, often did not write the request, and will decide in about a minute. Use exactly this heading and these six lines, in plain words with no code and no file paths except under "Where":
   ## For the approver
   - What changes: <one sentence, in terms of what a user of the product will see or get>
   - Where: <the page, screen or area; at most three>
   - Behaviour change: <the single word "none" if nothing will behave differently; otherwise what will behave differently once this ships, in one or two sentences. A changed default, limit, condition or rule is a behaviour change: say what the new value means for a real user, not just what it is>
   - Assumptions to confirm: <the single word "none", or only what would change the result if you guessed wrong or could not see it (a screenshot you could not open, which of two pages was meant, a value you picked). Do not restate the request here>
+  - Outside the repo: <the single word "none", or each change this plan makes outside the repository, with the system and what changes there (for example "uploads 3 images to question 1042 through Newton admin"). The coder may make no change outside the repository that this line does not name>
   - Risk: <low, medium or high>
 - A short summary of the user's intent.
 - A section headed exactly \`## Files to change\`: one bullet per file you will edit or create, as a backticked repo-relative path and a few words on why. ONLY files this change edits. Files you only read, files that must not be touched, globs, URLs and branch names do not belong in this section.
@@ -184,6 +185,11 @@ Requirements:
    they never open a PR, so a block costs the requester one reply and a wrong guess costs them a bad
    change on a live page. Only use this when you are genuinely stuck — a plan you can follow is not a
    reason to block.
+8. Change something outside this repository (a design in Figma, an upload through the Newton admin tools,
+   anything else a tool reaches) only when the approved plan's "Outside the repo" line names it, and only
+   that. Report every such change in "externalChanges": the system, what you changed (names, ids), what
+   changed, and how you checked it took effect. When the plan's whole change is outside the repository,
+   there is nothing to commit and no PR to open: say so in the summary.
 
 Return strict JSON:
 {
@@ -193,7 +199,10 @@ Return strict JSON:
   "summary": string,
   "testsAdded": string[],
   "branch": string,
-  "prUrl": string          // URL of the PR you created (empty string if PR creation failed)
+  "prUrl": string,         // URL of the PR you created (empty string if PR creation failed)
+  "externalChanges": [     // changes you made outside the repository, per requirement 8; [] if none
+    { "system": string, "target": string, "description": string, "verification": string }
+  ]
 }
 `.trim();
 }

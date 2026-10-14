@@ -28,6 +28,7 @@ import {
   waitForApproval,
   buildApprovalMessage,
   coderDeclaredBlocked,
+  formatExternalChanges,
 } from '../agents/pipeline.js';
 import { normalizePlannerOutput } from '../agents/normalizePlannerOutput.js';
 import { inferRepoFromAffectedFiles, readRepoAffinity, repoPathFor, resolveRepoOrAsk } from './shared/repoResolver.js';
@@ -2038,6 +2039,33 @@ Write your response as a ready-to-post Slack message describing what you did.
       rawCoderSummary || 'Pipeline completed but the agent did not return a summary. Check the repo for changes.';
 
     let prUrl = coderStep?.output?.prUrl ? String(coderStep.output.prUrl) : '';
+    const externalBlock = fullResult.externalChanges?.length
+      ? `\n\n${formatExternalChanges(fullResult.externalChanges, Boolean(fullResult.externalNotInPlan))}`
+      : '';
+
+    // The whole change was outside the repository (issue #432): nothing to
+    // commit, so no PR. It used to end as "I haven't touched any files" while
+    // seven Metabase cards had been changed.
+    if (fullResult.externalOnly && !prUrl) {
+      logStep?.({
+        stage: 'implementation.external_only',
+        message: 'The change was made outside the repository; no PR to open.',
+        data: { externalChanges: fullResult.externalChanges, notInPlan: fullResult.externalNotInPlan },
+      });
+      await slack.chat.postMessage({
+        channel: task.event.channelId,
+        thread_ts: task.event.threadTs,
+        text: `${summary}${externalBlock}\n\nNo pull request: nothing in the repository changed.`,
+      });
+      return {
+        workflow: 'IMPLEMENTATION',
+        status: 'SUCCESS',
+        message: summary,
+        notifyDesktop: false,
+        slackPosted: true,
+        result: { externalChanges: fullResult.externalChanges },
+      };
+    }
 
     // #413 belt-and-braces: the pipeline already routes a self-declared block to
     // the needs-input loop, so this should be unreachable — but a "Blocked: …"
@@ -2090,7 +2118,7 @@ Write your response as a ready-to-post Slack message describing what you did.
     await slack.chat.postMessage({
       channel: task.event.channelId,
       thread_ts: task.event.threadTs,
-      text: `${summary}${prBlock}`.trim(),
+      text: `${summary}${prBlock}${externalBlock}`.trim(),
     });
 
     return {

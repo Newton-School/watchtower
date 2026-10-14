@@ -68,4 +68,10 @@ export interface PipelineResult {
    * completed.
    */
   interrupted?: { kind: 'connection_lost' | 'killed'; role: AgentRole; retries: number };
+  /** Changes the coder reports making outside the repository (issue #432). */
+  externalChanges?: Array<{ system: string; target: string; description: string; verification: string }>;
+  /** The coder's whole change was outside the repository: nothing to review, no PR to open. */
+  externalOnly?: boolean;
+  /** The coder changed something outside the repository that the approved plan did not list. */
+  externalNotInPlan?: boolean;
 }
