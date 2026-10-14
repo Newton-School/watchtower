@@ -322,7 +322,8 @@ describe('JobStore and parked questions', () => {
 
   it('lists only jobs still parked on a question', () => {
     const { store, pending } = storeWithParkedQuestion();
-    expect(store.pausedRouteQuestions()).toEqual([{ id: 'job-asked', pending }]);
+    // With where it was asked: the parked-answer catch-up reads that thread (issue #431).
+    expect(store.pausedRouteQuestions()).toEqual([{ id: 'job-asked', channelId: 'C1', threadTs: '100.1', pending }]);
 
     store.markJob('job-asked', 'SKIPPED', { result: { reason: 'clarify_unanswered' } });
     expect(store.pausedRouteQuestions()).toEqual([]);

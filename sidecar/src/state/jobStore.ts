@@ -1521,20 +1521,20 @@ export class JobStore {
   }
 
   /** Every job still parked on a question, for the sweeper that expires them. */
-  pausedRouteQuestions(): Array<{ id: string; pending: PendingRouteQuestion }> {
+  pausedRouteQuestions(): Array<{ id: string; channelId: string; threadTs: string; pending: PendingRouteQuestion }> {
     const rows = this.db
       .prepare(
-        `SELECT j.id AS id, l.data_json AS data_json
+        `SELECT j.id AS id, j.channel_id AS channel_id, j.thread_ts AS thread_ts, l.data_json AS data_json
          FROM jobs j
          JOIN job_logs l ON l.job_id = j.id AND l.stage = '${ROUTE_CLARIFY_STAGE}'
          WHERE j.status = 'PAUSED'`,
       )
-      .all() as Array<{ id: string; data_json?: string | null }>;
-    const parked: Array<{ id: string; pending: PendingRouteQuestion }> = [];
+      .all() as Array<{ id: string; channel_id: string; thread_ts: string; data_json?: string | null }>;
+    const parked: Array<{ id: string; channelId: string; threadTs: string; pending: PendingRouteQuestion }> = [];
     for (const row of rows) {
       try {
         const pending = parsePendingRouteQuestion(JSON.parse(row.data_json ?? 'null'));
-        if (pending) parked.push({ id: row.id, pending });
+        if (pending) parked.push({ id: row.id, channelId: row.channel_id, threadTs: row.thread_ts, pending });
       } catch {
         // an unreadable row is not a pending question
       }

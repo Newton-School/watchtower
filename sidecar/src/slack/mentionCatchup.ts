@@ -4,6 +4,7 @@ import { detectMention } from '../router/intentParser.js';
 import { logger } from '../logging/logger.js';
 import type { AppConfig, SlackEventEnvelope } from '../types/contracts.js';
 import type { JobStore } from '../state/jobStore.js';
+import { catchUpParkedAnswers } from './parkedAnswerCatchup.js';
 
 const CATCHUP_STATE_KEY = 'mention_catchup_cursor_ts';
 const CATCHUP_INTERVAL_MS = 2 * 60 * 1000;
@@ -162,10 +163,20 @@ async function runMentionCatchup(deps: CatchupDeps): Promise<void> {
   const nextCursor = nowTs;
   store.setState(CATCHUP_STATE_KEY, String(nextCursor));
 
+  // Plain replies to a question miniOG asked are invisible to the scan above,
+  // which looks for mentions; a restart used to lose them (issue #431).
+  let answersRecovered = 0;
+  try {
+    answersRecovered = await catchUpParkedAnswers({ webClient, config, store, enqueue });
+  } catch (error) {
+    logger.warn({ component: 'slack-catchup', error: String(error) }, 'parked-answer catch-up failed');
+  }
+
   logger.info(
     {
       component: 'slack-catchup',
       recovered,
+      answersRecovered,
       scannedMessages,
       nextCursor,
     },
