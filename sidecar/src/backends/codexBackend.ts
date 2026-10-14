@@ -2,6 +2,7 @@ import fsSync from 'node:fs';
 import os from 'node:os';
 import path, { delimiter as pathDelimiter } from 'node:path';
 import type { AgentBackend, AgentRunRequest, ParsedBackendOutput } from './types.js';
+import { isTerminalShimDir } from './launchEnv.js';
 
 function isExecutable(filePath: string): boolean {
   try {
@@ -49,7 +50,8 @@ export function buildCodexPath(existingPath?: string): string {
   const parts = new Set<string>();
   const add = (value?: string): void => {
     const trimmed = value?.trim();
-    if (!trimmed) {
+    // A terminal's shim directory is not a toolchain (issue #572).
+    if (!trimmed || isTerminalShimDir(trimmed)) {
       return;
     }
     parts.add(trimmed);

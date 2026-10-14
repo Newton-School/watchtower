@@ -6,6 +6,7 @@ import type { TokenUsage } from '../types/contracts.js';
 import { buildCodexPath, parseStructuredOutput } from './codexBackend.js';
 import { personalSkillDenyRules } from './personalSkills.js';
 import { agentSandboxSettings, isAgentSandboxEnabled, sandboxReadDenyRules } from './agentSandbox.js';
+import { isTerminalShimDir } from './launchEnv.js';
 
 function asFiniteNumber(value: unknown): number | undefined {
   if (typeof value !== 'number') return undefined;
@@ -150,7 +151,8 @@ function findInPath(binary: string): string | undefined {
   const sourcePath = process.env.PATH ?? '';
   for (const dir of sourcePath.split(pathDelimiter)) {
     const trimmed = dir.trim();
-    if (!trimmed) continue;
+    // A terminal's shim rejects arguments over 120 KB: a large review's prompt (issue #572).
+    if (!trimmed || isTerminalShimDir(trimmed)) continue;
     const candidate = path.join(trimmed, binary);
     if (isExecutable(candidate)) return candidate;
   }
