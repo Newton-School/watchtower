@@ -251,6 +251,21 @@ export function diagnoseFailure(input: {
     };
   }
 
+  // The final check rejected the change. Nothing here matched it before, so
+  // it fell through to WORKFLOW_TIMEOUT and "increase the timeout" (issue #333).
+  const verifierFinishes = input.logs.filter(entry => entry.stage === 'pipeline.agent.verifier.finish');
+  const lastVerifier = verifierFinishes[verifierFinishes.length - 1];
+  if (lastVerifier && /:\s*failed\b/.test(lastVerifier.message)) {
+    return {
+      errorKind: 'VERIFIER_REJECTED',
+      summary: 'The final check (verifier) did not pass the change.',
+      actions: [
+        'Read the open findings in the thread, and push a follow-up commit to the same branch.',
+        'If the findings are wrong, mention me again with the change you want.',
+      ],
+    };
+  }
+
   // --- Workspace / repository errors ---
 
   if (
@@ -271,7 +286,9 @@ export function diagnoseFailure(input: {
 
   // --- Generic error patterns ---
 
-  if (haystack.includes('timeout') || haystack.includes('timed out')) {
+  // A timeout said in words, not the "totalTimeoutMs" of a logged config,
+  // which made every unmatched pipeline failure a timeout (issue #333).
+  if (/\btimeout\b|timed out/.test(haystack)) {
     return {
       errorKind: 'WORKFLOW_TIMEOUT',
       summary: 'The workflow hit its execution timeout.',

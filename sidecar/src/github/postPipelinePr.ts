@@ -55,6 +55,35 @@ async function unstageUnsafePaths(repoPath: string): Promise<string[]> {
   return unsafe;
 }
 
+/**
+ * The PR a run left behind and its state (issue #333): the URL the coder
+ * reported, or the PR for the workspace's branch. A reported URL whose state
+ * cannot be read is returned as UNKNOWN rather than dropped.
+ */
+export async function findRunPr(
+  cwd: string,
+  reportedUrl?: string,
+): Promise<{ url: string; state: string } | undefined> {
+  try {
+    let target = reportedUrl;
+    if (!target) {
+      const branch = await git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']);
+      if (!branch || branch === 'HEAD') return undefined;
+      target = branch;
+    }
+    const { stdout } = await execFileAsync('gh', ['pr', 'view', target, '--json', 'url,state'], {
+      cwd,
+      timeout: 15_000,
+      maxBuffer: 1024 * 1024,
+      env: toolchainEnv(),
+    });
+    const parsed = JSON.parse(stdout) as { url?: string; state?: string };
+    return parsed.url ? { url: parsed.url, state: parsed.state ?? 'UNKNOWN' } : undefined;
+  } catch {
+    return reportedUrl ? { url: reportedUrl, state: 'UNKNOWN' } : undefined;
+  }
+}
+
 /** Check if a PR already exists for the current branch. */
 async function existingPrUrl(cwd: string): Promise<string | undefined> {
   try {

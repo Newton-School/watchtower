@@ -39,7 +39,8 @@ import type { ClarificationRound } from './shared/clarificationGuards.js';
 import { profileForAgentRole } from '../codex/modelProfiles.js';
 import { buildPlannerPrompt, buildPlannerPlanModePrompt } from '../agents/prompts.js';
 import { resolveWorkspace } from '../workspaces/workspaceManager.js';
-import { createPrFromWorkspace } from '../github/postPipelinePr.js';
+import { createPrFromWorkspace, findRunPr } from '../github/postPipelinePr.js';
+import { buildUnfinishedRunMessage, coderReportedPrUrl } from '../agents/unfinishedRun.js';
 import { fetchUnresolvedReviewThreadCount } from '../github/prReviewComments.js';
 import { waitForExactConfirmation } from './shared/confirmationGate.js';
 import { cancelledResult } from './shared/cancelState.js';
@@ -2012,12 +2013,27 @@ Write your response as a ready-to-post Slack message describing what you did.
         data: { finalStatus: fullResult.finalStatus },
       });
 
-      const failureSummary =
+      // A PR the coder opened is the requester's to know about, whatever
+      // stopped the run: five times it was told "Not opening a PR" while
+      // one was open (issue #333).
+      const runPr = await findRunPr(pipelineCwd, coderReportedPrUrl(fullResult.steps));
+      const interruptedReason =
         fullResult.interrupted?.kind === 'connection_lost'
-          ? `${connectionLostReply(`the ${fullResult.interrupted.role} was running`)} Any work it had already done is still on its branch.`
+          ? connectionLostReply(`the ${fullResult.interrupted.role} was running`)
           : fullResult.interrupted
-            ? `${killedFromOutsideReply(`The ${fullResult.interrupted.role}`)} Any work it had already done is still on its branch.`
-            : `Pipeline finished with status: ${fullResult.finalStatus}. Not opening a PR.`;
+            ? killedFromOutsideReply(`The ${fullResult.interrupted.role}`)
+            : undefined;
+      const failureSummary =
+        interruptedReason && !runPr
+          ? `${interruptedReason} Any work it had already done is still on its branch.`
+          : buildUnfinishedRunMessage({ result: fullResult, pr: runPr, reason: interruptedReason });
+      logStep?.({
+        stage: 'implementation.pipeline.unfinished',
+        message: runPr
+          ? `The run did not pass; the coder's PR ${runPr.url} is ${runPr.state.toLowerCase()}.`
+          : 'The run did not pass; there is no PR.',
+        data: { finalStatus: fullResult.finalStatus, pr: runPr, budgetExhausted: fullResult.budgetExhausted },
+      });
       await slack.chat.postMessage({
         channel: task.event.channelId,
         thread_ts: task.event.threadTs,
@@ -2030,6 +2046,7 @@ Write your response as a ready-to-post Slack message describing what you did.
         message: failureSummary,
         notifyDesktop: false,
         slackPosted: true,
+        ...(runPr ? { result: { prUrl: runPr.url, prState: runPr.state } } : {}),
       };
     }
 
