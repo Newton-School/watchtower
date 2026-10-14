@@ -78,10 +78,11 @@ export function buildStaleCheckoutBlock(repos: Array<{ name: string; state: Shar
   return [
     'STALE CHECKOUTS — for these repos the files on disk are OUT OF DATE. Do not read, grep or glob them from disk:',
     ...lines,
+    // `cd … &&`, not `git -C`: a read-only run allows the first and refuses the second (issue #443).
     'Read the up-to-date tree through git instead, for example:',
-    `  git -C ${example.name} grep -n "<pattern>" ${example.state.upstream} -- <path>`,
-    `  git -C ${example.name} show ${example.state.upstream}:<path>`,
-    `  git -C ${example.name} log -5 ${example.state.upstream} -- <path>`,
+    `  cd ${example.name} && git grep -n "<pattern>" ${example.state.upstream} -- <path>`,
+    `  cd ${example.name} && git show ${example.state.upstream}:<path>`,
+    `  cd ${example.name} && git log -5 ${example.state.upstream} -- <path>`,
     'Never conclude that something "does not exist" or "is not there" in such a repo from the files on disk.',
     `Say in your answer that you read ${stale
       .map(repo => repo.state.upstream)

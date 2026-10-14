@@ -451,6 +451,15 @@ export interface CodexRunRequest {
    * runs sandboxed.
    */
   noTools?: boolean;
+  /**
+   * The run only reads: a lookup, a chat reply, an investigation (issue
+   * #443). On the claude-code backend it runs in `dontAsk` mode with an
+   * allow-list (`READ_ONLY_ALLOW_RULES`) instead of bypassed permissions:
+   * anything not allowed is refused, with no prompt. The Codex backend
+   * ignores this: `--full-auto` already confines writes to its cwd and /tmp,
+   * and a read-only sandbox would refuse the reply's attachments too.
+   */
+  readOnly?: boolean;
 }
 
 export type McpServerConfig =

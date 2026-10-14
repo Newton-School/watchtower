@@ -184,6 +184,39 @@ function resolveClaudeCodeBinary(): string {
 export const PROCESS_KILL_DENY_RULES = ['Bash(pkill:*)', 'Bash(killall:*)'];
 
 /**
+ * What a read-only run may do beyond what `dontAsk` mode allows by itself
+ * (issue #443). Measured on CLI 2.1.299, `dontAsk` alone allows reading and
+ * searching inside the run's working directories (its cwd and `--add-dir`
+ * directories) and the CLI's own read-only shell commands there (`grep`,
+ * `sed -n`, `cat`, `ls`, `find`, `git log|show|grep`, `cd … && … | head`). It
+ * refuses every write, `rm`, `sed -i`, redirection, `python3`, `curl`,
+ * `git checkout`, and any read outside those directories. On top of that:
+ * - files written and read back under /tmp, which is where the reply's
+ *   attachments go (`Edit` rules cover the Write tool; /tmp is /private/tmp);
+ * - read-only GitHub CLI commands, for questions about pull requests and runs.
+ * The run's connectors are allowed by server name in `readOnlyAllowRules`.
+ */
+export const READ_ONLY_ALLOW_RULES = [
+  'Edit(//tmp/**)',
+  'Edit(//private/tmp/**)',
+  'Read(//tmp/**)',
+  'Read(//private/tmp/**)',
+  'Bash(gh pr view:*)',
+  'Bash(gh pr list:*)',
+  'Bash(gh pr diff:*)',
+  'Bash(gh pr checks:*)',
+  'Bash(gh issue view:*)',
+  'Bash(gh issue list:*)',
+  'Bash(gh run list:*)',
+  'Bash(gh run view:*)',
+];
+
+/** The allow-list for a read-only run: the fixed rules, plus each of its connectors by server name. */
+export function readOnlyAllowRules(mcpServers: AgentRunRequest['mcpServers']): string[] {
+  return [...READ_ONLY_ALLOW_RULES, ...Object.keys(mcpServers ?? {}).map(name => `mcp__${name}`)];
+}
+
+/**
  * Flags for a text-in, text-out call (`noTools`). `--tools` and `--mcp-config`
  * are variadic, so each must be followed by another flag, never a positional.
  */
@@ -273,6 +306,10 @@ export const claudeCodeBackend: AgentBackend = {
       args.push(...NO_TOOLS_ARGS);
     } else if (request.planMode) {
       args.push('--permission-mode', 'plan');
+    } else if (request.readOnly) {
+      // A run that only reads gets what it needs to read, and no bypass
+      // (issue #443). Deny rules below still apply on top of the allow-list.
+      args.push('--permission-mode', 'dontAsk', '--allowedTools', ...readOnlyAllowRules(request.mcpServers));
     } else {
       args.push('--dangerously-skip-permissions');
     }

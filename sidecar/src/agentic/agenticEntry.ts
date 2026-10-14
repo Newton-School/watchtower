@@ -468,6 +468,8 @@ async function runAgenticTurn(params: RunAgenticEntryParams, workspace?: LookupW
       tier: MODE_POLICY[mode].tier,
       effort: MODE_POLICY[mode].effort,
       imagePaths: attached.imagePaths,
+      // A lookup or a chat reply only reads (issue #443).
+      readOnly: true,
       logStep,
       signal,
     }),

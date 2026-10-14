@@ -90,6 +90,13 @@ describe('runInvestigationWorkflow thread images', () => {
     expect(runCodex.mock.calls[0][0].imagePaths).toEqual(['/tmp/slack-files/F1-image.png']);
   });
 
+  it('investigates read-only, and tells the investigator so (issue #443)', async () => {
+    await runInvestigationWorkflow({ task: makeTask('button is misaligned'), config, slack: slackStub() as any });
+
+    expect(runCodex.mock.calls[0][0].readOnly).toBe(true);
+    expect(runCodex.mock.calls[0][0].prompt).toContain('This run is read-only.');
+  });
+
   it('passes no imagePaths when the thread has none', async () => {
     await runInvestigationWorkflow({ task: makeTask('button is misaligned'), config, slack: slackStub() as any });
 

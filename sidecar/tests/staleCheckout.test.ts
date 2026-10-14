@@ -73,8 +73,8 @@ describe('buildStaleCheckoutBlock (issue #446)', () => {
       '- newton-web: the files on disk are 707 commits behind origin/master (it has uncommitted changes to package-lock.json, package.json). Read it from origin/master.',
     );
     expect(block).not.toContain('newton-api');
-    expect(block).toContain('git -C newton-web grep -n "<pattern>" origin/master -- <path>');
-    expect(block).toContain('git -C newton-web show origin/master:<path>');
+    expect(block).toContain('cd newton-web && git grep -n "<pattern>" origin/master -- <path>');
+    expect(block).toContain('cd newton-web && git show origin/master:<path>');
     // The wrong answer in the incident was "that param doesn't exist anywhere: zero hits".
     expect(block).toContain('Never conclude that something "does not exist"');
     expect(block).toContain('Say in your answer that you read origin/master, not the local files.');

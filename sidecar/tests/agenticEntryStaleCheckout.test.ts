@@ -109,7 +109,7 @@ describe('runAgenticEntry reading a shared clone that is behind origin', () => {
 
     expect(prompt).toContain('STALE CHECKOUTS');
     expect(prompt).toContain('- newton-web: the files on disk are 707 commits behind origin/master');
-    expect(prompt).toContain('git -C newton-web grep -n "<pattern>" origin/master -- <path>');
+    expect(prompt).toContain('cd newton-web && git grep -n "<pattern>" origin/master -- <path>');
     // The repo that is current is not in the block (the base prompt lists every repo above it).
     expect(prompt.slice(prompt.indexOf('STALE CHECKOUTS'))).not.toContain('newton-api');
   });
