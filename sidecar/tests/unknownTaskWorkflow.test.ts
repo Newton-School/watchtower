@@ -127,6 +127,37 @@ describe('unknownTaskWorkflow', () => {
     );
   });
 
+  it('posts every sentence of a multi-sentence reply', async () => {
+    vi.mocked(fetchThreadContext).mockResolvedValue([]);
+    vi.mocked(runCodex).mockResolvedValue({
+      ok: true,
+      exitCode: 0,
+      timedOut: false,
+      stdout: '',
+      stderr: '',
+      lastMessage: '',
+      parsedJson: { reply: 'Yes. The deploy runs after the build passes.', reaction: 'eyes' },
+    });
+    const slack = {
+      chat: { postMessage: vi.fn().mockResolvedValue({ ok: true, ts: '123.45' }) },
+      reactions: { add: vi.fn().mockResolvedValue({ ok: true }) },
+    };
+
+    await runUnknownTaskWorkflow({
+      task: makeTask({
+        userId: 'U780',
+        eventId: 'EvUnknownMulti',
+        text: '<@UBOT1> does the deploy wait for the build?',
+      }),
+      config,
+      slack: slack as any,
+    });
+
+    expect(slack.chat.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ text: '<@U780> Yes. The deploy runs after the build passes.' }),
+    );
+  });
+
   it('strips joke clauses and keeps neutral reactions in replies', async () => {
     vi.mocked(fetchThreadContext).mockResolvedValue([
       {

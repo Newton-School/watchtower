@@ -1,4 +1,5 @@
 import type { DossierRole, NormalizedTask, PersonalityMode, WorkflowIntent } from '../types/contracts.js';
+import { STE_CORE_STYLE_BLOCK, STE_REPLY_STYLE_BLOCK } from './replyStyle.js';
 
 type MentionPromptWorkflow = Exclude<WorkflowIntent, 'DEV_ASSIST'>;
 
@@ -64,6 +65,9 @@ export function buildMentionSystemPrompt(params: {
     );
   }
 
+  const sentenceRulesOnly = workflow === 'IMPLEMENTATION' || workflow === 'INVESTIGATION' || workflow === 'UNKNOWN';
+  lines.push('', sentenceRulesOnly ? STE_CORE_STYLE_BLOCK : STE_REPLY_STYLE_BLOCK);
+
   return lines.join('\n');
 }
 
@@ -74,7 +78,7 @@ function toneLineFor(mode: PersonalityMode): string {
     case 'technical':
       return '- Tone preference: technical. Lean on code blocks, file paths, and concrete identifiers.';
     case 'casual':
-      return '- Tone preference: casual. A friendly opening line is fine; avoid stiff phrasing.';
+      return '- Tone preference: casual. A short friendly opening line is fine.';
     default:
       return '- Use plain, natural wording.';
   }

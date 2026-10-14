@@ -48,6 +48,7 @@ import { isAnchorInDiff, parseDiffHunks } from '../github/diffHunks.js';
 import { resolveWorkspace } from '../workspaces/workspaceManager.js';
 import { applyFollowUpScope, formatFollowUpLine, type FollowUpStats } from './reReview.js';
 import { withAgentCallContext } from '../state/runContext.js';
+import { STE_REVIEW_TEXT_RULE } from '../codex/replyStyle.js';
 
 /**
  * Per-PR review outcome. A job reviewing N PRs carries N of these in
@@ -185,6 +186,8 @@ ${NEVER_POST_RULE}
   "summaryNotes": string[],
   "summary": string
 }
+
+${STE_REVIEW_TEXT_RULE}
 
 PR Diff:
 \`\`\`diff
@@ -423,6 +426,8 @@ ${NEVER_POST_RULE}
   "summaryNotes": string[],
   "summary": string
 }
+
+${STE_REVIEW_TEXT_RULE}
 
 PR Diff:
 \`\`\`diff

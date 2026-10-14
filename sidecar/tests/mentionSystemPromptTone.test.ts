@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { buildMentionSystemPrompt } from '../src/codex/mentionSystemPrompt.js';
+import { STE_CORE_STYLE_BLOCK, STE_REPLY_STYLE_BLOCK } from '../src/codex/replyStyle.js';
 import type { NormalizedTask } from '../src/types/contracts.js';
 
 function makeTask(): NormalizedTask {
@@ -45,5 +46,31 @@ describe('mentionSystemPrompt tone branches', () => {
   it('emits a casual line when toneMode is casual', () => {
     const prompt = buildMentionSystemPrompt({ task: makeTask(), workflow: 'CONVERSATIONAL', toneMode: 'casual' });
     expect(prompt).toContain('Tone preference: casual');
+  });
+});
+
+describe('mentionSystemPrompt STE writing style', () => {
+  it('includes the STE block for every tone', () => {
+    for (const toneMode of ['normal', 'terse', 'technical', 'casual'] as const) {
+      const prompt = buildMentionSystemPrompt({ task: makeTask(), workflow: 'DEPLOY', toneMode });
+      expect(prompt).toContain(STE_REPLY_STYLE_BLOCK);
+    }
+  });
+
+  it('gives JSON, cleaned-summary and one-line workflows the sentence rules only', () => {
+    for (const workflow of ['IMPLEMENTATION', 'INVESTIGATION', 'UNKNOWN'] as const) {
+      const prompt = buildMentionSystemPrompt({ task: makeTask(), workflow });
+      expect(prompt).toContain(STE_CORE_STYLE_BLOCK);
+      expect(prompt).not.toContain('Use bullet lists');
+      expect(prompt).not.toContain('One topic per paragraph');
+    }
+  });
+
+  it('puts the STE block after the role guidance, at the end of the prompt', () => {
+    const prompt = buildMentionSystemPrompt({ task: makeTask(), workflow: 'INVESTIGATION', dossierRole: 'pm' });
+    const roleIndex = prompt.indexOf('The asker is a pm');
+    expect(roleIndex).toBeGreaterThanOrEqual(0);
+    expect(prompt.endsWith(STE_CORE_STYLE_BLOCK)).toBe(true);
+    expect(roleIndex).toBeLessThan(prompt.indexOf(STE_CORE_STYLE_BLOCK));
   });
 });
