@@ -74,6 +74,8 @@ describe('runAgenticEntry with the lookup copy of the repos', () => {
     await runAgenticEntry({ mode: 'informational', task, config, slack, store });
 
     expect(vi.mocked(runClaudeAgentic).mock.calls[0][0].cwd).toBe('/lookups/lookup-1');
+    // ...and only reads there (issue #443).
+    expect(vi.mocked(runClaudeAgentic).mock.calls[0][0].readOnly).toBe(true);
     expect(refreshSharedRepoToDefaultBranch).not.toHaveBeenCalled();
     expect(vi.mocked(runClaudeAgentic).mock.calls[0][0].systemPrompt).not.toContain('STALE CHECKOUTS');
     expect(cleanup).toHaveBeenCalledTimes(1);
@@ -93,5 +95,6 @@ describe('runAgenticEntry with the lookup copy of the repos', () => {
 
     expect(createLookupWorkspace).not.toHaveBeenCalled();
     expect(vi.mocked(runClaudeAgentic).mock.calls[0][0].cwd).toBe('/repos');
+    expect(vi.mocked(runClaudeAgentic).mock.calls[0][0].readOnly).toBe(true);
   });
 });

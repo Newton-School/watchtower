@@ -3,6 +3,7 @@ import { cancelledResult } from './shared/cancelState.js';
 import type { AppConfig, NormalizedTask, WorkflowResult, WorkflowStepLogger } from '../types/contracts.js';
 import { getActiveBackendId } from '../codex/runCodex.js';
 import { connectionLostReply, killedFromOutsideReply, runWithInfraRetry } from '../codex/infraRetry.js';
+import { READ_ONLY_RUN_NOTE } from '../agentic/runClaude.js';
 import { assembleRecall } from '../codex/recallAssembler.js';
 import { highReasoningProfile } from '../codex/modelProfiles.js';
 import { buildMentionSystemPrompt } from '../codex/mentionSystemPrompt.js';
@@ -168,6 +169,8 @@ Your job is to DIAGNOSE — not to fix. Read code, run read-only queries (git lo
 Environment:
 ${environmentBlock}${staleBlock ? `\n\n${staleBlock}` : ''}
 
+${READ_ONLY_RUN_NOTE}
+
 Slack thread context (includes the bug report and any evidence the user has shared):
 ${ctx.threadContext}${ctx.imageContext}
 
@@ -223,6 +226,8 @@ Return strict JSON:
       reasoningEffort: profile.reasoningEffort,
       mcpServers: connectors.mcpServers,
       disallowedTools: connectors.disallowedTools,
+      // An investigation reads and reports; the change, if any, is a later job (issue #443).
+      readOnly: true,
       // No per-agent timeoutMs. Substantive investigations on the high-reasoning
       // tier (Opus at xhigh) routinely exceed a fractional sub-budget (e.g. 40%
       // of bugFixTimeoutMs = 18 min) on real feature scoping, and a forced

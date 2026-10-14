@@ -5,6 +5,12 @@ import { extractReplyFromCodexResult } from '../workflows/shared/workflowUtils.j
 import type { WorkflowStepLogger, CodexReasoningEffort } from '../types/contracts.js';
 import type { AgentBackendId } from '../backends/types.js';
 
+/**
+ * Told to a run that only reads, so it does not spend turns on commands it
+ * will be refused (issue #443). Matches `READ_ONLY_ALLOW_RULES`.
+ */
+export const READ_ONLY_RUN_NOTE = `This run is read-only. You can read and search the repos under the current directory, run read-only commands there (grep, sed -n, cat, ls, find, git log / show / grep / diff, gh pr view), use the connectors you were given, and write files under /tmp to attach to your reply. Anything else is refused without asking: editing files in the repos, scripts (python, node), network calls (curl), reading outside the repos. If a command is refused, find a read-only way instead (for example \`cd newton-web && git log\`, not \`git -C newton-web log\`).`;
+
 export interface RunClaudeAgenticRequest {
   systemPrompt: string;
   userMessage: string;
@@ -42,6 +48,8 @@ export interface RunClaudeAgenticRequest {
    * connection never comes back: "answering this", "testing the page".
    */
   doing?: string;
+  /** The run only reads: no bypassed permissions, an allow-list instead (issue #443). */
+  readOnly?: boolean;
 }
 
 export interface RunClaudeAgenticResult {
@@ -79,9 +87,10 @@ export async function runClaudeAgentic(request: RunClaudeAgenticRequest): Promis
     effort,
     imagePaths,
     doing = 'answering this',
+    readOnly,
   } = request;
 
-  const prompt = `${systemPrompt}\n\n---\n\nUser message:\n${userMessage}`;
+  const prompt = `${readOnly ? `${systemPrompt}\n\n${READ_ONLY_RUN_NOTE}` : systemPrompt}\n\n---\n\nUser message:\n${userMessage}`;
   const backendId = forceBackend ?? getActiveBackendId();
   const profile = tier === 'light' ? lightweightProfile(backendId) : highReasoningProfile(backendId);
 
@@ -100,6 +109,7 @@ export async function runClaudeAgentic(request: RunClaudeAgenticRequest): Promis
         backendOverride: forceBackend,
         timeoutMs,
         imagePaths: imagePaths && imagePaths.length > 0 ? imagePaths : undefined,
+        readOnly,
         onLog: logStep,
         signal,
       },
