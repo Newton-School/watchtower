@@ -175,7 +175,7 @@ Requirements:
    **Raised by:** miniOG (Watchtower)${ctx.requestedBy ? `\n   **Triggered by:** ${ctx.requestedBy} via Slack` : ''}
    **Workflow:** ${ctx.workflowIntent}
    **Thread:** ${ctx.task.event.threadTs}
-5. When creating the PR with \`gh pr create\`, include the flag \`--label miniog\` to tag it
+5. Push with \`git push origin HEAD:<branch>\` (not \`git push -u\`: your shell cannot write git config, so the upstream is never recorded) and create the PR with \`gh pr create --head <branch>\`, including the flag \`--label miniog\` to tag it
 6. Do not run destructive git commands
 7. If you cannot map the request to a concrete change — the plan above is missing, the terminology
    doesn't resolve to anything in this repo, or you'd be guessing at which code the requester means —

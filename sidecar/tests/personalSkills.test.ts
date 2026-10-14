@@ -90,8 +90,13 @@ describe('personal skills are denied to working agents', () => {
         'Skill(deploy-prod)',
         'Skill(personal-browser)',
       ]);
-      // Variadic: the next argument must be a flag, and the prompt is still first.
-      expect(args[at + 5].startsWith('--')).toBe(true);
+      // Variadic: after the sandbox's Read rules (issue #445) the next argument must be a flag, and the prompt is still first.
+      expect(
+        args
+          .slice(at + 5)
+          .find(arg => !arg.startsWith('Read('))
+          ?.startsWith('--'),
+      ).toBe(true);
       expect(args.slice(0, 2)).toEqual(['-p', 'hello']);
       expect(args).toContain('--dangerously-skip-permissions');
     });

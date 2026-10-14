@@ -50,6 +50,8 @@ export interface RunClaudeAgenticRequest {
   doing?: string;
   /** The run only reads: no bypassed permissions, an allow-list instead (issue #443). */
   readOnly?: boolean;
+  /** False for a run the shell sandbox breaks, such as browser QA (issue #445). */
+  sandbox?: boolean;
 }
 
 export interface RunClaudeAgenticResult {
@@ -88,6 +90,7 @@ export async function runClaudeAgentic(request: RunClaudeAgenticRequest): Promis
     imagePaths,
     doing = 'answering this',
     readOnly,
+    sandbox,
   } = request;
 
   const prompt = `${readOnly ? `${systemPrompt}\n\n${READ_ONLY_RUN_NOTE}` : systemPrompt}\n\n---\n\nUser message:\n${userMessage}`;
@@ -110,6 +113,7 @@ export async function runClaudeAgentic(request: RunClaudeAgenticRequest): Promis
         timeoutMs,
         imagePaths: imagePaths && imagePaths.length > 0 ? imagePaths : undefined,
         readOnly,
+        sandbox,
         onLog: logStep,
         signal,
       },

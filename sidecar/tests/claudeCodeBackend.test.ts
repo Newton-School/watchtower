@@ -691,7 +691,9 @@ describe('claudeCodeBackend.buildArgs denies killing by name (issue #445)', () =
     expect(at).toBeGreaterThan(-1);
     expect(args.slice(at + 1, at + 3)).toEqual(['Bash(pkill:*)', 'Bash(killall:*)']);
     // Variadic: the rules end the argument list, or a flag follows them. The prompt is never after them.
-    const next = args.slice(at + 1).find(arg => !arg.startsWith('Bash(') && !arg.startsWith('Skill('));
+    const next = args
+      .slice(at + 1)
+      .find(arg => !arg.startsWith('Bash(') && !arg.startsWith('Skill(') && !arg.startsWith('Read('));
     expect(next === undefined || next.startsWith('--')).toBe(true);
     expect(args.indexOf('hello')).toBeLessThan(at);
   });

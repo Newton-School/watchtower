@@ -86,6 +86,8 @@ describe('runAgenticEntry per-mode model policy', () => {
         effort: 'high',
         forceBackend: 'claude-code',
         timeoutMs: 20 * 60 * 1000,
+        // Headless Chromium does not start inside the shell sandbox (issue #445).
+        sandbox: false,
       }),
     );
   });

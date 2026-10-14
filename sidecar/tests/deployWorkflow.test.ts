@@ -464,6 +464,8 @@ describe('runDeployWorkflow marketing branch', () => {
 
     expect(result.status).toBe('SUCCESS');
     expect(runCodex).toHaveBeenCalledTimes(1);
+    // A production deploy stays outside the shell sandbox (issue #445).
+    expect(vi.mocked(runCodex).mock.calls[0][0].sandbox).toBe(false);
     expect(ghExec).not.toHaveBeenCalled();
   });
 

@@ -742,6 +742,8 @@ async function runWebappQa(params: RunAgenticEntryParams): Promise<WorkflowResul
       effort: MODE_POLICY.qa.effort,
       timeoutMs: QA_TIMEOUT_MS,
       imagePaths: attached.imagePaths,
+      // Headless Chromium does not start inside the shell sandbox (issue #445).
+      sandbox: false,
       logStep,
       signal,
     });
