@@ -477,9 +477,19 @@ async function pollForApproval(params: {
     postedOnce.add(key);
     slack.chat.postMessage({ channel: channelId, thread_ts: threadTs, text }).catch(() => {});
   };
-  /** An approver said yes: done, unless the requester still has to confirm. */
+  /**
+   * An approver said yes: done, unless the requester still has to confirm.
+   * Logged once, when it counts: a plain "yes" is read again on every poll,
+   * and a held one was logged as approved every 5 seconds.
+   */
   const approve = (result: ApprovalResult): ApprovalResult | undefined => {
-    if (requesterConfirmed) return result;
+    if (requesterConfirmed) {
+      logStep({
+        stage: 'pipeline.approval.approved',
+        message: `Core-dev member <@${result.approverId}> approved the plan: "${result.userReply}"`,
+      });
+      return result;
+    }
     heldApproval ??= result;
     if (!postedOnce.has('held')) {
       logStep({
@@ -584,6 +594,10 @@ async function pollForApproval(params: {
             message: `<@${reply.user}> confirmed the plan is what they want: "${text}"`,
           });
           if (heldApproval) {
+            logStep({
+              stage: 'pipeline.approval.approved',
+              message: `Core-dev member <@${heldApproval.approverId}> approved the plan, and the requester confirmed it.`,
+            });
             return { ...heldApproval, replyTs: reply.ts > heldApproval.replyTs ? reply.ts : heldApproval.replyTs };
           }
           postOnce('confirmed', `Thanks <@${reply.user}>. Waiting for an admin to approve.`);
@@ -638,10 +652,6 @@ async function pollForApproval(params: {
           }
           continue;
         }
-        logStep({
-          stage: 'pipeline.approval.approved',
-          message: `Core-dev member <@${reply.user}> approved the plan: "${text}"`,
-        });
         const approved = approve({ outcome: 'approved', userReply: text, approverId: reply.user, replyTs: reply.ts });
         if (approved) return approved;
         continue;
@@ -681,10 +691,6 @@ async function pollForApproval(params: {
         }
         classifiedTs.add(reply.ts);
         if (intent === 'approve') {
-          logStep({
-            stage: 'pipeline.approval.approved',
-            message: `Core-dev member <@${reply.user}> approved the plan: "${text}"`,
-          });
           const approved = approve({ outcome: 'approved', userReply: text, approverId: reply.user, replyTs: reply.ts });
           if (approved) return approved;
           continue;
