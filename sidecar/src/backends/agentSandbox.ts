@@ -56,9 +56,10 @@ const SECRET_PATHS = [
   '~/Library/Application Support/Google',
   '~/Library/Mail',
   '~/Library/Messages',
-  '~/Documents',
-  '~/Desktop',
-  '~/Downloads',
+  // Not ~/Documents, ~/Desktop or ~/Downloads: macOS already guards them with
+  // a permission prompt, and the sandbox touches every path listed here when
+  // it starts. With the prompt pending (screen locked) ~/Documents blocked,
+  // and every agent hung before its first step, all evening of 2026-10-14.
 ];
 
 const toHomeForm = (absolute: string): string => {
