@@ -42,6 +42,8 @@ export interface RouterFacts {
   threadContext?: string;
   prUrlInTrigger: boolean;
   prUrlInThread: boolean;
+  /** miniOG already reviewed a pull request in this thread (issue #451). */
+  reviewedPrInThread?: boolean;
   /** Keyword matches from the legacy gates, as hints. Never decisions. */
   hints: string[];
   userDossierSummary?: string;
@@ -81,6 +83,7 @@ const RULES = `Rules:
 - Decide from what this message asks for. Thread context explains it; it is not the request.
 - A link is not a request. A pull-request link with a question about it ("is this merged?", "what does this change?") is answer.
 - review_pr: the person asks for a review of a pull request, or posts the link with nothing else or with only a description of the change. "Review and merge" and "review, approve, merge" are review_pr: you review, a person merges.
+- When you already reviewed a pull request in this thread, a message saying your review comments are fixed, addressed or resolved, or asking you to look again, is review_pr: you review it again. That holds with no link in the message. A request to merge is not a request to look again.
 - change_code needs both an instruction to build, change, fix, add or remove something and something to act on: an error, a file, a function, a failing request, a page, or a specific change ("change X to Y").
 - A problem report with no instruction and nothing to act on, or a vague "fix it", is investigate. Between change_code and investigate, prefer investigate.
 - A question is answer: how something works, where something is, what happened, how to do something in the product, or about miniOG itself. Pages on newtonschool.co are the team's own product: a question about one is answer, a change to one is change_code. Asking for the answer as a document or PDF does not change that.
@@ -123,6 +126,7 @@ export function buildRouterPrompt(facts: RouterFacts): string {
     `Addressed: ${ADDRESSED[facts.addressing]}`,
     `Pull-request link in this message: ${facts.prUrlInTrigger ? 'yes' : 'no'}`,
     `Pull-request link earlier in the thread: ${facts.prUrlInThread ? 'yes' : 'no'}`,
+    `You already reviewed a pull request in this thread: ${facts.reviewedPrInThread ? 'yes' : 'no'}`,
   );
   if (facts.hints.length > 0) {
     lines.push(`Keyword hints (may be coincidence): ${facts.hints.join(', ')}`);

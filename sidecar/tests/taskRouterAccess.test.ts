@@ -1269,6 +1269,30 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
   // in, "<@theOG> what is the name of this page?" and miniOG answered the
   // message — written to the owner — with "I'm not enabled for this kind of
   // request in this channel".
+  // Issue #451, seen in the soak: "Fixed all reviews @miniOG" in a thread
+  // where miniOG had reviewed the PR forty minutes earlier.
+  it('tells the router when miniOG already reviewed a pull request in the thread', async () => {
+    routerSays('review_pr', 0.9);
+    const hasReviewedPrInThread = vi.fn(() => true);
+
+    await route('Fixed all reviews <@UBOT1>', {}, { store: onStore({ hasReviewedPrInThread }) });
+
+    expect(hasReviewedPrInThread).toHaveBeenCalledWith('C-VIEW', '111.22');
+    expect(decideTool.mock.calls[0][0].facts.reviewedPrInThread).toBe(true);
+  });
+
+  it('decides without that fact when the store cannot say', async () => {
+    routerSays('answer', 0.9);
+    const hasReviewedPrInThread = vi.fn(() => {
+      throw new Error('db closed');
+    });
+
+    const { result } = await route('what changed?', {}, { store: onStore({ hasReviewedPrInThread }) });
+
+    expect(result.workflow).toBe('INFORMATIONAL');
+    expect(decideTool.mock.calls[0][0].facts).not.toHaveProperty('reviewedPrInThread');
+  });
+
   describe('an owner tag from someone without access of their own (issue #398)', () => {
     const tagger = {
       mentionType: 'owner' as const,

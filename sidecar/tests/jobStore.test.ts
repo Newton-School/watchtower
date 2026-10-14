@@ -9,6 +9,38 @@ function tempDbPath(): string {
 }
 
 describe('jobStore', () => {
+  // Issue #451: the router is told when miniOG already reviewed a PR in a thread.
+  it('knows whether miniOG reviewed a pull request in a thread, counting only a review that read a head', () => {
+    const store = new JobStore(tempDbPath());
+    const job = (
+      id: string,
+      threadTs: string,
+      workflow: string,
+      status: 'SUCCESS' | 'FAILED' | 'SKIPPED',
+      result: object,
+    ) => {
+      store.createJob({
+        id,
+        eventId: `e-${id}`,
+        dedupeKey: `k-${id}`,
+        workflow: 'IMPLEMENTATION',
+        channelId: 'C1',
+        threadTs,
+        payload: {},
+      });
+      store.markJob(id, status, { result, executedWorkflow: workflow as never });
+    };
+    job('reviewed', '1.1', 'PR_REVIEW', 'SUCCESS', { prUrl: 'u', prHeadSha: 'abc' });
+    job('denied', '2.2', 'PR_REVIEW', 'SKIPPED', {});
+    job('answered', '3.3', 'INFORMATIONAL', 'SUCCESS', { prHeadSha: 'abc' });
+
+    expect(store.hasReviewedPrInThread('C1', '1.1')).toBe(true);
+    expect(store.hasReviewedPrInThread('C1', '2.2')).toBe(false);
+    expect(store.hasReviewedPrInThread('C1', '3.3')).toBe(false);
+    expect(store.hasReviewedPrInThread('C2', '1.1')).toBe(false);
+    store.close();
+  });
+
   it('dedupes events and dedupe keys', () => {
     const dbPath = tempDbPath();
     const store = new JobStore(dbPath);
