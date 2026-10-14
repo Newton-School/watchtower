@@ -1780,6 +1780,25 @@ describe('waitForApproval', () => {
       });
     });
 
+    it('logs the approval once, when it takes effect, not on every poll while it is held', async () => {
+      const stages: string[] = [];
+      vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'yes', user: 'UCOREDEV', ts: '200.00' }]);
+      const promise = confirmRun({ logStep: (entry: any) => stages.push(entry.stage) });
+      await vi.advanceTimersByTimeAsync(60_000); // 12 polls
+
+      expect(stages.filter(stage => stage === 'pipeline.approval.approved')).toHaveLength(0);
+      expect(stages.filter(stage => stage === 'pipeline.approval.awaiting_requester')).toHaveLength(1);
+
+      vi.mocked(fetchThreadContext).mockResolvedValue([
+        { text: 'yes', user: 'UCOREDEV', ts: '200.00' },
+        { text: 'yes', user: 'UREQUESTER', ts: '210.00' },
+      ]);
+      await vi.advanceTimersByTimeAsync(6000);
+      await promise;
+
+      expect(stages.filter(stage => stage === 'pipeline.approval.approved')).toHaveLength(1);
+    });
+
     it('starts on the admin yes when the requester confirmed first', async () => {
       vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'correct', user: 'UREQUESTER', ts: '200.00' }]);
       const promise = confirmRun();
