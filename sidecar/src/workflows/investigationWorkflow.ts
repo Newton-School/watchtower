@@ -11,6 +11,7 @@ import { assertThreadParentExists, fetchThreadContext } from '../slack/threadCon
 import { classifyInvestigationScope, type InvestigationScope } from '../router/investigationScope.js';
 import { enabledRepoPaths } from '../repos/registry.js';
 import { connectorsFor, NO_CONNECTORS } from '../backends/connectors.js';
+import { refreshSharedClones } from '../workspaces/staleCheckout.js';
 import type { PipelineStore } from '../agents/pipeline.js';
 import type { InvestigationStore } from '../state/investigationStore.js';
 import type { RecallCapableStore } from '../state/dossierStore.js';
@@ -151,6 +152,12 @@ export async function runInvestigationWorkflow(params: {
         }${analyticsNote}
 - Read-only mode: you may use Read, Grep, Glob, and read-only git/bash (git log, git show, git blame, git diff)${useMetabase ? ', and read-only Metabase queries' : ''}. Do NOT invoke Edit, Write, any bash command that mutates the worktree, or any mutating MCP tool.`;
 
+  // A broad investigation reads the shared clones in place (issue #446).
+  const staleBlock =
+    scope.scope === 'broad'
+      ? await refreshSharedClones({ config, stage: 'investigation.repo_refresh', logStep })
+      : undefined;
+
   const investigatorPrompt = `${recallBlock}${`
 ${buildMentionSystemPrompt({ task, workflow: 'INVESTIGATION', toneMode: task.toneMode, dossierRole: task.dossierRole })}
 
@@ -159,7 +166,7 @@ You are the INVESTIGATOR agent.
 Your job is to DIAGNOSE — not to fix. Read code, run read-only queries (git log / git show / grep / ls), and form a concrete hypothesis about what is wrong. Do NOT modify any files. Do NOT create branches. Do NOT run destructive commands. If you cannot form a hypothesis because the user's report is too vague, say so in \`requiresMoreInfo\` and list what you'd need.
 
 Environment:
-${environmentBlock}
+${environmentBlock}${staleBlock ? `\n\n${staleBlock}` : ''}
 
 Slack thread context (includes the bug report and any evidence the user has shared):
 ${ctx.threadContext}${ctx.imageContext}

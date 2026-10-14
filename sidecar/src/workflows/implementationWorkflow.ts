@@ -44,7 +44,13 @@ import { cancelledResult } from './shared/cancelState.js';
 import type { PipelineStore } from '../agents/pipeline.js';
 import type { AgentStepResult, PipelineConfig } from '../agents/types.js';
 import type { InvestigationStore } from '../state/investigationStore.js';
-import { prepareWorkflowContext, sanitizeOwnerSummary, extractReplyFromCodexResult } from './shared/workflowUtils.js';
+import {
+  prepareWorkflowContext,
+  resolveCombinedWorkspaceRoot,
+  sanitizeOwnerSummary,
+  extractReplyFromCodexResult,
+} from './shared/workflowUtils.js';
+import { refreshSharedClones } from '../workspaces/staleCheckout.js';
 import { assertThreadParentExists } from '../slack/threadContext.js';
 import { runAgenticEntry } from '../agentic/agenticEntry.js';
 import type { JobStore } from '../state/jobStore.js';
@@ -935,6 +941,13 @@ async function runImplementationWorkflowBody(params: {
     const plannerProfile = profileForAgentRole('planner', plannerBackend);
     const plannerPlanMode = plannerBackend === 'claude-code';
     let plannerPrompt = plannerPlanMode ? buildPlannerPlanModePrompt(plannerCtx) : buildPlannerPrompt(plannerCtx);
+    // An owner's request plans from the shared clones, not a fresh worktree.
+    // A clone that is behind origin gets the same warning a lookup does
+    // (issue #446): read origin, never conclude "it does not exist" from disk.
+    if (ctx.cwd === resolveCombinedWorkspaceRoot(config)) {
+      const staleBlock = await refreshSharedClones({ config, stage: 'pipeline.repo_refresh', logStep });
+      if (staleBlock) plannerPrompt = `${plannerPrompt}\n\n${staleBlock}`;
+    }
     // Recall personalizes the plan to whoever the work is FOR — launchpad
     // retriggers carry the real requester in requestedForUserId (issue #343).
     const recallUserId = task.event.requestedForUserId ?? task.event.userId;

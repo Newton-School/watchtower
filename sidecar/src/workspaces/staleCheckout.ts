@@ -1,4 +1,7 @@
-import type { SharedRepoState } from './workspaceManager.js';
+import path from 'node:path';
+import type { AppConfig, WorkflowStepLogger } from '../types/contracts.js';
+import { enabledRepoPaths } from '../repos/registry.js';
+import { refreshSharedRepoToDefaultBranch, type SharedRepoState } from './workspaceManager.js';
 
 /**
  * What to say, and what to tell the agent, when a shared clone is behind
@@ -85,4 +88,50 @@ export function buildStaleCheckoutBlock(repos: Array<{ name: string; state: Shar
       .filter((v, i, a) => a.indexOf(v) === i)
       .join(' / ')}, not the local files.`,
   ].join('\n');
+}
+
+/**
+ * Refresh every shared clone a run is about to read, log where each one
+ * really is, and return the block that tells the agent which ones are stale
+ * (undefined when none are). Lookups, planners and broad investigations all
+ * read these clones in place (issue #446).
+ */
+export async function refreshSharedClones(params: {
+  config: AppConfig;
+  stage: string;
+  logStep?: WorkflowStepLogger;
+}): Promise<string | undefined> {
+  const { config, stage, logStep } = params;
+  const refreshed: Array<{ name: string; state: SharedRepoState | null }> = [];
+  for (const { path: repoPath } of enabledRepoPaths(config)) {
+    // A refresh that throws must not stop the run that wanted it: the clone
+    // is reported as not refreshed and the run reads what is on disk.
+    let state: SharedRepoState | null = null;
+    try {
+      state = await refreshSharedRepoToDefaultBranch(repoPath);
+    } catch {
+      state = null;
+    }
+    const name = path.basename(repoPath);
+    refreshed.push({ name, state });
+    // Says what happened, not what was attempted: a clone that could not be
+    // updated is a WARN with how far behind it is and why.
+    const { message, level } = describeRepoRefresh(name, state);
+    logStep?.({
+      stage,
+      message,
+      level,
+      data: {
+        repoPath,
+        branch: state?.branch,
+        head: state?.head,
+        upstream: state?.upstream,
+        behind: state?.behind,
+        staleReason: state?.staleReason,
+        dirtyFiles: state?.dirtyFiles,
+      },
+    });
+  }
+  // A stale clone still has origin's refs: point the agent at those.
+  return buildStaleCheckoutBlock(refreshed) || undefined;
 }
