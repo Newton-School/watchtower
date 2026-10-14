@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { __connectors } from '../src/backends/connectors.js';
 
 const runCodex = vi.fn();
@@ -24,6 +24,7 @@ vi.mock('../src/slack/threadContext.js', () => ({
 }));
 
 const { runInvestigationWorkflow } = await import('../src/workflows/investigationWorkflow.js');
+const { __infraRetry, connectionLostReply } = await import('../src/codex/infraRetry.js');
 
 const config: any = {
   ownerSlackUserIds: ['UOWNER'],
@@ -93,6 +94,75 @@ describe('runInvestigationWorkflow thread images', () => {
     await runInvestigationWorkflow({ task: makeTask('button is misaligned'), config, slack: slackStub() as any });
 
     expect(runCodex.mock.calls[0][0].imagePaths).toBeUndefined();
+  });
+});
+
+// Issue #439: an investigation that lost its connection used to tell the
+// requester it "couldn't complete" and to share more context.
+describe('runInvestigationWorkflow and a lost connection', () => {
+  const saved = { ...__infraRetry };
+
+  beforeEach(() => {
+    __infraRetry.sleep = vi.fn(async () => true);
+    __infraRetry.delaysMs = [1, 1];
+    classifyInvestigationScope.mockResolvedValue({
+      scope: 'newton-web',
+      confidence: 0.9,
+      reasoning: 'ui',
+      method: 'llm',
+    });
+  });
+
+  afterEach(() => Object.assign(__infraRetry, saved));
+
+  it('retries, and investigates once the connection is back', async () => {
+    runCodex.mockReset();
+    runCodex
+      .mockResolvedValueOnce({
+        ok: false,
+        exitCode: 1,
+        timedOut: false,
+        stdout: '',
+        stderr: '',
+        lastMessage: '',
+        errorKind: 'API_ERROR',
+      })
+      .mockResolvedValueOnce(investigatorOk());
+
+    const result = await runInvestigationWorkflow({
+      task: makeTask('button is misaligned'),
+      config,
+      slack: slackStub() as any,
+    });
+
+    expect(runCodex).toHaveBeenCalledTimes(2);
+    expect(result.status).toBe('SUCCESS');
+  });
+
+  it('says it lost the connection, and does not ask for more context, when retrying does not help', async () => {
+    runCodex.mockReset();
+    runCodex.mockResolvedValue({
+      ok: false,
+      exitCode: 1,
+      timedOut: false,
+      stdout: '',
+      stderr: '',
+      lastMessage: '',
+      errorKind: 'API_ERROR',
+    });
+    const slack = slackStub();
+
+    const result = await runInvestigationWorkflow({
+      task: makeTask('button is misaligned'),
+      config,
+      slack: slack as any,
+    });
+
+    expect(runCodex).toHaveBeenCalledTimes(3);
+    expect(result).toMatchObject({ workflow: 'INVESTIGATION', status: 'FAILED' });
+    const posted = slack.chat.postMessage.mock.calls.map(c => c[0].text as string);
+    expect(posted).toContain(connectionLostReply('investigating this', { changesCode: false }));
+    expect(posted.some(t => t.includes('share more context'))).toBe(false);
   });
 });
 

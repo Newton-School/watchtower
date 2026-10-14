@@ -11,6 +11,7 @@ import type {
   WorkflowStepLogger,
 } from '../types/contracts.js';
 import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
+import { runWithInfraRetry } from '../codex/infraRetry.js';
 import { highReasoningProfile, lightweightProfile, profileForAgentRole } from '../codex/modelProfiles.js';
 import type { CodexExecutionProfile } from '../codex/modelProfiles.js';
 import { ORCHESTRATOR_TIMEOUT_FACTOR, runOrchestratorReview } from './prReviewOrchestrator.js';
@@ -106,7 +107,9 @@ export const defaultPrReviewDeps: PrReviewDeps = {
   submitReview: submitPrReview,
   checkoutPr: checkoutPrBranch,
   resolveWorkspaceFn: resolveWorkspace,
-  runAgent: runCodex,
+  // The orchestrator, the lenses and the verifier all wait out a dropped
+  // connection and retry, as the change pipeline does (issue #439).
+  runAgent: request => runWithInfraRetry(request, { label: 'the review', logStep: request.onLog }),
   discoverSkills: discoverReviewSkills,
   runBuildGate: runPrBuildGate,
 };

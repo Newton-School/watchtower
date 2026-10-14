@@ -1,4 +1,5 @@
-import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
+import { getActiveBackendId } from '../codex/runCodex.js';
+import { connectionLostReply, killedFromOutsideReply, runWithInfraRetry } from '../codex/infraRetry.js';
 import { highReasoningProfile, lightweightProfile } from '../codex/modelProfiles.js';
 import { extractReplyFromCodexResult } from '../workflows/shared/workflowUtils.js';
 import type { WorkflowStepLogger, CodexReasoningEffort } from '../types/contracts.js';
@@ -36,6 +37,11 @@ export interface RunClaudeAgenticRequest {
    * a backend that supports image input.
    */
   imagePaths?: string[];
+  /**
+   * What the run is doing, read after "while" in the reply when the
+   * connection never comes back: "answering this", "testing the page".
+   */
+  doing?: string;
 }
 
 export interface RunClaudeAgenticResult {
@@ -44,6 +50,8 @@ export interface RunClaudeAgenticResult {
   /** Final reply text, ready to post to Slack. */
   reply: string;
   error?: string;
+  /** Set when the run died of something outside the agent: the network, or a kill from outside. */
+  interrupted?: 'API_ERROR' | 'EXTERNAL_KILL';
 }
 
 /**
@@ -70,6 +78,7 @@ export async function runClaudeAgentic(request: RunClaudeAgenticRequest): Promis
     tier,
     effort,
     imagePaths,
+    doing = 'answering this',
   } = request;
 
   const prompt = `${systemPrompt}\n\n---\n\nUser message:\n${userMessage}`;
@@ -77,21 +86,41 @@ export async function runClaudeAgentic(request: RunClaudeAgenticRequest): Promis
   const profile = tier === 'light' ? lightweightProfile(backendId) : highReasoningProfile(backendId);
 
   try {
-    const result = await runCodex({
-      cwd,
-      prompt,
-      githubToken,
-      ...profile,
-      reasoningEffort: effort ?? profile.reasoningEffort,
-      backendOverride: forceBackend,
-      timeoutMs,
-      imagePaths: imagePaths && imagePaths.length > 0 ? imagePaths : undefined,
-      onLog: logStep,
-      signal,
-    });
+    // A dropped connection or a kill from outside is waited out and retried,
+    // as for the change pipeline. Before, a lookup that lost its connection
+    // posted the CLI's "API Error: Can't reach the API server" into the
+    // thread as its answer (issue #439).
+    const result = await runWithInfraRetry(
+      {
+        cwd,
+        prompt,
+        githubToken,
+        ...profile,
+        reasoningEffort: effort ?? profile.reasoningEffort,
+        backendOverride: forceBackend,
+        timeoutMs,
+        imagePaths: imagePaths && imagePaths.length > 0 ? imagePaths : undefined,
+        onLog: logStep,
+        signal,
+      },
+      { label: 'the answer', logStep },
+    );
 
     if (signal?.aborted) {
       return { ok: false, reason: 'aborted', reply: '' };
+    }
+
+    if (!result.ok && (result.errorKind === 'API_ERROR' || result.errorKind === 'EXTERNAL_KILL')) {
+      return {
+        ok: false,
+        reason: 'error',
+        reply:
+          result.errorKind === 'API_ERROR'
+            ? connectionLostReply(doing, { changesCode: false })
+            : killedFromOutsideReply('My run', { changesCode: false }),
+        error: `${result.errorKind}: ${result.apiErrorDetail ?? result.killSignal ?? 'interrupted'} (after ${result.infraRetries} retries)`,
+        interrupted: result.errorKind,
+      };
     }
 
     const reply = extractReplyFromCodexResult(result).trim();
