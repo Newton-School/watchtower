@@ -94,6 +94,16 @@ describe('the shell sandbox for agent runs', () => {
     expect(sandboxReadDenyRules().some(rule => rule.includes('/code'))).toBe(false);
   });
 
+  it('lists no folder macOS guards with a permission prompt: a pending prompt hung every agent', () => {
+    configureAgentSandbox({ miniOgRepoRoot: root, repoPaths: [] });
+
+    const { filesystem } = agentSandboxSettings({ readOnly: false }).sandbox as { filesystem: { denyRead: string[] } };
+    for (const prompted of ['~/Documents', '~/Desktop', '~/Downloads']) {
+      expect(filesystem.denyRead).not.toContain(prompted);
+      expect(sandboxReadDenyRules()).not.toContain(`Read(${prompted}/**)`);
+    }
+  });
+
   it('hides no neighbours when the miniOG root sits directly in home', () => {
     configureAgentSandbox({ miniOgRepoRoot: path.join(home, 'mini-og'), repoPaths: [] });
 
