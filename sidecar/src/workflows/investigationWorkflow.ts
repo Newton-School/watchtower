@@ -1,7 +1,8 @@
 import type { WebClient } from '@slack/web-api';
 import { cancelledResult } from './shared/cancelState.js';
 import type { AppConfig, NormalizedTask, WorkflowResult, WorkflowStepLogger } from '../types/contracts.js';
-import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
+import { getActiveBackendId } from '../codex/runCodex.js';
+import { connectionLostReply, killedFromOutsideReply, runWithInfraRetry } from '../codex/infraRetry.js';
 import { assembleRecall } from '../codex/recallAssembler.js';
 import { highReasoningProfile } from '../codex/modelProfiles.js';
 import { buildMentionSystemPrompt } from '../codex/mentionSystemPrompt.js';
@@ -205,28 +206,60 @@ Return strict JSON:
     .catch(() => {});
 
   const profile = highReasoningProfile(getActiveBackendId());
-  const investigatorResult = await runCodex({
-    cwd: repoPath,
-    prompt: investigatorPrompt,
-    githubToken: ctx.githubToken,
-    imagePaths: ctx.imagePaths.length > 0 ? ctx.imagePaths : undefined,
-    model: profile.model,
-    reasoningEffort: profile.reasoningEffort,
-    mcpServers: connectors.mcpServers,
-    disallowedTools: connectors.disallowedTools,
-    // No per-agent timeoutMs. Substantive investigations on the high-reasoning
-    // tier (Opus at xhigh) routinely exceed a fractional sub-budget (e.g. 40%
-    // of bugFixTimeoutMs = 18 min) on real feature scoping, and a forced
-    // SIGKILL produces no plan content and no actionable error. The outer
-    // workflow's abort signal (passed below) is the safety net.
-    onLog: logStep,
-    signal,
-  });
+  const investigatorResult = await runWithInfraRetry(
+    {
+      cwd: repoPath,
+      prompt: investigatorPrompt,
+      githubToken: ctx.githubToken,
+      imagePaths: ctx.imagePaths.length > 0 ? ctx.imagePaths : undefined,
+      model: profile.model,
+      reasoningEffort: profile.reasoningEffort,
+      mcpServers: connectors.mcpServers,
+      disallowedTools: connectors.disallowedTools,
+      // No per-agent timeoutMs. Substantive investigations on the high-reasoning
+      // tier (Opus at xhigh) routinely exceed a fractional sub-budget (e.g. 40%
+      // of bugFixTimeoutMs = 18 min) on real feature scoping, and a forced
+      // SIGKILL produces no plan content and no actionable error. The outer
+      // workflow's abort signal (passed below) is the safety net.
+      onLog: logStep,
+      signal,
+    },
+    // A dropped connection is waited out and retried (issue #439).
+    { label: 'the investigation', logStep },
+  );
 
   // Cancelled mid-run: the dead agent is not a failed investigation, and the
   // "couldn't complete" copy below would be wrong (issue #438).
   if (signal?.aborted) {
     return cancelledResult('INVESTIGATION');
+  }
+
+  // The network or a kill from outside, not the report: say so instead of
+  // asking the requester for more context (issue #439).
+  if (
+    !investigatorResult.ok &&
+    (investigatorResult.errorKind === 'API_ERROR' || investigatorResult.errorKind === 'EXTERNAL_KILL')
+  ) {
+    const text =
+      investigatorResult.errorKind === 'API_ERROR'
+        ? connectionLostReply('investigating this', { changesCode: false })
+        : killedFromOutsideReply('The investigation', { changesCode: false });
+    logStep?.({
+      stage: 'investigation.interrupted',
+      message: `Investigation interrupted (${investigatorResult.errorKind}) after ${investigatorResult.infraRetries} retries.`,
+      level: 'ERROR',
+      data: { errorKind: investigatorResult.errorKind, retries: investigatorResult.infraRetries },
+    });
+    await slack.chat
+      .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text })
+      .catch(() => {});
+    return {
+      workflow: 'INVESTIGATION',
+      status: 'FAILED',
+      message: text,
+      notifyDesktop: true,
+      slackPosted: true,
+    };
   }
 
   if (!investigatorResult.ok || !investigatorResult.parsedJson) {

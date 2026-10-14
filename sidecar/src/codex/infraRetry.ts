@@ -153,12 +153,20 @@ export async function runWithInfraRetry(
   return { ...result, infraWaitMs, infraRetries };
 }
 
-/** What to tell a thread when the connection never came back. `doing` reads after "while". */
-export function connectionLostReply(doing: string): string {
-  return `I lost my connection to the model while ${doing}, and retrying didn't bring it back. Nothing has been merged. Mention me again in a few minutes and I'll pick it up.`;
+/**
+ * What to tell a thread when the connection never came back. `doing` reads
+ * after "while". A run that changes nothing (an answer, an investigation)
+ * passes `{ changesCode: false }`: "nothing has been merged" means nothing there.
+ */
+export function connectionLostReply(doing: string, options: { changesCode?: boolean } = {}): string {
+  const merged = options.changesCode === false ? '' : ' Nothing has been merged.';
+  return `I lost my connection to the model while ${doing}, and retrying didn't bring it back.${merged} Mention me again in a few minutes and I'll pick it up.`;
 }
 
 /** What to tell a thread when a run was killed from outside twice. `what` names the run: "the coder". */
-export function killedFromOutsideReply(what: string): string {
+export function killedFromOutsideReply(what: string, options: { changesCode?: boolean } = {}): string {
+  if (options.changesCode === false) {
+    return `${what} was killed from outside while it was working, and so was my retry. Mention me again and I'll run it again.`;
+  }
   return `${what} was killed from outside while it was working, and so was my retry. That was not a verdict on the change. Nothing has been merged. Mention me again and I'll run it again.`;
 }
