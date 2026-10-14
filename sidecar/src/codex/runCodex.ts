@@ -12,6 +12,7 @@ import type {
 import type { AgentBackend, AgentBackendId } from '../backends/types.js';
 import { getBackend } from '../backends/registry.js';
 import { currentConnectors } from '../backends/connectors.js';
+import { agentBaseEnv } from '../backends/launchEnv.js';
 import { computeCostUsd } from '../pricing/modelPrices.js';
 import { agentCallContext } from '../state/runContext.js';
 import { createStreamDecoder } from './streamEvents.js';
@@ -337,7 +338,8 @@ export async function runAgent(rawRequest: CodexRunRequest, backend: AgentBacken
 
   const args = backend.buildArgs(request, outputPath);
   const envOverrides = backend.buildEnv(request, process.env.PATH ?? '');
-  const env = { ...process.env, ...envOverrides };
+  // Not the launching terminal's or Claude Code session's variables (issue #572).
+  const env = { ...agentBaseEnv(process.env), ...envOverrides };
 
   let timedOut = false;
   let cancelled = false;
