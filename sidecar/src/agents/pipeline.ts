@@ -307,6 +307,25 @@ const REJECT_PATTERNS = /^(no|stop|cancel|abort|nevermind|never mind)\b/i;
 const PAUSE_PATTERNS =
   /^(wait|hold on|hold up|pause|brb|one sec|one moment|stand by|i'?ll get back to you|(give me|gimme) (a )?(sec|second|minute|moment|min)|pause for (now|a bit|a sec)|stop for now)[.! ]*$/i;
 
+/**
+ * A reply as the exact-phrase patterns above read it: miniOG's own @-mention
+ * and Slack formatting marks dropped. "@miniOG approve without confirmation",
+ * or the phrase pasted from miniOG's message with its backticks, is the
+ * phrase; matched raw, it fell through to the classifier, whose "approve"
+ * only held the plan again. Anyone else's mention stays: "@someone yes" may
+ * be addressed to them, and the classifier decides that.
+ */
+function approvalReplyCommand(text: string, botUserId?: string): string {
+  return text
+    .replace(/<@([A-Z0-9]+)(?:\|[^>]*)?>/gi, (mention, userId: string) =>
+      botUserId && userId === botUserId ? ' ' : mention,
+    )
+    .replace(/[‘’]/g, "'")
+    .replace(/[`*_~"“”]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 /** Resolves after `ms`, or as soon as the job is aborted. */
 function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise(resolve => {
@@ -560,12 +579,14 @@ async function pollForApproval(params: {
 
     for (const reply of candidateReplies) {
       const text = reply.text.trim();
+      /** What the exact-phrase patterns read; the classifier and the result keep `text`. */
+      const command = approvalReplyCommand(text, botUserId);
       const isApprover = approverUserIds.includes(reply.user);
 
       // Pause detection runs on EVERY non-bot reply (not admin-gated). Anyone in
       // the thread can park miniOG with a "wait" message; the workflow returns
       // PAUSED, releases its slot, and resumes on the next @miniOG mention.
-      if (isQuickPauseMessage(text)) {
+      if (isQuickPauseMessage(command)) {
         logStep({
           stage: 'pipeline.approval.paused',
           message: `<@${reply.user}> asked miniOG to wait: "${text}"`,
@@ -576,7 +597,7 @@ async function pollForApproval(params: {
       // The requester confirming, or saying what they want instead (issue #437).
       if (requester && reply.user === requester) {
         if (requesterConfirmed) continue;
-        let intent: ApprovalIntent | null = CONFIRM_PATTERNS.test(text) ? 'approve' : null;
+        let intent: ApprovalIntent | null = CONFIRM_PATTERNS.test(command) ? 'approve' : null;
         if (!intent) {
           if (classifiedTs.has(reply.ts)) continue;
           intent = await classifyApprovalIntent(
@@ -619,7 +640,8 @@ async function pollForApproval(params: {
         continue;
       }
 
-      if (isApprover && OVERRIDE_CONFIRMATION_RE.test(text)) {
+      const isOverride = OVERRIDE_CONFIRMATION_RE.test(command);
+      if (isApprover && isOverride) {
         logStep({
           stage: 'pipeline.approval.approved',
           message: `Core-dev member <@${reply.user}> approved the plan without the requester's confirmation: "${text}"`,
@@ -627,7 +649,8 @@ async function pollForApproval(params: {
         return { outcome: 'approved', userReply: text, approverId: reply.user, replyTs: reply.ts };
       }
 
-      if (APPROVE_PATTERNS.test(text)) {
+      // The override from someone who cannot approve is an approval attempt like any other.
+      if (isOverride || APPROVE_PATTERNS.test(command)) {
         if (!isApprover) {
           if (!notifiedUsers.has(reply.user)) {
             notifiedUsers.add(reply.user);
@@ -657,6 +680,8 @@ async function pollForApproval(params: {
         continue;
       }
 
+      // Raw text, not `command`: this pattern only anchors the start, and a rejection ends the job.
+      // "@miniOG no, use the v2 endpoint" is a change to the plan, so the classifier reads it.
       if (REJECT_PATTERNS.test(text)) {
         if (!isApprover) {
           if (!notifiedUsers.has(reply.user)) {

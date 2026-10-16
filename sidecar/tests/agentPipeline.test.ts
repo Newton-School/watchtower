@@ -9,6 +9,7 @@ import {
   postPlanForApproval,
   runAgentPipeline,
   waitForApproval,
+  type ApprovalResult,
 } from '../src/agents/pipeline.js';
 import { runCodex } from '../src/codex/runCodex.js';
 import { __infraRetry } from '../src/codex/infraRetry.js';
@@ -1851,6 +1852,117 @@ describe('waitForApproval', () => {
       await vi.advanceTimersByTimeAsync(6000);
 
       expect(await promise).toMatchObject({ outcome: 'approved', approverId: 'UCOREDEV' });
+    });
+
+    // The override miniOG itself advertises, typed the way people type to it: after an
+    // @-mention, or pasted from its message with the backticks. Both fell through to the
+    // classifier, whose "approve" only held the plan again, and the job never started.
+    describe('the override, addressed to miniOG', () => {
+      const heldThenOverride = (override: string) => [
+        { text: '<@UBOT> update the eligibility copy', user: 'UREQUESTER', ts: '100.00' },
+        { text: 'yes', user: 'UCOREDEV', ts: '200.00' },
+        { text: override, user: 'UCOREDEV', ts: '220.00' },
+      ];
+
+      it.each([
+        '<@UBOT> approve without confirmation',
+        '<@UBOT|miniOG> approve without confirmation',
+        '<@UBOT> `approve without confirmation`',
+        '*approve without confirmation*',
+      ])('starts the plan on %j after an admin yes', async override => {
+        // What the classifier said in the thread where this broke.
+        vi.mocked(runCodex).mockResolvedValue({ ok: true, parsedJson: { intent: 'approve' } } as any);
+        vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'yes', user: 'UCOREDEV', ts: '200.00' }]);
+        let result: ApprovalResult | undefined;
+        const controller = new AbortController();
+        const promise = confirmRun({ signal: controller.signal }).then(r => (result = r));
+        await vi.advanceTimersByTimeAsync(6000);
+        expect(result).toBeUndefined();
+        expect(texts()).toHaveLength(1); // held: "before I start: is the plan above what you want?"
+
+        vi.mocked(fetchThreadContext).mockResolvedValue(heldThenOverride(override));
+        await vi.advanceTimersByTimeAsync(6000);
+
+        expect(result).toEqual({
+          outcome: 'approved',
+          userReply: override,
+          approverId: 'UCOREDEV',
+          replyTs: '220.00',
+        });
+        expect(texts()).toHaveLength(1);
+        controller.abort();
+        await promise;
+      });
+
+      it('does not let someone who cannot approve use it, and tells them so', async () => {
+        vi.mocked(runCodex).mockResolvedValue({ ok: true, parsedJson: { intent: 'approve' } } as any);
+        vi.mocked(fetchThreadContext).mockResolvedValue([
+          { text: 'yes', user: 'UCOREDEV', ts: '200.00' },
+          { text: '<@UBOT> approve without confirmation', user: 'UOTHER', ts: '220.00' },
+        ]);
+        let settled = false;
+        const controller = new AbortController();
+        const promise = confirmRun({ signal: controller.signal }).then(result => {
+          settled = true;
+          return result;
+        });
+        await vi.advanceTimersByTimeAsync(30_000);
+
+        expect(settled).toBe(false);
+        expect(texts()).toContain('<@UOTHER> Only admins can approve plans. Waiting for an admin to respond.');
+        controller.abort();
+        expect((await promise).outcome).toBe('cancelled');
+      });
+
+      it("takes the requester's yes after a mention without asking the classifier", async () => {
+        vi.mocked(runCodex).mockResolvedValue({ ok: false } as any);
+        vi.mocked(fetchThreadContext).mockResolvedValue([
+          { text: 'yes', user: 'UCOREDEV', ts: '200.00' },
+          { text: '<@UBOT> yes', user: 'UREQUESTER', ts: '210.00' },
+        ]);
+
+        let result: ApprovalResult | undefined;
+        const controller = new AbortController();
+        const promise = confirmRun({ signal: controller.signal }).then(r => (result = r));
+        await vi.advanceTimersByTimeAsync(6000);
+
+        expect(result).toMatchObject({ outcome: 'approved', approverId: 'UCOREDEV', replyTs: '210.00' });
+        expect(runCodex).not.toHaveBeenCalled();
+        controller.abort();
+        await promise;
+      });
+
+      it("still holds an admin's yes addressed to someone else for the classifier", async () => {
+        vi.mocked(runCodex).mockResolvedValue({ ok: true, parsedJson: { intent: 'unrelated' } } as any);
+        vi.mocked(fetchThreadContext).mockResolvedValue([{ text: '<@UOTHER> yes', user: 'UCOREDEV', ts: '200.00' }]);
+        let settled = false;
+        const controller = new AbortController();
+        const promise = confirmRun({ signal: controller.signal }).then(result => {
+          settled = true;
+          return result;
+        });
+        await vi.advanceTimersByTimeAsync(6000);
+
+        expect(settled).toBe(false);
+        expect(runCodex).toHaveBeenCalledTimes(1);
+        controller.abort();
+        await promise;
+      });
+
+      // The reject pattern anchors only the start, and a rejection ends the job. Read after
+      // the mention, it would have thrown away a plan the admin only wanted changed.
+      it("revises the plan on an admin's no followed by a change, after a mention", async () => {
+        vi.mocked(runCodex).mockResolvedValue({ ok: true, parsedJson: { intent: 'feedback' } } as any);
+        vi.mocked(fetchThreadContext).mockResolvedValue([
+          { text: '<@UBOT> no, use the v2 endpoint instead', user: 'UCOREDEV', ts: '200.00' },
+        ]);
+
+        const promise = confirmRun();
+        await vi.advanceTimersByTimeAsync(6000);
+
+        expect(await promise).toMatchObject({ outcome: 'feedback', approverId: 'UCOREDEV', replyTs: '200.00' });
+        expect(runCodex).toHaveBeenCalledTimes(1);
+      });
     });
 
     it('needs nothing extra when the requester can approve: their yes is both', async () => {
