@@ -680,7 +680,9 @@ async function pollForApproval(params: {
         continue;
       }
 
-      if (REJECT_PATTERNS.test(command)) {
+      // Raw text, not `command`: this pattern only anchors the start, and a rejection ends the job.
+      // "@miniOG no, use the v2 endpoint" is a change to the plan, so the classifier reads it.
+      if (REJECT_PATTERNS.test(text)) {
         if (!isApprover) {
           if (!notifiedUsers.has(reply.user)) {
             notifiedUsers.add(reply.user);

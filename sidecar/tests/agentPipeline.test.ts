@@ -1948,6 +1948,21 @@ describe('waitForApproval', () => {
         controller.abort();
         await promise;
       });
+
+      // The reject pattern anchors only the start, and a rejection ends the job. Read after
+      // the mention, it would have thrown away a plan the admin only wanted changed.
+      it("revises the plan on an admin's no followed by a change, after a mention", async () => {
+        vi.mocked(runCodex).mockResolvedValue({ ok: true, parsedJson: { intent: 'feedback' } } as any);
+        vi.mocked(fetchThreadContext).mockResolvedValue([
+          { text: '<@UBOT> no, use the v2 endpoint instead', user: 'UCOREDEV', ts: '200.00' },
+        ]);
+
+        const promise = confirmRun();
+        await vi.advanceTimersByTimeAsync(6000);
+
+        expect(await promise).toMatchObject({ outcome: 'feedback', approverId: 'UCOREDEV', replyTs: '200.00' });
+        expect(runCodex).toHaveBeenCalledTimes(1);
+      });
     });
 
     it('needs nothing extra when the requester can approve: their yes is both', async () => {
