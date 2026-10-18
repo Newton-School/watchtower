@@ -87,34 +87,51 @@ export class JobSlots {
    */
   async whileWaitingOnHuman<T>(
     wait: () => Promise<T>,
-    options: { signal?: AbortSignal; logStep?: WorkflowStepLogger } = {},
+    options: {
+      signal?: AbortSignal;
+      logStep?: WorkflowStepLogger;
+      /**
+       * An answer that ends the job (a "stop", issue #598) needs no slot: only
+       * a line to post is left, and it must not queue behind running coders.
+       */
+      endsJob?: (result: T) => boolean;
+    } = {},
   ): Promise<T> {
     const holder = this.context.getStore();
     if (!holder?.held) return wait();
 
     holder.held = false;
     this.free();
+    let result: T;
     try {
-      return await wait();
-    } finally {
-      const startedAt = Date.now();
-      const queued = !this.canTakeNow(options.signal);
-      if (queued) {
-        options.logStep?.({
-          stage: 'job.slot.waiting',
-          message: 'Got the answer — waiting for a free job slot to carry on.',
-          data: { active: this.running, max: this.max() },
-        });
-      }
-      await this.takeBack(options.signal);
-      holder.held = true;
-      if (queued) {
-        options.logStep?.({
-          stage: 'job.slot.resumed',
-          message: 'Job slot free — carrying on.',
-          data: { waitedMs: Date.now() - startedAt },
-        });
-      }
+      result = await wait();
+    } catch (error) {
+      await this.reclaim(holder, options);
+      throw error;
+    }
+    if (options.endsJob?.(result)) return result;
+    await this.reclaim(holder, options);
+    return result;
+  }
+
+  private async reclaim(holder: SlotHolder, options: { signal?: AbortSignal; logStep?: WorkflowStepLogger }) {
+    const startedAt = Date.now();
+    const queued = !this.canTakeNow(options.signal);
+    if (queued) {
+      options.logStep?.({
+        stage: 'job.slot.waiting',
+        message: 'Got the answer — waiting for a free job slot to carry on.',
+        data: { active: this.running, max: this.max() },
+      });
+    }
+    await this.takeBack(options.signal);
+    holder.held = true;
+    if (queued) {
+      options.logStep?.({
+        stage: 'job.slot.resumed',
+        message: 'Job slot free — carrying on.',
+        data: { waitedMs: Date.now() - startedAt },
+      });
     }
   }
 
