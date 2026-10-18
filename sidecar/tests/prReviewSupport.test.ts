@@ -512,3 +512,31 @@ describe('follow-up review support (issue #451)', () => {
     expect(body).toContain('no actionable findings');
   });
 });
+
+describe('the Slack summary when the review went in as a PR comment (issue #590)', () => {
+  it('says so, why, and how to clear the pending review', () => {
+    const output = {
+      role: 'security',
+      findings: [{ severity: 'high', category: 'c', message: 'm', file: 'a.ts', line: 1 }],
+      attachableFindings: [],
+      unattachableFindings: [],
+      summaryNotes: [],
+      invalidFindings: 0,
+    } as any;
+    const text = formatSlackReviewSummary([output], 'https://github.com/o/r/pull/1', {
+      submitted: true,
+      event: 'COMMENT',
+      attemptedComments: 1,
+      commentsPosted: 0,
+      droppedOutsideDiff: 0,
+      fileLevelAttempted: 0,
+      fileLevelPosted: 0,
+      submissionMode: 'comment',
+      fallbackReason: 'pending_review',
+    });
+
+    expect(text).toContain('1 findings identified (1 high), posted as a PR comment');
+    expect(text).toContain('unsubmitted pending review on the PR');
+    expect(text).toContain('Submit or discard that pending review');
+  });
+});

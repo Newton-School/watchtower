@@ -822,6 +822,13 @@ export function formatSlackReviewSummary(
   // with 16 inline comments (issue #449).
   const notPosted = notPostedClause(reviewResult);
 
+  // GitHub would not take a review, so it went in as a PR comment (issue #590).
+  if (reviewResult?.submissionMode === 'comment') {
+    const what =
+      totalFindings > 0 ? `${totalFindings} findings identified (${buildSeverityBreakdown(allFindings)})` : 'Reviewed';
+    return `*PR Review Complete* - ${what}, posted as a PR comment: GitHub would not accept a review because this account has an unsubmitted pending review on the PR. Submit or discard that pending review so later reviews post normally. ${verdict}\n${prUrl}${skillsSuffix}`;
+  }
+
   if (totalFindings === 0 && totalSummaryNotes === 0) {
     if (reviewResult?.submissionMode === 'skipped') {
       return `*PR Review Complete* - No actionable findings. ${capitalize(notPosted)}. ${verdict}\n${prUrl}${skillsSuffix}`;
