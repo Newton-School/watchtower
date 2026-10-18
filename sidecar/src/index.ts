@@ -18,6 +18,7 @@ import {
 } from './launchpad/launchpadLifecycle.js';
 import { startLaunchpadRequestPoller } from './launchpad/launchpadIntake.js';
 import { logger } from './logging/logger.js';
+import { configureButtons } from './slack/buttonReplies.js';
 import { notifyDesktop } from './notify/desktopNotifier.js';
 import { botScopes, missingScopesNotice, NOTIFIED_MISSING_SCOPES_KEY } from './slack/botScopes.js';
 import { assertMacOS } from './platform.js';
@@ -1982,6 +1983,10 @@ async function main(): Promise<void> {
   };
   void checkBotScopes();
   setInterval(() => void checkBotScopes(), 10 * 60 * 1000);
+
+  // Buttons on the gates (suggestion 9) stay off until the Slack app has
+  // Interactivity enabled; the operator flips `slack_buttons` to `on` then.
+  configureButtons({ isEnabled: () => store.getState('slack_buttons') === 'on' });
 
   // Poll for cancel requests from the Watchtower UI (written to SQLite by Tauri)
   setInterval(() => {

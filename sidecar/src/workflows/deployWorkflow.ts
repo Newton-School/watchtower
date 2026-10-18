@@ -12,6 +12,7 @@ import { buildMentionSystemPrompt } from '../codex/mentionSystemPrompt.js';
 import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
 import { extractReplyFromCodexResult } from './shared/workflowUtils.js';
 import { waitForExactConfirmation } from './shared/confirmationGate.js';
+import { buttonsEnabled, confirmationBlocks } from '../slack/buttonReplies.js';
 import { classifyDeployTarget } from '../router/intentParser.js';
 import { getRepo, isRepoEnabled, repoPathOrNull } from '../repos/registry.js';
 import { toolchainEnv } from '../backends/codexBackend.js';
@@ -73,10 +74,12 @@ async function confirmDeploy(params: {
 
   let promptTs: string | undefined;
   try {
+    const confirmText = `Deploy *${targetLabel}* to production? <@${userId}>, reply \`${DEPLOY_CONFIRM_PHRASE}\` within 10 minutes and I'll start. Without that, nothing is deployed.`;
     const prompt = await slack.chat.postMessage({
       channel: channelId,
       thread_ts: threadTs,
-      text: `Deploy *${targetLabel}* to production? <@${userId}>, reply \`${DEPLOY_CONFIRM_PHRASE}\` within 10 minutes and I'll start. Without that, nothing is deployed.`,
+      text: confirmText,
+      ...(buttonsEnabled() ? { blocks: confirmationBlocks(confirmText, DEPLOY_CONFIRM_PHRASE, 'Confirm deploy') } : {}),
     });
     promptTs = typeof prompt.ts === 'string' ? prompt.ts : undefined;
   } catch {

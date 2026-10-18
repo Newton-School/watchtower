@@ -15,6 +15,7 @@ import { runCodex } from '../src/codex/runCodex.js';
 import { __infraRetry } from '../src/codex/infraRetry.js';
 import { currentConnectors, withConnectors } from '../src/backends/connectors.js';
 import { fetchThreadContext } from '../src/slack/threadContext.js';
+import { __resetButtonRepliesForTests, recordButtonReply } from '../src/slack/buttonReplies.js';
 import { checkCoderProducedChanges } from '../src/workspaces/gitState.js';
 import type { AgentContext, PipelineConfig } from '../src/agents/types.js';
 import type { AppConfig, NormalizedTask } from '../src/types/contracts.js';
@@ -2023,6 +2024,37 @@ describe('waitForApproval', () => {
       await vi.advanceTimersByTimeAsync(6000);
 
       expect((await promise).outcome).toBe('approved');
+    });
+  });
+
+  describe('a button on the prompt (suggestion 9)', () => {
+    it('reads an Approve click from an admin as a yes, and a Stop click as a stop', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([]);
+      recordButtonReply({ channelId: 'C1', threadTs: '100.00', userId: 'UCOREDEV', value: 'yes' });
+      const approved = runApproval();
+      await vi.advanceTimersByTimeAsync(6000);
+      expect((await approved).outcome).toBe('approved');
+
+      __resetButtonRepliesForTests();
+      recordButtonReply({ channelId: 'C1', threadTs: '100.00', userId: 'UTRIGGER', value: 'stop' });
+      const stopped = runApproval();
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(await stopped).toMatchObject({ outcome: 'cancelled', approverId: 'UTRIGGER' });
+      __resetButtonRepliesForTests();
+    });
+
+    it('still tells a bystander who clicks Approve that only admins can', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([]);
+      recordButtonReply({ channelId: 'C1', threadTs: '100.00', userId: 'UOTHER', value: 'yes' });
+      const controller = new AbortController();
+      const promise = runApproval({ signal: controller.signal });
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(mockSlack.chat.postMessage.mock.calls.map((call: any[]) => call[0].text)).toEqual([
+        '<@UOTHER> Only admins can approve plans. Waiting for an admin to respond.',
+      ]);
+      controller.abort();
+      await promise;
+      __resetButtonRepliesForTests();
     });
   });
 

@@ -13,6 +13,7 @@ import type {
 } from '../types/contracts.js';
 import { formatAdminMention, getAdminUserIds } from '../access/control.js';
 import { composeChangeReply, requesterIsEngineer, sanitizeRequesterSummary } from './shared/changeReply.js';
+import { approvalBlocks, buttonsEnabled, confirmationBlocks } from '../slack/buttonReplies.js';
 import { connectorsFor, withConnectors } from '../backends/connectors.js';
 import { runCodex, getActiveBackendId, selectBackendForUser } from '../codex/runCodex.js';
 import { connectionLostReply, killedFromOutsideReply, runWithInfraRetry } from '../codex/infraRetry.js';
@@ -269,10 +270,12 @@ async function confirmQuickPrAction(params: {
       : '';
   let promptTs: string | undefined;
   try {
+    const confirmText = `<@${userId}> asked me to ${action} ${target}.${unresolvedNote} ${ownerMentions}, reply \`${phrase}\` within 10 minutes and I'll do it. Without that, nothing changes.`;
     const prompt = await slack.chat.postMessage({
       channel: channelId,
       thread_ts: threadTs,
-      text: `<@${userId}> asked me to ${action} ${target}.${unresolvedNote} ${ownerMentions}, reply \`${phrase}\` within 10 minutes and I'll do it. Without that, nothing changes.`,
+      text: confirmText,
+      ...(buttonsEnabled() ? { blocks: confirmationBlocks(confirmText, phrase, `Confirm ${action}`) } : {}),
     });
     promptTs = typeof prompt.ts === 'string' ? prompt.ts : undefined;
   } catch {
@@ -459,6 +462,7 @@ export async function runApprovalLoop(input: {
           channel: task.event.channelId,
           thread_ts: task.event.threadTs,
           text: promptText,
+          ...(buttonsEnabled() ? { blocks: approvalBlocks(promptText) } : {}),
         });
         approvalPromptTs = promptResult.ts ?? undefined;
       } catch {

@@ -5,6 +5,7 @@ import {
   normalizeConfirmationReply,
   waitForExactConfirmation,
 } from '../src/workflows/shared/confirmationGate.js';
+import { __resetButtonRepliesForTests, recordButtonReply } from '../src/slack/buttonReplies.js';
 
 const REQUESTER = 'UREQ';
 const BOT = 'UBOT1';
@@ -67,6 +68,17 @@ describe('normalizeConfirmationReply', () => {
 });
 
 describe('waitForExactConfirmation', () => {
+  it('confirms on a button click that carries the phrase, from an allowed user (suggestion 9)', async () => {
+    const { slack } = slackWith([prompt]);
+    recordButtonReply({ channelId: 'C1', threadTs: '1791000000.000100', userId: REQUESTER, value: 'confirm deploy' });
+
+    const result = await wait(slack);
+
+    expect(result.outcome).toBe('confirmed');
+    expect(result.userId).toBe(REQUESTER);
+    __resetButtonRepliesForTests();
+  });
+
   it('confirms on the exact phrase from the requester', async () => {
     const { slack } = slackWith([prompt, after(5, REQUESTER, '<@UBOT1> `confirm deploy`')]);
     const result = await wait(slack);

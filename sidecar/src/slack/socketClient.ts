@@ -2,6 +2,7 @@ import { App, LogLevel } from '@slack/bolt';
 import type { WebClient } from '@slack/web-api';
 import type { AppConfig, SlackEventEnvelope, SlackReactionEvent } from '../types/contracts.js';
 import { logger } from '../logging/logger.js';
+import { BUTTON_ACTION_RE, clickedText, readButtonClick, recordButtonReply } from './buttonReplies.js';
 
 type SlackEventHandler = (event: SlackEventEnvelope, client: WebClient) => Promise<void>;
 type SlackReactionHandler = (event: SlackReactionEvent, client: WebClient) => Promise<void>;
@@ -155,6 +156,41 @@ export class SocketSlackClient {
         'received reaction_added event',
       );
       await this.onReaction(normalized, client);
+    });
+
+    // A button on a gate (suggestion 9): the click is kept as the reply the
+    // person would have typed, and the prompt loses its buttons so it is
+    // clicked once. Who may approve or confirm is still the gate's decision.
+    this.app.action(BUTTON_ACTION_RE, async ({ ack, body, client }) => {
+      await ack();
+      const click = readButtonClick(body as unknown as Record<string, unknown>);
+      if (!click) return;
+      recordButtonReply({
+        channelId: click.channelId,
+        threadTs: click.threadTs,
+        userId: click.userId,
+        value: click.value,
+      });
+      logger.info(
+        {
+          component: 'slack',
+          eventType: 'block_actions',
+          channelId: click.channelId,
+          threadTs: click.threadTs,
+          actionId: click.actionId,
+        },
+        'received a button click',
+      );
+      try {
+        await client.chat.update({
+          channel: click.channelId,
+          ts: click.messageTs,
+          text: clickedText(click.messageText, click.userId, click.actionId),
+          blocks: [],
+        });
+      } catch (error) {
+        logger.warn({ error: String(error) }, 'could not rewrite the clicked prompt');
+      }
     });
 
     this.app.command('/miniog', async ({ command, ack, client }) => {

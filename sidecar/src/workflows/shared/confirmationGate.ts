@@ -1,6 +1,7 @@
 import { jobSlots } from '../../runtime/jobSlots.js';
 import type { WebClient } from '@slack/web-api';
 import { fetchThreadRepliesSince, type ThreadMessage } from '../../slack/threadContext.js';
+import { buttonRepliesSince } from '../../slack/buttonReplies.js';
 import type { WorkflowStepLogger } from '../../types/contracts.js';
 
 /**
@@ -111,7 +112,8 @@ async function pollForExactConfirmation(params: {
       continue;
     }
 
-    for (const reply of messages) {
+    // A button on the prompt counts as the typed phrase (suggestion 9).
+    for (const reply of [...messages, ...buttonRepliesSince(channelId, threadTs, promptTs)]) {
       if (!(Number(reply.ts) > Number(promptTs)) || reply.user === botUserId) continue;
       const text = normalizeConfirmationReply(reply.text);
       const allowed = allowedUserIds.includes(reply.user);
