@@ -927,3 +927,42 @@ describe('pr_review_findings (durable review memory)', () => {
     store.close();
   });
 });
+
+describe('listChangeRunPrs (issue #603)', () => {
+  it('lists the PRs change runs opened, newest first, and not the PRs reviews looked at', () => {
+    const store = new JobStore(tempDbPath());
+    const add = (
+      id: string,
+      workflow: 'IMPLEMENTATION' | 'PR_REVIEW',
+      result: Record<string, unknown>,
+      executed?: string,
+    ) => {
+      store.createJob({
+        id,
+        eventId: `ev-${id}`,
+        dedupeKey: `dk-${id}`,
+        workflow,
+        channelId: 'C1',
+        threadTs: `${id}.1`,
+        payload: { requestUserId: 'UREQ' },
+      });
+      store.markJob(id, 'SUCCESS', { result, executedWorkflow: (executed ?? workflow) as never });
+    };
+    add('change-1', 'IMPLEMENTATION', { prUrl: 'https://github.com/Newton-School/newton-web/pull/1' });
+    add('review-1', 'PR_REVIEW', {
+      outcomes: [{ prUrl: 'https://github.com/Newton-School/newton-web/pull/2', status: 'SUCCESS' }],
+    });
+    add('change-2', 'IMPLEMENTATION', { prUrl: 'https://github.com/Newton-School/newton-marketing-web/pull/3' });
+    add('change-no-pr', 'IMPLEMENTATION', { externalChanges: [] });
+
+    const rows = store.listChangeRunPrs('2020-01-01T00:00:00.000Z');
+
+    expect(rows.map(row => row.prUrl)).toEqual([
+      'https://github.com/Newton-School/newton-marketing-web/pull/3',
+      'https://github.com/Newton-School/newton-web/pull/1',
+    ]);
+    expect(rows[0]).toMatchObject({ jobId: 'change-2', channelId: 'C1', threadTs: 'change-2.1', requestedBy: 'UREQ' });
+    expect(store.listChangeRunPrs(new Date(Date.now() + 60_000).toISOString())).toEqual([]);
+    store.close();
+  });
+});

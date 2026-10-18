@@ -210,9 +210,14 @@ export const QUICK_ACTION_DEPLOY_RE =
 export const QUICK_ACTION_DEPLOY_REDIRECT =
   "I don't deploy or roll back from here. If you want something shipped, ask me directly — `@miniOG deploy newton-web to prod` or `@miniOG deploy marketing to prod` — and I'll confirm with you before anything goes out.";
 
-/** Quick actions that change a pull request and cannot be taken back cheaply. */
-const QUICK_ACTION_PR_ACTION_RE = /\b(merge|close|revert)\b/i;
-type QuickPrAction = 'merge' | 'close' | 'revert';
+/**
+ * Quick actions that change a pull request and cannot be taken back cheaply.
+ * "sync" merges the base branch into the PR branch (issue #603): the daily
+ * follow-up offers it when a PR conflicts or is behind. Never a rebase or a
+ * force-push: the branch has an open PR.
+ */
+const QUICK_ACTION_PR_ACTION_RE = /\b(merge|close|revert|sync)\b/i;
+type QuickPrAction = 'merge' | 'close' | 'revert' | 'sync';
 
 export const QUICK_ACTION_APPROVE_REFUSAL =
   "I don't approve pull requests. Ask me to review one and I'll post comments; the approval is a person's call.";
@@ -1508,6 +1513,8 @@ Context:
 
 Task:
 Execute this request directly. No code changes are needed — this is a quick operational action (merge PR, close PR, run a command, etc.).
+
+"sync" means: bring the pull request's branch up to date with its base branch by merging the base branch into it (\`git fetch origin && git merge origin/<base>\`, resolve nothing by guesswork: if the merge conflicts, abort it and report the conflicting files) and push with a plain \`git push\`. Never rebase and never force-push a branch that has an open pull request.
 
 Never deploy, release, ship or roll back anything, and never run a deploy command, script or skill, even if the request asks for it. If the request includes that, do the rest and say that deploys go through "@miniOG deploy <target> to prod", which asks for confirmation first.
 
