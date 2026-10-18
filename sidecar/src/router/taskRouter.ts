@@ -42,6 +42,8 @@ import {
 import { askRequester, decideClarify, giveUpOnClarify, type ClarifyAction } from './routeClarify.js';
 import { cancelledResult } from '../workflows/shared/cancelState.js';
 import { buildHelpReply, isHelpRequest } from './helpReply.js';
+import { acknowledgementText, pickupDelayMs } from './acknowledgement.js';
+import { RESTART_EVENT_PREFIX } from '../runtime/restartRecovery.js';
 import { looksLikeFixAffirmation } from './resumeIntentParser.js';
 
 import { isPresencePing } from '../workflows/shared/workflowUtils.js';
@@ -151,6 +153,16 @@ export async function routeTask(params: {
 }): Promise<WorkflowResult> {
   const { task, config, slack, store, jobId, logStep, signal, onEngage, deps } = params;
   let resolvedIntent: WorkflowIntent = task.intent;
+  // How late this pickup is, so slow pickups are measurable and said out loud (issue #588).
+  const pickupDelay = pickupDelayMs(task.event.eventTs);
+  logStep?.({
+    stage: 'job.pickup_delay',
+    message:
+      pickupDelay === undefined
+        ? 'Pickup delay unknown: the message time could not be read.'
+        : `Picked up ${Math.round(pickupDelay / 1000)}s after the message was sent.`,
+    data: { pickupDelayMs: pickupDelay ?? null },
+  });
   let classificationReasoning: string | undefined;
   let engaged = false;
   const engage = async (): Promise<void> => {
@@ -654,6 +666,33 @@ export async function routeTask(params: {
   }
   const runWorkflow = WORKFLOW_RUNNERS[resolvedIntent];
   if (runWorkflow) {
+    // The first line the requester reads: what to expect, and an apology when
+    // the pickup was late (issue #588). Never fatal, never for a cancelled job.
+    const ack = acknowledgementText({
+      intent: resolvedIntent,
+      pickupDelayMs: pickupDelay,
+      // Only a PR named in the message itself: one from earlier in the thread
+      // does not make a new request a quick action.
+      aboutExistingPr: routedTask.prContexts
+        ? routedTask.prContexts.some(pr => pr.source === 'trigger')
+        : Boolean(routedTask.prContext),
+      replayed: task.event.ingestSource === 'launchpad' || task.event.eventId.startsWith(RESTART_EVENT_PREFIX),
+    });
+    if (ack && !signal?.aborted) {
+      // Not awaited: the run must not wait on a Slack round trip, and the
+      // workflow's own first post is seconds away.
+      void slack.chat
+        .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: ack })
+        .then(() => logStep?.({ stage: 'job.acknowledged', message: ack, data: { intent: resolvedIntent } }))
+        .catch(error =>
+          logStep?.({
+            stage: 'job.acknowledge_failed',
+            level: 'WARN',
+            message: 'Could not post the opening line.',
+            data: { error: String(error) },
+          }),
+        );
+    }
     return runWorkflow({ task: routedTask, config, slack, store, jobId, logStep, signal });
   }
 

@@ -1,6 +1,7 @@
 import path from 'node:path';
 import type { WebClient } from '@slack/web-api';
 import type {
+  DossierRole,
   AppConfig,
   CodexRunRequest,
   CodexRunResult,
@@ -11,6 +12,7 @@ import type {
   WorkflowStepLogger,
 } from '../types/contracts.js';
 import { formatAdminMention, getAdminUserIds } from '../access/control.js';
+import { composeChangeReply, requesterIsEngineer, sanitizeRequesterSummary } from './shared/changeReply.js';
 import { connectorsFor, withConnectors } from '../backends/connectors.js';
 import { runCodex, getActiveBackendId, selectBackendForUser } from '../codex/runCodex.js';
 import { connectionLostReply, killedFromOutsideReply, runWithInfraRetry } from '../codex/infraRetry.js';
@@ -324,7 +326,8 @@ type ApprovalLoopOutcome =
   | ({ kind: 'approved'; feedbackRounds: number; pipelineCwd: string } & ApprovalLoopState)
   | { kind: 'rejected_then_cancelled'; message: string }
   | { kind: 'exhausted' }
-  | { kind: 'cancelled' }
+  /** `stoppedBy` is set when a reply ("stop") ended it, not the job's abort (issue #598). */
+  | { kind: 'cancelled'; stoppedBy?: string }
   | { kind: 'paused'; resumeContext: ImplementationApprovalResume };
 
 /**
@@ -448,8 +451,8 @@ export async function runApprovalLoop(input: {
     } else {
       const promptText =
         iteration === 0
-          ? `Here's my plan. ${requesterToConfirm ? 'I start once the requester confirms it is what they want and an admin approves' : 'An admin needs to approve before I proceed'}:\n• "yes" or "go" — I'll start coding\n• "no" or "stop" — I'll cancel\n• Or reply with changes you'd like and I'll adjust`
-          : `Here's the revised plan. "yes" to proceed, "no" to cancel, or reply with more changes.${requesterToConfirm ? ' I start once the requester confirms it and an admin approves.' : ''}`;
+          ? `Here's my plan. ${requesterToConfirm ? 'I start once the requester confirms it is what they want and an admin approves' : 'An admin needs to approve before I proceed'}:\n• "yes" or "go" — I'll start coding\n• "stop" or "cancel" — I'll drop it\n• "no", or changes you'd like — I'll adjust the plan`
+          : `Here's the revised plan. "yes" to proceed, "stop" to drop it, or reply with more changes.${requesterToConfirm ? ' I start once the requester confirms it and an admin approves.' : ''}`;
 
       try {
         const promptResult = await slack.chat.postMessage({
@@ -491,7 +494,7 @@ export async function runApprovalLoop(input: {
     });
 
     if (approval.outcome === 'cancelled') {
-      return { kind: 'cancelled' };
+      return { kind: 'cancelled', stoppedBy: approval.approverId || undefined };
     }
 
     if (approval.outcome === 'paused') {
@@ -562,7 +565,7 @@ export async function runApprovalLoop(input: {
       });
 
       if (followUp.outcome === 'cancelled') {
-        return { kind: 'cancelled' };
+        return { kind: 'cancelled', stoppedBy: followUp.approverId || undefined };
       }
 
       if (followUp.outcome === 'paused') {
@@ -1328,11 +1331,12 @@ async function runImplementationWorkflowBody(params: {
               signal,
             });
 
-            if (approval.outcome === 'cancelled') {
+            // The job's abort: nothing to say. A "stop" or "cancel" by reply skips the merge like a "no".
+            if (approval.outcome === 'cancelled' && !approval.approverId) {
               return cancelledResult('IMPLEMENTATION');
             }
 
-            if (approval.outcome === 'rejected') {
+            if (approval.outcome === 'rejected' || approval.outcome === 'cancelled') {
               await slack.chat
                 .postMessage({
                   channel: task.event.channelId,
@@ -1746,6 +1750,23 @@ Write your response as a ready-to-post Slack message describing what you did.
     });
 
     if (loopOutcome.kind === 'cancelled') {
+      // A reply stopped it: say so, where the job's own cancel lane would have
+      // (issue #598). When the stop lane also saw the reply it has aborted the
+      // job and said "Stopped." already, so nothing is said twice.
+      if (loopOutcome.stoppedBy && !signal?.aborted) {
+        await slack.chat
+          .postMessage({
+            channel: task.event.channelId,
+            thread_ts: task.event.threadTs,
+            text: 'Stopped. Nothing was changed.',
+          })
+          .catch(() => {});
+        return {
+          ...cancelledResult('IMPLEMENTATION'),
+          message: `Stopped from Slack by <@${loopOutcome.stoppedBy}>.`,
+          slackPosted: true,
+        };
+      }
       return cancelledResult('IMPLEMENTATION');
     }
     if (loopOutcome.kind === 'paused') {
@@ -2097,12 +2118,35 @@ Write your response as a ready-to-post Slack message describing what you did.
       };
     }
 
-    const coderStep = fullResult.steps.find(s => s.role === 'coder');
+    // The latest coder pass: after a reviewer-driven retry the first pass is stale.
+    const coderStep = [...fullResult.steps].reverse().find(s => s.role === 'coder');
     const rawCoderSummary = coderStep?.output?.summary ? sanitizeOwnerSummary(String(coderStep.output.summary)) : '';
     const summary =
       rawCoderSummary || 'Pipeline completed but the agent did not return a summary. Check the repo for changes.';
+    // The person who asked reads two or three plain lines unless they are an
+    // engineer; the engineering account goes to the PR (issue #601).
+    const requesterSummary = coderStep?.output?.requesterSummary
+      ? sanitizeRequesterSummary(String(coderStep.output.requesterSummary))
+      : '';
+    const requesterUserId = task.event.requestedForUserId ?? task.event.userId;
+    let requesterRole: DossierRole | undefined;
+    try {
+      requesterRole = store?.dossierStore?.().getDossier(requesterUserId).profile?.role ?? undefined;
+    } catch {
+      // A dossier read must not decide whether the run reports.
+    }
+    const engineerReads = requesterIsEngineer({ userId: requesterUserId, config, role: requesterRole });
+    const replyFor = (prUrlForReply: string, external: string, prFailed = false): string =>
+      composeChangeReply({
+        summary,
+        requesterSummary,
+        engineerReads,
+        prUrl: prUrlForReply,
+        externalBlock: external,
+        prFailed,
+      });
 
-    let prUrl = coderStep?.output?.prUrl ? String(coderStep.output.prUrl) : '';
+    let prUrl = coderReportedPrUrl(fullResult.steps) ?? '';
     const externalBlock = fullResult.externalChanges?.length
       ? `\n\n${formatExternalChanges(fullResult.externalChanges, Boolean(fullResult.externalNotInPlan))}`
       : '';
@@ -2119,7 +2163,7 @@ Write your response as a ready-to-post Slack message describing what you did.
       await slack.chat.postMessage({
         channel: task.event.channelId,
         thread_ts: task.event.threadTs,
-        text: `${summary}${externalBlock}\n\nNo pull request: nothing in the repository changed.`,
+        text: `${replyFor('', externalBlock)}\n\nNo pull request: nothing in the repository changed.`,
       });
       return {
         workflow: 'IMPLEMENTATION',
@@ -2177,12 +2221,10 @@ Write your response as a ready-to-post Slack message describing what you did.
         })) ?? '';
     }
 
-    const prBlock = prUrl ? `\n${prUrl}` : '';
-
     await slack.chat.postMessage({
       channel: task.event.channelId,
       thread_ts: task.event.threadTs,
-      text: `${summary}${prBlock}${externalBlock}`.trim(),
+      text: replyFor(prUrl, externalBlock, prUrl === ''),
     });
 
     return {

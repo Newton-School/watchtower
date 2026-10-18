@@ -137,8 +137,45 @@ export const PINNED_FACT_MAX_CHARS = 280;
 /** Per-user cap; on overflow, oldest is rotated out. */
 export const PINNED_FACT_USER_CAP = 50;
 
+/**
+ * A role read off a Slack profile title (issue #601). Only ever fills a blank:
+ * a role someone set by hand is never changed by it. `undefined` when the
+ * title says nothing a reply should adapt to.
+ */
+export function inferRoleFromTitle(title: string | undefined | null): DossierRole | undefined {
+  const text = (title ?? '').toLowerCase();
+  if (!text.trim()) return undefined;
+  // Business functions first: an "Engineering Recruiter" or "Developer Marketing" is not a dev.
+  if (
+    /\b(recruit\w*|marketing|hr|people|talent|sales|finance|operations|ops|success|support|admissions?|counsell?or|placement|academic)\b/.test(
+      text,
+    )
+  )
+    return 'ops';
+  // Engineers before product and design: a "Product Engineer" or "UX Engineer" is a dev.
+  if (
+    /\b(engineer\w*|developer|dev|sde|swe|programmer|architect|cto|tech lead|devops|sre|qa|technology|technical|frontend|backend|full ?stack|platform|infra\w*|ml)\b/.test(
+      text,
+    )
+  )
+    return 'dev';
+  if (/\b(designer|design|ux|ui)\b/.test(text)) return 'designer';
+  if (/\b(product manager|product owner|product lead|head of product|program manager|product|pm|apm)\b/.test(text))
+    return 'pm';
+  if (/\b(analyst|analytics|data scien\w*|insights|growth)\b/.test(text)) return 'analyst';
+  return undefined;
+}
+
 export interface DossierStore {
-  firstSeen(input: { userId: string; displayName?: string; realName?: string; tz?: string; email?: string }): void;
+  firstSeen(input: {
+    userId: string;
+    displayName?: string;
+    realName?: string;
+    tz?: string;
+    email?: string;
+    /** The Slack profile title; fills the role when none is set (issue #601). */
+    title?: string;
+  }): void;
   getDossier(userId: string): UserDossier;
   setRole(userId: string, role: DossierRole): void;
   setTone(userId: string, mode: PersonalityMode, source: string): void;
@@ -210,6 +247,17 @@ export function createDossierStore(db: Database.Database): DossierStore {
          email = COALESCE(@email, email),
          updated_at = @now
      WHERE user_id = @userId AND updated_at < @staleBefore`,
+  );
+
+  // Fills a role from the Slack title, and keeps it current when the title
+  // changes. Keyed on the row's source, not on a blank role: a role a person
+  // set (set-role, admin-edit, slack-remember) or cleared (forget) is never touched.
+  const fillRoleFromTitle = db.prepare(
+    `UPDATE user_dossiers
+     SET role = @role, source = 'slack-title', updated_at = @now
+     WHERE user_id = @userId
+       AND ((role IS NULL AND source = 'auto') OR source = 'slack-title')
+       AND (role IS NULL OR role <> @role)`,
   );
 
   const selectProfile = db.prepare(
@@ -601,6 +649,8 @@ export function createDossierStore(db: Database.Database): DossierStore {
       insertProfile.run(params);
       const staleBefore = new Date(Date.now() - PROFILE_REFRESH_MS).toISOString();
       refreshProfile.run({ ...params, staleBefore });
+      const inferredRole = inferRoleFromTitle(input.title);
+      if (inferredRole) fillRoleFromTitle.run({ userId: input.userId, role: inferredRole, now });
       cache.invalidate(input.userId);
       scheduleVaultRender({ kind: 'user', userId: input.userId });
     },
@@ -906,7 +956,11 @@ export function formatDossierForHuman(
   lines.push(`• *Name*: ${name}`);
 
   if (profile?.role) {
-    lines.push(`• *Role*: ${profile.role}`);
+    lines.push(
+      profile.source === 'slack-title'
+        ? `• *Role*: ${profile.role} (read from your Slack title — \`set-role dev\` or another role to change it)`
+        : `• *Role*: ${profile.role}`,
+    );
   } else {
     lines.push('• *Role*: not set — try `set-role pm` (or dev/designer/ops)');
   }
