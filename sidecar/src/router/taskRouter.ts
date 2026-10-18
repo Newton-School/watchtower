@@ -635,9 +635,9 @@ export async function routeTask(params: {
       pickupDelayMs: pickupDelay,
       // Only a PR named in the message itself: one from earlier in the thread
       // does not make a new request a quick action.
-      aboutExistingPr:
-        routedTask.prContext?.source === 'trigger' ||
-        Boolean(routedTask.prContexts?.some(pr => pr.source === 'trigger')),
+      aboutExistingPr: routedTask.prContexts
+        ? routedTask.prContexts.some(pr => pr.source === 'trigger')
+        : Boolean(routedTask.prContext),
       replayed: task.event.ingestSource === 'launchpad' || task.event.eventId.startsWith(RESTART_EVENT_PREFIX),
     });
     if (ack && !signal?.aborted) {
