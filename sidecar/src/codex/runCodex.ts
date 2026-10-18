@@ -16,6 +16,7 @@ import { agentBaseEnv } from '../backends/launchEnv.js';
 import { computeCostUsd } from '../pricing/modelPrices.js';
 import { agentCallContext } from '../state/runContext.js';
 import { createStreamDecoder } from './streamEvents.js';
+import { reportConnectorStatuses } from '../runtime/connectorAlerts.js';
 import type { DossierStore } from '../state/dossierStore.js';
 
 /**
@@ -401,6 +402,7 @@ export async function runAgent(rawRequest: CodexRunRequest, backend: AgentBacken
   // trail of tool / skill / MCP / subagent activity in job_logs and the Slack
   // status line.
   const decoder = createStreamDecoder(backend.id);
+  let connectorsReported = false;
 
   /** Emit decoded steps without ever letting a decode bug kill the run. */
   const emitSteps = (steps: WorkflowStepLog[]): void => {
@@ -430,6 +432,12 @@ export async function runAgent(rawRequest: CodexRunRequest, backend: AgentBacken
     }
     try {
       emitSteps(decoder.push(text));
+      // A connector that needs signing in again is the owner's to fix (issue #593).
+      const connectors = connectorsReported ? undefined : decoder.connectorStatuses();
+      if (connectors) {
+        connectorsReported = true;
+        reportConnectorStatuses(connectors, agentCallContext.getStore()?.jobId);
+      }
     } catch {
       // Non-fatal: a malformed stream must not abort the run.
     }

@@ -189,7 +189,9 @@ describe('connectorPromptBlock', () => {
 
     expect(block).toContain('- `mcp__metabase__*` (read-only): the database');
     expect(block).toContain('- `mcp__openpanel__*` (read-only): product analytics');
-    expect(block).toContain('say plainly that you could not reach it');
+    expect(block).toContain("I can't reach <connector> right now; I've let the owner know.");
+    // Signing in is the owner's job, not the requester's (issue #593).
+    expect(block).toContain('Never tell the requester how to sign in to a connector or mention `/mcp`');
     expect(block).toContain('You have no other connectors');
   });
 

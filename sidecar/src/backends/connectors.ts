@@ -229,7 +229,8 @@ export function connectorPromptBlock(connectors: RunConnectors): string | undefi
   return [
     'Connectors you have in this run:',
     ...lines,
-    "- If a connector's tools are not available in this session, say plainly that you could not reach it. Never estimate a number you could not query.",
+    "- If a connector's tools are not available in this session, open your reply by saying so, in these words: \"I can't reach <connector> right now; I've let the owner know.\" Then answer only what you can without it. Never estimate a number you could not query.",
+    "- Never tell the requester how to sign in to a connector or mention `/mcp`: reconnecting one is the owner's job, and the owner is told automatically.",
     '- You have no other connectors: no Slack search, no Drive, no mail. If the answer needs one, say so instead of looking for a way around it.',
   ].join('\n');
 }

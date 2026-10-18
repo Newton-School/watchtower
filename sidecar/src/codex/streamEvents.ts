@@ -1,5 +1,6 @@
 import { sanitizeStatusFragment, summarizeCommand } from '../slack/statusNarrator.js';
 import type { WorkflowStepLog } from '../types/contracts.js';
+import type { ConnectorStatus } from '../runtime/connectorAlerts.js';
 
 /**
  * Guard against a pathological single line (a huge tool result echoed inline)
@@ -33,6 +34,8 @@ export interface StreamDecoder {
    * arrived — strictly better than handing raw JSONL to a summary parser.
    */
   assistantText(): string | undefined;
+  /** The run's connectors and their state, once the session has started (Claude Code only). */
+  connectorStatuses(): ConnectorStatus[] | undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -155,9 +158,12 @@ function decodeClaudeLine(raw: string, state: DecoderState): WorkflowStepLog[] {
     // connect is a capability the agent was meant to have and does not. The
     // usual cause is an OAuth server nobody has signed in to for the headless CLI.
     // Only a status that says so: a server still connecting is not a failure.
-    const unusable = (servers ?? [])
-      .map(server => ({ name: asString(server.name) ?? 'unknown', status: asString(server.status) ?? 'unknown' }))
-      .filter(server => server.status === 'needs-auth' || server.status === 'failed');
+    const statuses = (servers ?? []).map(server => ({
+      name: asString(server.name) ?? 'unknown',
+      status: asString(server.status) ?? 'unknown',
+    }));
+    state.connectorStatuses = statuses;
+    const unusable = statuses.filter(server => server.status === 'needs-auth' || server.status === 'failed');
     if (unusable.length > 0) {
       const list = unusable.map(server => `${server.name} (${server.status})`).join(', ');
       steps.push({
@@ -301,6 +307,7 @@ function decodeCodexLine(raw: string, state: DecoderState): WorkflowStepLog[] {
 interface DecoderState {
   finalMessage?: string;
   assistantText: string[];
+  connectorStatuses?: ConnectorStatus[];
 }
 
 /**
@@ -350,6 +357,9 @@ export function createStreamDecoder(backendId: string): StreamDecoder {
     assistantText(): string | undefined {
       const joined = state.assistantText.join('\n').trim();
       return joined.length > 0 ? joined : undefined;
+    },
+    connectorStatuses(): ConnectorStatus[] | undefined {
+      return state.connectorStatuses;
     },
   };
 }
