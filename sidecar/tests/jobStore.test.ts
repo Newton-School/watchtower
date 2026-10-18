@@ -304,7 +304,10 @@ describe('listRunningJobsWithLastStage (issue #436)', () => {
 
     const jobs = store.listRunningJobsWithLastStage().sort((a, b) => a.id.localeCompare(b.id));
 
-    expect(jobs).toEqual([
+    // What the job was running and the request that started it come along too (issue #589).
+    expect(jobs[0].workflow).toBeTruthy();
+    expect(jobs[0].eventId).toBeTruthy();
+    expect(jobs).toMatchObject([
       {
         id: 'job-coding',
         channelId: 'C1',
@@ -331,7 +334,7 @@ describe('listRunningJobsWithLastStage (issue #436)', () => {
     store.markJob('job-paused', 'PAUSED');
     makeJob(store, 'job-new', 'T-new');
 
-    expect(store.listRunningJobsWithLastStage()).toEqual([
+    expect(store.listRunningJobsWithLastStage()).toMatchObject([
       { id: 'job-new', channelId: 'C1', threadTs: 'T-new', requestedBy: undefined, lastStage: undefined },
     ]);
     store.close();
