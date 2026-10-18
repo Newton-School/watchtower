@@ -1796,16 +1796,67 @@ describe('waitForApproval', () => {
       expect(texts()).toEqual([]);
     });
 
-    it('leaves "@miniOG stop" to the stop lane, which aborts the job', async () => {
+    it('acts on "@miniOG stop" too, as the backstop for a stop lane that missed the event', async () => {
       vi.mocked(fetchThreadContext).mockResolvedValue([{ text: '<@UBOT> stop', user: 'UCOREDEV', ts: '200.00' }]);
+      const promise = runApproval();
+      await vi.advanceTimersByTimeAsync(6000);
+
+      const result = await promise;
+      expect(result.outcome).toBe('cancelled');
+      expect(result.approverId).toBe('UCOREDEV');
+      expect(vi.mocked(runCodex)).not.toHaveBeenCalled();
+    });
+
+    it('lets a requester who has already confirmed still stop, through the classifier', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([
+        { text: 'yes', user: 'UTRIGGER', ts: '200.00' },
+        { text: 'please drop this whole thing, we are not doing it', user: 'UTRIGGER', ts: '201.00' },
+      ]);
+      vi.mocked(runCodex).mockResolvedValue({ ok: true, parsedJson: { intent: 'cancel' } } as any);
+      const promise = runApproval({ requesterToConfirm: 'UTRIGGER' });
+      await vi.advanceTimersByTimeAsync(6000);
+
+      const result = await promise;
+      expect(result.outcome).toBe('cancelled');
+      expect(result.approverId).toBe('UTRIGGER');
+    });
+
+    it('reads "No, go ahead and ship it" through the classifier, not as a rejection', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([
+        { text: 'No, go ahead and ship it', user: 'UCOREDEV', ts: '200.00' },
+      ]);
+      vi.mocked(runCodex).mockResolvedValue({ ok: true, parsedJson: { intent: 'approve' } } as any);
+      const promise = runApproval();
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect((await promise).outcome).toBe('approved');
+    });
+
+    it('tells a bystander who says "no" only that admins turn plans down', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'no', user: 'UOTHER', ts: '200.00' }]);
       const controller = new AbortController();
       const promise = runApproval({ signal: controller.signal });
-      await vi.advanceTimersByTimeAsync(12_000);
+      await vi.advanceTimersByTimeAsync(6000);
 
-      expect(vi.mocked(runCodex)).not.toHaveBeenCalled();
-      expect(texts()).toEqual([]);
+      expect(texts()).toEqual(['<@UOTHER> only admins can turn a plan down.']);
       controller.abort();
-      expect((await promise).approverId).toBe('');
+      await promise;
+    });
+
+    it('still reads a requester confirmation that courtesy-mentions the admin', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([
+        { text: '<@UCOREDEV> correct, that is what I want', user: 'UTRIGGER', ts: '200.00' },
+      ]);
+      vi.mocked(runCodex).mockResolvedValue({ ok: true, parsedJson: { intent: 'approve' } } as any);
+      const controller = new AbortController();
+      const log = vi.fn();
+      const promise = runApproval({ requesterToConfirm: 'UTRIGGER', signal: controller.signal, logStep: log });
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect(vi.mocked(runCodex)).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledWith(expect.objectContaining({ stage: 'pipeline.approval.requester_confirmed' }));
+      controller.abort();
+      await promise;
     });
 
     it('reads a change of mind that starts with a stop word through the classifier', async () => {
@@ -2298,10 +2349,11 @@ describe('waitForApproval', () => {
     expect((await promise).outcome).toBe('cancelled');
   });
 
-  it('stops at once on "stop" followed by a reason (issue #598)', async () => {
+  it('reads "stop" followed by a reason through the classifier, which now knows a stop (issue #598)', async () => {
     vi.mocked(fetchThreadContext).mockResolvedValue([
       { text: 'stop - as this is huge change', user: 'UCOREDEV', ts: '200.00' },
     ]);
+    vi.mocked(runCodex).mockResolvedValue({ ok: true, parsedJson: { intent: 'cancel' } } as any);
 
     const promise = runApproval();
     await vi.advanceTimersByTimeAsync(6000);

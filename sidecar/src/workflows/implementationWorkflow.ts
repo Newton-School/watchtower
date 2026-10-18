@@ -1748,8 +1748,10 @@ Write your response as a ready-to-post Slack message describing what you did.
     });
 
     if (loopOutcome.kind === 'cancelled') {
-      // A reply stopped it: say so, where the job's own cancel lane would have (issue #598).
-      if (loopOutcome.stoppedBy) {
+      // A reply stopped it: say so, where the job's own cancel lane would have
+      // (issue #598). When the stop lane also saw the reply it has aborted the
+      // job and said "Stopped." already, so nothing is said twice.
+      if (loopOutcome.stoppedBy && !signal?.aborted) {
         await slack.chat
           .postMessage({
             channel: task.event.channelId,
@@ -1757,7 +1759,11 @@ Write your response as a ready-to-post Slack message describing what you did.
             text: 'Stopped. Nothing was changed.',
           })
           .catch(() => {});
-        return { ...cancelledResult('IMPLEMENTATION'), slackPosted: true };
+        return {
+          ...cancelledResult('IMPLEMENTATION'),
+          message: `Stopped from Slack by <@${loopOutcome.stoppedBy}>.`,
+          slackPosted: true,
+        };
       }
       return cancelledResult('IMPLEMENTATION');
     }

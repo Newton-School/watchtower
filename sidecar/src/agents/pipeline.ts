@@ -21,7 +21,7 @@ import { REPO_KEYS, type RepoKey } from '../repos/registry.js';
 import { withAgentCallContext } from '../state/runContext.js';
 import { currentConnectors, NO_CONNECTORS, withConnectors } from '../backends/connectors.js';
 import { fetchThreadContext } from '../slack/threadContext.js';
-import { GATE_STOP_PHRASES, slackMentionIds } from '../router/stopIntent.js';
+import { isGateStop, normalizeControlText, slackMentionIds, stripSlackMentions } from '../router/stopIntent.js';
 import { createProgressMessage, formatElapsed, type ProgressMessage } from '../slack/progressMessage.js';
 import { currentHead, checkCoderProducedChanges, getDiffVsBase } from '../workspaces/gitState.js';
 
@@ -310,59 +310,73 @@ const CONFIRM_PATTERNS =
 const OVERRIDE_CONFIRMATION_RE = /^approve without (the requester'?s? )?confirmation[.!]*$/i;
 /**
  * "no" from an approver: the plan is turned down and miniOG asks what to change
- * (issue #598). Whole word only: "No worries, go ahead" is for the classifier.
- * A stop is different, see `readsAsCancel`.
+ * (issue #598). Only a bare no: "No worries, go ahead" and "No, go ahead and
+ * ship it" are the classifier's. A stop is different: see `isGateStop`.
  */
-const REJECT_PATTERNS = /^(no|nope)(?:[.!,;:]|$)/i;
-const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-/**
- * A stop phrase, optionally followed by punctuation and a reason: "stop",
- * "stop - this is a huge change". The vocabulary is the stop lane's
- * (`router/stopIntent.ts`), minus "no".
- */
-const CANCEL_RE = new RegExp(
-  `^(?:please )?(${GATE_STOP_PHRASES.map(escapeRegExp).join('|')})(?: please)?(?:\\s*[.!?,;:—–-]+\\s*(.*))?$`,
-  'i',
-);
-/** Words that make the text after a stop word a change of mind, not a reason to stop. */
-const RESUME_CUES =
-  /\b(go ahead|go|yes|yep|proceed|ship it|do it|instead|actually|rather|original|approve|keep|continue)\b/i;
-/**
- * A stop, from an approver or the requester, ends the job at once (issue #598).
- * The reply has to be the stop, with at most a reason after punctuation:
- * "stop using X and add Y" is feedback, and "nevermind, go ahead with the
- * original plan" is a change of mind that the classifier reads.
- */
-export function readsAsCancel(command: string): boolean {
-  const match = CANCEL_RE.exec(command.trim());
-  if (!match) return false;
-  const reason = (match[2] ?? '').trim();
-  return reason === '' || !RESUME_CUES.test(reason);
-}
+const REJECT_PATTERNS = /^(no|nope)(?:[.!;:]|$)/i;
 // Strict pause patterns: pause word must be the entire message (modulo punctuation).
 // "wait, that's wrong" / "wait, also include X" → feedback, not pause.
 const PAUSE_PATTERNS =
   /^(wait|hold on|hold up|pause|brb|one sec|one moment|stand by|i'?ll get back to you|(give me|gimme) (a )?(sec|second|minute|moment|min)|pause for (now|a bit|a sec)|stop for now)[.! ]*$/i;
 
-/** Words that show a reply decides something for miniOG, whoever else it mentions. */
-const DECISION_CUES =
-  /\b(yes|yep|yeah|yup|approve|approved|go ahead|proceed|lgtm|looks good|ship it|do it|confirm|confirmed|stop|cancel|abort|no|nope|hold|wait)\b/i;
+/**
+ * Words that show a reply decides something for miniOG, whoever else it
+ * mentions: the approval, confirmation and stop vocabularies, plus the plain
+ * yes/no words. Read on the normalised text, so case, punctuation and the
+ * forwarding footer do not matter.
+ */
+const DECISION_WORDS = new Set([
+  'yes',
+  'yep',
+  'yeah',
+  'yup',
+  'ok',
+  'okay',
+  'sure',
+  'correct',
+  'confirm',
+  'confirmed',
+  'exactly',
+  'right',
+  'go',
+  'proceed',
+  'approve',
+  'approved',
+  'lgtm',
+  'looks',
+  'ship',
+  'do',
+  'start',
+  'no',
+  'nope',
+  'not',
+  'dont',
+  'stop',
+  'cancel',
+  'abort',
+  'halt',
+  'nevermind',
+  'never',
+  'drop',
+  'kill',
+  'hold',
+  'wait',
+  'pause',
+]);
 
 /**
  * A reply that @-mentions people and not miniOG, and decides nothing, is to
  * them (issue #599): "thanks <@U1>, can you also update the other pages" is
  * not plan feedback, and reading it as one re-planned and paged the admins
- * again. "<@U1> yes, looks good" still goes to the classifier.
+ * again. "<@U1> yes, looks good" and "<@U1> correct, that's what I want"
+ * still go to the classifier.
  */
 export function addressesSomeoneElse(text: string, botUserId?: string): boolean {
   const mentions = slackMentionIds(text);
   if (mentions.length === 0) return false;
   if (botUserId && mentions.includes(botUserId)) return false;
-  return !DECISION_CUES.test(text.replace(/<@[^>]+>/g, ' '));
-}
-
-function mentionsBot(text: string, botUserId?: string): boolean {
-  return Boolean(botUserId) && slackMentionIds(text).includes(botUserId as string);
+  const words = normalizeControlText(stripSlackMentions(text)).split(' ');
+  return !words.some(word => DECISION_WORDS.has(word));
 }
 
 /**
@@ -691,18 +705,21 @@ async function pollForApproval(params: {
 
       // A stop from an approver or the requester ends the job now (issue #598).
       // "no" is not a stop: an approver's no turns the plan down and the
-      // workflow asks what to change; a requester's no is read below.
-      // "@miniOG stop" is the stop lane's (index.ts), which aborts the job: not read twice here.
-      if (readsAsCancel(command)) {
-        if (mentionsBot(text, botUserId)) continue;
+      // workflow asks what to change; a requester's no is read below. A stop
+      // with a reason after it is the classifier's. "@miniOG stop" is also
+      // the stop lane's (index.ts), which aborts the job; reading it here too
+      // is the backstop for a lane that missed the event, and the workflow
+      // says nothing twice.
+      if (isGateStop(command)) {
         if (isApprover || reply.user === params.triggerUserId) return stoppedBy(reply);
         noticeCannotStop(reply);
         continue;
       }
 
       // The requester confirming, or saying what they want instead (issue #437).
-      if (requester && reply.user === requester) {
-        if (requesterConfirmed) continue;
+      // Once they have confirmed, their later replies are read below like anyone
+      // else's, so a stop from them still counts.
+      if (requester && reply.user === requester && !requesterConfirmed) {
         let intent: ApprovalIntent | null = CONFIRM_PATTERNS.test(command) ? 'approve' : null;
         if (!intent) {
           if (classifiedTs.has(reply.ts)) continue;
@@ -798,7 +815,10 @@ async function pollForApproval(params: {
               .postMessage({
                 channel: channelId,
                 thread_ts: threadTs,
-                text: `<@${reply.user}> only admins can turn a plan down. Say "stop" if you want me to drop it.`,
+                text:
+                  reply.user === params.triggerUserId
+                    ? `<@${reply.user}> only admins can turn a plan down. Say "stop" if you want me to drop it.`
+                    : `<@${reply.user}> only admins can turn a plan down.`,
               })
               .catch(() => {});
           }

@@ -44,17 +44,14 @@ const STOP_PATTERNS = [
   /^(?:dont|do not) (?:deploy|merge|review)(?: (?:it|this|that))?$/,
 ];
 
-/**
- * The stop words a plan's approval gate reads (issue #598): everything above
- * except "no", which at a plan means "not this plan", not "drop the job".
- */
-export const GATE_STOP_PHRASES: readonly string[] = [...STOP_PHRASES].filter(
-  phrase => phrase !== 'no' && phrase !== 'nope',
-);
-
 /** The user ids a Slack message @-mentions, in order. */
 export function slackMentionIds(text: string): string[] {
   return [...text.matchAll(/<@([A-Z0-9]+)(?:\|[^>]*)?>/gi)].map(match => match[1]);
+}
+
+/** The text with every @-mention taken out. */
+export function stripSlackMentions(text: string): string {
+  return text.replace(/<@[A-Z0-9]+(?:\|[^>]*)?>/gi, ' ');
 }
 
 /** Mentions, a forwarding app's "Sent using" footer, case and punctuation don't change what was said. */
@@ -76,6 +73,18 @@ export function isStopCommand(text: string): boolean {
   const cleaned = normalizeControlText(text);
   if (!cleaned) return false;
   return STOP_PHRASES.has(cleaned) || STOP_PATTERNS.some(pattern => pattern.test(cleaned));
+}
+
+/**
+ * A stop as a plan's approval gate reads it (issue #598): the same vocabulary
+ * as the stop lane, except "no" and "nope", which at a plan mean "not this
+ * plan", not "drop the job". The whole reply has to be the stop; a stop with a
+ * reason or a change of mind after it is the classifier's to read.
+ */
+export function isGateStop(text: string): boolean {
+  const cleaned = normalizeControlText(text);
+  if (cleaned === 'no' || cleaned === 'nope') return false;
+  return isStopCommand(text);
 }
 
 export type StopDecision =
