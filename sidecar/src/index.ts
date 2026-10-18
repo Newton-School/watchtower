@@ -51,6 +51,7 @@ import { createThreadStatus, type ThreadStatus } from './slack/threadStatus.js';
 import { resolveUserGroup } from './slack/userGroupResolver.js';
 import { isOlderVersion, readSidecarBuild } from './runtime/buildInfo.js';
 import { recoveryFor } from './runtime/restartRecovery.js';
+import { connectorAlertText, connectorsToAlert, onConnectorStatuses } from './runtime/connectorAlerts.js';
 import { acquireInstanceLock, instanceLockPath, releaseInstanceLock } from './runtime/instanceLock.js';
 import {
   registerActiveJob,
@@ -1719,6 +1720,23 @@ async function main(): Promise<void> {
   } else if (sidecarBuild.appVersion !== 'dev') {
     store.setState('last_app_version', sidecarBuild.appVersion);
   }
+
+  // A connector that needs signing in again left requesters blocked until the
+  // owner happened to notice (issue #593). The first run to find one tells the
+  // owner, on the desktop and by DM, once until it is connected again.
+  const connectorAlertClient = config.slackBotToken ? new WebClient(config.slackBotToken) : undefined;
+  onConnectorStatuses((statuses, jobId) => {
+    for (const connector of connectorsToAlert(statuses, store)) {
+      const text = connectorAlertText(connector, jobId);
+      logger.warn({ connector, jobId }, 'a connector runs need is not usable; telling the owner');
+      notifyDesktop('A connector needs attention', text);
+      for (const ownerId of config.ownerSlackUserIds) {
+        void connectorAlertClient?.chat
+          .postMessage({ channel: ownerId, text })
+          .catch(err => logger.warn({ connector, err: String(err) }, 'could not DM the owner about a connector'));
+      }
+    }
+  });
 
   // Boot the optional Obsidian-compatible vault writer. When disabled (or no
   // path configured), scheduleVaultRender calls become no-ops; the dossier

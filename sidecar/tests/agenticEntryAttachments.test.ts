@@ -291,7 +291,7 @@ describe('runAgenticEntry and connectors', () => {
     const prompt = vi.mocked(runClaudeAgentic).mock.calls[0][0].systemPrompt;
 
     expect(prompt).toContain('`mcp__metabase__*` (read-only): the database');
-    expect(prompt).toContain('say plainly that you could not reach it');
+    expect(prompt).toContain("I can't reach <connector> right now; I've let the owner know.");
     expect(prompt).toContain('You have no other connectors');
     expect(prompt).not.toContain('mcp__openpanel__');
   });

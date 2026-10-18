@@ -157,6 +157,12 @@ describe('createStreamDecoder — claude-code', () => {
         'Sign in to it once from Claude Code on this machine (/mcp), under the same server name.',
     );
     expect(steps[1].data).toEqual({ servers: [{ name: 'metabase', status: 'needs-auth' }] });
+    // What the run reports so the owner can be told (issue #593).
+    expect(decoder.connectorStatuses()).toEqual([
+      { name: 'metabase', status: 'needs-auth' },
+      { name: 'figma', status: 'connected' },
+      { name: 'slow', status: 'pending' },
+    ]);
   });
 
   // The critical regression guard: parseOutput must still receive the exact
