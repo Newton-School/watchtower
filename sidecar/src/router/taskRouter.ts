@@ -42,6 +42,7 @@ import {
 import { askRequester, decideClarify, giveUpOnClarify, type ClarifyAction } from './routeClarify.js';
 import { cancelledResult } from '../workflows/shared/cancelState.js';
 import { acknowledgementText, pickupDelayMs } from './acknowledgement.js';
+import { RESTART_EVENT_PREFIX } from '../runtime/restartRecovery.js';
 import { looksLikeFixAffirmation } from './resumeIntentParser.js';
 
 import { isPresencePing } from '../workflows/shared/workflowUtils.js';
@@ -632,13 +633,27 @@ export async function routeTask(params: {
     const ack = acknowledgementText({
       intent: resolvedIntent,
       pickupDelayMs: pickupDelay,
-      aboutExistingPr: Boolean(routedTask.prContext || routedTask.prContexts?.length),
+      // Only a PR named in the message itself: one from earlier in the thread
+      // does not make a new request a quick action.
+      aboutExistingPr:
+        routedTask.prContext?.source === 'trigger' ||
+        Boolean(routedTask.prContexts?.some(pr => pr.source === 'trigger')),
+      replayed: task.event.ingestSource === 'launchpad' || task.event.eventId.startsWith(RESTART_EVENT_PREFIX),
     });
     if (ack && !signal?.aborted) {
-      await slack.chat
+      // Not awaited: the run must not wait on a Slack round trip, and the
+      // workflow's own first post is seconds away.
+      void slack.chat
         .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: ack })
-        .catch(() => {});
-      logStep?.({ stage: 'job.acknowledged', message: ack, data: { intent: resolvedIntent } });
+        .then(() => logStep?.({ stage: 'job.acknowledged', message: ack, data: { intent: resolvedIntent } }))
+        .catch(error =>
+          logStep?.({
+            stage: 'job.acknowledge_failed',
+            level: 'WARN',
+            message: 'Could not post the opening line.',
+            data: { error: String(error) },
+          }),
+        );
     }
     return runWorkflow({ task: routedTask, config, slack, store, jobId, logStep, signal });
   }

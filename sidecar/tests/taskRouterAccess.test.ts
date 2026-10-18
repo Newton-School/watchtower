@@ -174,7 +174,7 @@ function makeTask(
 function repliesOf(slack: { chat: { postMessage: { mock: { calls: unknown[][] } } } }): string[] {
   return slack.chat.postMessage.mock.calls
     .map(call => (call[0] as { text: string }).text)
-    .filter(text => !/^(On it\.|Sorry, I was offline)/.test(text));
+    .filter(text => !/^(On it\.|Sorry for the wait)/.test(text));
 }
 function expectNoReply(slack: { chat: { postMessage: { mock: { calls: unknown[][] } } } }): void {
   expect(repliesOf(slack)).toEqual([]);
@@ -1660,15 +1660,32 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
 describe('the opening line (issue #588)', () => {
   const recent = () => String((Date.now() - 20_000) / 1000);
   const late = () => String((Date.now() - 25 * 60_000) / 1000);
+  const pr = (source: 'trigger' | 'thread') =>
+    ({
+      owner: 'Newton-School',
+      repo: 'newton-web',
+      number: 1,
+      url: 'https://github.com/Newton-School/newton-web/pull/1',
+      source,
+    }) as never;
+  const lookup = (eventTs: string) => {
+    const task = makeTask({ userId: 'UOWNER1', channelId: 'C-BUILD', text: '<@UBOT1> how does XP work?' });
+    task.event.eventTs = eventTs;
+    return task;
+  };
 
   it('says what to expect before a lookup runs', async () => {
     const slack = makeSlack();
     const logStep = vi.fn();
     routerPicks('INFORMATIONAL');
-    const task = makeTask({ userId: 'UOWNER1', channelId: 'C-BUILD', text: '<@UBOT1> how does XP work?' });
-    task.event.eventTs = recent();
 
-    await routeTask({ task, config: makeConfig('enforce'), slack: slack as never, store: {} as never, logStep });
+    await routeTask({
+      task: lookup(recent()),
+      config: makeConfig('enforce'),
+      slack: slack as never,
+      store: {} as never,
+      logStep,
+    });
 
     expect(slack.chat.postMessage).toHaveBeenCalledTimes(1);
     expect(slack.chat.postMessage.mock.calls[0][0].text).toBe(
@@ -1687,14 +1704,40 @@ describe('the opening line (issue #588)', () => {
   it('says it is late when the pickup was', async () => {
     const slack = makeSlack();
     routerPicks('INFORMATIONAL');
-    const task = makeTask({ userId: 'UOWNER1', channelId: 'C-BUILD', text: '<@UBOT1> how does XP work?' });
-    task.event.eventTs = late();
 
-    await routeTask({ task, config: makeConfig('enforce'), slack: slack as never, store: {} as never });
+    await routeTask({ task: lookup(late()), config: makeConfig('enforce'), slack: slack as never, store: {} as never });
 
     expect(slack.chat.postMessage.mock.calls[0][0].text).toBe(
-      'Sorry, I was offline for a while and only just saw this, 25 min after you sent it. On it. A lookup like this usually takes a couple of minutes.',
+      "Sorry for the wait: I'm only picking this up 25 min after you sent it. On it. A lookup like this usually takes a couple of minutes.",
     );
+  });
+
+  it('does not apologise for a desktop retrigger or a restart re-run, whose event time is old by design', async () => {
+    routerPicks('INFORMATIONAL');
+    for (const shape of [{ ingestSource: 'launchpad' as const }, { eventId: 'restart:job-1' }]) {
+      const slack = makeSlack();
+      const task = lookup(late());
+      task.event = { ...task.event, ...shape };
+      await routeTask({ task, config: makeConfig('enforce'), slack: slack as never, store: {} as never });
+      expect(slack.chat.postMessage.mock.calls[0][0].text).toBe(
+        'On it. A lookup like this usually takes a couple of minutes.',
+      );
+    }
+  });
+
+  it('posts no opening line once the job is cancelled', async () => {
+    const slack = makeSlack();
+    routerPicks('INFORMATIONAL');
+    const controller = new AbortController();
+    controller.abort();
+    await routeTask({
+      task: lookup(recent()),
+      config: makeConfig('enforce'),
+      slack: slack as never,
+      store: {} as never,
+      signal: controller.signal,
+    });
+    expect(slack.chat.postMessage).not.toHaveBeenCalled();
   });
 
   it('posts only the apology before a review, which opens with its own line', async () => {
@@ -1705,20 +1748,15 @@ describe('the opening line (issue #588)', () => {
       channelId: 'C-BUILD',
       text: '<@UBOT1> review <https://github.com/Newton-School/newton-web/pull/1>',
       intent: 'PR_REVIEW',
-      prContext: {
-        owner: 'Newton-School',
-        repo: 'newton-web',
-        number: 1,
-        url: 'https://github.com/Newton-School/newton-web/pull/1',
-      },
+      prContext: pr('trigger'),
     });
     task.event.eventTs = late();
 
     await routeTask({ task, config: makeConfig('enforce'), slack: slack as never, store: {} as never });
 
     expect(slack.chat.postMessage).toHaveBeenCalledTimes(1);
-    expect(slack.chat.postMessage.mock.calls[0][0].text).toMatch(
-      /^Sorry, I was offline for a while and only just saw this, 25 min after you sent it\.$/,
+    expect(slack.chat.postMessage.mock.calls[0][0].text).toBe(
+      "Sorry for the wait: I'm only picking this up 25 min after you sent it.",
     );
   });
 
@@ -1736,19 +1774,14 @@ describe('the opening line (issue #588)', () => {
       channelId: 'C-BUILD',
       text: '<@UBOT1> review <https://github.com/Newton-School/newton-web/pull/1>',
       intent: 'PR_REVIEW',
-      prContext: {
-        owner: 'Newton-School',
-        repo: 'newton-web',
-        number: 1,
-        url: 'https://github.com/Newton-School/newton-web/pull/1',
-      },
+      prContext: pr('trigger'),
     });
     review.event.eventTs = recent();
     await routeTask({ task: review, config: makeConfig('enforce'), slack: slack as never, store: {} as never });
     expect(slack.chat.postMessage).not.toHaveBeenCalled();
   });
 
-  it('does not promise a plan for a change request about an existing PR', async () => {
+  it('does not promise a plan for a change request about a PR named in the message', async () => {
     const slack = makeSlack();
     routerPicks('IMPLEMENTATION');
     const task = makeTask({
@@ -1756,12 +1789,7 @@ describe('the opening line (issue #588)', () => {
       channelId: 'C-BUILD',
       text: '<@UBOT1> merge <https://github.com/Newton-School/newton-web/pull/1>',
       intent: 'IMPLEMENTATION',
-      prContext: {
-        owner: 'Newton-School',
-        repo: 'newton-web',
-        number: 1,
-        url: 'https://github.com/Newton-School/newton-web/pull/1',
-      },
+      prContext: pr('trigger'),
     });
     task.event.eventTs = recent();
 
@@ -1769,5 +1797,22 @@ describe('the opening line (issue #588)', () => {
 
     expect(slack.chat.postMessage).not.toHaveBeenCalled();
     expect(runImplementationWorkflow).toHaveBeenCalledOnce();
+  });
+
+  it('still promises a plan when the only PR link is earlier in the thread', async () => {
+    const slack = makeSlack();
+    routerPicks('IMPLEMENTATION');
+    const task = makeTask({
+      userId: 'UOWNER1',
+      channelId: 'C-BUILD',
+      text: '<@UBOT1> also fix the empty-state copy',
+      intent: 'IMPLEMENTATION',
+    });
+    task.prContexts = [pr('thread')];
+    task.event.eventTs = recent();
+
+    await routeTask({ task, config: makeConfig('enforce'), slack: slack as never, store: {} as never });
+
+    expect(slack.chat.postMessage.mock.calls[0][0].text).toContain('post a plan for approval');
   });
 });
