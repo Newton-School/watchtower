@@ -125,9 +125,10 @@ What the plan must contain (markdown):
   - Outside the repo: <the single word "none", or each change this plan makes outside the repository, with the system and what changes there (for example "uploads 3 images to question 1042 through Newton admin"). The coder may make no change outside the repository that this line does not name>
   - Risk: <low, medium or high>
 - A short summary of the user's intent.
-- A section headed exactly \`## Files to change\`: one bullet per file you will edit or create, as a backticked repo-relative path and a few words on why. ONLY files this change edits. Files you only read, files that must not be touched, globs, URLs and branch names do not belong in this section.
+- A section headed exactly \`## Files to change\`: one bullet per file you will edit or create, as a backticked repo-relative path and a few words on why. ONLY files this change edits. Files you only read, files that must not be touched, globs, URLs and branch names do not belong in this section. Test files you plan count: list each one here.
 - An ordered list of implementation steps.
-- A scope tag on its own line, exactly one of: \`Scope: small\`, \`Scope: medium\`, or \`Scope: large\`. Treat anything under ~50 lines across 1–2 files as small; multi-file feature work as medium; cross-cutting refactors or new subsystems as large. Coder agent uses this to decide whether to include tests in the PR.
+- Tests: plan a test only when the change has logic worth guarding (a condition, a calculation, a data flow), not for copy, styling or config values. The coder commits exactly the tests you plan, and the reviewer and verifier check the change against your plan, tests included.
+- A scope tag on its own line, exactly one of: \`Scope: small\`, \`Scope: medium\`, or \`Scope: large\`. Treat anything under ~50 lines across 1–2 files as small; multi-file feature work as medium; cross-cutting refactors or new subsystems as large.
 - A code-changes tag on its own line, exactly one of: \`Requires code changes: yes\` or \`Requires code changes: no\`. Set \`no\` ONLY for purely informational requests (explain, describe, list, check status, answer a question) or operational/lifecycle actions that do NOT modify source (merge PR, close PR, deploy, run tests, restart service; a deploy, release or rollback ask is not executed by this pipeline, it is redirected to the deploy command). For ANY implementation, feature, fix, change, or modification of source files set \`yes\`; when in doubt, \`yes\`.
 - Anything the coder MUST avoid (existing patterns, deprecated APIs, owner conventions).
 
@@ -165,8 +166,7 @@ Requirements:
    - DO NOT \`git clone\` anything — the working tree you were given is the only repo you may touch.
    - If the worktree appears to be the wrong repo for the task (files from the planner's scope are missing), return {"status":"failed","summary":"wrong-repo-assigned: …"} instead of switching directories. A supervisor will re-run the task with the correct repo.
 2. Create a NEW branch named ${ctx.requestedBy ? `${sanitizeForBranch(ctx.requestedBy)}/` : ''}<short-task-name>-${ctx.task.event.threadTs.replace('.', '-')} (the suffix ensures uniqueness — do NOT reuse or checkout an existing branch)
-3. Implement changes and write tests to verify correctness. Run the tests to make sure everything works.
-   IMPORTANT: If the planner scope is "small" or "medium", do NOT include test files in the commit or PR — only commit the source code changes. Delete or git-restore any test files you created before committing. For "large" scope, include tests in the PR.
+3. Implement the changes. Write the tests the approved plan lists, run them, and commit them with the change: the reviewer and verifier check the change against the plan, tests included. Do not add test files the plan does not list; you may still run the existing tests to check your work.
 4. Commit and open a PR to the default branch.${ctx.requestedBy ? ` Prefix the PR title with [${ctx.requestedBy} via miniOG], e.g. "[${ctx.requestedBy} via miniOG] Fix button text".` : ''}
    In the PR description, always include this at the top:
    > Requested by **${ctx.requestedBy ?? 'Unknown'}** via Slack · [View thread](${buildSlackThreadLink(ctx.task.event.channelId, ctx.task.event.threadTs)})
@@ -243,7 +243,7 @@ Do not approve work that diverges from the approved plan, even if the code is cl
 Review checklist:
 - Does the diff actually implement the approved plan? (see PLAN CONFORMANCE above)
 - Are there logic errors, edge cases, or regressions?
-- Are tests adequate and meaningful?
+- Are the tests the approved plan lists present and meaningful? A test the plan did not ask for is at most a "low" finding: the plan decides which tests the change carries.
 - Is the code clean, readable, and maintainable?
 - Are there any missing error handlers or boundary conditions?
 
