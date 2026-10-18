@@ -12,15 +12,27 @@ import type { AppConfig, DossierRole } from '../../types/contracts.js';
  * An engineer still gets the full account: owners, admins (the core-dev group),
  * and anyone whose dossier says they are a dev.
  */
-export function requesterIsEngineer(params: {
-  userId: string;
-  isOwnerAuthor: boolean;
-  config: AppConfig;
-  role?: DossierRole;
-}): boolean {
-  if (params.isOwnerAuthor) return true;
+export function requesterIsEngineer(params: { userId: string; config: AppConfig; role?: DossierRole }): boolean {
+  // Owners are in the admin list. The id is the person the run is for, not
+  // whoever queued it: an owner retriggering a PM's request writes for the PM.
   if (getAdminUserIds(params.config).includes(params.userId)) return true;
   return params.role === 'dev';
+}
+
+/**
+ * The requester summary, kept readable: the coder may write bullets, and the
+ * engineering sanitiser would drop every one of them. Only whitespace is
+ * normalised and the length capped.
+ */
+export function sanitizeRequesterSummary(raw: string): string {
+  const text = raw
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map(line => line.trimEnd())
+    .filter((line, index, lines) => line.trim() !== '' || (index > 0 && lines[index - 1].trim() !== ''))
+    .join('\n')
+    .trim();
+  return text.length > 700 ? `${text.slice(0, 699).trimEnd()}…` : text;
 }
 
 /**
@@ -37,8 +49,10 @@ export function composeChangeReply(params: {
   prUrl: string;
   /** Already formatted, with its leading blank lines; '' when there is none. */
   externalBlock: string;
+  /** Set when a PR was expected and could not be opened: the plain summary must not read as shipped. */
+  prFailed?: boolean;
 }): string {
-  const { summary, requesterSummary, engineerReads, prUrl, externalBlock } = params;
+  const { summary, requesterSummary, engineerReads, prUrl, externalBlock, prFailed } = params;
   const forRequester = !engineerReads && requesterSummary.trim() !== '';
   const lead = forRequester ? requesterSummary.trim() : summary;
   const prBlock = prUrl ? `\n${prUrl}` : '';
@@ -46,5 +60,9 @@ export function composeChangeReply(params: {
     forRequester && prUrl && requesterSummary.trim() !== summary.trim()
       ? '\n_The engineering notes are in the PR._'
       : '';
-  return `${lead}${prBlock}${pointer}${externalBlock}`.trim();
+  const noPr =
+    forRequester && !prUrl && prFailed
+      ? '\n:warning: I could not open a pull request for this, so nothing is live yet. An admin needs to look at the branch.'
+      : '';
+  return `${lead}${prBlock}${pointer}${noPr}${externalBlock}`.trim();
 }

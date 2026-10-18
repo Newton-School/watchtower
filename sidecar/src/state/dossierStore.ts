@@ -145,17 +145,24 @@ export const PINNED_FACT_USER_CAP = 50;
 export function inferRoleFromTitle(title: string | undefined | null): DossierRole | undefined {
   const text = (title ?? '').toLowerCase();
   if (!text.trim()) return undefined;
-  if (/\b(designer|design|ux|ui)\b/.test(text)) return 'designer';
-  if (/\b(product manager|product|program manager|pm|apm)\b/.test(text)) return 'pm';
-  if (/\b(analyst|analytics|data scientist|data|insights|growth)\b/.test(text)) return 'analyst';
-  if (/\b(engineer|engineering|developer|dev|sde|swe|programmer|architect|cto|tech lead|devops|sre|qa)\b/.test(text))
-    return 'dev';
+  // Business functions first: an "Engineering Recruiter" or "Developer Marketing" is not a dev.
   if (
-    /\b(operations|ops|success|support|admissions?|counsell?or|placement|marketing|academic|manager|lead|head)\b/.test(
+    /\b(recruit\w*|marketing|hr|people|talent|sales|finance|operations|ops|success|support|admissions?|counsell?or|placement|academic)\b/.test(
       text,
     )
   )
     return 'ops';
+  // Engineers before product and design: a "Product Engineer" or "UX Engineer" is a dev.
+  if (
+    /\b(engineer\w*|developer|dev|sde|swe|programmer|architect|cto|tech lead|devops|sre|qa|technology|technical|frontend|backend|full ?stack|platform|infra\w*|ml)\b/.test(
+      text,
+    )
+  )
+    return 'dev';
+  if (/\b(designer|design|ux|ui)\b/.test(text)) return 'designer';
+  if (/\b(product manager|product owner|product lead|head of product|program manager|product|pm|apm)\b/.test(text))
+    return 'pm';
+  if (/\b(analyst|analytics|data scien\w*|insights|growth)\b/.test(text)) return 'analyst';
   return undefined;
 }
 
@@ -242,12 +249,15 @@ export function createDossierStore(db: Database.Database): DossierStore {
      WHERE user_id = @userId AND updated_at < @staleBefore`,
   );
 
-  // Fills a blank role from the Slack title. A role set by a person (set-role,
-  // admin-edit, slack-remember) is never touched: the WHERE keeps it.
+  // Fills a role from the Slack title, and keeps it current when the title
+  // changes. Keyed on the row's source, not on a blank role: a role a person
+  // set (set-role, admin-edit, slack-remember) or cleared (forget) is never touched.
   const fillRoleFromTitle = db.prepare(
     `UPDATE user_dossiers
      SET role = @role, source = 'slack-title', updated_at = @now
-     WHERE user_id = @userId AND role IS NULL`,
+     WHERE user_id = @userId
+       AND ((role IS NULL AND source = 'auto') OR source = 'slack-title')
+       AND (role IS NULL OR role <> @role)`,
   );
 
   const selectProfile = db.prepare(
@@ -946,7 +956,11 @@ export function formatDossierForHuman(
   lines.push(`• *Name*: ${name}`);
 
   if (profile?.role) {
-    lines.push(`• *Role*: ${profile.role}`);
+    lines.push(
+      profile.source === 'slack-title'
+        ? `• *Role*: ${profile.role} (read from your Slack title — \`set-role dev\` or another role to change it)`
+        : `• *Role*: ${profile.role}`,
+    );
   } else {
     lines.push('• *Role*: not set — try `set-role pm` (or dev/designer/ops)');
   }

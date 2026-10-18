@@ -178,6 +178,7 @@ export async function resolveDisplayNames(
           realName,
           tz: info.user?.tz || undefined,
           email: info.user?.profile?.email || undefined,
+          title: info.user?.profile?.title || undefined,
         });
       } catch {
         // dossier capture is a bonus, never a blocker

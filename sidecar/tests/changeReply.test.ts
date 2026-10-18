@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { composeChangeReply, requesterIsEngineer } from '../src/workflows/shared/changeReply.js';
+import {
+  composeChangeReply,
+  requesterIsEngineer,
+  sanitizeRequesterSummary,
+} from '../src/workflows/shared/changeReply.js';
 import type { AppConfig } from '../src/types/contracts.js';
 
 const config = { ownerSlackUserIds: ['UOWNER'], coreDevSlackUserIds: ['UADMIN'] } as unknown as AppConfig;
@@ -11,15 +15,24 @@ const requesterSummary =
 
 describe('requesterIsEngineer', () => {
   it('is true for the owner, an admin, or a dossier that says dev', () => {
-    expect(requesterIsEngineer({ userId: 'UX', isOwnerAuthor: true, config })).toBe(true);
-    expect(requesterIsEngineer({ userId: 'UADMIN', isOwnerAuthor: false, config })).toBe(true);
-    expect(requesterIsEngineer({ userId: 'UDEV', isOwnerAuthor: false, config, role: 'dev' })).toBe(true);
+    expect(requesterIsEngineer({ userId: 'UOWNER', config })).toBe(true);
+    expect(requesterIsEngineer({ userId: 'UADMIN', config })).toBe(true);
+    expect(requesterIsEngineer({ userId: 'UDEV', config, role: 'dev' })).toBe(true);
   });
 
   it('is false for a PM, a designer, ops, an analyst, or someone with no role', () => {
     for (const role of ['pm', 'designer', 'ops', 'analyst', undefined] as const) {
-      expect(requesterIsEngineer({ userId: 'UPM', isOwnerAuthor: false, config, role })).toBe(false);
+      expect(requesterIsEngineer({ userId: 'UPM', config, role })).toBe(false);
     }
+  });
+});
+
+describe('sanitizeRequesterSummary', () => {
+  it('keeps bullets and line breaks, trims, and caps the length', () => {
+    expect(sanitizeRequesterSummary('- The number now reads +91 74117 82198.\r\n\n\n- Check the call button.\n')).toBe(
+      '- The number now reads +91 74117 82198.\n\n- Check the call button.',
+    );
+    expect(sanitizeRequesterSummary('x'.repeat(800))).toHaveLength(700);
   });
 });
 
@@ -58,6 +71,20 @@ describe('composeChangeReply', () => {
       externalBlock: '',
     });
     expect(text).toBe(`${summary}\nhttps://github.com/x/y/pull/1`);
+  });
+
+  it('says so when a PR was expected and could not be opened', () => {
+    const text = composeChangeReply({
+      summary,
+      requesterSummary,
+      engineerReads: false,
+      prUrl: '',
+      externalBlock: '',
+      prFailed: true,
+    });
+    expect(text).toBe(
+      `${requesterSummary}\n:warning: I could not open a pull request for this, so nothing is live yet. An admin needs to look at the branch.`,
+    );
   });
 
   it('keeps the changes-outside-the-repo block and skips the pointer when there is no PR', () => {

@@ -52,7 +52,7 @@ export async function runMiniogDossierWorkflow(params: {
       realName = info.user?.real_name || info.user?.profile?.real_name || undefined;
       tz = info.user?.tz || undefined;
       email = info.user?.profile?.email || undefined;
-      dossiers.firstSeen({ userId, displayName, realName, tz, email });
+      dossiers.firstSeen({ userId, displayName, realName, tz, email, title: info.user?.profile?.title || undefined });
     } catch (err) {
       logStep?.({
         stage: 'miniog.dossier.users_info_failed',
