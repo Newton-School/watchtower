@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { JobStore } from '../src/state/jobStore.js';
-import { __test__, formatDossierForPrompt } from '../src/state/dossierStore.js';
+import { inferRoleFromTitle, __test__, formatDossierForPrompt } from '../src/state/dossierStore.js';
 
 const { TtlLru } = __test__;
 
@@ -244,6 +244,56 @@ describe('dossier_cache_signals bridge (#284)', () => {
 
     const repeated = dossiers.getDossier('U_REPEAT');
     expect(repeated.profile?.role).toBe('pm'); // cache still trusted
+    store.close();
+  });
+});
+
+describe('a role from the Slack profile title (issue #601)', () => {
+  it('reads the common titles and says nothing for the rest', () => {
+    expect(inferRoleFromTitle('Product Manager')).toBe('pm');
+    expect(inferRoleFromTitle('Head of Product')).toBe('pm');
+    expect(inferRoleFromTitle('Senior Product Designer')).toBe('designer');
+    expect(inferRoleFromTitle('Software Engineer II')).toBe('dev');
+    expect(inferRoleFromTitle('Senior Product Engineer')).toBe('dev');
+    expect(inferRoleFromTitle('Data Engineer')).toBe('dev');
+    expect(inferRoleFromTitle('UX Engineer')).toBe('dev');
+    expect(inferRoleFromTitle('Frontend Lead')).toBe('dev');
+    expect(inferRoleFromTitle('Head of Technology')).toBe('dev');
+    expect(inferRoleFromTitle('Data Analyst')).toBe('analyst');
+    expect(inferRoleFromTitle('Admissions Counsellor')).toBe('ops');
+    expect(inferRoleFromTitle('Marketing Lead')).toBe('ops');
+    expect(inferRoleFromTitle('Engineering Recruiter')).toBe('ops');
+    expect(inferRoleFromTitle('Developer Marketing')).toBe('ops');
+    expect(inferRoleFromTitle('')).toBeUndefined();
+    expect(inferRoleFromTitle(undefined)).toBeUndefined();
+    expect(inferRoleFromTitle('Wizard')).toBeUndefined();
+    expect(inferRoleFromTitle('Team Lead')).toBeUndefined();
+  });
+
+  it('fills a role from the title, follows a changed title, and never touches one a person set or cleared', () => {
+    const store = makeStore();
+    const dossiers = store.dossierStore();
+
+    dossiers.firstSeen({ userId: 'UT1', displayName: 'maya', title: 'Product Manager' });
+    expect(dossiers.getDossier('UT1').profile?.role).toBe('pm');
+    expect(dossiers.getDossier('UT1').profile?.source).toBe('slack-title');
+
+    // The title changed: the inferred role follows it.
+    dossiers.firstSeen({ userId: 'UT1', displayName: 'maya', title: 'Software Engineer' });
+    expect(dossiers.getDossier('UT1').profile?.role).toBe('dev');
+
+    // A role a person set stays.
+    dossiers.setRole('UT1', 'designer');
+    dossiers.firstSeen({ userId: 'UT1', displayName: 'maya', title: 'Product Manager' });
+    expect(dossiers.getDossier('UT1').profile?.role).toBe('designer');
+
+    // A role a person cleared is not filled back in.
+    dossiers.forgetField('UT1', 'role');
+    dossiers.firstSeen({ userId: 'UT1', displayName: 'maya', title: 'Product Manager' });
+    expect(dossiers.getDossier('UT1').profile?.role ?? undefined).toBeUndefined();
+
+    dossiers.firstSeen({ userId: 'UT2', displayName: 'sam', title: 'Wizard' });
+    expect(dossiers.getDossier('UT2').profile?.role ?? undefined).toBeUndefined();
     store.close();
   });
 });

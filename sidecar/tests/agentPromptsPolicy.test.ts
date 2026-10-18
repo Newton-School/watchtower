@@ -135,3 +135,19 @@ describe('plan-mode planner prompt asks for a plan an approver can read (issue #
     expect(prompt).toContain('ONLY files this change edits');
   });
 });
+
+describe('the coder writes for two readers (issue #601)', () => {
+  it('asks for a plain requester summary beside the engineering one', () => {
+    const prompt = buildPromptForRole('coder', {
+      workflowIntent: 'IMPLEMENTATION',
+      task: { event: { channelId: 'C1', threadTs: '1.1', userId: 'U1', text: 'change the copy', eventTs: '1.1' } },
+      config: {},
+      repoPath: '/ws/repo',
+      threadContext: '',
+      previousSteps: [],
+      pipelineConfig: { agents: ['coder'] },
+    } as unknown as AgentContext);
+    expect(prompt).toContain('"requesterSummary": string');
+    expect(prompt).toContain('process ids, tooling, lint, git, dependency or sandbox details in it.');
+  });
+});
