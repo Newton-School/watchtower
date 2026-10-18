@@ -1664,6 +1664,16 @@ describe('a bare help request (suggestion 13)', () => {
     expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'router.help_gate' }));
   });
 
+  it('ignores a mention in passing', async () => {
+    const slack = makeSlack();
+    const passing = makeTask({ userId: 'UBUILDER', channelId: 'C-BUILD', text: '<@UOWNER1> cc <@UBOT1> help' });
+    passing.mentionReference = true;
+    routerPicks('CONVERSATIONAL');
+    await routeTask({ task: passing, config: makeConfig('enforce'), slack: slack as never, store: {} as never });
+    const texts = slack.chat.postMessage.mock.calls.map((call: unknown[]) => (call[0] as { text: string }).text);
+    expect(texts.some(text => text.startsWith("Here's what I can do"))).toBe(false);
+  });
+
   it('still tells someone who is not on the access list that they are not', async () => {
     const slack = makeSlack();
     const task = makeTask({ userId: 'USTRANGER', channelId: 'C-BUILD', text: '<@UBOT1> help' });

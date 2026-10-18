@@ -228,8 +228,16 @@ export async function routeTask(params: {
   } catch {
     // advisory: the router decides without it
   }
-  /** A bare "help": answered at once, for this person in this channel, with no model run. */
-  const helpRequested = task.mentionType === 'bot' && isHelpRequest(userMessage);
+  /**
+   * A bare "help", addressed to miniOG and not seeded by an exact-syntax or
+   * keyword gate: answered at once, for this person in this channel, with no
+   * model run. A mention in passing ("<@owner> cc <@miniOG> help") is not one.
+   */
+  const helpRequested =
+    task.mentionType === 'bot' &&
+    !task.mentionReference &&
+    !['DEV_ASSIST', 'MINIOG_DOSSIER', 'PR_REVIEW', 'WEBAPP_QA'].includes(task.intent) &&
+    isHelpRequest(userMessage);
   const routerShadow = helpRequested
     ? undefined
     : startRouterShadow({ task, userMessage, reviewedPrInThread, logStep, signal });
@@ -627,6 +635,7 @@ export async function routeTask(params: {
 
   await engage();
   if (helpRequested) {
+    if (signal?.aborted) return cancelledResult('CONVERSATIONAL');
     const text = buildHelpReply({
       config,
       userId: task.event.userId,
