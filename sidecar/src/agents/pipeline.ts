@@ -1568,6 +1568,9 @@ export async function runAgentPipeline(params: {
             outputSchemaPath: schemaPath,
             githubToken: ctx.githubToken,
             planMode,
+            // Every agent sees the thread's screenshots and PDFs. None did, so a
+            // coder shipped the wrong PDF and plans said "could not open" (#595).
+            imagePaths: ctx.imagePaths && ctx.imagePaths.length > 0 ? ctx.imagePaths : undefined,
             ...profile,
             // timeoutMs: perAgentTimeoutMs,
             onLog: logStep,
@@ -1889,6 +1892,7 @@ export async function runAgentPipeline(params: {
               prompt: coderPrompt,
               outputSchemaPath: coderSchemaPath,
               githubToken: ctx.githubToken,
+              imagePaths: ctx.imagePaths && ctx.imagePaths.length > 0 ? ctx.imagePaths : undefined,
               ...coderProfile,
               onLog: logStep,
               signal,

@@ -15,6 +15,7 @@ import { __infraRetry, connectionLostReply } from '../src/codex/infraRetry.js';
 import { runAgenticEntry } from '../src/agentic/agenticEntry.js';
 import { refreshSharedRepoToDefaultBranch } from '../src/workspaces/workspaceManager.js';
 import { __connectors, currentConnectors } from '../src/backends/connectors.js';
+import { collectThreadAttachments } from '../src/slack/threadAttachments.js';
 
 // Regression coverage for #348 RC2: when the planner concludes no code changes
 // are needed AND the request is not an operational action, the implementation
@@ -57,6 +58,10 @@ vi.mock('../src/backends/registry.js', () => ({
   getBackend: vi.fn().mockReturnValue({ supportsImages: () => false }),
 }));
 
+// The thread's attachments: none, unless a test says otherwise (issue #595).
+vi.mock('../src/slack/threadAttachments.js', () => ({
+  collectThreadAttachments: vi.fn(async () => ({ imagePaths: [], documentContext: '', unreadableNote: '' })),
+}));
 vi.mock('../src/router/repoClassifier.js', () => ({
   classifyRepo: vi.fn().mockReturnValue({ selectedRepo: 'newton-web', confidence: 0.9, uncertain: false }),
 }));
@@ -263,6 +268,27 @@ describe('implementationWorkflow — no code needed (#348 RC2)', () => {
       notifyDesktop: false,
       slackPosted: true,
     });
+  });
+
+  it("hands the thread's screenshots and PDFs to the planner (issue #595)", async () => {
+    // A plan written without the attached PDF assumed an old one, and it shipped to production.
+    vi.mocked(collectThreadAttachments).mockResolvedValueOnce({
+      imagePaths: ['/tmp/slack-files/F1-report.pdf', '/tmp/slack-files/F2-screen.png'],
+      documentContext: '',
+      unreadableNote: '',
+    } as never);
+    vi.mocked(runCodex).mockResolvedValue(plannerNoCodeResult());
+
+    await runImplementationWorkflow({
+      task: makeTask('<@UBOT1> add the banner using the attached report'),
+      config,
+      slack: makeSlack() as unknown as import('@slack/web-api').WebClient,
+    });
+
+    expect(vi.mocked(runCodex).mock.calls[0][0].imagePaths).toEqual([
+      '/tmp/slack-files/F1-report.pdf',
+      '/tmp/slack-files/F2-screen.png',
+    ]);
   });
 
   it('answers an informational ask via the INFORMATIONAL path instead of running the coder', async () => {

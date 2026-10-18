@@ -1179,6 +1179,60 @@ vi.mock('../src/slack/threadContext.js', () => ({
   assertThreadParentExists: vi.fn().mockResolvedValue(true),
 }));
 
+describe("the pipeline's agents see the thread's attachments (issue #595)", () => {
+  it('gives the coder, reviewer and verifier the screenshots and PDFs, and the coder again on a retry', async () => {
+    const ok = (parsedJson: Record<string, unknown>) =>
+      ({ ok: true, exitCode: 0, timedOut: false, stdout: '', stderr: '', lastMessage: '', parsedJson }) as any;
+    vi.mocked(runCodex)
+      .mockReset()
+      .mockResolvedValueOnce(ok({ status: 'done', summary: 'Added the banner.', prUrl: '' }))
+      .mockResolvedValueOnce(
+        ok({ approved: false, findings: [{ severity: 'high', category: 'c', message: 'Wrong PDF.' }] }),
+      )
+      .mockResolvedValueOnce(ok({ status: 'done', summary: 'Used the attached PDF.', prUrl: '' }))
+      .mockResolvedValueOnce(ok({ approved: true, findings: [] }))
+      .mockResolvedValueOnce(ok({ verified: true, testsPassed: true, requirementsMet: true, findings: [] }));
+    const files = ['/tmp/slack-files/F1-report.pdf'];
+    const ctx = makeContext({
+      workflowIntent: 'IMPLEMENTATION',
+      imagePaths: files,
+      pipelineConfig: makePipelineConfig({ agents: ['coder', 'reviewer', 'verifier'], maxRetryLoops: 1 }),
+    });
+
+    await runAgentPipeline({
+      ctx,
+      slack: { chat: { postMessage: vi.fn().mockResolvedValue({ ts: '1' }), update: vi.fn() } } as any,
+      logStep: vi.fn(),
+    });
+
+    expect(vi.mocked(runCodex).mock.calls.length).toBe(5);
+    for (const call of vi.mocked(runCodex).mock.calls) expect(call[0].imagePaths).toEqual(files);
+  });
+
+  it('passes nothing when the thread has no attachments', async () => {
+    vi.mocked(runCodex)
+      .mockReset()
+      .mockResolvedValue({
+        ok: true,
+        exitCode: 0,
+        timedOut: false,
+        stdout: '',
+        stderr: '',
+        lastMessage: '',
+        parsedJson: { approved: true, findings: [] },
+      } as any);
+    const ctx = makeContext({ pipelineConfig: makePipelineConfig({ agents: ['reviewer'] }) });
+
+    await runAgentPipeline({
+      ctx,
+      slack: { chat: { postMessage: vi.fn().mockResolvedValue({ ts: '1' }), update: vi.fn() } } as any,
+      logStep: vi.fn(),
+    });
+
+    expect(vi.mocked(runCodex).mock.calls[0][0].imagePaths).toBeUndefined();
+  });
+});
+
 describe('formatPlanMessage: the plan as the approver sees it (issue #437)', () => {
   const block = (behaviour: string, assumptions = 'none') =>
     [

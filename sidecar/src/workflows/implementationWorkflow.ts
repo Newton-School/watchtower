@@ -377,6 +377,8 @@ async function runApprovalLoop(input: {
   logStep?: WorkflowStepLogger;
   /** The job's abort signal: ends the approval wait and stops a revision run (issue #264). */
   signal?: AbortSignal;
+  /** The thread's screenshots and PDFs, for revisions too (issue #595). */
+  imagePaths?: string[];
 }): Promise<ApprovalLoopOutcome> {
   const {
     slack,
@@ -658,6 +660,7 @@ Return the JSON now.`;
           prompt: feedbackPrompt,
           outputSchemaPath: plannerSchemaPath,
           githubToken,
+          imagePaths: input.imagePaths,
           ...plannerProfile,
           // No per-agent timeoutMs — see investigationWorkflow.ts for rationale.
           // Outer abort signal remains the safety net.
@@ -1036,6 +1039,9 @@ async function runImplementationWorkflowBody(params: {
         outputSchemaPath: plannerPlanMode ? undefined : plannerSchemaPath,
         githubToken: ctx.githubToken,
         planMode: plannerPlanMode,
+        // The thread's screenshots and PDFs: a plan written without them
+        // shipped the wrong PDF to production (issue #595).
+        imagePaths: plannerCtx.imagePaths,
         ...plannerProfile,
         // No per-agent timeoutMs — see investigationWorkflow.ts for rationale.
         // The outer abort signal is the safety net, so it has to be passed:
@@ -1217,6 +1223,7 @@ async function runImplementationWorkflowBody(params: {
           ...(plannerSessionId ? { resumeSessionId: plannerSessionId } : {}),
           outputSchemaPath: plannerSchemaPath,
           githubToken: ctx.githubToken,
+          imagePaths: plannerCtx.imagePaths,
           ...plannerProfile,
           // No per-agent timeoutMs — see investigationWorkflow.ts for rationale.
           // Outer abort signal remains the safety net.
@@ -1693,6 +1700,7 @@ Write your response as a ready-to-post Slack message describing what you did.
       plannerBackend,
       workflowTimeoutMs,
       githubToken: ctx.githubToken,
+      imagePaths: ctx.imagePaths.length > 0 ? ctx.imagePaths : undefined,
       workflowIntent: task.intent === 'OWNER_AUTOPILOT' ? 'OWNER_AUTOPILOT' : 'IMPLEMENTATION',
       logStep,
       signal,
