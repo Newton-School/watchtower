@@ -172,8 +172,29 @@ interface PrReviewComment {
 }
 
 export type ReviewEvent = 'APPROVE' | 'REQUEST_CHANGES' | 'COMMENT';
-export type PrReviewSubmissionMode = 'inline' | 'summary_only' | 'skipped';
-export type PrReviewFallbackReason = 'missing_location' | 'github_rejected_comments' | 'no_token';
+/** `comment`: GitHub would not take a review, so the findings went in as a PR comment (issue #590). */
+export type PrReviewSubmissionMode = 'inline' | 'summary_only' | 'comment' | 'skipped';
+export type PrReviewFallbackReason = 'missing_location' | 'github_rejected_comments' | 'no_token' | 'pending_review';
+
+/** GitHub's 422 when the account already has an unsubmitted (PENDING) review on the PR. */
+const PENDING_REVIEW_RE = /one pending review per pull request/i;
+
+/** GitHub's own reason for refusing a request: the first entry of `errors`, else `message`. */
+export function githubRefusalReason(errorBody: string): string {
+  try {
+    const parsed = JSON.parse(errorBody) as { message?: unknown; errors?: unknown };
+    const first = Array.isArray(parsed.errors) ? parsed.errors[0] : undefined;
+    const fromErrors =
+      typeof first === 'string'
+        ? first
+        : first && typeof first === 'object' && typeof (first as { message?: unknown }).message === 'string'
+          ? (first as { message: string }).message
+          : '';
+    return fromErrors || (typeof parsed.message === 'string' ? parsed.message : '') || 'no reason given';
+  } catch {
+    return errorBody.slice(0, 160) || 'no reason given';
+  }
+}
 
 export interface SubmitPrReviewResult {
   submitted: boolean;
@@ -392,7 +413,7 @@ export async function submitPrReview(params: {
   type PostAttempt =
     | { kind: 'accepted' }
     | { kind: 'landed'; commentsPosted: number }
-    | { kind: 'rejected' }
+    | { kind: 'rejected'; githubReason: string }
     | { kind: 'not_landed'; reason: string }
     | { kind: 'unknown'; reason: string };
 
@@ -407,7 +428,7 @@ export async function submitPrReview(params: {
       logGithubRejection(logStep, labels.rejected, response.status, errorBody, errorContext);
       // Rate limited: refused before anything was processed.
       if (response.status === 429) return { kind: 'not_landed', reason: 'rate limited (HTTP 429)' };
-      if (response.status < 500) return { kind: 'rejected' };
+      if (response.status < 500) return { kind: 'rejected', githubReason: githubRefusalReason(errorBody) };
       reason = `HTTP ${response.status}`;
     } catch (error) {
       logGithubThrew(logStep, labels.threw, error, errorContext);
@@ -466,6 +487,8 @@ export async function submitPrReview(params: {
     submissionMode: 'skipped',
     fallbackReason,
     ...(attempt.kind === 'not_landed' || attempt.kind === 'unknown' ? { failureReason: attempt.reason } : {}),
+    // A refusal says why: it used to leave the thread with no reason at all (issue #590).
+    ...(attempt.kind === 'rejected' ? { failureReason: `GitHub refused it: ${attempt.githubReason}` } : {}),
     ...(attempt.kind === 'unknown' ? { unconfirmed: true } : {}),
   });
 
@@ -495,6 +518,61 @@ export async function submitPrReview(params: {
     };
   };
 
+  /**
+   * GitHub allows one pending review per person per PR. miniOG reviews as the
+   * owner's account, so an unsubmitted draft of theirs blocks every review,
+   * however often it is retried. The findings go in as a PR comment instead,
+   * and the thread is told how to clear the draft (issue #590).
+   */
+  const postAsComment = async (): Promise<SubmitPrReviewResult> => {
+    const inlineList =
+      inlineComments.length > 0
+        ? `\n\n**Inline findings** (posted here, not on the lines):\n${inlineComments
+            .map(
+              comment =>
+                `- \`${comment.path}:${comment.line}\` ${comment.body.split('\n').find(line => line.trim()) ?? ''}`,
+            )
+            .join('\n')}`
+        : '';
+    const body = `_This review is a comment because GitHub would not take a review: this account has an unsubmitted pending review on the PR._\n\n${summary}${inlineList}`;
+    try {
+      const response = await postReviewOnce(
+        `https://api.github.com/repos/${owner}/${repo}/issues/${pullNumber}/comments`,
+        githubToken,
+        { body },
+      );
+      if (response.ok) {
+        logStep?.({
+          level: 'WARN',
+          stage: 'pr_review.github_review.posted_as_comment',
+          message:
+            'GitHub refused the review (a pending review from this account is open on the PR); posted the findings as a PR comment.',
+          data: errorContext,
+        });
+        return {
+          submitted: true,
+          event,
+          attemptedComments,
+          commentsPosted: 0,
+          droppedOutsideDiff,
+          fileLevelAttempted: fileLevelFindings.length,
+          fileLevelPosted: 0,
+          submissionMode: 'comment',
+          fallbackReason: 'pending_review',
+        };
+      }
+      return notPosted({
+        kind: 'not_landed',
+        reason: `GitHub refused the review because this account has a pending review open on the PR, and posting it as a comment failed too (HTTP ${response.status})`,
+      });
+    } catch (error) {
+      return notPosted({
+        kind: 'not_landed',
+        reason: `GitHub refused the review because this account has a pending review open on the PR, and posting it as a comment failed too (${describeFailure(error)})`,
+      });
+    }
+  };
+
   const full = await postWithOneRetry(fullPayload, {
     rejected: 'review POST with inline comments',
     threw: 'review POST',
@@ -505,6 +583,10 @@ export async function submitPrReview(params: {
   }
   if (full.kind !== 'rejected') {
     return notPosted(full, missingLocationFallback);
+  }
+  // A pending review blocks the body-only retry just the same.
+  if (PENDING_REVIEW_RE.test(full.githubReason)) {
+    return postAsComment();
   }
 
   // GitHub refused the batch, which it does whole when one comment's anchor is
@@ -520,6 +602,9 @@ export async function submitPrReview(params: {
   });
   if (bodyOnly.kind === 'accepted' || bodyOnly.kind === 'landed') {
     return posted(0, 'summary_only', 'github_rejected_comments');
+  }
+  if (bodyOnly.kind === 'rejected' && PENDING_REVIEW_RE.test(bodyOnly.githubReason)) {
+    return postAsComment();
   }
   return notPosted(bodyOnly, 'github_rejected_comments');
 }

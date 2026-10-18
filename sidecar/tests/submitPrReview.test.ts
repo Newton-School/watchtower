@@ -295,6 +295,65 @@ describe('submitPrReview', () => {
     expect(retryBody.comments).toHaveLength(0);
   });
 
+  // Issue #590: a re-review was refused twice with "User can only have one
+  // pending review per pull request" (an unsubmitted draft on the same
+  // account), nothing reached GitHub, and the job still ended SUCCESS.
+  describe('when GitHub refuses the review', () => {
+    const PENDING = JSON.stringify({
+      message: 'Unprocessable Entity',
+      errors: ['User can only have one pending review per pull request'],
+      status: '422',
+    });
+    const submit = () =>
+      submitPrReview({
+        owner: 'Newton-School',
+        repo: 'newton-web',
+        pullNumber: 9303,
+        commitId: 'abc123',
+        findingsByRole: [{ role: 'security', findings: [baseFinding('high', 'src/auth.ts', 10)] }],
+        summary: 'Watchtower found 1 issue.',
+        githubToken: 'ghp_test',
+        diff: 'diff --git a/src/auth.ts b/src/auth.ts\n--- a/src/auth.ts\n+++ b/src/auth.ts\n@@ -8,3 +8,4 @@\n a\n b\n+c\n d\n',
+      } as any);
+
+    it('posts the findings as a PR comment when a pending review blocks it, without a pointless retry', async () => {
+      const gh = github({ posts: [new Response(PENDING, { status: 422 }), new Response('{}', { status: 201 })] });
+
+      const result = await submit();
+
+      expect(result).toMatchObject({ submitted: true, submissionMode: 'comment', fallbackReason: 'pending_review' });
+      const posts = gh.posts();
+      expect(posts).toHaveLength(2);
+      expect(posts[1].url).toBe('https://api.github.com/repos/Newton-School/newton-web/issues/9303/comments');
+      expect(posts[1].body.body).toContain('GitHub would not take a review');
+      expect(posts[1].body.body).toContain('Watchtower found 1 issue.');
+      expect(posts[1].body.body).toContain('`src/auth.ts:10`');
+    });
+
+    it('says GitHub refused it, and why, when posting the comment fails too', async () => {
+      github({ posts: [new Response(PENDING, { status: 422 }), new Response('nope', { status: 403 })] });
+
+      const result = await submit();
+
+      expect(result.submitted).toBe(false);
+      expect(result.failureReason).toContain('pending review open on the PR');
+      expect(result.failureReason).toContain('HTTP 403');
+    });
+
+    it("gives GitHub's reason for any other refusal, instead of none", async () => {
+      const refused = JSON.stringify({
+        message: 'Unprocessable Entity',
+        errors: ['Pull request review thread line must be part of the diff'],
+      });
+      github({ posts: [new Response(refused, { status: 422 }), new Response(refused, { status: 422 })] });
+
+      const result = await submit();
+
+      expect(result.submitted).toBe(false);
+      expect(result.failureReason).toBe('GitHub refused it: Pull request review thread line must be part of the diff');
+    });
+  });
+
   it('retries the body-only fallback once after a transient 5xx, once GitHub confirms it did not land', async () => {
     vi.useFakeTimers();
     try {
