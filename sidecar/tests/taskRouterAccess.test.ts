@@ -170,6 +170,16 @@ function makeTask(
   };
 }
 
+/** What was posted, minus the opening "what to expect" line a run starts with (issue #588). */
+function repliesOf(slack: { chat: { postMessage: { mock: { calls: unknown[][] } } } }): string[] {
+  return slack.chat.postMessage.mock.calls
+    .map(call => (call[0] as { text: string }).text)
+    .filter(text => !/^(On it\.|Sorry for the wait)/.test(text));
+}
+function expectNoReply(slack: { chat: { postMessage: { mock: { calls: unknown[][] } } } }): void {
+  expect(repliesOf(slack)).toEqual([]);
+}
+
 function makeSlack() {
   return {
     chat: {
@@ -358,7 +368,7 @@ describe('routeTask access control', () => {
 
     expect(result.status).toBe('SUCCESS');
     expect(runAgenticEntry).toHaveBeenCalledOnce();
-    expect(slack.chat.postMessage).not.toHaveBeenCalled();
+    expectNoReply(slack);
   });
 
   it('lets the owner DM miniOG regardless of group config', async () => {
@@ -378,7 +388,7 @@ describe('routeTask access control', () => {
     });
 
     expect(result.status).toBe('SUCCESS');
-    expect(slack.chat.postMessage).not.toHaveBeenCalled();
+    expectNoReply(slack);
   });
 
   it('blocks builders from deploy and lets the owner bypass', async () => {
@@ -638,7 +648,7 @@ describe('routeTask investigation resume gate', () => {
     expect(runImplementationWorkflow).not.toHaveBeenCalled();
     expect(runAgenticEntry).toHaveBeenCalledOnce();
     expect(runAgenticEntry).toHaveBeenCalledWith(expect.objectContaining({ mode: 'informational' }));
-    expect(slack.chat.postMessage).not.toHaveBeenCalled();
+    expectNoReply(slack);
     expect(logStep).toHaveBeenCalledWith(
       expect.objectContaining({
         stage: 'router.classify.override',
@@ -954,7 +964,7 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
       level: 'WARN',
       data: { error: 'router call failed (exit 1)' },
     });
-    expect(slack.chat.postMessage).not.toHaveBeenCalled();
+    expectNoReply(slack);
   });
 
   it('says it could not read the message when the router fails twice, and runs nothing (issue #440)', async () => {
@@ -1003,7 +1013,7 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
     const { result, slack } = await route('<@UBOT1> fix the login redirect', {}, { signal: controller.signal });
 
     expect(decideTool).toHaveBeenCalledTimes(1);
-    expect(slack.chat.postMessage).not.toHaveBeenCalled();
+    expectNoReply(slack);
     expect(result.status).toBe('FAILED');
   });
 
@@ -1016,7 +1026,7 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
     expect(stageLog(thrown.logStep, 'router.silent').message).toContain('Router returned NONE');
     // Two tries, then silence: a failure never makes miniOG speak into people's conversation.
     expect(decideTool).toHaveBeenCalledTimes(2);
-    expect(thrown.slack.chat.postMessage).not.toHaveBeenCalled();
+    expectNoReply(thrown.slack);
 
     routerSays('stay_silent');
     const silent = await route('<@UOWNER1> fyi the release went out', ownerMention);
@@ -1128,7 +1138,7 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
 
       nothingRan();
       expect(result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
-      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+      expectNoReply(slack);
     });
 
     it('never answers an owner mention with a question', async () => {
@@ -1140,7 +1150,7 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
       });
 
       expect(result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
-      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+      expectNoReply(slack);
     });
 
     it('gives a requester who would be denied the denial, not a question', async () => {
@@ -1165,7 +1175,7 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
       const { result, slack } = await route('<@UBOT1> check now', builder, { ...enforce(), signal: controller.signal });
 
       expect(result.status).toBe('CANCELLED');
-      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+      expectNoReply(slack);
     });
 
     it('leaves a question unparked when another job is already parked in the thread', async () => {
@@ -1193,7 +1203,7 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
       const { result, slack } = await route(text, inPassing, { config: makeConfig('enforce') });
 
       expect(result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
-      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+      expectNoReply(slack);
       expect(runAgenticPrReview).not.toHaveBeenCalled();
       expect(decideTool.mock.calls[0][0].facts.addressing).toBe('reference');
     });
@@ -1212,12 +1222,12 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
       routerSays('ask_user', 0.8, { question: 'What do you need?' });
       const asked = await route('cc: <@UBOT1>', inPassing, { config: makeConfig('enforce') });
       expect(asked.result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
-      expect(asked.slack.chat.postMessage).not.toHaveBeenCalled();
+      expectNoReply(asked.slack);
 
       decideTool.mockResolvedValue({ ok: false, error: 'router call failed (exit 1)', durationMs: 3 });
       const failed = await route('cc: <@UBOT1>', inPassing, { config: makeConfig('enforce') });
       expect(failed.result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
-      expect(failed.slack.chat.postMessage).not.toHaveBeenCalled();
+      expectNoReply(failed.slack);
     });
 
     // A message that mentions miniOG in passing is seeded as a change request
@@ -1235,7 +1245,7 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
       expect(runImplementationWorkflow).not.toHaveBeenCalled();
       expect(runAgenticPrReview).not.toHaveBeenCalled();
       expect(result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
-      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+      expectNoReply(slack);
       expect(stageLog(logStep, 'router.classify.low_confidence_hold')).toBeUndefined();
       expect(stageLog(logStep, 'router.unsure_in_passing').data).toMatchObject({ tool, confidence });
     });
@@ -1325,7 +1335,7 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
         requesterDenyReason: 'CHANNEL_NOT_ENABLED',
         inherited: false,
       });
-      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+      expectNoReply(slack);
       expect(onEngage).toHaveBeenCalledOnce();
     });
 
@@ -1337,7 +1347,7 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
 
       expect(result).toMatchObject({ status: 'SKIPPED', slackPosted: false });
       expect(runAgenticEntry).not.toHaveBeenCalled();
-      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+      expectNoReply(slack);
       expect(onEngage).not.toHaveBeenCalled();
       expect(stageLog(logStep, 'access.owner_tag.silent_deny').data).toMatchObject({ reason: 'guest' });
     });
@@ -1358,7 +1368,7 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
 
       expect(result).toMatchObject({ status: 'SKIPPED', slackPosted: false });
       expect(decideTool).not.toHaveBeenCalled();
-      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+      expectNoReply(slack);
       expect(onEngage).not.toHaveBeenCalled();
       expect(stageLog(logStep, 'router.owner_tag.stand_down').data).toMatchObject({ ownerId: 'UOWNER1' });
     });
@@ -1370,7 +1380,7 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
       const { result, slack } = await route(text, tagger, { config: enforce, deps: member, onEngage });
 
       expect(result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
-      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+      expectNoReply(slack);
       expect(onEngage).not.toHaveBeenCalled();
     });
 
@@ -1405,7 +1415,7 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
 
       expect(runImplementationWorkflow).toHaveBeenCalledOnce();
       expect(stageLog(answered.logStep, 'access.owner_delegated').data).toMatchObject({ inherited: true });
-      expect(answered.slack.chat.postMessage).not.toHaveBeenCalled();
+      expectNoReply(answered.slack);
     });
 
     it('does not change a direct mention: the same person gets the access error', async () => {
@@ -1505,7 +1515,7 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
 
       expect(result.status).toBe('SKIPPED');
       expect(runImplementationWorkflow).not.toHaveBeenCalled();
-      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+      expectNoReply(slack);
     });
 
     it('runs a review the gate seeded without waiting on the router', async () => {
@@ -1581,7 +1591,7 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
 
       expect(runDeployWorkflow).not.toHaveBeenCalled();
       expect(result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
-      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+      expectNoReply(slack);
     });
 
     it('is never started from a reply to a question miniOG asked', async () => {
@@ -1644,5 +1654,165 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
 
     expect(result.status).toBe('SKIPPED');
     expect(runImplementationWorkflow).not.toHaveBeenCalled();
+  });
+});
+
+describe('the opening line (issue #588)', () => {
+  const recent = () => String((Date.now() - 20_000) / 1000);
+  const late = () => String((Date.now() - 25 * 60_000) / 1000);
+  const pr = (source: 'trigger' | 'thread') =>
+    ({
+      owner: 'Newton-School',
+      repo: 'newton-web',
+      number: 1,
+      url: 'https://github.com/Newton-School/newton-web/pull/1',
+      source,
+    }) as never;
+  const lookup = (eventTs: string) => {
+    const task = makeTask({ userId: 'UOWNER1', channelId: 'C-BUILD', text: '<@UBOT1> how does XP work?' });
+    task.event.eventTs = eventTs;
+    return task;
+  };
+
+  it('says what to expect before a lookup runs', async () => {
+    const slack = makeSlack();
+    const logStep = vi.fn();
+    routerPicks('INFORMATIONAL');
+
+    await routeTask({
+      task: lookup(recent()),
+      config: makeConfig('enforce'),
+      slack: slack as never,
+      store: {} as never,
+      logStep,
+    });
+
+    expect(slack.chat.postMessage).toHaveBeenCalledTimes(1);
+    expect(slack.chat.postMessage.mock.calls[0][0].text).toBe(
+      'On it. A lookup like this usually takes a couple of minutes.',
+    );
+    expect(runAgenticEntry).toHaveBeenCalledOnce();
+    expect(logStep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stage: 'job.pickup_delay',
+        data: expect.objectContaining({ pickupDelayMs: expect.any(Number) }),
+      }),
+    );
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'job.acknowledged' }));
+  });
+
+  it('says it is late when the pickup was', async () => {
+    const slack = makeSlack();
+    routerPicks('INFORMATIONAL');
+
+    await routeTask({ task: lookup(late()), config: makeConfig('enforce'), slack: slack as never, store: {} as never });
+
+    expect(slack.chat.postMessage.mock.calls[0][0].text).toBe(
+      "Sorry for the wait: I'm only picking this up 25 min after you sent it. On it. A lookup like this usually takes a couple of minutes.",
+    );
+  });
+
+  it('does not apologise for a desktop retrigger or a restart re-run, whose event time is old by design', async () => {
+    routerPicks('INFORMATIONAL');
+    for (const shape of [{ ingestSource: 'launchpad' as const }, { eventId: 'restart:job-1' }]) {
+      const slack = makeSlack();
+      const task = lookup(late());
+      task.event = { ...task.event, ...shape };
+      await routeTask({ task, config: makeConfig('enforce'), slack: slack as never, store: {} as never });
+      expect(slack.chat.postMessage.mock.calls[0][0].text).toBe(
+        'On it. A lookup like this usually takes a couple of minutes.',
+      );
+    }
+  });
+
+  it('posts no opening line once the job is cancelled', async () => {
+    const slack = makeSlack();
+    routerPicks('INFORMATIONAL');
+    const controller = new AbortController();
+    controller.abort();
+    await routeTask({
+      task: lookup(recent()),
+      config: makeConfig('enforce'),
+      slack: slack as never,
+      store: {} as never,
+      signal: controller.signal,
+    });
+    expect(slack.chat.postMessage).not.toHaveBeenCalled();
+  });
+
+  it('posts only the apology before a review, which opens with its own line', async () => {
+    const slack = makeSlack();
+    routerPicks('PR_REVIEW');
+    const task = makeTask({
+      userId: 'UOWNER1',
+      channelId: 'C-BUILD',
+      text: '<@UBOT1> review <https://github.com/Newton-School/newton-web/pull/1>',
+      intent: 'PR_REVIEW',
+      prContext: pr('trigger'),
+    });
+    task.event.eventTs = late();
+
+    await routeTask({ task, config: makeConfig('enforce'), slack: slack as never, store: {} as never });
+
+    expect(slack.chat.postMessage).toHaveBeenCalledTimes(1);
+    expect(slack.chat.postMessage.mock.calls[0][0].text).toBe(
+      "Sorry for the wait: I'm only picking this up 25 min after you sent it.",
+    );
+  });
+
+  it('posts nothing before a chat or a prompt review', async () => {
+    const slack = makeSlack();
+    routerPicks('CONVERSATIONAL');
+    const chat = makeTask({ userId: 'UOWNER1', channelId: 'C-BUILD', text: '<@UBOT1> thanks!' });
+    chat.event.eventTs = recent();
+    await routeTask({ task: chat, config: makeConfig('enforce'), slack: slack as never, store: {} as never });
+    expect(slack.chat.postMessage).not.toHaveBeenCalled();
+
+    routerPicks('PR_REVIEW');
+    const review = makeTask({
+      userId: 'UOWNER1',
+      channelId: 'C-BUILD',
+      text: '<@UBOT1> review <https://github.com/Newton-School/newton-web/pull/1>',
+      intent: 'PR_REVIEW',
+      prContext: pr('trigger'),
+    });
+    review.event.eventTs = recent();
+    await routeTask({ task: review, config: makeConfig('enforce'), slack: slack as never, store: {} as never });
+    expect(slack.chat.postMessage).not.toHaveBeenCalled();
+  });
+
+  it('does not promise a plan for a change request about a PR named in the message', async () => {
+    const slack = makeSlack();
+    routerPicks('IMPLEMENTATION');
+    const task = makeTask({
+      userId: 'UOWNER1',
+      channelId: 'C-BUILD',
+      text: '<@UBOT1> merge <https://github.com/Newton-School/newton-web/pull/1>',
+      intent: 'IMPLEMENTATION',
+      prContext: pr('trigger'),
+    });
+    task.event.eventTs = recent();
+
+    await routeTask({ task, config: makeConfig('enforce'), slack: slack as never, store: {} as never });
+
+    expect(slack.chat.postMessage).not.toHaveBeenCalled();
+    expect(runImplementationWorkflow).toHaveBeenCalledOnce();
+  });
+
+  it('still promises a plan when the only PR link is earlier in the thread', async () => {
+    const slack = makeSlack();
+    routerPicks('IMPLEMENTATION');
+    const task = makeTask({
+      userId: 'UOWNER1',
+      channelId: 'C-BUILD',
+      text: '<@UBOT1> also fix the empty-state copy',
+      intent: 'IMPLEMENTATION',
+    });
+    task.prContexts = [pr('thread')];
+    task.event.eventTs = recent();
+
+    await routeTask({ task, config: makeConfig('enforce'), slack: slack as never, store: {} as never });
+
+    expect(slack.chat.postMessage.mock.calls[0][0].text).toContain('post a plan for approval');
   });
 });

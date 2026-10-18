@@ -43,6 +43,11 @@ export interface ToolSpec {
   routerSelectable: boolean;
   /** One line for the router: when this is the right tool. */
   description: string;
+  /**
+   * What the requester reads when the tool starts: how long it usually takes
+   * (issue #588). Absent for a tool that answers at once or opens with its own line.
+   */
+  expectation?: string;
 }
 
 export const TOOLS: readonly ToolSpec[] = [
@@ -65,6 +70,8 @@ export const TOOLS: readonly ToolSpec[] = [
     irreversible: false,
     routerSelectable: true,
     description: 'Build, change or fix something in a repository, through a plan an admin approves.',
+    expectation:
+      "On it. I'll post a plan for approval in a few minutes; the change itself usually takes under an hour after that.",
   },
   {
     id: 'investigate',
@@ -85,6 +92,7 @@ export const TOOLS: readonly ToolSpec[] = [
     irreversible: false,
     routerSelectable: true,
     description: 'Answer a question by reading the code and the data. Read-only.',
+    expectation: 'On it. A lookup like this usually takes a couple of minutes.',
   },
   {
     id: 'chat',
@@ -106,6 +114,7 @@ export const TOOLS: readonly ToolSpec[] = [
     irreversible: false,
     routerSelectable: false,
     description: 'Test a running web app, or a pull request, in a browser and report what was found.',
+    expectation: 'On it. A browser check usually takes five to ten minutes.',
   },
   {
     id: 'deploy',
