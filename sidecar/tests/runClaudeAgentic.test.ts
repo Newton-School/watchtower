@@ -30,9 +30,9 @@ describe('runClaudeAgentic tier/effort resolution (live claude-code backend)', (
     runCodex.mockResolvedValue(okResult());
   });
 
-  it('defaults to the high tier at its own effort (opus @ xhigh)', async () => {
+  it('defaults to the high tier at its own effort (opus @ high)', async () => {
     await runClaudeAgentic({ systemPrompt: 's', userMessage: 'u', cwd: '/tmp' });
-    expect(runCodex.mock.calls[0][0]).toMatchObject({ model: 'claude-opus-5-5', reasoningEffort: 'xhigh' });
+    expect(runCodex.mock.calls[0][0]).toMatchObject({ model: 'claude-opus-5-5', reasoningEffort: 'high' });
   });
 
   it('effort override keeps the tier model and dials only effort', async () => {

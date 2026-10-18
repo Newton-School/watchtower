@@ -21,27 +21,32 @@ describe('modelProfiles — claude-code column (live backend)', () => {
     });
   });
 
-  it('highReasoning tier is opus at xhigh effort', () => {
+  it('highReasoning tier is opus at high effort', () => {
     expect(highReasoningProfile('claude-code')).toEqual({
       model: 'claude-opus-5-5',
-      reasoningEffort: 'xhigh',
+      reasoningEffort: 'high',
     });
   });
 
-  it('planner override runs opus at xhigh, not max', () => {
+  it('planner override runs opus on the high tier, not max', () => {
     expect(profileForAgentRole('planner', 'claude-code')).toEqual({
       model: 'claude-opus-5-5',
-      reasoningEffort: 'xhigh',
+      reasoningEffort: 'high',
     });
   });
 
-  it('coder/reviewer/security resolve to the high tier; performance/verifier to the light tier', () => {
+  it('verifier runs sonnet at medium, so it actually runs the checks', () => {
+    expect(profileForAgentRole('verifier', 'claude-code')).toEqual({
+      model: 'claude-sonnet-5-5',
+      reasoningEffort: 'medium',
+    });
+  });
+
+  it('coder/reviewer/security resolve to the high tier; performance to the light tier', () => {
     for (const role of ['coder', 'reviewer', 'security'] as const) {
       expect(profileForAgentRole(role, 'claude-code')).toEqual(highReasoningProfile('claude-code'));
     }
-    for (const role of ['performance', 'verifier'] as const) {
-      expect(profileForAgentRole(role, 'claude-code')).toEqual(lightweightProfile('claude-code'));
-    }
+    expect(profileForAgentRole('performance', 'claude-code')).toEqual(lightweightProfile('claude-code'));
   });
 });
 
@@ -77,6 +82,23 @@ describe('modelProfiles — every producible model has a price entry', () => {
       cacheCreatePer1k: 0.005,
     });
     expect(getModelPricing('claude-sonnet-5-5')).toEqual({
+      inputPer1k: 0.002,
+      outputPer1k: 0.01,
+      cacheReadPer1k: 0.0002,
+      cacheCreatePer1k: 0.0025,
+    });
+  });
+
+  // The documented rollback (WATCHTOWER_CLAUDE_* back to the 5.0 ids) must
+  // still record correct cost.
+  it('rollback-tier prices match Anthropic list pricing', () => {
+    expect(getModelPricing('claude-opus-5')).toEqual({
+      inputPer1k: 0.005,
+      outputPer1k: 0.025,
+      cacheReadPer1k: 0.0005,
+      cacheCreatePer1k: 0.00625,
+    });
+    expect(getModelPricing('claude-sonnet-5')).toEqual({
       inputPer1k: 0.002,
       outputPer1k: 0.01,
       cacheReadPer1k: 0.0002,

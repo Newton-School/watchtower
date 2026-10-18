@@ -42,9 +42,13 @@ const BACKEND_PROFILES: Record<AgentBackendId, BackendProfileTable> = {
       model: CLAUDE_LIGHTWEIGHT_MODEL,
       reasoningEffort: 'low',
     },
+    // high, not xhigh: Opus 5.5 thinks more per turn than Opus 5 at the same
+    // level (most at xhigh), and Anthropic measured Opus 5.5 at medium above
+    // Opus 5 at high — so this keeps Opus 5 @ xhigh quality without longer
+    // turns on the uncapped planner/investigator runs.
     highReasoning: {
       model: CLAUDE_HIGH_REASONING_MODEL,
-      reasoningEffort: 'xhigh',
+      reasoningEffort: 'high',
     },
   },
 };
@@ -61,12 +65,18 @@ const ROLE_TIER: Record<AgentRole, 'lightweight' | 'highReasoning'> = {
 export function profileForAgentRole(role: AgentRole, backendId: AgentBackendId): CodexExecutionProfile {
   const backend = backendId;
   if (role === 'planner' && backend === 'claude-code') {
-    // xhigh, not max: max is prone to overthinking with diminishing returns on
-    // Opus 5, and this is the least-bounded call in the system (no timeout,
+    // The high tier, never max: max is prone to overthinking with diminishing
+    // returns, and this is the least-bounded call in the system (no timeout,
     // up to 3 runs per job). See docs/model-effort-audit.md.
+    return BACKEND_PROFILES[backend].highReasoning;
+  }
+  if (role === 'verifier' && backend === 'claude-code') {
+    // medium, not the tier's low: at low Sonnet 5.5 often reports a change as
+    // checked without running the tests or build, and this is the last gate
+    // before a PR opens.
     return {
-      model: CLAUDE_HIGH_REASONING_MODEL,
-      reasoningEffort: 'xhigh',
+      model: CLAUDE_LIGHTWEIGHT_MODEL,
+      reasoningEffort: 'medium',
     };
   }
   const tier = ROLE_TIER[role];
