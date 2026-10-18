@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { JobStore } from '../src/state/jobStore.js';
-import { __test__, formatDossierForPrompt } from '../src/state/dossierStore.js';
+import { inferRoleFromTitle, __test__, formatDossierForPrompt } from '../src/state/dossierStore.js';
 
 const { TtlLru } = __test__;
 
@@ -245,5 +245,34 @@ describe('dossier_cache_signals bridge (#284)', () => {
     const repeated = dossiers.getDossier('U_REPEAT');
     expect(repeated.profile?.role).toBe('pm'); // cache still trusted
     store.close();
+  });
+});
+
+describe('a role from the Slack profile title (issue #601)', () => {
+  it('reads the common titles and says nothing for the rest', () => {
+    expect(inferRoleFromTitle('Product Manager')).toBe('pm');
+    expect(inferRoleFromTitle('Senior Product Designer')).toBe('designer');
+    expect(inferRoleFromTitle('Software Engineer II')).toBe('dev');
+    expect(inferRoleFromTitle('Data Analyst')).toBe('analyst');
+    expect(inferRoleFromTitle('Admissions Counsellor')).toBe('ops');
+    expect(inferRoleFromTitle('Marketing Lead')).toBe('ops');
+    expect(inferRoleFromTitle('')).toBeUndefined();
+    expect(inferRoleFromTitle(undefined)).toBeUndefined();
+    expect(inferRoleFromTitle('Wizard')).toBeUndefined();
+  });
+
+  it('fills a blank role on first sight and never changes one a person set', () => {
+    const dossiers = makeStore().dossierStore();
+
+    dossiers.firstSeen({ userId: 'UT1', displayName: 'maya', title: 'Product Manager' });
+    expect(dossiers.getDossier('UT1').profile?.role).toBe('pm');
+    expect(dossiers.getDossier('UT1').profile?.source).toBe('slack-title');
+
+    dossiers.setRole('UT1', 'designer');
+    dossiers.firstSeen({ userId: 'UT1', displayName: 'maya', title: 'Product Manager' });
+    expect(dossiers.getDossier('UT1').profile?.role).toBe('designer');
+
+    dossiers.firstSeen({ userId: 'UT2', displayName: 'sam', title: 'Wizard' });
+    expect(dossiers.getDossier('UT2').profile?.role ?? undefined).toBeUndefined();
   });
 });

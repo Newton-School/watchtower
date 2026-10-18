@@ -190,13 +190,19 @@ Requirements:
    that. Report every such change in "externalChanges": the system, what you changed (names, ids), what
    changed, and how you checked it took effect. When the plan's whole change is outside the repository,
    there is nothing to commit and no PR to open: say so in the summary.
+9. Write for two readers. "summary" is the engineering account, for the PR and the reviewers: what
+   changed and why, how you checked it, and anything an admin has to do. "requesterSummary" is for the
+   person who asked, who may not be an engineer: two or three plain sentences saying what changed and
+   where (the page, section or URL they named), and anything they must do or check. No commands,
+   process ids, tooling, lint, git, dependency or sandbox details in it. Put those in the PR description.
 
 Return strict JSON:
 {
   "status": string,        // "done" once you've implemented the change, or "blocked" per requirement 7
   "blockedReason": string, // required when status is "blocked": what you need, phrased as a question. "" otherwise
   "filesChanged": string[],
-  "summary": string,
+  "summary": string,       // the engineering account, per requirement 9
+  "requesterSummary": string, // two or three plain sentences for the person who asked, per requirement 9
   "testsAdded": string[],
   "branch": string,
   "prUrl": string,         // URL of the PR you created (empty string if PR creation failed)

@@ -1,6 +1,7 @@
 import path from 'node:path';
 import type { WebClient } from '@slack/web-api';
 import type {
+  DossierRole,
   AppConfig,
   CodexRunRequest,
   CodexRunResult,
@@ -11,6 +12,7 @@ import type {
   WorkflowStepLogger,
 } from '../types/contracts.js';
 import { formatAdminMention, getAdminUserIds } from '../access/control.js';
+import { composeChangeReply, requesterIsEngineer } from './shared/changeReply.js';
 import { connectorsFor, withConnectors } from '../backends/connectors.js';
 import { runCodex, getActiveBackendId, selectBackendForUser } from '../codex/runCodex.js';
 import { connectionLostReply, killedFromOutsideReply, runWithInfraRetry } from '../codex/infraRetry.js';
@@ -2101,6 +2103,26 @@ Write your response as a ready-to-post Slack message describing what you did.
     const rawCoderSummary = coderStep?.output?.summary ? sanitizeOwnerSummary(String(coderStep.output.summary)) : '';
     const summary =
       rawCoderSummary || 'Pipeline completed but the agent did not return a summary. Check the repo for changes.';
+    // The person who asked reads two or three plain lines unless they are an
+    // engineer; the engineering account goes to the PR (issue #601).
+    const requesterSummary = coderStep?.output?.requesterSummary
+      ? sanitizeOwnerSummary(String(coderStep.output.requesterSummary))
+      : '';
+    const requesterUserId = task.event.requestedForUserId ?? task.event.userId;
+    let requesterRole: DossierRole | undefined;
+    try {
+      requesterRole = store?.dossierStore?.().getDossier(requesterUserId).profile?.role;
+    } catch {
+      // A dossier read must not decide whether the run reports.
+    }
+    const engineerReads = requesterIsEngineer({
+      userId: requesterUserId,
+      isOwnerAuthor: task.isOwnerAuthor,
+      config,
+      role: requesterRole,
+    });
+    const replyFor = (prUrlForReply: string, external: string): string =>
+      composeChangeReply({ summary, requesterSummary, engineerReads, prUrl: prUrlForReply, externalBlock: external });
 
     let prUrl = coderStep?.output?.prUrl ? String(coderStep.output.prUrl) : '';
     const externalBlock = fullResult.externalChanges?.length
@@ -2119,7 +2141,7 @@ Write your response as a ready-to-post Slack message describing what you did.
       await slack.chat.postMessage({
         channel: task.event.channelId,
         thread_ts: task.event.threadTs,
-        text: `${summary}${externalBlock}\n\nNo pull request: nothing in the repository changed.`,
+        text: `${replyFor('', externalBlock)}\n\nNo pull request: nothing in the repository changed.`,
       });
       return {
         workflow: 'IMPLEMENTATION',
@@ -2177,12 +2199,10 @@ Write your response as a ready-to-post Slack message describing what you did.
         })) ?? '';
     }
 
-    const prBlock = prUrl ? `\n${prUrl}` : '';
-
     await slack.chat.postMessage({
       channel: task.event.channelId,
       thread_ts: task.event.threadTs,
-      text: `${summary}${prBlock}${externalBlock}`.trim(),
+      text: replyFor(prUrl, externalBlock),
     });
 
     return {

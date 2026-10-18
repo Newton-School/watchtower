@@ -308,6 +308,7 @@ export async function prepareWorkflowContext(params: {
           realName: userInfo.user?.real_name || userInfo.user?.profile?.real_name || undefined,
           tz: userInfo.user?.tz || undefined,
           email: userInfo.user?.profile?.email || undefined,
+          title: userInfo.user?.profile?.title || undefined,
         });
       } catch (err) {
         logStep?.({

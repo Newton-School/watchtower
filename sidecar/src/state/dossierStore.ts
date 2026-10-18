@@ -137,8 +137,38 @@ export const PINNED_FACT_MAX_CHARS = 280;
 /** Per-user cap; on overflow, oldest is rotated out. */
 export const PINNED_FACT_USER_CAP = 50;
 
+/**
+ * A role read off a Slack profile title (issue #601). Only ever fills a blank:
+ * a role someone set by hand is never changed by it. `undefined` when the
+ * title says nothing a reply should adapt to.
+ */
+export function inferRoleFromTitle(title: string | undefined | null): DossierRole | undefined {
+  const text = (title ?? '').toLowerCase();
+  if (!text.trim()) return undefined;
+  if (/\b(designer|design|ux|ui)\b/.test(text)) return 'designer';
+  if (/\b(product manager|product|program manager|pm|apm)\b/.test(text)) return 'pm';
+  if (/\b(analyst|analytics|data scientist|data|insights|growth)\b/.test(text)) return 'analyst';
+  if (/\b(engineer|engineering|developer|dev|sde|swe|programmer|architect|cto|tech lead|devops|sre|qa)\b/.test(text))
+    return 'dev';
+  if (
+    /\b(operations|ops|success|support|admissions?|counsell?or|placement|marketing|academic|manager|lead|head)\b/.test(
+      text,
+    )
+  )
+    return 'ops';
+  return undefined;
+}
+
 export interface DossierStore {
-  firstSeen(input: { userId: string; displayName?: string; realName?: string; tz?: string; email?: string }): void;
+  firstSeen(input: {
+    userId: string;
+    displayName?: string;
+    realName?: string;
+    tz?: string;
+    email?: string;
+    /** The Slack profile title; fills the role when none is set (issue #601). */
+    title?: string;
+  }): void;
   getDossier(userId: string): UserDossier;
   setRole(userId: string, role: DossierRole): void;
   setTone(userId: string, mode: PersonalityMode, source: string): void;
@@ -210,6 +240,14 @@ export function createDossierStore(db: Database.Database): DossierStore {
          email = COALESCE(@email, email),
          updated_at = @now
      WHERE user_id = @userId AND updated_at < @staleBefore`,
+  );
+
+  // Fills a blank role from the Slack title. A role set by a person (set-role,
+  // admin-edit, slack-remember) is never touched: the WHERE keeps it.
+  const fillRoleFromTitle = db.prepare(
+    `UPDATE user_dossiers
+     SET role = @role, source = 'slack-title', updated_at = @now
+     WHERE user_id = @userId AND role IS NULL`,
   );
 
   const selectProfile = db.prepare(
@@ -601,6 +639,8 @@ export function createDossierStore(db: Database.Database): DossierStore {
       insertProfile.run(params);
       const staleBefore = new Date(Date.now() - PROFILE_REFRESH_MS).toISOString();
       refreshProfile.run({ ...params, staleBefore });
+      const inferredRole = inferRoleFromTitle(input.title);
+      if (inferredRole) fillRoleFromTitle.run({ userId: input.userId, role: inferredRole, now });
       cache.invalidate(input.userId);
       scheduleVaultRender({ kind: 'user', userId: input.userId });
     },
