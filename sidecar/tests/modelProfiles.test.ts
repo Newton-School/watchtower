@@ -16,21 +16,21 @@ import type { AgentBackendId } from '../src/backends/types.js';
 describe('modelProfiles — claude-code column (live backend)', () => {
   it('lightweight tier is sonnet at low effort', () => {
     expect(lightweightProfile('claude-code')).toEqual({
-      model: 'claude-sonnet-5',
+      model: 'claude-sonnet-5-5',
       reasoningEffort: 'low',
     });
   });
 
   it('highReasoning tier is opus at xhigh effort', () => {
     expect(highReasoningProfile('claude-code')).toEqual({
-      model: 'claude-opus-5',
+      model: 'claude-opus-5-5',
       reasoningEffort: 'xhigh',
     });
   });
 
   it('planner override runs opus at xhigh, not max', () => {
     expect(profileForAgentRole('planner', 'claude-code')).toEqual({
-      model: 'claude-opus-5',
+      model: 'claude-opus-5-5',
       reasoningEffort: 'xhigh',
     });
   });
@@ -70,17 +70,17 @@ describe('modelProfiles — every producible model has a price entry', () => {
   // Pin the actual rates for the live tier so a fat-fingered decimal fails the
   // build — cost telemetry is computed from these on 99.6% of rows.
   it('live-tier prices match Anthropic list pricing', () => {
-    expect(getModelPricing('claude-opus-5')).toEqual({
-      inputPer1k: 0.005,
-      outputPer1k: 0.025,
-      cacheReadPer1k: 0.0005,
-      cacheCreatePer1k: 0.00625,
+    expect(getModelPricing('claude-opus-5-5')).toEqual({
+      inputPer1k: 0.004,
+      outputPer1k: 0.02,
+      cacheReadPer1k: 0.0002,
+      cacheCreatePer1k: 0.005,
     });
-    expect(getModelPricing('claude-sonnet-5')).toEqual({
-      inputPer1k: 0.003,
-      outputPer1k: 0.015,
-      cacheReadPer1k: 0.0003,
-      cacheCreatePer1k: 0.00375,
+    expect(getModelPricing('claude-sonnet-5-5')).toEqual({
+      inputPer1k: 0.002,
+      outputPer1k: 0.01,
+      cacheReadPer1k: 0.0002,
+      cacheCreatePer1k: 0.0025,
     });
   });
 });

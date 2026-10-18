@@ -508,10 +508,10 @@ export const claudeCodeBackend: AgentBackend = {
   },
 
   availableModels(): string[] {
-    return ['claude-sonnet-5', 'claude-opus-5'];
+    return ['claude-sonnet-5-5', 'claude-opus-5-5'];
   },
 
   defaultModel(): string {
-    return 'claude-sonnet-5';
+    return 'claude-sonnet-5-5';
   },
 };

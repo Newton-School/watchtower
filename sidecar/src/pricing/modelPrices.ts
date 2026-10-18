@@ -14,6 +14,19 @@ export interface ModelPricing {
 
 const PRICES: Record<string, ModelPricing> = {
   // Anthropic Claude
+  'claude-opus-5-5': {
+    inputPer1k: 0.004,
+    outputPer1k: 0.02,
+    cacheReadPer1k: 0.0002,
+    cacheCreatePer1k: 0.005,
+  },
+  'claude-sonnet-5-5': {
+    inputPer1k: 0.002,
+    outputPer1k: 0.01,
+    cacheReadPer1k: 0.0002,
+    cacheCreatePer1k: 0.0025,
+  },
+  // Previous live tier — kept so historical rows and env overrides still price.
   'claude-opus-5': {
     inputPer1k: 0.005,
     outputPer1k: 0.025,

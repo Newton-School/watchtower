@@ -35,6 +35,6 @@ describe('claude-code model env overrides', () => {
     vi.resetModules();
     const m = await import('../src/codex/modelProfiles.js');
 
-    expect(m.highReasoningProfile('claude-code').model).toBe('claude-opus-5');
+    expect(m.highReasoningProfile('claude-code').model).toBe('claude-opus-5-5');
   });
 });

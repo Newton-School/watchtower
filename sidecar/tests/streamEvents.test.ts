@@ -111,7 +111,7 @@ describe('createStreamDecoder — claude-code', () => {
       `${JSON.stringify({
         type: 'system',
         subtype: 'init',
-        model: 'claude-opus-5',
+        model: 'claude-opus-5-5',
         tools: ['Read', 'Bash'],
         skills: ['dataviz'],
         mcp_servers: [{ name: 'metabase' }],
@@ -122,7 +122,7 @@ describe('createStreamDecoder — claude-code', () => {
     expect(steps).toHaveLength(1);
     expect(steps[0].stage).toBe('agent.session.init');
     expect(steps[0].data).toMatchObject({
-      model: 'claude-opus-5',
+      model: 'claude-opus-5-5',
       tools: 2,
       skills: 1,
       mcpServers: 1,
@@ -138,7 +138,7 @@ describe('createStreamDecoder — claude-code', () => {
       `${JSON.stringify({
         type: 'system',
         subtype: 'init',
-        model: 'claude-opus-5',
+        model: 'claude-opus-5-5',
         tools: ['Read'],
         mcp_servers: [
           { name: 'metabase', status: 'needs-auth' },
@@ -263,7 +263,7 @@ describe('decoder output feeds claudeCodeBackend.parseOutput unchanged', () => {
   it('parses a normal structured reply out of a full JSONL stream', () => {
     const decoder = createStreamDecoder('claude-code');
     const stream = [
-      JSON.stringify({ type: 'system', subtype: 'init', model: 'claude-opus-5', tools: [] }),
+      JSON.stringify({ type: 'system', subtype: 'init', model: 'claude-opus-5-5', tools: [] }),
       JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'working' }] } }),
       claudeToolUse('Read', { file_path: 'a.ts' }).trimEnd(),
       JSON.stringify({

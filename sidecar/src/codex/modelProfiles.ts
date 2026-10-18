@@ -27,8 +27,8 @@ export const HIGH_REASONING_CODEX_PROFILE: CodexExecutionProfile = {
 // sidecar restart. An override id missing from pricing/modelPrices.ts records
 // NULL cost silently; the price guard in modelProfiles.test.ts only covers
 // the table defaults.
-const CLAUDE_LIGHTWEIGHT_MODEL = readOverride('WATCHTOWER_CLAUDE_LIGHTWEIGHT_MODEL') ?? 'claude-sonnet-5';
-const CLAUDE_HIGH_REASONING_MODEL = readOverride('WATCHTOWER_CLAUDE_HIGH_REASONING_MODEL') ?? 'claude-opus-5';
+const CLAUDE_LIGHTWEIGHT_MODEL = readOverride('WATCHTOWER_CLAUDE_LIGHTWEIGHT_MODEL') ?? 'claude-sonnet-5-5';
+const CLAUDE_HIGH_REASONING_MODEL = readOverride('WATCHTOWER_CLAUDE_HIGH_REASONING_MODEL') ?? 'claude-opus-5-5';
 
 type BackendProfileTable = Record<'lightweight' | 'highReasoning', CodexExecutionProfile>;
 
