@@ -24,7 +24,7 @@ const MAX_CONSECUTIVE_FAILURES = 3;
  * channel, a deleted parent. Latch off immediately rather than burning a call
  * per logStep for the rest of the job.
  */
-const FATAL_SLACK_ERRORS = new Set([
+export const FATAL_SLACK_ERRORS: ReadonlySet<string> = new Set([
   'missing_scope',
   'not_allowed_token_type',
   'invalid_auth',
@@ -37,6 +37,15 @@ const FATAL_SLACK_ERRORS = new Set([
   'method_deprecated',
   'deprecated_endpoint',
 ]);
+
+/** Pull the Slack error code out of whatever the SDK threw. */
+export function slackErrorCode(error: unknown): string {
+  const data = (error as { data?: { error?: unknown } } | undefined)?.data;
+  if (data && typeof data.error === 'string') return data.error;
+  const code = (error as { code?: unknown } | undefined)?.code;
+  if (typeof code === 'string') return code;
+  return String(error);
+}
 
 export interface ThreadStatus {
   /**
@@ -134,15 +143,6 @@ export function createThreadStatus(params: {
       message: `Live thread status turned off for this job (${reason}).`,
       data: { reason, detail },
     });
-  }
-
-  /** Pull the Slack error code out of whatever the SDK threw. */
-  function slackErrorCode(error: unknown): string {
-    const data = (error as { data?: { error?: unknown } } | undefined)?.data;
-    if (data && typeof data.error === 'string') return data.error;
-    const code = (error as { code?: unknown } | undefined)?.code;
-    if (typeof code === 'string') return code;
-    return String(error);
   }
 
   /** `Retry-After` seconds from a rate-limit rejection, if present. */

@@ -523,16 +523,25 @@ describe('agentPipeline', () => {
         parsedJson: { approved: true, findings: [], blockers: [] },
       });
 
+    // The progress message is the first post; only it needs a ts back.
+    slack.chat.postMessage.mockResolvedValueOnce({ ok: true, ts: '555.001' });
+
     await runAgentPipeline({ ctx, slack: slack as any, logStep });
 
-    // Pipeline start + per-agent (start + completion) + plan message + finish
-    expect(slack.chat.postMessage.mock.calls.length).toBeGreaterThanOrEqual(5);
-    expect(slack.chat.postMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ text: expect.stringContaining('[1/2] Thinking through the approach') }),
+    // One progress message, edited in place (issue #600): the intro stays as its
+    // first line, every stage is an edit of that message, and the only other
+    // new message is the plan, which a person acts on.
+    const posted = slack.chat.postMessage.mock.calls.map((call: any[]) => call[0].text as string);
+    expect(posted[0]).toMatch(
+      /^On it — planning the approach first.*\nthinking through the approach · step 1\/2 · \d+s$/s,
     );
-    expect(slack.chat.postMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ text: expect.stringContaining('[2/2] Reviewing the changes') }),
-    );
+    expect(posted.slice(1).filter(text => /step \d\/\d/.test(text))).toEqual([]);
+    const edits = slack.chat.update.mock.calls.map((call: any[]) => call[0]);
+    expect(edits.every(edit => edit.ts === '555.001')).toBe(true);
+    const edited = edits.map(edit => edit.text as string);
+    expect(edited.every(text => text.startsWith('On it — planning the approach first'))).toBe(true);
+    expect(edited.some(text => text.includes('\nreviewing the changes · step 2/2 · '))).toBe(true);
+    expect(edited[edited.length - 1]).toMatch(/\nDone in \d+s\. Summary below\.$/);
   });
 
   it('aggregates findings from all agents', async () => {

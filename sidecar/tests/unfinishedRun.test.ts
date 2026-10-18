@@ -172,7 +172,11 @@ describe('the time limit, when it runs out right after a coder pass', () => {
           posted.push(args.text);
           return { ts: '9.9' };
         }),
-        update: vi.fn(),
+        // The progress line is edited in place (issue #600): the final text lands here.
+        update: vi.fn(async (args: any) => {
+          posted.push(args.text);
+          return { ok: true };
+        }),
       },
     } as any;
     vi.mocked(runCodex)
@@ -194,8 +198,8 @@ describe('the time limit, when it runs out right after a coder pass', () => {
     expect(run.finalStatus).toBe('aborted');
     expect(run.budgetExhausted).toMatchObject({ limitMs: 45 * 60_000, lastCoderPassUnreviewed: true });
     expect(runCodex).toHaveBeenCalledTimes(3);
-    expect(posted).toContain(
-      "Stopped after 2760s: this run's time limit ran out before the latest changes were reviewed again.",
+    expect(posted.join('\n')).toContain(
+      "Stopped after 46 min: this run's time limit ran out before the latest changes were reviewed again.",
     );
     expect(posted.some(text => text.includes('see the summary below'))).toBe(false);
   });

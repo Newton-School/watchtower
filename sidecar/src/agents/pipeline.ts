@@ -21,6 +21,7 @@ import { REPO_KEYS, type RepoKey } from '../repos/registry.js';
 import { withAgentCallContext } from '../state/runContext.js';
 import { currentConnectors, NO_CONNECTORS, withConnectors } from '../backends/connectors.js';
 import { fetchThreadContext } from '../slack/threadContext.js';
+import { createProgressMessage, formatElapsed, type ProgressMessage } from '../slack/progressMessage.js';
 import { currentHead, checkCoderProducedChanges, getDiffVsBase } from '../workspaces/gitState.js';
 
 export type PipelineStore = {
@@ -75,34 +76,15 @@ function determineStepStatus(output: Record<string, unknown>, findings: AgentFin
   return 'passed';
 }
 
-const ROLE_START_MESSAGES: Record<AgentRole, string> = {
-  planner: 'Thinking through the approach...',
-  coder: 'Writing the code now.',
-  reviewer: 'Reviewing the changes for quality.',
-  security: 'Checking for security issues.',
-  performance: 'Checking for performance issues.',
-  verifier: 'Running final checks.',
+/** What each agent is doing, as the clause of the progress line (issue #600). */
+const ROLE_STAGE_TEXT: Record<AgentRole, string> = {
+  planner: 'thinking through the approach',
+  coder: 'writing the code',
+  reviewer: 'reviewing the changes',
+  security: 'checking for security issues',
+  performance: 'checking for performance issues',
+  verifier: 'running final checks',
 };
-
-function buildCompletionMessage(role: AgentRole, status: string, nextRole?: AgentRole): string {
-  if (!nextRole) {
-    return role === 'verifier' ? 'All checks done. Wrapping up.' : 'Done. Wrapping up.';
-  }
-
-  const transitions: Record<AgentRole, string> = {
-    planner: 'Got a plan. Starting the code changes.',
-    coder: "Code's done — running it through review.",
-    reviewer:
-      status === 'passed'
-        ? 'Review looks good. Running final checks.'
-        : 'Review flagged some things. Running final checks.',
-    security: 'Security check done. Moving on.',
-    performance: 'Performance check done. Moving on.',
-    verifier: 'All checks done. Wrapping up.',
-  };
-
-  return transitions[role];
-}
 
 async function postSlackProgress(params: {
   slack: WebClient;
@@ -1408,7 +1390,7 @@ function normalizedFromSeededPlanner(seeded: AgentStepResult[]): NormalizedPlann
   return normalized;
 }
 
-export async function runAgentPipeline(params: {
+export interface RunAgentPipelineParams {
   ctx: AgentContext;
   slack: WebClient;
   logStep: WorkflowStepLogger;
@@ -1416,8 +1398,34 @@ export async function runAgentPipeline(params: {
   jobId?: string;
   introMessage?: string;
   signal?: AbortSignal;
-}): Promise<PipelineResult> {
-  const { ctx, slack, logStep, store, jobId, introMessage, signal } = params;
+}
+
+export async function runAgentPipeline(params: RunAgentPipelineParams): Promise<PipelineResult> {
+  // One progress message per run, edited in place (issue #600). Created out
+  // here so the body can throw and the elapsed-time refresh still stops.
+  const progress = params.ctx.pipelineConfig.slackProgressUpdates
+    ? createProgressMessage({
+        slack: params.slack,
+        channelId: params.ctx.task.event.channelId,
+        threadTs: params.ctx.task.event.threadTs,
+        header: buildPipelineIntroMessage(params.ctx.pipelineConfig.agents, params.introMessage),
+        logStep: params.logStep,
+      })
+    : undefined;
+  try {
+    return await runAgentPipelineBody(params, progress);
+  } finally {
+    // A body that threw must not leave a live-looking "writing the code · 12 min" behind.
+    if (progress && !progress.finished) await progress.finish('Stopped before it finished. Details below.');
+    progress?.dispose();
+  }
+}
+
+async function runAgentPipelineBody(
+  params: RunAgentPipelineParams,
+  progress: ProgressMessage | undefined,
+): Promise<PipelineResult> {
+  const { ctx, slack, logStep, store, jobId, signal } = params;
   const {
     agents,
     maxRetryLoops,
@@ -1439,6 +1447,8 @@ export async function runAgentPipeline(params: {
   const promptSteps = (): AgentStepResult[] => [...seededSteps, ...steps];
   let retryLoops = 0;
   let aborted = false;
+  /** The plan was turned down at the in-pipeline approval gate. */
+  let planRejected = false;
   let pendingNeedsInput = false;
   let needsInputQuestion: string | undefined;
   let usageLimitHit = false;
@@ -1502,9 +1512,6 @@ export async function runAgentPipeline(params: {
     data: { agents, maxRetryLoops, totalTimeoutMs },
   });
 
-  const introText = buildPipelineIntroMessage(agents, introMessage);
-  await postSlackProgress({ slack, ctx, text: introText });
-
   // Track plan message so we can append a completion marker after the coder runs.
   let planMessageTs: string | undefined;
   // Seeded from an externally-approved planner step when there is one (the
@@ -1550,11 +1557,7 @@ export async function runAgentPipeline(params: {
       message: `Starting ${role} agent (step ${i + 1}/${agents.length}).`,
     });
 
-    await postSlackProgress({
-      slack,
-      ctx,
-      text: `[${i + 1}/${agents.length}] ${ROLE_START_MESSAGES[role]}`,
-    });
+    await progress?.set({ text: ROLE_STAGE_TEXT[role], step: i + 1, total: agents.length });
 
     const prompt = buildPromptForRole(role, {
       ...ctx,
@@ -1759,13 +1762,6 @@ export async function runAgentPipeline(params: {
     // Nothing in the repository to review: the reviewer and verifier read diffs (issue #432).
     if (externalOnly) break;
 
-    const nextRole = i < agents.length - 1 ? agents[i + 1] : undefined;
-    await postSlackProgress({
-      slack,
-      ctx,
-      text: `[${i + 1}/${agents.length}] ${buildCompletionMessage(role, status, nextRole)}`,
-    });
-
     // After planner completes: normalize the output and post the plan as a formatted message
     if (role === 'planner' && status === 'passed') {
       plannerNormalized = normalizePlannerOutput(output, backendId);
@@ -1804,6 +1800,7 @@ export async function runAgentPipeline(params: {
         });
 
         if (approvalPromptTs) {
+          await progress?.hold('waiting for an admin to approve the plan');
           const adminUserIds = getAdminUserIds(ctx.config);
           const approval = await waitForApproval({
             slack,
@@ -1823,6 +1820,7 @@ export async function runAgentPipeline(params: {
           }
           if (approval.outcome === 'rejected') {
             await postSlackProgress({ slack, ctx, text: 'Got it, cancelling.' });
+            planRejected = true;
             aborted = true;
             break;
           }
@@ -1893,10 +1891,12 @@ export async function runAgentPipeline(params: {
           data: { retryLoops, maxRetryLoops },
         });
 
-        await postSlackProgress({
-          slack,
-          ctx,
-          text: `Reviewer flagged issues — sending feedback to the coding agent for revision (attempt ${retryLoops}/${maxRetryLoops}).`,
+        await progress?.set({
+          text: 'review flagged some things, the coder is revising',
+          step: coderIndex + 1,
+          total: agents.length,
+          round: retryLoops,
+          rounds: maxRetryLoops,
         });
 
         // Re-run coder with reviewer feedback in context (and the approved plan —
@@ -2053,24 +2053,29 @@ export async function runAgentPipeline(params: {
     data: { finalStatus, totalDurationMs, retryLoops, totalFindings: aggregatedFindings.length },
   });
 
-  const durationSec = Math.round(totalDurationMs / 1000);
-  const finishText =
-    finalStatus === 'passed'
-      ? `Done in ${durationSec}s. Preparing the summary.`
-      : finalStatus === 'needs-input'
-        ? `Paused after ${durationSec}s — I need a bit more info before I can code a fix.`
-        : finalStatus === 'usage-limit'
-          ? `Paused — Claude usage limit hit${usageLimitResetsAt ? ` (resets ${usageLimitResetsAt})` : ''}. No code was lost.`
-          : interrupted?.kind === 'connection_lost'
-            ? `Stopped after ${durationSec}s — I lost my connection to the model and retrying didn't bring it back.`
-            : interrupted
-              ? `Stopped after ${durationSec}s — the ${interrupted.role} was killed from outside, twice.`
-              : budgetExhausted
-                ? `Stopped after ${durationSec}s: this run's time limit ran out${budgetExhausted.lastCoderPassUnreviewed ? ' before the latest changes were reviewed again' : ''}.`
-                : finalStatus === 'aborted'
-                  ? `Stopped after ${durationSec}s: a check found a critical issue.`
-                  : `Finished in ${durationSec}s, but the checks did not pass.`;
-  await postSlackProgress({ slack, ctx, text: finishText });
+  const took = formatElapsed(totalDurationMs);
+  // The last edit of the progress message is its permanent state, so a cancel
+  // or a turned-down plan must not read as a failed check.
+  const finishText = signal?.aborted
+    ? `Stopped after ${took}.`
+    : planRejected
+      ? `Stopped after ${took}: the plan was not approved.`
+      : finalStatus === 'passed'
+        ? `Done in ${took}. Summary below.`
+        : finalStatus === 'needs-input'
+          ? `Paused after ${took} — I need a bit more info before I can code a fix.`
+          : finalStatus === 'usage-limit'
+            ? `Paused — Claude usage limit hit${usageLimitResetsAt ? ` (resets ${usageLimitResetsAt})` : ''}. No code was lost.`
+            : interrupted?.kind === 'connection_lost'
+              ? `Stopped after ${took} — I lost my connection to the model and retrying didn't bring it back.`
+              : interrupted
+                ? `Stopped after ${took} — the ${interrupted.role} was killed from outside, twice.`
+                : budgetExhausted
+                  ? `Stopped after ${took}: this run's time limit ran out${budgetExhausted.lastCoderPassUnreviewed ? ' before the latest changes were reviewed again' : ''}.`
+                  : finalStatus === 'aborted'
+                    ? `Stopped after ${took}: a check found a critical issue.`
+                    : `Finished in ${took}, but the checks did not pass.`;
+  await progress?.finish(finishText);
 
   if (store && jobId) {
     try {
