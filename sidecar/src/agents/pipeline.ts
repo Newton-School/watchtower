@@ -207,6 +207,13 @@ export function formatPlanMessage(
     // A write to another system rides on the same yes as the code, so the approver sees it (issue #432).
     ...(outside ? [`*Outside the repo:* :warning: ${summary.outsideRepo.trim()}`] : []),
   ];
+  // A revision says what it changed, right under the header (issue #388).
+  const changes = changesSinceLastPlan(planMarkdown);
+  if (changes.length > 0) {
+    const shown = changes.slice(0, MAX_CHANGES_SHOWN).map(change => `• ${change}`);
+    if (changes.length > MAX_CHANGES_SHOWN) shown.push(`• … and ${changes.length - MAX_CHANGES_SHOWN} more`);
+    block.splice(1, 0, `*Changed since the last plan:*\n${shown.join('\n')}`);
+  }
   if (requesterId && (changesBehaviour || assumed || outside)) {
     const parts = [
       changesBehaviour ? 'the behaviour change' : '',
@@ -220,6 +227,23 @@ export function formatPlanMessage(
     );
   }
   return [block.join('\n'), ...(filesSection ? [filesSection] : [])].join('\n\n').concat(completedSuffix);
+}
+
+const CHANGED_HEADING_RE = /^#{1,6}\s*changed since the last plan\b/i;
+const MAX_CHANGES_SHOWN = 6;
+
+/** The bullets of a revised plan's "Changed since the last plan" section (issue #388). */
+export function changesSinceLastPlan(planMarkdown: string): string[] {
+  const lines = planMarkdown.split('\n');
+  const start = lines.findIndex(line => CHANGED_HEADING_RE.test(line.trim()));
+  if (start === -1) return [];
+  const changes: string[] = [];
+  for (const line of lines.slice(start + 1)) {
+    if (/^#{1,6}\s/.test(line.trim())) break;
+    const bullet = /^\s*[-*•]\s+(.*\S)\s*$/.exec(line);
+    if (bullet) changes.push(bullet[1]);
+  }
+  return changes;
 }
 
 /** The full plan, posted below the approver block. Empty when the plan has no block: it was posted whole. */

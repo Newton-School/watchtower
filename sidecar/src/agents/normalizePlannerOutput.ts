@@ -291,6 +291,12 @@ export function normalizePlannerOutput(raw: unknown, backendId: AgentBackendId):
           : typeof raw === 'string'
             ? raw.trim()
             : '';
+    // A plan that came back as JSON steps rather than markdown (an older
+    // revision prompt asked for that) is rendered, never dropped: dropping it
+    // kept the previous plan and the coder built that instead (issue #388).
+    if (!markdown && Array.isArray(rawObj?.plan)) {
+      return normalizePlannerOutput(raw, 'codex');
+    }
 
     // What the planner listed as files to change wins over a guess from every
     // path-shaped token in the plan (issue #437).

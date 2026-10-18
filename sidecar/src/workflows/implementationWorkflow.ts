@@ -25,6 +25,7 @@ import {
   runAgentPipeline,
   planNeedsRequesterConfirmation,
   postPlanForApproval,
+  changesSinceLastPlan,
   waitForApproval,
   buildApprovalMessage,
   coderDeclaredBlocked,
@@ -356,7 +357,7 @@ export function stampApprovedPlan(
  * message rather than only chat.update'ing the original — so the "Here's the
  * revised plan" prompt actually sits below visible plan content.
  */
-async function runApprovalLoop(input: {
+export async function runApprovalLoop(input: {
   slack: WebClient;
   config: AppConfig;
   task: NormalizedTask;
@@ -634,7 +635,14 @@ async function runApprovalLoop(input: {
       // instead of JSON, the parser bailed, and the workflow re-posted the old
       // plan unchanged. Passing the plan inline + restating the contract is
       // slightly more tokens but reliably produces parseable JSON.
-      const feedbackPrompt = `You previously produced this plan:
+      // On claude-code the plan is markdown with an approver block, so the
+      // revision is too. It used to ask for JSON steps, which normalized to an
+      // empty plan: the old plan was re-posted as "revised" and the coder built
+      // the old one (issue #388).
+      const feedbackPrompt =
+        plannerBackend === 'claude-code'
+          ? revisionPromptMarkdown(planMarkdown, approval.userReply)
+          : `You previously produced this plan:
 ${JSON.stringify(plannerOutput, null, 2)}
 
 It was reviewed, and this feedback came back (from an admin, or from the requester saying what they want):
@@ -661,6 +669,9 @@ Return the JSON now.`;
           outputSchemaPath: plannerSchemaPath,
           githubToken,
           imagePaths: input.imagePaths,
+          // A revision only reads. It runs in the coder's worktree, before
+          // anyone approved a change.
+          readOnly: true,
           ...plannerProfile,
           // No per-agent timeoutMs — see investigationWorkflow.ts for rationale.
           // Outer abort signal remains the safety net.
@@ -677,7 +688,13 @@ Return the JSON now.`;
       // step or follow-up logging can reference this revision's session.
       plannerSessionId = revisedResult.sessionId ?? plannerSessionId;
 
-      if (!(revisedResult.ok && revisedResult.parsedJson)) {
+      // A revision that yields no plan is a failed revision, not the old plan
+      // again (issue #388).
+      const revisedPlan =
+        revisedResult.ok && revisedResult.parsedJson
+          ? normalizePlannerOutput(revisedResult.parsedJson, plannerBackend)
+          : undefined;
+      if (!revisedPlan?.planMarkdown) {
         // Re-plan failed (model output wasn't valid JSON, or runCodex errored).
         // Pre-fix, the workflow silently fell through to "post the revised plan
         // as a new message" using the unchanged old plan — making "Here's the
@@ -687,7 +704,7 @@ Return the JSON now.`;
           message:
             revisedResult.errorKind === 'API_ERROR'
               ? 'Plan revision lost the connection to the model API; surfacing recovery prompt to the user.'
-              : 'Revised plan generation produced non-JSON output; surfacing recovery prompt to the user.',
+              : 'Plan revision returned no plan; surfacing recovery prompt to the user.',
           level: 'WARN',
           data: {
             feedbackRounds,
@@ -703,7 +720,7 @@ Return the JSON now.`;
             text:
               revisedResult.errorKind === 'API_ERROR'
                 ? "I lost my connection to the model while revising the plan, and retrying didn't bring it back. The plan above is unchanged. Reply with your feedback again in a few minutes, `yes` to proceed with the original plan, or `no` to cancel."
-                : 'I had trouble revising the plan from that feedback — the planner returned non-JSON output. Reply with rephrased feedback, `yes` to proceed with the original plan, or `no` to cancel.',
+                : 'I had trouble revising the plan from that feedback: the planner did not return a revised plan. The plan above is unchanged. Reply with rephrased feedback, `yes` to proceed with it as it stands, or `no` to cancel.',
           });
           overrideNextPromptTs = recoveryPosted.ts ?? undefined;
         } catch {
@@ -715,16 +732,15 @@ Return the JSON now.`;
         continue;
       }
 
-      plannerOutput = revisedResult.parsedJson;
-      // Normalize per the backend the planner actually ran on. On claude-code the
-      // revision schema is unenforced (buildArgs ignores outputSchemaPath), so a
-      // prose/markdown revision must go through the claude-code branch — the codex
-      // branch would yield an empty planMarkdown and silently keep the stale plan.
-      const revisedNormalized = normalizePlannerOutput(plannerOutput, plannerBackend);
-      planMarkdown = revisedNormalized.planMarkdown || planMarkdown;
-      planAffectedFiles =
-        revisedNormalized.affectedFiles.length > 0 ? revisedNormalized.affectedFiles : planAffectedFiles;
-      planScope = revisedNormalized.scope || planScope;
+      plannerOutput = revisedResult.parsedJson as Record<string, unknown>;
+      planMarkdown = revisedPlan.planMarkdown;
+      planAffectedFiles = revisedPlan.affectedFiles.length > 0 ? revisedPlan.affectedFiles : planAffectedFiles;
+      planScope = revisedPlan.scope || planScope;
+      logStep?.({
+        stage: 'implementation.approval.revised',
+        message: `Revised the plan (${planMarkdown.length} chars, ${planAffectedFiles.length} file(s)).`,
+        data: { feedbackRounds, changes: changesSinceLastPlan(planMarkdown) },
+      });
 
       // If the revision swung the plan to a different repo (e.g. admin said
       // "make changes in newton-web, not newton-api"), materialize the matching
@@ -777,6 +793,29 @@ Return the JSON now.`;
   }
 
   return { kind: 'exhausted' };
+}
+
+/**
+ * The prompt for revising a markdown plan (claude-code). The revision is the
+ * whole plan again, in the same format, with its approver block rewritten and
+ * a list of what changed, so the approver and the requester see the new plan
+ * and the coder builds it (issue #388).
+ */
+export function revisionPromptMarkdown(previousPlan: string, feedback: string): string {
+  return `You wrote this implementation plan:
+
+${previousPlan}
+
+It was reviewed, and this feedback came back (from an admin, or from the requester saying what they want):
+
+"${feedback}"
+
+Revise the plan to do what the feedback asks. Read the code again where you need to.
+
+Reply with the complete revised plan as markdown and nothing else, in the same format as before:
+- First the "## For the approver" block with all its lines, rewritten for the revised plan. Do not copy the old block: every line must be true of the revised plan, including "Behaviour change" and "Outside the repo".
+- Then a section headed exactly "## Changed since the last plan", with one bullet for each thing you changed because of the feedback.
+- Then the rest of the plan: the intent, the "## Files to change" section, the steps, and the "Scope:" and "Requires code changes:" tags.`;
 }
 
 /**
