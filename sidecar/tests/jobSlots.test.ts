@@ -26,6 +26,29 @@ function makeSlots(max: number) {
 }
 
 describe('JobSlots (issue #434)', () => {
+  it('does not queue for a slot when the answer ends the job (issue #598)', async () => {
+    const { slots } = makeSlots(1);
+    const answer = deferred<string>();
+    const other = deferred();
+
+    expect(slots.tryAcquire()).toBe(true);
+    const stopped = slots.run(() =>
+      slots.whileWaitingOnHuman(() => answer.promise, { endsJob: result => result === 'stop' }),
+    );
+    await tick();
+    // The freed slot goes to another job that keeps it for a long time.
+    expect(slots.tryAcquire()).toBe(true);
+    const busy = slots.run(() => other.promise);
+
+    answer.resolve('stop');
+    expect(await stopped).toBe('stop');
+    expect(slots.active).toBe(1);
+
+    other.resolve();
+    await busy;
+    expect(slots.active).toBe(0);
+  });
+
   it('runs at most the configured number of jobs and frees a slot when one ends', async () => {
     const { slots, onFree } = makeSlots(2);
     const first = deferred();

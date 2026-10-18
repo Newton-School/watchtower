@@ -21,6 +21,7 @@ import { REPO_KEYS, type RepoKey } from '../repos/registry.js';
 import { withAgentCallContext } from '../state/runContext.js';
 import { currentConnectors, NO_CONNECTORS, withConnectors } from '../backends/connectors.js';
 import { fetchThreadContext } from '../slack/threadContext.js';
+import { GATE_STOP_PHRASES, slackMentionIds } from '../router/stopIntent.js';
 import { createProgressMessage, formatElapsed, type ProgressMessage } from '../slack/progressMessage.js';
 import { currentHead, checkCoderProducedChanges, getDiffVsBase } from '../workspaces/gitState.js';
 
@@ -309,21 +310,60 @@ const CONFIRM_PATTERNS =
 const OVERRIDE_CONFIRMATION_RE = /^approve without (the requester'?s? )?confirmation[.!]*$/i;
 /**
  * "no" from an approver: the plan is turned down and miniOG asks what to change
- * (issue #598). A stop is different, see `CANCEL_PATTERNS`.
+ * (issue #598). Whole word only: "No worries, go ahead" is for the classifier.
+ * A stop is different, see `readsAsCancel`.
  */
-const REJECT_PATTERNS = /^(no|nope)\b/i;
+const REJECT_PATTERNS = /^(no|nope)(?:[.!,;:]|$)/i;
+const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+/**
+ * A stop phrase, optionally followed by punctuation and a reason: "stop",
+ * "stop - this is a huge change". The vocabulary is the stop lane's
+ * (`router/stopIntent.ts`), minus "no".
+ */
+const CANCEL_RE = new RegExp(
+  `^(?:please )?(${GATE_STOP_PHRASES.map(escapeRegExp).join('|')})(?: please)?(?:\\s*[.!?,;:—–-]+\\s*(.*))?$`,
+  'i',
+);
+/** Words that make the text after a stop word a change of mind, not a reason to stop. */
+const RESUME_CUES =
+  /\b(go ahead|go|yes|yep|proceed|ship it|do it|instead|actually|rather|original|approve|keep|continue)\b/i;
 /**
  * A stop, from an approver or the requester, ends the job at once (issue #598).
- * The reply has to be the stop, with at most a reason after punctuation
- * ("stop - this is a huge change"): "stop using X and add Y" is feedback.
- * Mirrors the stop lane's vocabulary in `router/stopIntent.ts`, minus "no".
+ * The reply has to be the stop, with at most a reason after punctuation:
+ * "stop using X and add Y" is feedback, and "nevermind, go ahead with the
+ * original plan" is a change of mind that the classifier reads.
  */
-const CANCEL_PATTERNS =
-  /^(?:please )?(stop|cancel|abort|halt|kill it|stop it|cancel it|stop this|cancel this|stop that|cancel that|stop now|cancel now|nevermind|never mind|drop it)(?: please)?(?:$|\s*[.!,;:—–-])/i;
+export function readsAsCancel(command: string): boolean {
+  const match = CANCEL_RE.exec(command.trim());
+  if (!match) return false;
+  const reason = (match[2] ?? '').trim();
+  return reason === '' || !RESUME_CUES.test(reason);
+}
 // Strict pause patterns: pause word must be the entire message (modulo punctuation).
 // "wait, that's wrong" / "wait, also include X" → feedback, not pause.
 const PAUSE_PATTERNS =
   /^(wait|hold on|hold up|pause|brb|one sec|one moment|stand by|i'?ll get back to you|(give me|gimme) (a )?(sec|second|minute|moment|min)|pause for (now|a bit|a sec)|stop for now)[.! ]*$/i;
+
+/** Words that show a reply decides something for miniOG, whoever else it mentions. */
+const DECISION_CUES =
+  /\b(yes|yep|yeah|yup|approve|approved|go ahead|proceed|lgtm|looks good|ship it|do it|confirm|confirmed|stop|cancel|abort|no|nope|hold|wait)\b/i;
+
+/**
+ * A reply that @-mentions people and not miniOG, and decides nothing, is to
+ * them (issue #599): "thanks <@U1>, can you also update the other pages" is
+ * not plan feedback, and reading it as one re-planned and paged the admins
+ * again. "<@U1> yes, looks good" still goes to the classifier.
+ */
+export function addressesSomeoneElse(text: string, botUserId?: string): boolean {
+  const mentions = slackMentionIds(text);
+  if (mentions.length === 0) return false;
+  if (botUserId && mentions.includes(botUserId)) return false;
+  return !DECISION_CUES.test(text.replace(/<@[^>]+>/g, ' '));
+}
+
+function mentionsBot(text: string, botUserId?: string): boolean {
+  return Boolean(botUserId) && slackMentionIds(text).includes(botUserId as string);
+}
 
 /**
  * A reply as the exact-phrase patterns above read it: miniOG's own @-mention
@@ -333,17 +373,6 @@ const PAUSE_PATTERNS =
  * only held the plan again. Anyone else's mention stays: "@someone yes" may
  * be addressed to them, and the classifier decides that.
  */
-/**
- * A reply that @-mentions people and not miniOG is to them, not to miniOG
- * (issue #599): "thanks <@U1>, can you also update the other pages" is not
- * plan feedback, and reading it as one re-planned and paged the admins again.
- */
-export function addressesSomeoneElse(text: string, botUserId?: string): boolean {
-  const mentions = [...text.matchAll(/<@([A-Z0-9]+)(?:\|[^>]*)?>/gi)].map(match => match[1]);
-  if (mentions.length === 0) return false;
-  return !mentions.some(userId => botUserId !== undefined && userId === botUserId);
-}
-
 function approvalReplyCommand(text: string, botUserId?: string): string {
   return text
     .replace(/<@([A-Z0-9]+)(?:\|[^>]*)?>/gi, (mention, userId: string) =>
@@ -379,7 +408,7 @@ export type ApprovalResult = {
   replyTs: string;
 };
 
-type ApprovalIntent = 'approve' | 'feedback' | 'reject' | 'pause' | 'unrelated';
+type ApprovalIntent = 'approve' | 'feedback' | 'reject' | 'cancel' | 'pause' | 'unrelated';
 
 /**
  * Runs on every non-bot reply during a wait gate. Anyone — requester, approver,
@@ -404,15 +433,17 @@ async function classifyApprovalIntent(
   recentThread: string[],
   logStep: WorkflowStepLogger,
 ): Promise<ApprovalIntent | null> {
-  const prompt = `You are a classifier for a developer bot called miniOG. miniOG just posted a plan in a Slack thread and asked for admin approval ("yes"/"go" to proceed, "no"/"stop" to cancel, or reply with feedback).
+  const prompt = `You are a classifier for a developer bot called miniOG. miniOG just posted a plan in a Slack thread and asked for admin approval ("yes"/"go" to proceed, "no" to turn the plan down, "stop"/"cancel" to drop the job, or reply with feedback).
 
-A new message appeared in the thread. Classify the message into one of five categories:
+A new message appeared in the thread. Classify the message into one of six categories:
 
 "approve" — The message is approving the plan and telling miniOG to proceed. Examples: "looks good, go ahead", "yes do it", "approved, start coding", "go ahead but also handle X" (approval WITH extra notes).
 
 "feedback" — The message is directed at miniOG with instructions, changes, or additional context for the plan, but does NOT explicitly approve it. Examples: "also make sure X", "change the approach to Y", "use the existing middleware instead", "don't forget to handle edge case Z". The user wants the plan revised, not executed as-is.
 
-"reject" — The message is telling miniOG to stop or cancel. Examples: "no", "stop", "don't do this", "cancel it".
+"reject" — The message turns this plan down without dropping the job: miniOG should ask what to change or propose something else. Examples: "no", "not like this", "this isn't right", "don't do this".
+
+"cancel" — The message tells miniOG to stop and drop the job altogether. Examples: "stop", "cancel it", "abort", "drop this, we're not doing it", "stop this is a huge change".
 
 "pause" — The message tells miniOG to wait / hold / pause without rejecting. The user explicitly wants miniOG to STOP working for now and resume later when tagged. Examples: "wait", "hold on", "pause", "gimme a minute", "I'll get back to you", "wait for me", "stop for now, I need to check something". CRITICAL: a "wait" used as filler before a real instruction (e.g. "wait, that's wrong" or "wait, also include X") is FEEDBACK, not pause — the user is still actively giving direction.
 
@@ -428,7 +459,7 @@ New message to classify:
 
 Return strict JSON:
 {
-  "intent": "approve" | "feedback" | "reject" | "pause" | "unrelated",
+  "intent": "approve" | "feedback" | "reject" | "cancel" | "pause" | "unrelated",
   "reasoning": "one sentence explaining why"
 }`;
 
@@ -453,7 +484,7 @@ Return strict JSON:
     }
 
     const raw = result.parsedJson as { intent?: string; reasoning?: string };
-    const validIntents: ApprovalIntent[] = ['approve', 'feedback', 'reject', 'pause', 'unrelated'];
+    const validIntents: ApprovalIntent[] = ['approve', 'feedback', 'reject', 'cancel', 'pause', 'unrelated'];
     const intent: ApprovalIntent = validIntents.includes(raw.intent as ApprovalIntent)
       ? (raw.intent as ApprovalIntent)
       : 'unrelated';
@@ -480,6 +511,8 @@ export function waitForApproval(params: Parameters<typeof pollForApproval>[0]): 
   return jobSlots.whileWaitingOnHuman(() => pollForApproval(params), {
     signal: params.signal,
     logStep: params.logStep,
+    // A stop by reply leaves only a line to post: it must not queue for a slot (issue #598).
+    endsJob: result => result.outcome === 'cancelled',
   });
 }
 
@@ -570,6 +603,39 @@ async function pollForApproval(params: {
   // Per-call cache: messages we've already classified (and got non-actionable
   // intent for) — avoids re-classifying the same ts every 5s poll cycle.
   const classifiedTs = new Set<string>();
+  /** Bystanders told, once, who can stop the plan. Separate from `notifiedUsers`: a stop notice must not swallow the later approve notice. */
+  const stopNoticeUsers = new Set<string>();
+  const stoppedBy = (reply: { text: string; user: string; ts: string }): ApprovalResult => {
+    logStep({
+      stage: 'pipeline.approval.cancelled',
+      message: `<@${reply.user}> stopped the plan: "${reply.text.trim()}"`,
+    });
+    return { outcome: 'cancelled', userReply: reply.text.trim(), approverId: reply.user, replyTs: reply.ts };
+  };
+  const noticeCannotStop = (reply: { user: string }): void => {
+    if (stopNoticeUsers.has(reply.user)) return;
+    stopNoticeUsers.add(reply.user);
+    slack.chat
+      .postMessage({
+        channel: channelId,
+        thread_ts: threadTs,
+        text: `<@${reply.user}> only an admin or the person who asked can stop this.`,
+      })
+      .catch(() => {});
+  };
+  /** A reply to someone else is not a reply to miniOG (issue #599): logged once, never classified. */
+  const ignoreAsAddressedElsewhere = (reply: { text: string; user: string; ts: string }): boolean => {
+    if (!addressesSomeoneElse(reply.text, botUserId)) return false;
+    if (!classifiedTs.has(reply.ts)) {
+      classifiedTs.add(reply.ts);
+      logStep({
+        stage: 'pipeline.approval.ignored',
+        message: `Ignored a reply addressed to someone else: "${reply.text.trim()}"`,
+        data: { user: reply.user },
+      });
+    }
+    return true;
+  };
 
   while (true) {
     if (signal?.aborted) return cancelled();
@@ -626,37 +692,11 @@ async function pollForApproval(params: {
       // A stop from an approver or the requester ends the job now (issue #598).
       // "no" is not a stop: an approver's no turns the plan down and the
       // workflow asks what to change; a requester's no is read below.
-      if (CANCEL_PATTERNS.test(command)) {
-        if (isApprover || reply.user === params.triggerUserId || reply.user === requester) {
-          logStep({
-            stage: 'pipeline.approval.cancelled',
-            message: `<@${reply.user}> stopped the plan: "${text}"`,
-          });
-          return { outcome: 'cancelled', userReply: text, approverId: reply.user, replyTs: reply.ts };
-        }
-        if (!notifiedUsers.has(reply.user)) {
-          notifiedUsers.add(reply.user);
-          slack.chat
-            .postMessage({
-              channel: channelId,
-              thread_ts: threadTs,
-              text: `<@${reply.user}> only an admin or the person who asked can stop this.`,
-            })
-            .catch(() => {});
-        }
-        continue;
-      }
-
-      // A reply to someone else is not a reply to miniOG (issue #599).
-      if (addressesSomeoneElse(text, botUserId)) {
-        if (!classifiedTs.has(reply.ts)) {
-          classifiedTs.add(reply.ts);
-          logStep({
-            stage: 'pipeline.approval.ignored',
-            message: `Ignored a reply addressed to someone else: "${text}"`,
-            data: { user: reply.user },
-          });
-        }
+      // "@miniOG stop" is the stop lane's (index.ts), which aborts the job: not read twice here.
+      if (readsAsCancel(command)) {
+        if (mentionsBot(text, botUserId)) continue;
+        if (isApprover || reply.user === params.triggerUserId) return stoppedBy(reply);
+        noticeCannotStop(reply);
         continue;
       }
 
@@ -666,6 +706,7 @@ async function pollForApproval(params: {
         let intent: ApprovalIntent | null = CONFIRM_PATTERNS.test(command) ? 'approve' : null;
         if (!intent) {
           if (classifiedTs.has(reply.ts)) continue;
+          if (ignoreAsAddressedElsewhere(reply)) continue;
           intent = await classifyApprovalIntent(
             text,
             messages.slice(-6).map(m => m.text.trim()),
@@ -700,6 +741,7 @@ async function pollForApproval(params: {
         if (intent === 'pause') {
           return { outcome: 'paused', userReply: text, approverId: reply.user, replyTs: reply.ts };
         }
+        if (intent === 'cancel') return stoppedBy(reply);
         if (intent === 'reject') {
           postOnce('askWhat', `<@${reply.user}> tell me what you want instead, and I'll revise the plan.`);
         }
@@ -772,6 +814,7 @@ async function pollForApproval(params: {
       // Non-pattern text from an approver — classify intent (approve/feedback/reject/pause/unrelated)
       if (isApprover) {
         if (classifiedTs.has(reply.ts)) continue;
+        if (ignoreAsAddressedElsewhere(reply)) continue;
         const recentThread = messages.slice(-6).map(m => m.text.trim());
         const intent = await classifyApprovalIntent(text, recentThread, logStep);
         if (intent === null) {
@@ -800,6 +843,7 @@ async function pollForApproval(params: {
           });
           return { outcome: 'rejected', userReply: text, approverId: reply.user, replyTs: reply.ts };
         }
+        if (intent === 'cancel') return stoppedBy(reply);
         if (intent === 'pause') {
           logStep({
             stage: 'pipeline.approval.paused',
@@ -819,6 +863,7 @@ async function pollForApproval(params: {
       // with a nuanced wait message that the cheap regex missed. Cached per-ts
       // only on a successful classify, so transient failures can retry next poll.
       if (classifiedTs.has(reply.ts)) continue;
+      if (ignoreAsAddressedElsewhere(reply)) continue;
       const recentThread = messages.slice(-6).map(m => m.text.trim());
       const intent = await classifyApprovalIntent(text, recentThread, logStep);
       if (intent === null) continue;
@@ -829,6 +874,11 @@ async function pollForApproval(params: {
           message: `<@${reply.user}> asked miniOG to wait: "${text}"`,
         });
         return { outcome: 'paused', userReply: text, approverId: reply.user, replyTs: reply.ts };
+      }
+      if (intent === 'cancel') {
+        if (reply.user === params.triggerUserId) return stoppedBy(reply);
+        noticeCannotStop(reply);
+        continue;
       }
       // Anything else from a non-approver: silently ignore — admins still drive
       // approve/feedback/reject.
@@ -1507,7 +1557,7 @@ async function runAgentPipelineBody(
   const promptSteps = (): AgentStepResult[] => [...seededSteps, ...steps];
   let retryLoops = 0;
   let aborted = false;
-  /** The plan was turned down at the in-pipeline approval gate. */
+  /** The plan was turned down, or stopped by a reply, at the in-pipeline approval gate. */
   let planRejected = false;
   let pendingNeedsInput = false;
   let needsInputQuestion: string | undefined;
@@ -1875,6 +1925,10 @@ async function runAgentPipelineBody(
           });
 
           if (approval.outcome === 'cancelled') {
+            if (approval.approverId) {
+              await postSlackProgress({ slack, ctx, text: 'Stopped. Nothing was changed.' });
+              planRejected = true;
+            }
             aborted = true;
             break;
           }

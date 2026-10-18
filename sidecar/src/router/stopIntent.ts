@@ -44,6 +44,19 @@ const STOP_PATTERNS = [
   /^(?:dont|do not) (?:deploy|merge|review)(?: (?:it|this|that))?$/,
 ];
 
+/**
+ * The stop words a plan's approval gate reads (issue #598): everything above
+ * except "no", which at a plan means "not this plan", not "drop the job".
+ */
+export const GATE_STOP_PHRASES: readonly string[] = [...STOP_PHRASES].filter(
+  phrase => phrase !== 'no' && phrase !== 'nope',
+);
+
+/** The user ids a Slack message @-mentions, in order. */
+export function slackMentionIds(text: string): string[] {
+  return [...text.matchAll(/<@([A-Z0-9]+)(?:\|[^>]*)?>/gi)].map(match => match[1]);
+}
+
 /** Mentions, a forwarding app's "Sent using" footer, case and punctuation don't change what was said. */
 export function normalizeControlText(text: string): string {
   return (

@@ -1329,11 +1329,12 @@ async function runImplementationWorkflowBody(params: {
               signal,
             });
 
-            if (approval.outcome === 'cancelled') {
+            // The job's abort: nothing to say. A "stop" or "cancel" by reply skips the merge like a "no".
+            if (approval.outcome === 'cancelled' && !approval.approverId) {
               return cancelledResult('IMPLEMENTATION');
             }
 
-            if (approval.outcome === 'rejected') {
+            if (approval.outcome === 'rejected' || approval.outcome === 'cancelled') {
               await slack.chat
                 .postMessage({
                   channel: task.event.channelId,
