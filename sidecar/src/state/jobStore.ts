@@ -1659,10 +1659,18 @@ export class JobStore {
     threadTs: string;
     requestedBy?: string;
     lastStage?: string;
+    /** What the job was running, and the request that started it (issue #589). */
+    workflow?: string;
+    eventId?: string;
+    text?: string;
+    eventTs?: string;
   }> {
     const rows = this.db
       .prepare(
-        `SELECT j.id, j.channel_id, j.thread_ts,
+        `SELECT j.id, j.channel_id, j.thread_ts, j.event_id,
+                COALESCE(NULLIF(j.executed_workflow, ''), j.workflow) AS workflow,
+                json_extract(j.payload_json, '$.text') AS text,
+                json_extract(j.payload_json, '$.eventTs') AS event_ts,
                 json_extract(j.payload_json, '$.requestUserId') AS requested_by,
                 (SELECT l.stage FROM job_logs l WHERE l.job_id = j.id ORDER BY l.created_at DESC, l.id DESC LIMIT 1) AS last_stage
          FROM jobs j
@@ -1674,6 +1682,10 @@ export class JobStore {
       thread_ts: string;
       requested_by: string | null;
       last_stage: string | null;
+      event_id: string | null;
+      workflow: string | null;
+      text: string | null;
+      event_ts: string | null;
     }>;
     return rows.map(row => ({
       id: row.id,
@@ -1681,6 +1693,10 @@ export class JobStore {
       threadTs: row.thread_ts,
       requestedBy: row.requested_by ?? undefined,
       lastStage: row.last_stage ?? undefined,
+      workflow: row.workflow ?? undefined,
+      eventId: row.event_id ?? undefined,
+      text: row.text ?? undefined,
+      eventTs: row.event_ts ?? undefined,
     }));
   }
 

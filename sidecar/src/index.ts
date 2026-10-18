@@ -50,7 +50,7 @@ import { fetchThreadContext } from './slack/threadContext.js';
 import { createThreadStatus, type ThreadStatus } from './slack/threadStatus.js';
 import { resolveUserGroup } from './slack/userGroupResolver.js';
 import { isOlderVersion, readSidecarBuild } from './runtime/buildInfo.js';
-import { buildRestartNotice, humanGateForStage } from './runtime/restartNotice.js';
+import { recoveryFor } from './runtime/restartRecovery.js';
 import { acquireInstanceLock, instanceLockPath, releaseInstanceLock } from './runtime/instanceLock.js';
 import {
   registerActiveJob,
@@ -67,6 +67,9 @@ import type { AccessGroupKey, SlackEventEnvelope, SlackReactionEvent, WorkflowSt
 
 assertMacOS();
 loadPolicies();
+
+/** How long after startup a review lost to a restart is run again (issue #589). */
+const RESTART_RERUN_DELAY_MS = 15_000;
 
 const dbPath = process.env.WATCHTOWER_DB_PATH ?? path.resolve(process.cwd(), 'watchtower.db');
 
@@ -1745,12 +1748,10 @@ async function main(): Promise<void> {
   // synthesizer (idle + delta + interval gates, light tier, concurrency 2).
   startThreadSynthesizerScheduler(store);
 
-  // Jobs that were waiting on a person when the previous process went away.
-  // Read before the cleanup below fails them; their threads are told after.
-  const parkedAtRestart = store
-    .listRunningJobsWithLastStage()
-    .map(job => ({ ...job, gate: humanGateForStage(job.lastStage) }))
-    .filter(job => job.gate !== undefined);
+  // Jobs the previous process was running or holding for a person. Read
+  // before the cleanup below fails them; every thread is told after, and a PR
+  // review is run again (issues #436, #589).
+  const lostAtRestart = store.listRunningJobsWithLastStage().map(job => ({ ...job, recovery: recoveryFor(job) }));
 
   // Mark any leftover RUNNING jobs as FAILED — their processes are gone after restart
   const orphaned = store.cleanupOrphanedRunningJobs();
@@ -1758,24 +1759,32 @@ async function main(): Promise<void> {
     logger.warn({ orphaned }, 'cleaned up orphaned RUNNING jobs from previous session');
   }
 
-  // A plan awaiting approval used to vanish on a restart without a word
-  // (issue #436). Best effort, and never blocks startup.
-  if (parkedAtRestart.length > 0 && config.slackBotToken) {
+  // A plan awaiting approval (#436) and a review mid-run (#589) used to
+  // vanish on a restart without a word. Best effort, never blocks startup.
+  if (lostAtRestart.length > 0 && config.slackBotToken) {
     const noticeClient = new WebClient(config.slackBotToken);
-    for (const job of parkedAtRestart) {
-      const text = buildRestartNotice({ gate: job.gate!, requestedBy: job.requestedBy });
+    for (const job of lostAtRestart) {
+      const { notice, kind, requeue } = job.recovery;
       void noticeClient.chat
-        .postMessage({ channel: job.channelId, thread_ts: job.threadTs, text })
+        .postMessage({ channel: job.channelId, thread_ts: job.threadTs, text: notice })
         .then(() =>
           store.appendJobLog({
             jobId: job.id,
             stage: 'job.restart_notice',
             level: 'WARN',
-            message: `Told the thread the request was dropped by a restart (was waiting: ${job.gate}).`,
-            data: { gate: job.gate, lastStage: job.lastStage },
+            message: `Told the thread the job was lost to a restart (${kind}).`,
+            data: { kind, lastStage: job.lastStage, workflow: job.workflow },
           }),
         )
         .catch(err => logger.warn({ jobId: job.id, err: String(err) }, 'restart notice failed'));
+      if (requeue) {
+        // After startup settles: the queue, slots and connectors are set up below.
+        setTimeout(() => {
+          void enqueueSlackEvent(requeue, noticeClient, 'catchup').catch(err =>
+            logger.warn({ jobId: job.id, err: String(err) }, 'could not re-run the review lost to a restart'),
+          );
+        }, RESTART_RERUN_DELAY_MS);
+      }
     }
   }
 
