@@ -325,7 +325,19 @@ const CONFIRM_PATTERNS =
   /^(yes|yep|yeah|yup|correct|confirmed?|exactly|right|go|go ahead|proceed|do it|lgtm|looks good|that'?s (right|correct|it|what i want))[.!]*$/i;
 /** An approver going ahead without the requester's confirmation: exact phrase, never inferred. */
 const OVERRIDE_CONFIRMATION_RE = /^approve without (the requester'?s? )?confirmation[.!]*$/i;
-const REJECT_PATTERNS = /^(no|stop|cancel|abort|nevermind|never mind)\b/i;
+/**
+ * "no" from an approver: the plan is turned down and miniOG asks what to change
+ * (issue #598). A stop is different, see `CANCEL_PATTERNS`.
+ */
+const REJECT_PATTERNS = /^(no|nope)\b/i;
+/**
+ * A stop, from an approver or the requester, ends the job at once (issue #598).
+ * The reply has to be the stop, with at most a reason after punctuation
+ * ("stop - this is a huge change"): "stop using X and add Y" is feedback.
+ * Mirrors the stop lane's vocabulary in `router/stopIntent.ts`, minus "no".
+ */
+const CANCEL_PATTERNS =
+  /^(?:please )?(stop|cancel|abort|halt|kill it|stop it|cancel it|stop this|cancel this|stop that|cancel that|stop now|cancel now|nevermind|never mind|drop it)(?: please)?(?:$|\s*[.!,;:—–-])/i;
 // Strict pause patterns: pause word must be the entire message (modulo punctuation).
 // "wait, that's wrong" / "wait, also include X" → feedback, not pause.
 const PAUSE_PATTERNS =
@@ -339,6 +351,17 @@ const PAUSE_PATTERNS =
  * only held the plan again. Anyone else's mention stays: "@someone yes" may
  * be addressed to them, and the classifier decides that.
  */
+/**
+ * A reply that @-mentions people and not miniOG is to them, not to miniOG
+ * (issue #599): "thanks <@U1>, can you also update the other pages" is not
+ * plan feedback, and reading it as one re-planned and paged the admins again.
+ */
+export function addressesSomeoneElse(text: string, botUserId?: string): boolean {
+  const mentions = [...text.matchAll(/<@([A-Z0-9]+)(?:\|[^>]*)?>/gi)].map(match => match[1]);
+  if (mentions.length === 0) return false;
+  return !mentions.some(userId => botUserId !== undefined && userId === botUserId);
+}
+
 function approvalReplyCommand(text: string, botUserId?: string): string {
   return text
     .replace(/<@([A-Z0-9]+)(?:\|[^>]*)?>/gi, (mention, userId: string) =>
@@ -618,6 +641,43 @@ async function pollForApproval(params: {
         return { outcome: 'paused', userReply: text, approverId: reply.user, replyTs: reply.ts };
       }
 
+      // A stop from an approver or the requester ends the job now (issue #598).
+      // "no" is not a stop: an approver's no turns the plan down and the
+      // workflow asks what to change; a requester's no is read below.
+      if (CANCEL_PATTERNS.test(command)) {
+        if (isApprover || reply.user === params.triggerUserId || reply.user === requester) {
+          logStep({
+            stage: 'pipeline.approval.cancelled',
+            message: `<@${reply.user}> stopped the plan: "${text}"`,
+          });
+          return { outcome: 'cancelled', userReply: text, approverId: reply.user, replyTs: reply.ts };
+        }
+        if (!notifiedUsers.has(reply.user)) {
+          notifiedUsers.add(reply.user);
+          slack.chat
+            .postMessage({
+              channel: channelId,
+              thread_ts: threadTs,
+              text: `<@${reply.user}> only an admin or the person who asked can stop this.`,
+            })
+            .catch(() => {});
+        }
+        continue;
+      }
+
+      // A reply to someone else is not a reply to miniOG (issue #599).
+      if (addressesSomeoneElse(text, botUserId)) {
+        if (!classifiedTs.has(reply.ts)) {
+          classifiedTs.add(reply.ts);
+          logStep({
+            stage: 'pipeline.approval.ignored',
+            message: `Ignored a reply addressed to someone else: "${text}"`,
+            data: { user: reply.user },
+          });
+        }
+        continue;
+      }
+
       // The requester confirming, or saying what they want instead (issue #437).
       if (requester && reply.user === requester) {
         if (requesterConfirmed) continue;
@@ -714,7 +774,7 @@ async function pollForApproval(params: {
               .postMessage({
                 channel: channelId,
                 thread_ts: threadTs,
-                text: `<@${reply.user}> Only admins can approve or reject plans.`,
+                text: `<@${reply.user}> only admins can turn a plan down. Say "stop" if you want me to drop it.`,
               })
               .catch(() => {});
           }
@@ -1800,7 +1860,7 @@ export async function runAgentPipeline(params: {
         const approvalPromptTs = await postSlackProgress({
           slack,
           ctx,
-          text: 'Here\'s my plan. An admin needs to approve before I proceed:\n• "yes" or "go" — I\'ll start coding\n• "no" or "stop" — I\'ll cancel\n• Or reply with changes you\'d like and I\'ll adjust',
+          text: 'Here\'s my plan. An admin needs to approve before I proceed:\n• "yes" or "go" — I\'ll start coding\n• "stop" or "cancel" — I\'ll drop it\n• "no", or changes you\'d like — I\'ll adjust the plan',
         });
 
         if (approvalPromptTs) {

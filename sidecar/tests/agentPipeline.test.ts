@@ -1762,6 +1762,105 @@ describe('waitForApproval', () => {
     });
   });
 
+  describe('a stop, and a reply to someone else (issues #598, #599)', () => {
+    const texts = () => mockSlack.chat.postMessage.mock.calls.map((call: any[]) => call[0].text as string);
+
+    it('ends the wait at once on an admin "stop"', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'stop', user: 'UCOREDEV', ts: '200.00' }]);
+      const promise = runApproval();
+      await vi.advanceTimersByTimeAsync(6000);
+
+      const result = await promise;
+      expect(result.outcome).toBe('cancelled');
+      expect(result.approverId).toBe('UCOREDEV');
+      expect(vi.mocked(runCodex)).not.toHaveBeenCalled();
+    });
+
+    it('lets the requester stop their own request', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([{ text: '<@UBOT> cancel it', user: 'UTRIGGER', ts: '200.00' }]);
+      const promise = runApproval();
+      await vi.advanceTimersByTimeAsync(6000);
+
+      const result = await promise;
+      expect(result.outcome).toBe('cancelled');
+      expect(result.approverId).toBe('UTRIGGER');
+      expect(texts()).toEqual([]);
+    });
+
+    it('tells a bystander who can stop it, once, and keeps waiting', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'stop', user: 'UOTHER', ts: '200.00' }]);
+      const controller = new AbortController();
+      const promise = runApproval({ signal: controller.signal });
+      await vi.advanceTimersByTimeAsync(12_000);
+
+      expect(texts()).toEqual(['<@UOTHER> only an admin or the person who asked can stop this.']);
+      controller.abort();
+      expect((await promise).outcome).toBe('cancelled');
+      expect((await promise).approverId).toBe('');
+    });
+
+    it('reads an admin "no" as turning the plan down, not as a stop', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'no', user: 'UCOREDEV', ts: '200.00' }]);
+      const promise = runApproval();
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect((await promise).outcome).toBe('rejected');
+    });
+
+    it('does not read "stop using X" as a stop', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([
+        { text: 'stop using the v1 endpoint and add a test', user: 'UCOREDEV', ts: '200.00' },
+      ]);
+      vi.mocked(runCodex).mockResolvedValue({
+        ok: true,
+        exitCode: 0,
+        timedOut: false,
+        stdout: '',
+        stderr: '',
+        lastMessage: '',
+        parsedJson: { intent: 'feedback', reasoning: 'a change to the plan' },
+      });
+      const promise = runApproval();
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect((await promise).outcome).toBe('feedback');
+    });
+
+    it('ignores a reply that @-mentions someone else and not miniOG, without asking the classifier', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([
+        { text: 'thanks <@UHUMAN>, can you also update the other pages?', user: 'UCOREDEV', ts: '200.00' },
+      ]);
+      const controller = new AbortController();
+      const log = vi.fn();
+      const promise = runApproval({ signal: controller.signal, logStep: log });
+      await vi.advanceTimersByTimeAsync(12_000);
+
+      expect(vi.mocked(runCodex)).not.toHaveBeenCalled();
+      expect(log).toHaveBeenCalledWith(expect.objectContaining({ stage: 'pipeline.approval.ignored' }));
+      controller.abort();
+      await promise;
+    });
+
+    it('still reads a reply that mentions miniOG alongside a person', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([
+        { text: '<@UHUMAN> fyi. <@UBOT> yes', user: 'UCOREDEV', ts: '200.00' },
+      ]);
+      vi.mocked(runCodex).mockResolvedValue({
+        ok: true,
+        exitCode: 0,
+        timedOut: false,
+        stdout: '',
+        stderr: '',
+        lastMessage: '',
+        parsedJson: { intent: 'approve', reasoning: 'says yes to miniOG' },
+      });
+      const promise = runApproval();
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect((await promise).outcome).toBe('approved');
+    });
+  });
+
   describe('a yes from someone who cannot approve', () => {
     const texts = () => mockSlack.chat.postMessage.mock.calls.map((call: any[]) => call[0].text as string);
 
@@ -1986,8 +2085,7 @@ describe('waitForApproval', () => {
         await promise;
       });
 
-      it("still holds an admin's yes addressed to someone else for the classifier", async () => {
-        vi.mocked(runCodex).mockResolvedValue({ ok: true, parsedJson: { intent: 'unrelated' } } as any);
+      it("ignores an admin's yes addressed to someone else, without asking the classifier (issue #599)", async () => {
         vi.mocked(fetchThreadContext).mockResolvedValue([{ text: '<@UOTHER> yes', user: 'UCOREDEV', ts: '200.00' }]);
         let settled = false;
         const controller = new AbortController();
@@ -1998,7 +2096,7 @@ describe('waitForApproval', () => {
         await vi.advanceTimersByTimeAsync(6000);
 
         expect(settled).toBe(false);
-        expect(runCodex).toHaveBeenCalledTimes(1);
+        expect(runCodex).not.toHaveBeenCalled();
         controller.abort();
         await promise;
       });
@@ -2085,7 +2183,7 @@ describe('waitForApproval', () => {
     expect((await promise).outcome).toBe('cancelled');
   });
 
-  it('rejects when message starts with "stop" followed by a reason', async () => {
+  it('stops at once on "stop" followed by a reason (issue #598)', async () => {
     vi.mocked(fetchThreadContext).mockResolvedValue([
       { text: 'stop - as this is huge change', user: 'UCOREDEV', ts: '200.00' },
     ]);
@@ -2094,7 +2192,7 @@ describe('waitForApproval', () => {
     await vi.advanceTimersByTimeAsync(6000);
     const result = await promise;
 
-    expect(result.outcome).toBe('rejected');
+    expect(result.outcome).toBe('cancelled');
     expect(result.approverId).toBe('UCOREDEV');
   });
 
