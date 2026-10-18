@@ -1408,13 +1408,15 @@ export async function runAgentPipeline(params: RunAgentPipelineParams): Promise<
         slack: params.slack,
         channelId: params.ctx.task.event.channelId,
         threadTs: params.ctx.task.event.threadTs,
-        intro: buildPipelineIntroMessage(params.ctx.pipelineConfig.agents, params.introMessage),
+        header: buildPipelineIntroMessage(params.ctx.pipelineConfig.agents, params.introMessage),
         logStep: params.logStep,
       })
     : undefined;
   try {
     return await runAgentPipelineBody(params, progress);
   } finally {
+    // A body that threw must not leave a live-looking "writing the code · 12 min" behind.
+    if (progress && !progress.finished) await progress.finish('Stopped before it finished. Details below.');
     progress?.dispose();
   }
 }
@@ -1445,6 +1447,8 @@ async function runAgentPipelineBody(
   const promptSteps = (): AgentStepResult[] => [...seededSteps, ...steps];
   let retryLoops = 0;
   let aborted = false;
+  /** The plan was turned down at the in-pipeline approval gate. */
+  let planRejected = false;
   let pendingNeedsInput = false;
   let needsInputQuestion: string | undefined;
   let usageLimitHit = false;
@@ -1796,6 +1800,7 @@ async function runAgentPipelineBody(
         });
 
         if (approvalPromptTs) {
+          await progress?.hold('waiting for an admin to approve the plan');
           const adminUserIds = getAdminUserIds(ctx.config);
           const approval = await waitForApproval({
             slack,
@@ -1815,6 +1820,7 @@ async function runAgentPipelineBody(
           }
           if (approval.outcome === 'rejected') {
             await postSlackProgress({ slack, ctx, text: 'Got it, cancelling.' });
+            planRejected = true;
             aborted = true;
             break;
           }
@@ -2048,22 +2054,27 @@ async function runAgentPipelineBody(
   });
 
   const took = formatElapsed(totalDurationMs);
-  const finishText =
-    finalStatus === 'passed'
-      ? `Done in ${took}. Summary below.`
-      : finalStatus === 'needs-input'
-        ? `Paused after ${took} — I need a bit more info before I can code a fix.`
-        : finalStatus === 'usage-limit'
-          ? `Paused — Claude usage limit hit${usageLimitResetsAt ? ` (resets ${usageLimitResetsAt})` : ''}. No code was lost.`
-          : interrupted?.kind === 'connection_lost'
-            ? `Stopped after ${took} — I lost my connection to the model and retrying didn't bring it back.`
-            : interrupted
-              ? `Stopped after ${took} — the ${interrupted.role} was killed from outside, twice.`
-              : budgetExhausted
-                ? `Stopped after ${took}: this run's time limit ran out${budgetExhausted.lastCoderPassUnreviewed ? ' before the latest changes were reviewed again' : ''}.`
-                : finalStatus === 'aborted'
-                  ? `Stopped after ${took}: a check found a critical issue.`
-                  : `Finished in ${took}, but the checks did not pass.`;
+  // The last edit of the progress message is its permanent state, so a cancel
+  // or a turned-down plan must not read as a failed check.
+  const finishText = signal?.aborted
+    ? `Stopped after ${took}.`
+    : planRejected
+      ? `Stopped after ${took}: the plan was not approved.`
+      : finalStatus === 'passed'
+        ? `Done in ${took}. Summary below.`
+        : finalStatus === 'needs-input'
+          ? `Paused after ${took} — I need a bit more info before I can code a fix.`
+          : finalStatus === 'usage-limit'
+            ? `Paused — Claude usage limit hit${usageLimitResetsAt ? ` (resets ${usageLimitResetsAt})` : ''}. No code was lost.`
+            : interrupted?.kind === 'connection_lost'
+              ? `Stopped after ${took} — I lost my connection to the model and retrying didn't bring it back.`
+              : interrupted
+                ? `Stopped after ${took} — the ${interrupted.role} was killed from outside, twice.`
+                : budgetExhausted
+                  ? `Stopped after ${took}: this run's time limit ran out${budgetExhausted.lastCoderPassUnreviewed ? ' before the latest changes were reviewed again' : ''}.`
+                  : finalStatus === 'aborted'
+                    ? `Stopped after ${took}: a check found a critical issue.`
+                    : `Finished in ${took}, but the checks did not pass.`;
   await progress?.finish(finishText);
 
   if (store && jobId) {

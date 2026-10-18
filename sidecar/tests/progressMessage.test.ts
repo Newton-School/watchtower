@@ -11,6 +11,10 @@ function makeSlack() {
   };
 }
 
+function slackError(code: string): Error & { data: { error: string } } {
+  return Object.assign(new Error(`An API error occurred: ${code}`), { data: { error: code } });
+}
+
 describe('formatElapsed', () => {
   it('reads as seconds, minutes, then hours', () => {
     expect(formatElapsed(0)).toBe('0s');
@@ -45,13 +49,13 @@ describe('createProgressMessage', () => {
     vi.useRealTimers();
   });
 
-  it('posts the intro once and edits that message for every stage and the finish', async () => {
+  it('posts once with the header as its first line, and edits that message for every stage and the finish', async () => {
     const slack = makeSlack();
     const progress = createProgressMessage({
       slack: slack as any,
       channelId: 'C1',
       threadTs: '1.0',
-      intro: 'Plan approved — I will code it up.',
+      header: 'Plan approved — I will code it up.',
     });
 
     await progress.set({ text: 'writing the code', step: 1, total: 3 });
@@ -63,16 +67,16 @@ describe('createProgressMessage', () => {
     expect(slack.chat.postMessage.mock.calls[0][0]).toMatchObject({
       channel: 'C1',
       thread_ts: '1.0',
-      text: 'Plan approved — I will code it up.',
+      text: 'Plan approved — I will code it up.\nwriting the code · step 1/3 · 0s',
     });
     const edits = slack.chat.update.mock.calls.map((call: any[]) => call[0]);
-    expect(edits.map(edit => edit.ts)).toEqual(['100.5', '100.5', '100.5']);
+    expect(edits.map(edit => edit.ts)).toEqual(['100.5', '100.5']);
     expect(edits.map(edit => edit.text)).toEqual([
-      'writing the code · step 1/3 · 0s',
-      'reviewing the changes · step 2/3 · 4 min',
-      'Done in 4 min. Summary below.',
+      'Plan approved — I will code it up.\nreviewing the changes · step 2/3 · 4 min',
+      'Plan approved — I will code it up.\nDone in 4 min. Summary below.',
     ]);
     expect(progress.ts).toBe('100.5');
+    expect(progress.finished).toBe(true);
     progress.dispose();
   });
 
@@ -95,24 +99,101 @@ describe('createProgressMessage', () => {
     progress.dispose();
   });
 
-  it('never throws when Slack refuses, and says so once in the log', async () => {
+  it('never lets a slow tick land after the finish', async () => {
+    const slack = makeSlack();
+    let releaseTick: (() => void) | undefined;
+    slack.chat.update
+      .mockImplementationOnce(() => new Promise<void>(resolve => (releaseTick = resolve)))
+      .mockResolvedValue({ ok: true });
+    const progress = createProgressMessage({ slack: slack as any, channelId: 'C1', threadTs: '1.0' });
+
+    await progress.set({ text: 'running final checks', step: 3, total: 3 });
+    await vi.advanceTimersByTimeAsync(60_000); // the tick's edit is now in flight
+    const finishing = progress.finish('Done in 1 min. Summary below.');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(slack.chat.update).toHaveBeenCalledTimes(1); // the finish waits its turn
+    releaseTick?.();
+    await finishing;
+
+    const texts = slack.chat.update.mock.calls.map((call: any[]) => call[0].text as string);
+    expect(texts[texts.length - 1]).toBe('Done in 1 min. Summary below.');
+    progress.dispose();
+  });
+
+  it('hold shows a line and stops the clock until the next stage', async () => {
+    const slack = makeSlack();
+    const progress = createProgressMessage({ slack: slack as any, channelId: 'C1', threadTs: '1.0' });
+
+    await progress.set({ text: 'thinking through the approach', step: 1, total: 2 });
+    await progress.hold('waiting for an admin to approve the plan');
+    await vi.advanceTimersByTimeAsync(3 * 60_000);
+    expect(slack.chat.update).toHaveBeenCalledTimes(1);
+    expect(slack.chat.update.mock.calls[0][0].text).toBe('waiting for an admin to approve the plan');
+
+    await progress.set({ text: 'writing the code', step: 2, total: 2 });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(slack.chat.update).toHaveBeenCalledTimes(3);
+    progress.dispose();
+  });
+
+  it('gives up after a Slack error that cannot succeed on retry, with one WARN row', async () => {
+    const slack = makeSlack();
+    slack.chat.update.mockRejectedValue(slackError('message_not_found'));
+    const logStep = vi.fn();
+    const progress = createProgressMessage({ slack: slack as any, channelId: 'C1', threadTs: '1.0', logStep });
+
+    await progress.set({ text: 'writing the code', step: 1, total: 3 });
+    await progress.set({ text: 'reviewing the changes', step: 2, total: 3 });
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    await progress.finish('Done in 5 min. Summary below.');
+
+    expect(slack.chat.update).toHaveBeenCalledTimes(1);
+    expect(logStep).toHaveBeenCalledTimes(1);
+    expect(logStep).toHaveBeenCalledWith(
+      expect.objectContaining({ stage: 'slack.progress.disabled', level: 'WARN', data: expect.anything() }),
+    );
+    progress.dispose();
+  });
+
+  it('gives up after three failures in a row', async () => {
+    const slack = makeSlack();
+    slack.chat.update.mockRejectedValue(new Error('socket hang up'));
+    const logStep = vi.fn();
+    const progress = createProgressMessage({ slack: slack as any, channelId: 'C1', threadTs: '1.0', logStep });
+
+    await progress.set({ text: 'writing the code', step: 1, total: 3 });
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+
+    expect(slack.chat.update).toHaveBeenCalledTimes(3);
+    expect(logStep).toHaveBeenCalledTimes(1);
+    progress.dispose();
+  });
+
+  it('posts at most once: a failed post never becomes a second message', async () => {
     const slack = makeSlack();
     slack.chat.postMessage.mockRejectedValue(new Error('channel_not_found'));
     const logStep = vi.fn();
     const progress = createProgressMessage({ slack: slack as any, channelId: 'C1', threadTs: '1.0', logStep });
 
     await expect(progress.set({ text: 'writing the code', step: 1, total: 3 })).resolves.toBeUndefined();
-    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'slack.progress.failed', level: 'WARN' }));
+    await progress.set({ text: 'reviewing the changes', step: 2, total: 3 });
+    await progress.finish('Done');
+
+    expect(slack.chat.postMessage).toHaveBeenCalledTimes(1);
+    expect(slack.chat.update).not.toHaveBeenCalled();
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'slack.progress.disabled', level: 'WARN' }));
     progress.dispose();
   });
 
-  it('does nothing after dispose', async () => {
+  it('does nothing after dispose, and finish is a no-op the second time', async () => {
     const slack = makeSlack();
     const progress = createProgressMessage({ slack: slack as any, channelId: 'C1', threadTs: '1.0' });
-    progress.dispose();
     await progress.set({ text: 'writing the code' });
     await progress.finish('Done');
-    expect(slack.chat.postMessage).not.toHaveBeenCalled();
-    expect(slack.chat.update).not.toHaveBeenCalled();
+    await progress.finish('Stopped before it finished.');
+    progress.dispose();
+    await progress.set({ text: 'writing the code' });
+    expect(slack.chat.postMessage).toHaveBeenCalledTimes(1);
+    expect(slack.chat.update).toHaveBeenCalledTimes(1);
   });
 });

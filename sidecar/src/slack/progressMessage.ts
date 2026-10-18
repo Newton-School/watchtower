@@ -1,5 +1,6 @@
 import type { WebClient } from '@slack/web-api';
 import type { WorkflowStepLogger } from '../types/contracts.js';
+import { FATAL_SLACK_ERRORS, slackErrorCode } from './threadStatus.js';
 
 /**
  * One Slack message per run that says where the run is, edited in place
@@ -8,13 +9,23 @@ import type { WorkflowStepLogger } from '../types/contracts.js';
  * Now the first stage posts the message and every later stage edits it. New
  * messages are left to what a person must act on and to the result.
  *
- * The line reads: `<what is happening> · step 2/3 · 7 min`. Elapsed time is
- * refreshed once a minute while a stage is running so a long silent agent run
- * does not look stuck.
+ * The message keeps its opening line ("Plan approved — I'll code it up…") and
+ * the second line is the stage: `writing the code · step 2/3 · 7 min`. The
+ * elapsed time is refreshed once a minute while a stage is running so a long
+ * silent agent run does not look stuck.
+ *
+ * Progress is decoration: nothing here throws. A Slack error that cannot
+ * succeed on retry (the message was deleted, the bot lost the channel), or
+ * three failures in a row, turns the message off for the rest of the run with
+ * one WARN row. The message is posted at most once: a post whose answer was
+ * lost must not become a second message.
  */
 
 /** How often the elapsed time on the message is refreshed. */
 const TICK_MS = 60_000;
+
+/** Consecutive transport failures tolerated before the message is given up. */
+const MAX_CONSECUTIVE_FAILURES = 3;
 
 export interface ProgressStage {
   /** What is happening now, as a short clause: "writing the code". */
@@ -30,12 +41,20 @@ export interface ProgressStage {
 export interface ProgressMessage {
   /** Show a stage. Posts the message the first time, edits it afterwards. Never throws. */
   set(stage: ProgressStage): Promise<void>;
-  /** Final text; stops the elapsed-time refresh. Never throws. */
+  /**
+   * Show a line and stop refreshing the elapsed time: for a human wait, where
+   * a counter would say the run is working while it waits. The next `set()`
+   * resumes the refresh.
+   */
+  hold(text: string): Promise<void>;
+  /** Final text; stops the elapsed-time refresh. A second call does nothing. Never throws. */
   finish(text: string): Promise<void>;
   /** Release the timer. Safe to call twice. */
   dispose(): void;
   /** The message's ts once posted, for tests and for threading a reply to it. */
   readonly ts: string | undefined;
+  /** Whether `finish` has run. */
+  readonly finished: boolean;
 }
 
 export function formatElapsed(ms: number): string {
@@ -62,20 +81,27 @@ export function createProgressMessage(params: {
   threadTs: string;
   /** When the run started; elapsed time counts from here. Defaults to now. */
   startedAt?: number;
-  /** Posted first, on its own, before any stage edits it: "Plan approved — …". */
-  intro?: string;
+  /** The message's first line, kept through every edit: "Plan approved — …". */
+  header?: string;
   logStep?: WorkflowStepLogger;
 }): ProgressMessage {
   const { slack, channelId, threadTs, logStep } = params;
   const startedAt = params.startedAt ?? Date.now();
+  const header = params.header?.trim() || undefined;
   let ts: string | undefined;
+  let posted = false;
   let current: ProgressStage | undefined;
   let finished = false;
   let disposed = false;
+  let disabled = false;
+  let consecutiveFailures = 0;
   let timer: ReturnType<typeof setInterval> | undefined;
-  /** Serialises posts and edits so an edit never overtakes the post it edits. */
+  /** Serialises posts, edits and ticks so an edit never overtakes the post it edits. */
   let chain: Promise<void> = Promise.resolve();
-  let pendingIntro = params.intro;
+
+  function compose(line: string): string {
+    return header ? `${header}\n${line}` : line;
+  }
 
   function stopTimer(): void {
     if (timer) {
@@ -85,36 +111,58 @@ export function createProgressMessage(params: {
   }
 
   function startTimer(): void {
-    if (timer || disposed || finished) return;
+    if (timer || disposed || finished || disabled) return;
     timer = setInterval(() => {
-      if (!current || finished || disposed) return;
-      void write(formatProgressLine(current, Date.now() - startedAt));
+      if (!current || finished || disposed || disabled) return;
+      const stage = current;
+      enqueue(() => compose(formatProgressLine(stage, Date.now() - startedAt)));
     }, TICK_MS);
     timer.unref?.();
   }
 
+  function disable(reason: string, detail: string): void {
+    if (disabled) return;
+    disabled = true;
+    stopTimer();
+    logStep?.({
+      level: 'WARN',
+      stage: 'slack.progress.disabled',
+      message: `Progress message turned off for this run (${reason}).`,
+      data: { reason, detail },
+    });
+  }
+
   async function write(text: string): Promise<void> {
-    if (disposed) return;
+    if (disposed || disabled) return;
     try {
-      if (!ts) {
+      if (!posted) {
+        posted = true;
         const result = await slack.chat.postMessage({ channel: channelId, thread_ts: threadTs, text });
         ts = result.ts ?? undefined;
-      } else {
+        if (!ts) {
+          // Slack took it but told us nothing we can edit: never post again.
+          disable('no message id returned', 'chat.postMessage returned no ts');
+        }
+      } else if (ts) {
         await slack.chat.update({ channel: channelId, ts, text });
       }
+      consecutiveFailures = 0;
     } catch (error) {
-      // Progress is decoration: it never fails the run.
-      logStep?.({
-        level: 'WARN',
-        stage: 'slack.progress.failed',
-        message: 'Could not update the progress message.',
-        data: { error: String(error) },
-      });
+      const code = slackErrorCode(error);
+      if (!posted || !ts || FATAL_SLACK_ERRORS.has(code) || code === 'message_not_found') {
+        disable(code, String(error));
+        return;
+      }
+      consecutiveFailures += 1;
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        disable('repeated transport failures', String(error));
+      }
     }
   }
 
-  function enqueue(text: string): Promise<void> {
-    chain = chain.then(() => write(text));
+  /** The text is built when its turn comes, so a tick never shows a stale clock. */
+  function enqueue(text: () => string): Promise<void> {
+    chain = chain.then(() => write(text()));
     return chain;
   }
 
@@ -122,23 +170,27 @@ export function createProgressMessage(params: {
     get ts() {
       return ts;
     },
+    get finished() {
+      return finished;
+    },
     async set(stage) {
-      if (finished || disposed) return;
+      if (finished || disposed || disabled) return;
       current = stage;
-      if (pendingIntro) {
-        const intro = pendingIntro;
-        pendingIntro = undefined;
-        await enqueue(intro);
-      }
       startTimer();
-      await enqueue(formatProgressLine(stage, Date.now() - startedAt));
+      await enqueue(() => compose(formatProgressLine(stage, Date.now() - startedAt)));
+    },
+    async hold(text) {
+      if (finished || disposed || disabled) return;
+      current = undefined;
+      stopTimer();
+      await enqueue(() => compose(text));
     },
     async finish(text) {
-      if (finished || disposed) return;
+      if (finished || disposed || disabled) return;
       finished = true;
       stopTimer();
       current = undefined;
-      await enqueue(text);
+      await enqueue(() => compose(text));
     },
     dispose() {
       disposed = true;
