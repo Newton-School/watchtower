@@ -41,6 +41,7 @@ import {
 } from './routerShadow.js';
 import { askRequester, decideClarify, giveUpOnClarify, type ClarifyAction } from './routeClarify.js';
 import { cancelledResult } from '../workflows/shared/cancelState.js';
+import { buildHelpReply, isHelpRequest } from './helpReply.js';
 import { looksLikeFixAffirmation } from './resumeIntentParser.js';
 
 import { isPresencePing } from '../workflows/shared/workflowUtils.js';
@@ -227,7 +228,11 @@ export async function routeTask(params: {
   } catch {
     // advisory: the router decides without it
   }
-  const routerShadow = startRouterShadow({ task, userMessage, reviewedPrInThread, logStep, signal });
+  /** A bare "help": answered at once, for this person in this channel, with no model run. */
+  const helpRequested = task.mentionType === 'bot' && isHelpRequest(userMessage);
+  const routerShadow = helpRequested
+    ? undefined
+    : startRouterShadow({ task, userMessage, reviewedPrInThread, logStep, signal });
   let legacyDecidedBy: LegacyDecidedBy = 'gate';
   let routerCouldNotDecide = false;
   let clarify: ClarifyAction = { kind: 'run' };
@@ -254,6 +259,13 @@ export async function routeTask(params: {
   ) {
     if (isPresencePing(userMessage)) {
       resolvedIntent = 'CONVERSATIONAL';
+    } else if (helpRequested) {
+      resolvedIntent = 'CONVERSATIONAL';
+      logStep?.({
+        stage: 'router.help_gate',
+        message: 'A bare help request — answering with what miniOG can do here, no model run.',
+        data: { userMessage },
+      });
     } else if (
       looksLikeFixAffirmation(userMessage) &&
       typeof store?.investigationStore === 'function' &&
@@ -614,6 +626,23 @@ export async function routeTask(params: {
   }
 
   await engage();
+  if (helpRequested) {
+    const text = buildHelpReply({
+      config,
+      userId: task.event.userId,
+      channelId: task.event.channelId,
+      channelType: task.event.channelType,
+      role: dossierRole,
+    });
+    await slack.chat.postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text });
+    return {
+      workflow: 'CONVERSATIONAL',
+      status: 'SUCCESS',
+      message: 'Answered a help request with what miniOG can do here.',
+      notifyDesktop: false,
+      slackPosted: true,
+    };
+  }
   const runWorkflow = WORKFLOW_RUNNERS[resolvedIntent];
   if (runWorkflow) {
     return runWorkflow({ task: routedTask, config, slack, store, jobId, logStep, signal });

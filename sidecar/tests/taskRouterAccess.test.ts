@@ -1646,3 +1646,31 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
     expect(runImplementationWorkflow).not.toHaveBeenCalled();
   });
 });
+
+describe('a bare help request (suggestion 13)', () => {
+  it('is answered at once with what miniOG can do here, with no router call and no agent', async () => {
+    const slack = makeSlack();
+    const logStep = vi.fn();
+    const task = makeTask({ userId: 'UBUILDER', channelId: 'C-BUILD', text: '<@UBOT1> what can you do?' });
+
+    await routeTask({ task, config: makeConfig('enforce'), slack: slack as never, store: {} as never, logStep });
+
+    expect(decideTool).not.toHaveBeenCalled();
+    expect(runAgenticEntry).not.toHaveBeenCalled();
+    expect(slack.chat.postMessage).toHaveBeenCalledTimes(1);
+    const text = slack.chat.postMessage.mock.calls[0][0].text as string;
+    expect(text.startsWith("Here's what I can do for you in this channel.")).toBe(true);
+    expect(text).toContain('Make a change and open a PR for it');
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'router.help_gate' }));
+  });
+
+  it('still tells someone who is not on the access list that they are not', async () => {
+    const slack = makeSlack();
+    const task = makeTask({ userId: 'USTRANGER', channelId: 'C-BUILD', text: '<@UBOT1> help' });
+
+    await routeTask({ task, config: makeConfig('enforce'), slack: slack as never, store: {} as never });
+
+    expect(slack.chat.postMessage).toHaveBeenCalledTimes(1);
+    expect(slack.chat.postMessage.mock.calls[0][0].text).toContain("you're not on the access list");
+  });
+});
