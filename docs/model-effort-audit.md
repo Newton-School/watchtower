@@ -2,6 +2,8 @@
 
 **Date:** 2026-08-03 · **Live backend:** `claude-code` (`app_settings.agent_backend`) · **CLI:** `claude` 2.1.220
 
+> **Later change (2026-10-18).** The live tier moved to `claude-opus-5-5` / `claude-sonnet-5-5`. Effort was re-tuned for the new calibration: the claude-code high tier and planner run at `high` (Opus 5.5 thinks more per turn than Opus 5, and at `medium` already beats Opus 5 at `high`), and the verifier runs at `medium` (Sonnet 5.5 at `low` can skip running checks). Sonnet 5 / 5.5 list at $2/$10. Rows below that say opus-5 @ xhigh describe the earlier tier.
+>
 > **Later change (2026-10).** The workflow-intent classifier this audit lists (`router/classifyIntent.ts`) no longer exists. The tool-router (`router/toolRouter.ts`, issue #456) makes that one call now; rows that cite the classifier are history.
 
 Every model and effort decision in the sidecar resolves through **one 24-line table**:

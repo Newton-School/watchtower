@@ -14,6 +14,20 @@ export interface ModelPricing {
 
 const PRICES: Record<string, ModelPricing> = {
   // Anthropic Claude
+  'claude-opus-5-5': {
+    inputPer1k: 0.004,
+    outputPer1k: 0.02,
+    cacheReadPer1k: 0.0002,
+    cacheCreatePer1k: 0.005,
+  },
+  'claude-sonnet-5-5': {
+    inputPer1k: 0.002,
+    outputPer1k: 0.01,
+    cacheReadPer1k: 0.0002,
+    cacheCreatePer1k: 0.0025,
+  },
+  // Previous tier — kept so a WATCHTOWER_CLAUDE_* rollback to Opus 5 /
+  // Sonnet 5 still records cost (rows are priced once, at write time).
   'claude-opus-5': {
     inputPer1k: 0.005,
     outputPer1k: 0.025,
@@ -21,10 +35,10 @@ const PRICES: Record<string, ModelPricing> = {
     cacheCreatePer1k: 0.00625,
   },
   'claude-sonnet-5': {
-    inputPer1k: 0.003,
-    outputPer1k: 0.015,
-    cacheReadPer1k: 0.0003,
-    cacheCreatePer1k: 0.00375,
+    inputPer1k: 0.002,
+    outputPer1k: 0.01,
+    cacheReadPer1k: 0.0002,
+    cacheCreatePer1k: 0.0025,
   },
   // Opus 4.7 lists at $5/$25 per MTok — this previously carried legacy
   // Opus 4.0/4.1 rates ($15/$75), inflating every recorded cost ~3x.

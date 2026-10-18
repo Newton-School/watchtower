@@ -30,23 +30,23 @@ describe('runClaudeAgentic tier/effort resolution (live claude-code backend)', (
     runCodex.mockResolvedValue(okResult());
   });
 
-  it('defaults to the high tier at its own effort (opus @ xhigh)', async () => {
+  it('defaults to the high tier at its own effort (opus @ high)', async () => {
     await runClaudeAgentic({ systemPrompt: 's', userMessage: 'u', cwd: '/tmp' });
-    expect(runCodex.mock.calls[0][0]).toMatchObject({ model: 'claude-opus-5', reasoningEffort: 'xhigh' });
+    expect(runCodex.mock.calls[0][0]).toMatchObject({ model: 'claude-opus-5-5', reasoningEffort: 'high' });
   });
 
   it('effort override keeps the tier model and dials only effort', async () => {
     await runClaudeAgentic({ systemPrompt: 's', userMessage: 'u', cwd: '/tmp', effort: 'medium' });
-    expect(runCodex.mock.calls[0][0]).toMatchObject({ model: 'claude-opus-5', reasoningEffort: 'medium' });
+    expect(runCodex.mock.calls[0][0]).toMatchObject({ model: 'claude-opus-5-5', reasoningEffort: 'medium' });
   });
 
   it("tier 'light' resolves the lightweight profile (sonnet @ low)", async () => {
     await runClaudeAgentic({ systemPrompt: 's', userMessage: 'u', cwd: '/tmp', tier: 'light' });
-    expect(runCodex.mock.calls[0][0]).toMatchObject({ model: 'claude-sonnet-5', reasoningEffort: 'low' });
+    expect(runCodex.mock.calls[0][0]).toMatchObject({ model: 'claude-sonnet-5-5', reasoningEffort: 'low' });
   });
 
   it("tier 'light' composes with an effort override", async () => {
     await runClaudeAgentic({ systemPrompt: 's', userMessage: 'u', cwd: '/tmp', tier: 'light', effort: 'medium' });
-    expect(runCodex.mock.calls[0][0]).toMatchObject({ model: 'claude-sonnet-5', reasoningEffort: 'medium' });
+    expect(runCodex.mock.calls[0][0]).toMatchObject({ model: 'claude-sonnet-5-5', reasoningEffort: 'medium' });
   });
 });

@@ -16,7 +16,7 @@ describe('claude-code model env overrides', () => {
     const m = await import('../src/codex/modelProfiles.js');
 
     expect(m.lightweightProfile('claude-code')).toEqual({ model: 'claude-sonnet-4-6', reasoningEffort: 'low' });
-    expect(m.highReasoningProfile('claude-code')).toEqual({ model: 'claude-opus-4-7', reasoningEffort: 'xhigh' });
+    expect(m.highReasoningProfile('claude-code')).toEqual({ model: 'claude-opus-4-7', reasoningEffort: 'high' });
   });
 
   it('planner override follows the high-reasoning env var (no third hardcoded copy)', async () => {
@@ -26,7 +26,7 @@ describe('claude-code model env overrides', () => {
 
     expect(m.profileForAgentRole('planner', 'claude-code')).toEqual({
       model: 'claude-opus-4-7',
-      reasoningEffort: 'xhigh',
+      reasoningEffort: 'high',
     });
   });
 
@@ -35,6 +35,6 @@ describe('claude-code model env overrides', () => {
     vi.resetModules();
     const m = await import('../src/codex/modelProfiles.js');
 
-    expect(m.highReasoningProfile('claude-code').model).toBe('claude-opus-5');
+    expect(m.highReasoningProfile('claude-code').model).toBe('claude-opus-5-5');
   });
 });

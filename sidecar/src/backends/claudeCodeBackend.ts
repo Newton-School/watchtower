@@ -7,6 +7,7 @@ import { buildCodexPath, parseStructuredOutput } from './codexBackend.js';
 import { personalSkillDenyRules } from './personalSkills.js';
 import { agentSandboxSettings, isAgentSandboxEnabled, sandboxReadDenyRules } from './agentSandbox.js';
 import { isTerminalShimDir } from './launchEnv.js';
+import { highReasoningProfile, lightweightProfile } from '../codex/modelProfiles.js';
 
 function asFiniteNumber(value: unknown): number | undefined {
   if (typeof value !== 'number') return undefined;
@@ -508,10 +509,10 @@ export const claudeCodeBackend: AgentBackend = {
   },
 
   availableModels(): string[] {
-    return ['claude-sonnet-5', 'claude-opus-5'];
+    return [lightweightProfile('claude-code').model, highReasoningProfile('claude-code').model];
   },
 
   defaultModel(): string {
-    return 'claude-sonnet-5';
+    return lightweightProfile('claude-code').model;
   },
 };
