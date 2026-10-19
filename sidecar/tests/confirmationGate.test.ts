@@ -54,6 +54,7 @@ beforeEach(() => {
 
 afterEach(() => {
   Object.assign(__confirmationTiming, realTiming);
+  __resetButtonRepliesForTests();
 });
 
 describe('normalizeConfirmationReply', () => {
@@ -74,7 +75,6 @@ describe('waitForExactConfirmation', () => {
     rememberPrompt({ channelId: 'C1', ts: PROMPT_TS, text: 'Deploy *newton-web* to production?' });
     recordButtonReply({
       channelId: 'C1',
-      threadTs: '1791000000.000100',
       messageTs: PROMPT_TS,
       userId: REQUESTER,
       value: 'confirm deploy',
@@ -91,7 +91,6 @@ describe('waitForExactConfirmation', () => {
       text: `Deploy *newton-web* to production?\n_Confirmed by <@${REQUESTER}>._`,
       blocks: [],
     });
-    __resetButtonRepliesForTests();
   });
 
   it('confirms on the exact phrase from the requester', async () => {

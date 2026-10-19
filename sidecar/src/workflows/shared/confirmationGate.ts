@@ -1,7 +1,7 @@
 import { jobSlots } from '../../runtime/jobSlots.js';
 import type { WebClient } from '@slack/web-api';
 import { fetchThreadRepliesSince, type ThreadMessage } from '../../slack/threadContext.js';
-import { buttonRepliesSince, retirePrompt } from '../../slack/buttonReplies.js';
+import { withButtonReplies, withRetire } from '../../slack/buttonReplies.js';
 import type { WorkflowStepLogger } from '../../types/contracts.js';
 
 /**
@@ -60,17 +60,14 @@ export function waitForExactConfirmation(
   params: Parameters<typeof pollForExactConfirmation>[0],
 ): Promise<ConfirmationResult> {
   return jobSlots.whileWaitingOnHuman(
-    async () => {
-      const result = await pollForExactConfirmation(params);
-      // The prompt's buttons go when the wait ends, however it ended (suggestion 9).
-      await retirePrompt({
+    // The prompt's buttons go when the wait ends, however it ended (suggestion 9).
+    () =>
+      withRetire(() => pollForExactConfirmation(params), {
         slack: params.slack,
         channelId: params.channelId,
         promptTs: params.promptTs,
-        outcome: confirmationOutcomeLine(result),
-      });
-      return result;
-    },
+        line: confirmationOutcomeLine,
+      }),
     { signal: params.signal, logStep: params.logStep },
   );
 }
@@ -137,7 +134,7 @@ async function pollForExactConfirmation(params: {
     }
 
     // A button on the prompt counts as the typed phrase (suggestion 9).
-    for (const reply of [...messages, ...buttonRepliesSince(channelId, threadTs, promptTs)]) {
+    for (const reply of withButtonReplies(messages, channelId, promptTs)) {
       if (!(Number(reply.ts) > Number(promptTs)) || reply.user === botUserId) continue;
       const text = normalizeConfirmationReply(reply.text);
       const allowed = allowedUserIds.includes(reply.user);

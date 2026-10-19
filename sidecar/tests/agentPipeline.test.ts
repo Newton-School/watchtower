@@ -2030,7 +2030,7 @@ describe('waitForApproval', () => {
   describe('a button on the prompt (suggestion 9)', () => {
     afterEach(() => __resetButtonRepliesForTests());
     const click = (userId: string, value: string, messageTs = '150.00') =>
-      recordButtonReply({ channelId: 'C1', threadTs: '100.00', messageTs, userId, value, actionTs: '200.000000' });
+      recordButtonReply({ channelId: 'C1', messageTs, userId, value, actionTs: '200.000000' });
 
     it('reads an Approve click from an admin as a yes, and a Stop click as a stop', async () => {
       vi.mocked(fetchThreadContext).mockResolvedValue([]);

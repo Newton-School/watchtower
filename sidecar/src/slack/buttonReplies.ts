@@ -14,7 +14,7 @@ import type { ThreadMessage } from './threadContext.js';
  * still decided by the gate, which also retires the prompt's buttons when it
  * ends, whatever ended it, so a dead prompt cannot be clicked into looking
  * acted on. A Stop click goes through the stop lane, which works at any
- * point in a job, not only while a gate is polling.
+ * point in a job; a click nothing is waiting on is answered as such.
  *
  * Buttons are off until the Slack app has Interactivity enabled (a click on
  * a button the app cannot receive shows the person an error). The operator
@@ -26,12 +26,8 @@ export const BUTTON_ACTION_RE = /^miniog_(approve|stop|confirm|decline)$/;
 /** How long a recorded click and a prompt's text are kept: longer than any gate waits. */
 const RETENTION_MS = 24 * 3_600_000;
 
-interface RecordedClick extends ThreadMessage {
-  /** The prompt the button sat on. A click on an older prompt is not a reply to a newer one. */
-  messageTs: string;
-}
-
-const clicksByThread = new Map<string, RecordedClick[]>();
+/** Clicks by the prompt they sat on (`channel|promptTs`); a prompt's ts is unique in its channel. */
+const clicksByPrompt = new Map<string, ThreadMessage[]>();
 /** The text each prompt was posted with, so it can be rewritten without its buttons. */
 const promptTexts = new Map<string, { text: string; at: number }>();
 
@@ -46,19 +42,20 @@ export interface ButtonClick {
   actionTs: string;
 }
 
-let settings: { isEnabled: () => boolean; onStopClick?: (click: ButtonClick) => Promise<boolean> } = {
-  isEnabled: () => false,
-};
-
-/**
- * The operator's switch, read on every use so it can be flipped without a
- * restart, and the stop lane a Stop click is handed to.
- */
-export function configureButtons(options: {
+interface ButtonSettings {
+  /** The operator's switch, read on every use so it can be flipped without a restart. */
   isEnabled: () => boolean;
   /** Hands a Stop to the stop lane; resolves false when no job was there to stop. */
   onStopClick?: (click: ButtonClick) => Promise<boolean>;
-}): void {
+  /** Whether a job still owns the thread, so a click has something to reach. */
+  hasListener?: (click: ButtonClick) => boolean;
+  /** Tells the person a click reached nothing. */
+  onOrphanClick?: (click: ButtonClick) => Promise<void>;
+}
+
+let settings: ButtonSettings = { isEnabled: () => false };
+
+export function configureButtons(options: ButtonSettings): void {
   settings = options;
 }
 
@@ -70,20 +67,16 @@ export function buttonsEnabled(): boolean {
   }
 }
 
-export function stopClickHandler(): ((click: ButtonClick) => Promise<boolean>) | undefined {
-  return settings.onStopClick;
-}
-
-function threadKey(channelId: string, threadTs: string): string {
-  return `${channelId}|${threadTs}`;
+function promptKey(channelId: string, promptTs: string): string {
+  return `${channelId}|${promptTs}`;
 }
 
 function prune(now: number): void {
   const cutoffTs = (now - RETENTION_MS) / 1000;
-  for (const [key, list] of clicksByThread) {
+  for (const [key, list] of clicksByPrompt) {
     const kept = list.filter(click => Number(click.ts) >= cutoffTs);
-    if (kept.length === 0) clicksByThread.delete(key);
-    else if (kept.length !== list.length) clicksByThread.set(key, kept);
+    if (kept.length === 0) clicksByPrompt.delete(key);
+    else if (kept.length !== list.length) clicksByPrompt.set(key, kept);
   }
   for (const [key, entry] of promptTexts) {
     if (entry.at < now - RETENTION_MS) promptTexts.delete(key);
@@ -94,13 +87,33 @@ function prune(now: number): void {
 export function rememberPrompt(params: { channelId: string; ts: string; text: string; now?: number }): void {
   const now = params.now ?? Date.now();
   prune(now);
-  promptTexts.set(`${params.channelId}|${params.ts}`, { text: params.text, at: now });
+  promptTexts.set(promptKey(params.channelId, params.ts), { text: params.text, at: now });
+}
+
+/**
+ * Posts a gate prompt: with its buttons when the switch is on, remembered so
+ * the gate can retire them. Returns the prompt's ts, or undefined when the
+ * post failed. One place for every gate, so they all behave the same.
+ */
+export async function postGatePrompt(
+  slack: Pick<WebClient, 'chat'>,
+  params: { channel: string; thread_ts: string; text: string; blocks: () => KnownBlock[] },
+): Promise<string | undefined> {
+  const withButtons = buttonsEnabled();
+  const result = await slack.chat.postMessage({
+    channel: params.channel,
+    thread_ts: params.thread_ts,
+    text: params.text,
+    ...(withButtons ? { blocks: params.blocks() } : {}),
+  });
+  const ts = typeof result.ts === 'string' ? result.ts : undefined;
+  if (withButtons && ts) rememberPrompt({ channelId: params.channel, ts, text: params.text });
+  return ts;
 }
 
 /** A click, kept as the reply the person would have typed, at Slack's time for it. */
 export function recordButtonReply(params: {
   channelId: string;
-  threadTs: string;
   messageTs: string;
   userId: string;
   value: string;
@@ -110,24 +123,31 @@ export function recordButtonReply(params: {
   const now = params.now ?? Date.now();
   prune(now);
   const ts = params.actionTs && Number.isFinite(Number(params.actionTs)) ? params.actionTs : (now / 1000).toFixed(6);
-  const click: RecordedClick = { text: params.value, user: params.userId, ts, messageTs: params.messageTs };
-  const key = threadKey(params.channelId, params.threadTs);
-  clicksByThread.set(key, [...(clicksByThread.get(key) ?? []), click]);
-  return { text: click.text, user: click.user, ts: click.ts };
+  const reply: ThreadMessage = { text: params.value, user: params.userId, ts };
+  const key = promptKey(params.channelId, params.messageTs);
+  clicksByPrompt.set(key, [...(clicksByPrompt.get(key) ?? []), reply]);
+  return reply;
 }
 
 /** Clicks on the prompt posted at `promptTs`, after it, oldest first. */
-export function buttonRepliesSince(channelId: string, threadTs: string, promptTs: string): ThreadMessage[] {
-  const list = clicksByThread.get(threadKey(channelId, threadTs)) ?? [];
-  return list
-    .filter(click => click.messageTs === promptTs && Number(click.ts) > Number(promptTs))
-    .map(({ text, user, ts }) => ({ text, user, ts }));
+export function buttonRepliesSince(channelId: string, promptTs: string): ThreadMessage[] {
+  const list = clicksByPrompt.get(promptKey(channelId, promptTs)) ?? [];
+  return list.filter(click => Number(click.ts) > Number(promptTs)).sort((a, b) => Number(a.ts) - Number(b.ts));
 }
+
+/** Thread messages and clicks together, in time order: a reply that came first is read first. */
+export function withButtonReplies(messages: ThreadMessage[], channelId: string, promptTs: string): ThreadMessage[] {
+  return [...messages, ...buttonRepliesSince(channelId, promptTs)].sort((a, b) => Number(a.ts) - Number(b.ts));
+}
+
+/** Slack errors that mean the prompt is gone: nothing left to retire. */
+const PROMPT_GONE = new Set(['message_not_found', 'channel_not_found', 'thread_not_found']);
 
 /**
  * The gate ended: the prompt loses its buttons and says how it ended. A
- * prompt posted without buttons (switch off, or by an older build) is left
- * alone. Never throws.
+ * prompt posted without buttons (switch off, an older build) is left alone.
+ * A transient Slack failure keeps the prompt remembered, so a later retire
+ * can still take the buttons away. Never throws.
  */
 export async function retirePrompt(params: {
   slack: Pick<WebClient, 'chat'>;
@@ -135,9 +155,9 @@ export async function retirePrompt(params: {
   promptTs: string;
   outcome: string;
 }): Promise<void> {
-  const entry = promptTexts.get(`${params.channelId}|${params.promptTs}`);
+  const key = promptKey(params.channelId, params.promptTs);
+  const entry = promptTexts.get(key);
   if (!entry) return;
-  promptTexts.delete(`${params.channelId}|${params.promptTs}`);
   try {
     await params.slack.chat.update({
       channel: params.channelId,
@@ -145,13 +165,37 @@ export async function retirePrompt(params: {
       text: `${entry.text}\n_${params.outcome}_`,
       blocks: [],
     });
-  } catch {
-    // The prompt may have been deleted; nothing to retire.
+    promptTexts.delete(key);
+  } catch (error) {
+    const code = (error as { data?: { error?: unknown } } | undefined)?.data?.error;
+    if (typeof code === 'string' && PROMPT_GONE.has(code)) promptTexts.delete(key);
   }
 }
 
+/**
+ * Runs a gate's wait and retires its prompt when the wait ends. `line` says
+ * how it ended, or undefined to leave the buttons in place (a pause: the
+ * same prompt is resumed later).
+ */
+export async function withRetire<T>(
+  wait: () => Promise<T>,
+  params: {
+    slack: Pick<WebClient, 'chat'>;
+    channelId: string;
+    promptTs: string;
+    line: (result: T) => string | undefined;
+  },
+): Promise<T> {
+  const result = await wait();
+  const line = params.line(result);
+  if (line !== undefined) {
+    await retirePrompt({ slack: params.slack, channelId: params.channelId, promptTs: params.promptTs, outcome: line });
+  }
+  return result;
+}
+
 export function __resetButtonRepliesForTests(): void {
-  clicksByThread.clear();
+  clicksByPrompt.clear();
   promptTexts.clear();
   settings = { isEnabled: () => false };
 }
@@ -176,17 +220,20 @@ export function readButtonClick(body: Record<string, unknown>): ButtonClick | un
 }
 
 /**
- * What a click does: a Stop goes to the stop lane, which aborts the job at any
- * point; the others are kept for the gate that is polling.
+ * What a click does: a Stop goes to the stop lane, which aborts the job at
+ * any point; a click on a prompt no job is waiting on is answered as such;
+ * the others are kept for the gate that is polling.
  */
 export async function handleButtonClick(click: ButtonClick): Promise<void> {
-  if (click.actionId === 'miniog_stop') {
-    const onStop = stopClickHandler();
-    if (onStop && (await onStop(click).catch(() => false))) return;
+  if (click.actionId === 'miniog_stop' && settings.onStopClick) {
+    if (await settings.onStopClick(click).catch(() => false)) return;
+  }
+  if (settings.hasListener && !settings.hasListener(click)) {
+    await settings.onOrphanClick?.(click).catch(() => undefined);
+    return;
   }
   recordButtonReply({
     channelId: click.channelId,
-    threadTs: click.threadTs,
     messageTs: click.messageTs,
     userId: click.userId,
     value: click.value,
@@ -216,6 +263,14 @@ export function approvalBlocks(text: string): KnownBlock[] {
   return promptBlocks(text, 'miniog_approval', [
     button('miniog_approve', 'Approve', 'yes', 'primary'),
     button('miniog_stop', 'Stop', 'stop', 'danger'),
+  ]);
+}
+
+/** A yes-or-no question (merge despite unresolved comments?): No turns it down, it does not stop the job. */
+export function yesNoBlocks(text: string): KnownBlock[] {
+  return promptBlocks(text, 'miniog_yes_no', [
+    button('miniog_approve', 'Yes', 'yes', 'primary'),
+    button('miniog_decline', 'No', 'no'),
   ]);
 }
 

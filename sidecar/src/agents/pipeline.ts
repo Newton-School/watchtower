@@ -23,10 +23,10 @@ import { currentConnectors, NO_CONNECTORS, withConnectors } from '../backends/co
 import { fetchThreadContext } from '../slack/threadContext.js';
 import {
   approvalBlocks,
-  buttonRepliesSince,
   buttonsEnabled,
   rememberPrompt,
-  retirePrompt,
+  withButtonReplies,
+  withRetire,
 } from '../slack/buttonReplies.js';
 import { isGateStop, normalizeControlText, slackMentionIds, stripSlackMentions } from '../router/stopIntent.js';
 import { createProgressMessage, formatElapsed, type ProgressMessage } from '../slack/progressMessage.js';
@@ -532,17 +532,14 @@ Return strict JSON:
 /** Waits for a plan to be approved. The job's slot is free while it waits (issue #434). */
 export function waitForApproval(params: Parameters<typeof pollForApproval>[0]): Promise<ApprovalResult> {
   return jobSlots.whileWaitingOnHuman(
-    async () => {
-      const result = await pollForApproval(params);
-      // The prompt's buttons go when the wait ends, however it ended (suggestion 9).
-      await retirePrompt({
+    // The prompt's buttons go when the wait ends, however it ended (suggestion 9).
+    () =>
+      withRetire(() => pollForApproval(params), {
         slack: params.slack,
         channelId: params.channelId,
         promptTs: params.approvalPromptTs,
-        outcome: approvalOutcomeLine(result),
-      });
-      return result;
-    },
+        line: approvalOutcomeLine,
+      }),
     {
       signal: params.signal,
       logStep: params.logStep,
@@ -552,17 +549,18 @@ export function waitForApproval(params: Parameters<typeof pollForApproval>[0]): 
   );
 }
 
-function approvalOutcomeLine(result: ApprovalResult): string {
+/** How the prompt ends. A pause keeps its buttons: the same prompt is resumed later. */
+function approvalOutcomeLine(result: ApprovalResult): string | undefined {
   const who = result.approverId ? `<@${result.approverId}>` : '';
   switch (result.outcome) {
     case 'approved':
       return `${who} approved.`;
     case 'rejected':
-      return `${who} turned the plan down.`;
+      return `${who} turned it down.`;
     case 'feedback':
-      return `${who} asked for changes; a revised plan follows.`;
+      return `${who} asked for changes.`;
     case 'paused':
-      return `Paused by ${who}.`;
+      return undefined;
     default:
       return who ? `Stopped by ${who}.` : 'Stopped.';
   }
@@ -723,7 +721,7 @@ async function pollForApproval(params: {
 
     // Find messages newer than the approval prompt, excluding the bot itself.
     // Button clicks on the prompt count as replies (suggestion 9).
-    const candidateReplies = [...messages, ...buttonRepliesSince(channelId, threadTs, approvalPromptTs)].filter(
+    const candidateReplies = withButtonReplies(messages, channelId, approvalPromptTs).filter(
       m => m.ts > approvalPromptTs && m.user !== botUserId,
     );
 
