@@ -2,7 +2,7 @@ import { App, LogLevel } from '@slack/bolt';
 import type { WebClient } from '@slack/web-api';
 import type { AppConfig, SlackEventEnvelope, SlackReactionEvent } from '../types/contracts.js';
 import { logger } from '../logging/logger.js';
-import { BUTTON_ACTION_RE, clickedText, readButtonClick, recordButtonReply } from './buttonReplies.js';
+import { BUTTON_ACTION_RE, handleButtonClick, readButtonClick } from './buttonReplies.js';
 
 type SlackEventHandler = (event: SlackEventEnvelope, client: WebClient) => Promise<void>;
 type SlackReactionHandler = (event: SlackReactionEvent, client: WebClient) => Promise<void>;
@@ -159,18 +159,13 @@ export class SocketSlackClient {
     });
 
     // A button on a gate (suggestion 9): the click is kept as the reply the
-    // person would have typed, and the prompt loses its buttons so it is
-    // clicked once. Who may approve or confirm is still the gate's decision.
-    this.app.action(BUTTON_ACTION_RE, async ({ ack, body, client }) => {
+    // person would have typed, for the gate that is polling; a Stop goes to
+    // the stop lane. The gate decides who may act and retires the buttons
+    // when it ends, so nothing is rewritten here.
+    this.app.action(BUTTON_ACTION_RE, async ({ ack, body }) => {
       await ack();
       const click = readButtonClick(body as unknown as Record<string, unknown>);
       if (!click) return;
-      recordButtonReply({
-        channelId: click.channelId,
-        threadTs: click.threadTs,
-        userId: click.userId,
-        value: click.value,
-      });
       logger.info(
         {
           component: 'slack',
@@ -181,16 +176,7 @@ export class SocketSlackClient {
         },
         'received a button click',
       );
-      try {
-        await client.chat.update({
-          channel: click.channelId,
-          ts: click.messageTs,
-          text: clickedText(click.messageText, click.userId, click.actionId),
-          blocks: [],
-        });
-      } catch (error) {
-        logger.warn({ error: String(error) }, 'could not rewrite the clicked prompt');
-      }
+      await handleButtonClick(click);
     });
 
     this.app.command('/miniog', async ({ command, ack, client }) => {

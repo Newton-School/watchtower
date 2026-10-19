@@ -1867,6 +1867,27 @@ async function main(): Promise<void> {
     process.exit(0);
   });
 
+  // Buttons on the gates (suggestion 9) stay off until the Slack app has
+  // Interactivity enabled; the operator flips `slack_buttons` to `on` then.
+  // A Stop click takes the stop lane, like "@miniOG stop", so it works at any
+  // point in a job; when no job is running it is kept for a polling gate.
+  configureButtons({
+    isEnabled: () => store.getState('slack_buttons') === 'on',
+    onStopClick: click =>
+      tryHandleStopControl(
+        {
+          eventId: `button:${click.channelId}:${click.actionTs}`,
+          channelId: click.channelId,
+          channelType: click.channelId.startsWith('D') ? 'im' : 'channel',
+          threadTs: click.threadTs,
+          eventTs: click.actionTs,
+          userId: click.userId,
+          text: `<@${config.botUserId}> stop`,
+          rawEvent: {},
+        },
+        client.webClient,
+      ),
+  });
   await client.start();
   logger.info('autonomous feed/digest/incident posting disabled; mention-triggered replies only');
 
@@ -1983,10 +2004,6 @@ async function main(): Promise<void> {
   };
   void checkBotScopes();
   setInterval(() => void checkBotScopes(), 10 * 60 * 1000);
-
-  // Buttons on the gates (suggestion 9) stay off until the Slack app has
-  // Interactivity enabled; the operator flips `slack_buttons` to `on` then.
-  configureButtons({ isEnabled: () => store.getState('slack_buttons') === 'on' });
 
   // Poll for cancel requests from the Watchtower UI (written to SQLite by Tauri)
   setInterval(() => {

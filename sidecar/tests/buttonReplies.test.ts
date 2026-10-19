@@ -1,33 +1,64 @@
-import { afterEach, describe, expect, it } from 'vitest';
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   __resetButtonRepliesForTests,
   approvalBlocks,
   buttonRepliesSince,
   buttonsEnabled,
-  clickedText,
   configureButtons,
   confirmationBlocks,
+  handleButtonClick,
   readButtonClick,
   recordButtonReply,
+  rememberPrompt,
+  retirePrompt,
 } from '../src/slack/buttonReplies.js';
 
 afterEach(() => __resetButtonRepliesForTests());
 
+const now = Date.parse('2026-10-19T10:00:00Z');
+
 describe('the click registry', () => {
-  it('keeps a click as the reply the person would have typed, after the prompt', () => {
-    const now = Date.parse('2026-10-19T10:00:00Z');
-    const reply = recordButtonReply({ channelId: 'C1', threadTs: '100.1', userId: 'U1', value: 'yes', now });
-    expect(reply).toEqual({ text: 'yes', user: 'U1', ts: (now / 1000).toFixed(6) });
-    expect(buttonRepliesSince('C1', '100.1', '100.1')).toEqual([reply]);
-    expect(buttonRepliesSince('C1', '100.1', reply.ts)).toEqual([]);
-    expect(buttonRepliesSince('C1', '200.2', '0')).toEqual([]);
+  it('keeps a click as the reply the person would have typed, at Slack’s time, for the prompt it sat on', () => {
+    const reply = recordButtonReply({
+      channelId: 'C1',
+      threadTs: '100.1',
+      messageTs: '150.0',
+      userId: 'U1',
+      value: 'yes',
+      actionTs: '151.000200',
+      now,
+    });
+    expect(reply).toEqual({ text: 'yes', user: 'U1', ts: '151.000200' });
+    expect(buttonRepliesSince('C1', '100.1', '150.0')).toEqual([reply]);
+    // A click on an older prompt is not a reply to a newer one.
+    expect(buttonRepliesSince('C1', '100.1', '160.0')).toEqual([]);
+    expect(buttonRepliesSince('C1', '200.2', '150.0')).toEqual([]);
+  });
+
+  it('falls back to the host clock when Slack sent no time', () => {
+    const reply = recordButtonReply({
+      channelId: 'C1',
+      threadTs: '100.1',
+      messageTs: '150.0',
+      userId: 'U1',
+      value: 'yes',
+      now,
+    });
+    expect(reply.ts).toBe((now / 1000).toFixed(6));
   });
 
   it('forgets clicks older than a day', () => {
-    const now = Date.parse('2026-10-19T10:00:00Z');
-    recordButtonReply({ channelId: 'C1', threadTs: '100.1', userId: 'U1', value: 'yes', now: now - 25 * 3_600_000 });
-    recordButtonReply({ channelId: 'C1', threadTs: '100.1', userId: 'U2', value: 'stop', now });
-    expect(buttonRepliesSince('C1', '100.1', '0').map(reply => reply.text)).toEqual(['stop']);
+    recordButtonReply({
+      channelId: 'C1',
+      threadTs: '100.1',
+      messageTs: '150.0',
+      userId: 'U1',
+      value: 'yes',
+      now: now - 25 * 3_600_000,
+    });
+    recordButtonReply({ channelId: 'C1', threadTs: '100.1', messageTs: '150.0', userId: 'U2', value: 'stop', now });
+    expect(buttonRepliesSince('C1', '100.1', '150.0').map(reply => reply.text)).toEqual(['stop']);
   });
 
   it('is off until the operator turns it on, and a broken switch reads as off', () => {
@@ -43,13 +74,41 @@ describe('the click registry', () => {
   });
 });
 
+describe('retirePrompt', () => {
+  it('rewrites a remembered prompt with the outcome and no buttons, once', async () => {
+    const slack = { chat: { update: vi.fn().mockResolvedValue({ ok: true }) } };
+    rememberPrompt({ channelId: 'C1', ts: '150.0', text: 'Deploy?', now });
+
+    await retirePrompt({ slack: slack as any, channelId: 'C1', promptTs: '150.0', outcome: 'Confirmed by <@U1>.' });
+    await retirePrompt({ slack: slack as any, channelId: 'C1', promptTs: '150.0', outcome: 'again' });
+
+    expect(slack.chat.update).toHaveBeenCalledTimes(1);
+    expect(slack.chat.update.mock.calls[0][0]).toEqual({
+      channel: 'C1',
+      ts: '150.0',
+      text: 'Deploy?\n_Confirmed by <@U1>._',
+      blocks: [],
+    });
+  });
+
+  it('leaves a prompt it does not know alone, and never throws', async () => {
+    const slack = { chat: { update: vi.fn().mockRejectedValue(new Error('message_not_found')) } };
+    await retirePrompt({ slack: slack as any, channelId: 'C1', promptTs: '150.0', outcome: 'x' });
+    expect(slack.chat.update).not.toHaveBeenCalled();
+    rememberPrompt({ channelId: 'C1', ts: '150.0', text: 'Deploy?', now });
+    await expect(
+      retirePrompt({ slack: slack as any, channelId: 'C1', promptTs: '150.0', outcome: 'x' }),
+    ).resolves.toBeUndefined();
+  });
+});
+
 describe('readButtonClick', () => {
   const body = {
     type: 'block_actions',
     user: { id: 'UADMIN' },
     channel: { id: 'C1' },
-    message: { ts: '150.00', thread_ts: '100.1', text: "Here's my plan. An admin needs to approve before I proceed:" },
-    actions: [{ action_id: 'miniog_approve', value: 'yes', type: 'button' }],
+    message: { ts: '150.00', thread_ts: '100.1', text: "Here's my plan." },
+    actions: [{ action_id: 'miniog_approve', value: 'yes', type: 'button', action_ts: '151.000200' }],
   };
 
   it('reads miniOG’s own buttons and nothing else', () => {
@@ -60,7 +119,7 @@ describe('readButtonClick', () => {
       userId: 'UADMIN',
       actionId: 'miniog_approve',
       value: 'yes',
-      messageText: "Here's my plan. An admin needs to approve before I proceed:",
+      actionTs: '151.000200',
     });
     expect(readButtonClick({ ...body, actions: [{ action_id: 'other_app_button', value: 'x' }] })).toBeUndefined();
     expect(readButtonClick({ ...body, user: {} })).toBeUndefined();
@@ -68,6 +127,37 @@ describe('readButtonClick', () => {
 
   it('uses the message itself as the thread when the prompt is a top-level message', () => {
     expect(readButtonClick({ ...body, message: { ts: '150.00', text: 't' } })?.threadTs).toBe('150.00');
+  });
+});
+
+describe('handleButtonClick', () => {
+  const click = {
+    channelId: 'C1',
+    threadTs: '100.1',
+    messageTs: '150.0',
+    userId: 'U1',
+    actionId: 'miniog_stop',
+    value: 'stop',
+    actionTs: '151.0',
+  };
+
+  it('hands a Stop to the stop lane and records nothing when it stopped a job', async () => {
+    const onStopClick = vi.fn().mockResolvedValue(true);
+    configureButtons({ isEnabled: () => true, onStopClick });
+    await handleButtonClick(click);
+    expect(onStopClick).toHaveBeenCalledWith(click);
+    expect(buttonRepliesSince('C1', '100.1', '150.0')).toEqual([]);
+  });
+
+  it('keeps a Stop for a polling gate when no job was there to stop', async () => {
+    configureButtons({ isEnabled: () => true, onStopClick: vi.fn().mockResolvedValue(false) });
+    await handleButtonClick(click);
+    expect(buttonRepliesSince('C1', '100.1', '150.0')).toEqual([{ text: 'stop', user: 'U1', ts: '151.0' }]);
+  });
+
+  it('records every other click', async () => {
+    await handleButtonClick({ ...click, actionId: 'miniog_approve', value: 'yes' });
+    expect(buttonRepliesSince('C1', '100.1', '150.0')).toEqual([{ text: 'yes', user: 'U1', ts: '151.0' }]);
   });
 });
 
@@ -89,10 +179,5 @@ describe('the blocks', () => {
       ['miniog_confirm', 'confirm deploy', 'Confirm deploy'],
       ['miniog_decline', 'cancel', 'Cancel'],
     ]);
-  });
-
-  it('rewrites a clicked prompt with the choice and no buttons', () => {
-    expect(clickedText('Deploy?', 'U1', 'miniog_confirm')).toBe('Deploy?\n_<@U1> confirmed with a button._');
-    expect(clickedText('Plan', 'U1', 'miniog_stop')).toBe('Plan\n_<@U1> stopped it with a button._');
   });
 });

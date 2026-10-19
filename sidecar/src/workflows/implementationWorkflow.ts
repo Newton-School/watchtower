@@ -13,7 +13,7 @@ import type {
 } from '../types/contracts.js';
 import { formatAdminMention, getAdminUserIds } from '../access/control.js';
 import { composeChangeReply, requesterIsEngineer, sanitizeRequesterSummary } from './shared/changeReply.js';
-import { approvalBlocks, buttonsEnabled, confirmationBlocks } from '../slack/buttonReplies.js';
+import { approvalBlocks, buttonsEnabled, confirmationBlocks, rememberPrompt } from '../slack/buttonReplies.js';
 import { connectorsFor, withConnectors } from '../backends/connectors.js';
 import { runCodex, getActiveBackendId, selectBackendForUser } from '../codex/runCodex.js';
 import { connectionLostReply, killedFromOutsideReply, runWithInfraRetry } from '../codex/infraRetry.js';
@@ -271,13 +271,15 @@ async function confirmQuickPrAction(params: {
   let promptTs: string | undefined;
   try {
     const confirmText = `<@${userId}> asked me to ${action} ${target}.${unresolvedNote} ${ownerMentions}, reply \`${phrase}\` within 10 minutes and I'll do it. Without that, nothing changes.`;
+    const withButtons = buttonsEnabled();
     const prompt = await slack.chat.postMessage({
       channel: channelId,
       thread_ts: threadTs,
       text: confirmText,
-      ...(buttonsEnabled() ? { blocks: confirmationBlocks(confirmText, phrase, `Confirm ${action}`) } : {}),
+      ...(withButtons ? { blocks: confirmationBlocks(confirmText, phrase, `Confirm ${action}`) } : {}),
     });
     promptTs = typeof prompt.ts === 'string' ? prompt.ts : undefined;
+    if (withButtons && promptTs) rememberPrompt({ channelId, ts: promptTs, text: confirmText });
   } catch {
     // Handled below: without an anchored prompt there is nothing safe to wait on.
   }
@@ -458,13 +460,17 @@ export async function runApprovalLoop(input: {
           : `Here's the revised plan. "yes" to proceed, "stop" to drop it, or reply with more changes.${requesterToConfirm ? ' I start once the requester confirms it and an admin approves.' : ''}`;
 
       try {
+        const withButtons = buttonsEnabled();
         const promptResult = await slack.chat.postMessage({
           channel: task.event.channelId,
           thread_ts: task.event.threadTs,
           text: promptText,
-          ...(buttonsEnabled() ? { blocks: approvalBlocks(promptText) } : {}),
+          ...(withButtons ? { blocks: approvalBlocks(promptText) } : {}),
         });
         approvalPromptTs = promptResult.ts ?? undefined;
+        if (withButtons && approvalPromptTs) {
+          rememberPrompt({ channelId: task.event.channelId, ts: approvalPromptTs, text: promptText });
+        }
       } catch {
         // Non-fatal
       }
@@ -1316,12 +1322,17 @@ async function runImplementationWorkflowBody(params: {
 
         if (unresolvedCount > 0) {
           const confirmMsg = `This PR has ${unresolvedCount} unresolved review comment${unresolvedCount > 1 ? 's' : ''}. Should I still merge? Reply *yes* to proceed or *no* to cancel.`;
+          const withButtons = buttonsEnabled();
           const confirmResult = await slack.chat.postMessage({
             channel: task.event.channelId,
             thread_ts: task.event.threadTs,
             text: confirmMsg,
+            ...(withButtons ? { blocks: approvalBlocks(confirmMsg) } : {}),
           });
 
+          if (withButtons && confirmResult.ts) {
+            rememberPrompt({ channelId: task.event.channelId, ts: confirmResult.ts, text: confirmMsg });
+          }
           if (confirmResult.ts) {
             const approval = await waitForApproval({
               slack,

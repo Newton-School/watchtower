@@ -5,7 +5,7 @@ import {
   normalizeConfirmationReply,
   waitForExactConfirmation,
 } from '../src/workflows/shared/confirmationGate.js';
-import { __resetButtonRepliesForTests, recordButtonReply } from '../src/slack/buttonReplies.js';
+import { __resetButtonRepliesForTests, recordButtonReply, rememberPrompt } from '../src/slack/buttonReplies.js';
 
 const REQUESTER = 'UREQ';
 const BOT = 'UBOT1';
@@ -70,12 +70,27 @@ describe('normalizeConfirmationReply', () => {
 describe('waitForExactConfirmation', () => {
   it('confirms on a button click that carries the phrase, from an allowed user (suggestion 9)', async () => {
     const { slack } = slackWith([prompt]);
-    recordButtonReply({ channelId: 'C1', threadTs: '1791000000.000100', userId: REQUESTER, value: 'confirm deploy' });
+    slack.chat.update = vi.fn().mockResolvedValue({ ok: true });
+    rememberPrompt({ channelId: 'C1', ts: PROMPT_TS, text: 'Deploy *newton-web* to production?' });
+    recordButtonReply({
+      channelId: 'C1',
+      threadTs: '1791000000.000100',
+      messageTs: PROMPT_TS,
+      userId: REQUESTER,
+      value: 'confirm deploy',
+      actionTs: `${1791000100 + 5}.000100`,
+    });
 
     const result = await wait(slack);
 
     expect(result.outcome).toBe('confirmed');
     expect(result.userId).toBe(REQUESTER);
+    expect(slack.chat.update).toHaveBeenCalledWith({
+      channel: 'C1',
+      ts: PROMPT_TS,
+      text: `Deploy *newton-web* to production?\n_Confirmed by <@${REQUESTER}>._`,
+      blocks: [],
+    });
     __resetButtonRepliesForTests();
   });
 

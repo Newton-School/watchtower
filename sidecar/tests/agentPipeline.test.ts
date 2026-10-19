@@ -15,7 +15,7 @@ import { runCodex } from '../src/codex/runCodex.js';
 import { __infraRetry } from '../src/codex/infraRetry.js';
 import { currentConnectors, withConnectors } from '../src/backends/connectors.js';
 import { fetchThreadContext } from '../src/slack/threadContext.js';
-import { __resetButtonRepliesForTests, recordButtonReply } from '../src/slack/buttonReplies.js';
+import { __resetButtonRepliesForTests, recordButtonReply, rememberPrompt } from '../src/slack/buttonReplies.js';
 import { checkCoderProducedChanges } from '../src/workspaces/gitState.js';
 import type { AgentContext, PipelineConfig } from '../src/agents/types.js';
 import type { AppConfig, NormalizedTask } from '../src/types/contracts.js';
@@ -1675,7 +1675,7 @@ describe('agentPipeline and a dropped connection (issue #439)', () => {
 
 describe('waitForApproval', () => {
   const mockSlack = {
-    chat: { postMessage: vi.fn().mockResolvedValue({}) },
+    chat: { postMessage: vi.fn().mockResolvedValue({}), update: vi.fn().mockResolvedValue({}) },
   } as any;
   const noopLog: any = () => {};
 
@@ -2028,24 +2028,37 @@ describe('waitForApproval', () => {
   });
 
   describe('a button on the prompt (suggestion 9)', () => {
+    afterEach(() => __resetButtonRepliesForTests());
+    const click = (userId: string, value: string, messageTs = '150.00') =>
+      recordButtonReply({ channelId: 'C1', threadTs: '100.00', messageTs, userId, value, actionTs: '200.000000' });
+
     it('reads an Approve click from an admin as a yes, and a Stop click as a stop', async () => {
       vi.mocked(fetchThreadContext).mockResolvedValue([]);
-      recordButtonReply({ channelId: 'C1', threadTs: '100.00', userId: 'UCOREDEV', value: 'yes' });
+      click('UCOREDEV', 'yes');
       const approved = runApproval();
       await vi.advanceTimersByTimeAsync(6000);
       expect((await approved).outcome).toBe('approved');
 
       __resetButtonRepliesForTests();
-      recordButtonReply({ channelId: 'C1', threadTs: '100.00', userId: 'UTRIGGER', value: 'stop' });
+      click('UTRIGGER', 'stop');
       const stopped = runApproval();
       await vi.advanceTimersByTimeAsync(6000);
       expect(await stopped).toMatchObject({ outcome: 'cancelled', approverId: 'UTRIGGER' });
-      __resetButtonRepliesForTests();
+    });
+
+    it('ignores a click on an older prompt in the same thread', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([]);
+      click('UCOREDEV', 'yes', '140.00');
+      const controller = new AbortController();
+      const promise = runApproval({ signal: controller.signal });
+      await vi.advanceTimersByTimeAsync(12_000);
+      controller.abort();
+      expect((await promise).approverId).toBe('');
     });
 
     it('still tells a bystander who clicks Approve that only admins can', async () => {
       vi.mocked(fetchThreadContext).mockResolvedValue([]);
-      recordButtonReply({ channelId: 'C1', threadTs: '100.00', userId: 'UOTHER', value: 'yes' });
+      click('UOTHER', 'yes');
       const controller = new AbortController();
       const promise = runApproval({ signal: controller.signal });
       await vi.advanceTimersByTimeAsync(6000);
@@ -2054,7 +2067,20 @@ describe('waitForApproval', () => {
       ]);
       controller.abort();
       await promise;
-      __resetButtonRepliesForTests();
+    });
+
+    it('retires the prompt’s buttons with the outcome when the wait ends', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'yes', user: 'UCOREDEV', ts: '200.00' }]);
+      rememberPrompt({ channelId: 'C1', ts: '150.00', text: "Here's my plan." });
+      const promise = runApproval();
+      await vi.advanceTimersByTimeAsync(6000);
+      await promise;
+      expect(mockSlack.chat.update).toHaveBeenCalledWith({
+        channel: 'C1',
+        ts: '150.00',
+        text: "Here's my plan.\n_<@UCOREDEV> approved._",
+        blocks: [],
+      });
     });
   });
 
