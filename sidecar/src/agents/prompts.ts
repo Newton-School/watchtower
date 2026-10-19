@@ -78,7 +78,7 @@ IMPORTANT: "requiresCodeChanges" rules:
 - Set to true when the user requests ANY implementation, feature, fix, change, or modification — even if similar code already exists in the repo.
 - The user's explicit request takes priority. If they say "I want to…", "add…", "implement…", "fix…", "block…", "create…", "change…", or "update…" — that is an implementation request and requiresCodeChanges MUST be true.
 - Set to false for purely informational requests (explain, describe, list, check status, answer a question) where NO file changes are needed.
-- Set to false for operational/lifecycle actions that do NOT modify source code: merge PR, close PR, deploy, run tests, restart service, check CI status, approve PR, assign reviewers.
+- Set to false for operational/lifecycle actions that do NOT modify source code: merge PR, close PR, sync a PR branch with its base, deploy, run tests, restart service, check CI status, approve PR, assign reviewers.
 - A deploy, release or rollback ask is never executed by this pipeline. Still set false for it; it is redirected to the deploy command, which asks for confirmation.
 - The key distinction: if the user wants to CHANGE source code files → true. If the user wants to perform a git/GitHub/infrastructure action on existing code → false.
 
