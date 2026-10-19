@@ -212,9 +212,14 @@ export const QUICK_ACTION_DEPLOY_RE =
 export const QUICK_ACTION_DEPLOY_REDIRECT =
   "I don't deploy or roll back from here. If you want something shipped, ask me directly — `@miniOG deploy newton-web to prod` or `@miniOG deploy marketing to prod` — and I'll confirm with you before anything goes out.";
 
-/** Quick actions that change a pull request and cannot be taken back cheaply. */
-const QUICK_ACTION_PR_ACTION_RE = /\b(merge|close|revert)\b/i;
-type QuickPrAction = 'merge' | 'close' | 'revert';
+/**
+ * Quick actions that change a pull request and cannot be taken back cheaply.
+ * "sync" merges the base branch into the PR branch (issue #603): the daily
+ * follow-up offers it when a PR conflicts or is behind. Never a rebase or a
+ * force-push: the branch has an open PR.
+ */
+const QUICK_ACTION_PR_ACTION_RE = /\b(merge|close|revert|sync)\b/i;
+type QuickPrAction = 'merge' | 'close' | 'revert' | 'sync';
 
 export const QUICK_ACTION_APPROVE_REFUSAL =
   "I don't approve pull requests. Ask me to review one and I'll post comments; the approval is a person's call.";
@@ -1386,7 +1391,7 @@ async function runImplementationWorkflowBody(params: {
       // INFORMATIONAL path instead. Default to informational — both misroute
       // directions are non-destructive (a misrouted op just gets explained).
       const operationalAction =
-        /\b(merge|close|reopen|revert|restart|rerun|re-run|run (?:the )?tests?|approve|assign)\b/i.test(
+        /\b(merge|close|reopen|revert|sync|restart|rerun|re-run|run (?:the )?tests?|approve|assign)\b/i.test(
           task.event.text,
         );
 
@@ -1511,11 +1516,13 @@ Context:
 Task:
 Execute this request directly. No code changes are needed — this is a quick operational action (merge PR, close PR, run a command, etc.).
 
+"sync" means: bring the pull request's branch up to date with its base branch by merging the base branch into it. Do it in a fresh, isolated checkout under the OS temp directory (\`gh pr checkout <number>\` inside a new \`git worktree\` or clone there), never in the working directory you were started in, which other runs read. Then \`git fetch origin && git merge origin/<base>\`; resolve nothing by guesswork: if the merge conflicts, abort it, remove the checkout and report the conflicting files. Push with a plain \`git push\`, remove the checkout, and say what the branch now contains. Never rebase and never force-push a branch that has an open pull request.
+
 Never deploy, release, ship or roll back anything, and never run a deploy command, script or skill, even if the request asks for it. If the request includes that, do the rest and say that deploys go through "@miniOG deploy <target> to prod", which asks for confirmation first.
 
 Never submit an approving review or request changes on a pull request (no \`gh pr review --approve\`, no \`--request-changes\`), even if the request asks for it. Say that approval is a person's call.${
         prUrls.length > 0
-          ? `\n\nPull requests you may act on: ${prUrls.join(', ')}. Do not merge, close or revert any other pull request.`
+          ? `\n\nPull requests you may act on: ${prUrls.join(', ')}. Do not merge, close, revert or sync any other pull request.`
           : ''
       }
 

@@ -2,6 +2,7 @@ import path from 'node:path';
 import { v4 as uuidv4 } from 'uuid';
 import { WebClient } from '@slack/web-api';
 import {
+  formatAdminMention,
   getAdminUserIds,
   getConfiguredAccessControl,
   hydrateBundleUserIds,
@@ -18,6 +19,8 @@ import {
 } from './launchpad/launchpadLifecycle.js';
 import { startLaunchpadRequestPoller } from './launchpad/launchpadIntake.js';
 import { logger } from './logging/logger.js';
+import { runPrFollowUp } from './workflows/prFollowUp.js';
+import { resolveGithubTokenForCodex } from './github/githubAuth.js';
 import { notifyDesktop } from './notify/desktopNotifier.js';
 import { botScopes, missingScopesNotice, NOTIFIED_MISSING_SCOPES_KEY } from './slack/botScopes.js';
 import { assertMacOS } from './platform.js';
@@ -1982,6 +1985,36 @@ async function main(): Promise<void> {
   };
   void checkBotScopes();
   setInterval(() => void checkBotScopes(), 10 * 60 * 1000);
+
+  // Once a day, in the 10 o'clock hour, each PR miniOG opened and nobody has
+  // closed gets one line in its thread: age, review state, conflicts, who it
+  // waits on (issue #603). Kill switch: WATCHTOWER_PR_FOLLOWUP=0.
+  const PR_FOLLOWUP_LAST_RUN_KEY = 'pr_followup:last_run';
+  const prFollowUpTick = async (): Promise<void> => {
+    if (process.env.WATCHTOWER_PR_FOLLOWUP === '0') return;
+    const now = new Date();
+    // From 10 until the evening: a host asleep at 10 catches up on the next tick.
+    if (now.getHours() < 10 || now.getHours() >= 19) return;
+    const dateKey = localDateKey(now);
+    if (store.getState(PR_FOLLOWUP_LAST_RUN_KEY) === dateKey) return;
+    try {
+      const summary = await runPrFollowUp({
+        store,
+        slack: client.webClient,
+        githubToken: await resolveGithubTokenForCodex(),
+        mergeMention: formatAdminMention(config) || 'Admins,',
+        botMention: `<@${config.botUserId}>`,
+        dateKey,
+      });
+      // Marked done only after a pass ran; a pass that threw is retried next tick.
+      store.setState(PR_FOLLOWUP_LAST_RUN_KEY, dateKey);
+      logger.info(summary, 'pr follow-up: daily pass done');
+    } catch (error) {
+      logger.warn({ error: String(error) }, 'pr follow-up: daily pass failed');
+    }
+  };
+  void prFollowUpTick();
+  setInterval(() => void prFollowUpTick(), 10 * 60 * 1000);
 
   // Poll for cancel requests from the Watchtower UI (written to SQLite by Tauri)
   setInterval(() => {
