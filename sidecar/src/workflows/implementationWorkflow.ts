@@ -1389,7 +1389,7 @@ async function runImplementationWorkflowBody(params: {
       // INFORMATIONAL path instead. Default to informational — both misroute
       // directions are non-destructive (a misrouted op just gets explained).
       const operationalAction =
-        /\b(merge|close|reopen|revert|restart|rerun|re-run|run (?:the )?tests?|approve|assign)\b/i.test(
+        /\b(merge|close|reopen|revert|sync|restart|rerun|re-run|run (?:the )?tests?|approve|assign)\b/i.test(
           task.event.text,
         );
 
@@ -1514,13 +1514,13 @@ Context:
 Task:
 Execute this request directly. No code changes are needed — this is a quick operational action (merge PR, close PR, run a command, etc.).
 
-"sync" means: bring the pull request's branch up to date with its base branch by merging the base branch into it (\`git fetch origin && git merge origin/<base>\`, resolve nothing by guesswork: if the merge conflicts, abort it and report the conflicting files) and push with a plain \`git push\`. Never rebase and never force-push a branch that has an open pull request.
+"sync" means: bring the pull request's branch up to date with its base branch by merging the base branch into it. Do it in a fresh, isolated checkout under the OS temp directory (\`gh pr checkout <number>\` inside a new \`git worktree\` or clone there), never in the working directory you were started in, which other runs read. Then \`git fetch origin && git merge origin/<base>\`; resolve nothing by guesswork: if the merge conflicts, abort it, remove the checkout and report the conflicting files. Push with a plain \`git push\`, remove the checkout, and say what the branch now contains. Never rebase and never force-push a branch that has an open pull request.
 
 Never deploy, release, ship or roll back anything, and never run a deploy command, script or skill, even if the request asks for it. If the request includes that, do the rest and say that deploys go through "@miniOG deploy <target> to prod", which asks for confirmation first.
 
 Never submit an approving review or request changes on a pull request (no \`gh pr review --approve\`, no \`--request-changes\`), even if the request asks for it. Say that approval is a person's call.${
         prUrls.length > 0
-          ? `\n\nPull requests you may act on: ${prUrls.join(', ')}. Do not merge, close or revert any other pull request.`
+          ? `\n\nPull requests you may act on: ${prUrls.join(', ')}. Do not merge, close, revert or sync any other pull request.`
           : ''
       }
 

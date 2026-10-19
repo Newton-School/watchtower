@@ -9,17 +9,21 @@ export interface PrFollowUpState {
   state: 'open' | 'merged' | 'closed';
   title?: string;
   createdAt?: string;
+  draft?: boolean;
   /** GitHub's mergeable_state: clean, dirty (conflicts), behind, blocked, unstable, unknown. */
   mergeableState?: string;
   /** The latest review from each reviewer, worst first. */
   reviews: Array<{ login: string; state: 'APPROVED' | 'CHANGES_REQUESTED' | 'COMMENTED' }>;
-  /** Reviewers GitHub is still waiting on. */
+  /** Reviewers GitHub is still waiting on: logins, and teams as `team <slug>`. */
   requestedReviewers: string[];
   baseRef?: string;
   headRef?: string;
 }
 
 export type Fetcher = (url: string, init?: RequestInit) => Promise<Response>;
+
+/** GitHub computes mergeability lazily: the first read after a push says `unknown`. */
+const MERGEABILITY_RETRY_DELAY_MS = 2_500;
 
 export async function fetchPrFollowUpState(params: {
   owner: string;
@@ -28,30 +32,46 @@ export async function fetchPrFollowUpState(params: {
   githubToken?: string;
   fetcher?: Fetcher;
   logStep?: WorkflowStepLogger;
+  /** Test seam: the wait before re-reading an `unknown` mergeability. */
+  retryDelayMs?: number;
 }): Promise<PrFollowUpState | undefined> {
   const { owner, repo, number, githubToken, logStep } = params;
   const fetcher = params.fetcher ?? fetch;
   const headers: Record<string, string> = { Accept: 'application/vnd.github+json' };
   if (githubToken) headers.Authorization = `Bearer ${githubToken}`;
   const base = `https://api.github.com/repos/${owner}/${repo}/pulls/${number}`;
-  try {
-    const prResponse = await fetcher(base, { headers, signal: AbortSignal.timeout(15_000) });
-    if (!prResponse.ok) {
+  const text = (value: unknown) => (typeof value === 'string' ? value : undefined);
+  const readPr = async (): Promise<Record<string, unknown> | undefined> => {
+    const response = await fetcher(base, { headers, signal: AbortSignal.timeout(15_000) });
+    if (!response.ok) {
       logStep?.({
         stage: 'pr_followup.fetch_failed',
         level: 'WARN',
-        message: `GitHub answered ${prResponse.status} for ${owner}/${repo}#${number}.`,
+        message: `GitHub answered ${response.status} for ${owner}/${repo}#${number}.`,
+        data: { status: response.status },
       });
       return undefined;
     }
-    const pr = (await prResponse.json()) as Record<string, unknown>;
-    const text = (value: unknown) => (typeof value === 'string' ? value : undefined);
+    return (await response.json()) as Record<string, unknown>;
+  };
+  try {
+    let pr = await readPr();
+    if (!pr) return undefined;
+    if (pr.state === 'open' && (pr.mergeable === null || pr.mergeable_state === 'unknown')) {
+      await new Promise(resolve => setTimeout(resolve, params.retryDelayMs ?? MERGEABILITY_RETRY_DELAY_MS));
+      pr = (await readPr()) ?? pr;
+    }
     const state: PrFollowUpState['state'] =
       pr.merged === true || text(pr.merged_at) ? 'merged' : pr.state === 'closed' ? 'closed' : 'open';
     const requested = Array.isArray(pr.requested_reviewers) ? pr.requested_reviewers : [];
-    const requestedReviewers = requested
-      .map(entry => text((entry as Record<string, unknown>)?.login))
-      .filter((login): login is string => Boolean(login));
+    const requestedTeams = Array.isArray(pr.requested_teams) ? pr.requested_teams : [];
+    const requestedReviewers = [
+      ...requested.map(entry => text((entry as Record<string, unknown>)?.login)),
+      ...requestedTeams.map(entry => {
+        const slug = text((entry as Record<string, unknown>)?.slug) ?? text((entry as Record<string, unknown>)?.name);
+        return slug ? `team ${slug}` : undefined;
+      }),
+    ].filter((name): name is string => Boolean(name));
 
     let reviews: PrFollowUpState['reviews'] = [];
     if (state === 'open') {
@@ -79,6 +99,7 @@ export async function fetchPrFollowUpState(params: {
       state,
       title: text(pr.title),
       createdAt: text(pr.created_at),
+      draft: pr.draft === true,
       mergeableState: text(pr.mergeable_state),
       reviews,
       requestedReviewers,

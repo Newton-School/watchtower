@@ -2868,48 +2868,6 @@ export class JobStore {
    * events tables (30-day retention window). Seed list for the conversation
    * backfill's cheap pass — Slack is then the source of truth for content.
    */
-  /**
-   * The PRs change runs opened since `sinceIso`, newest first (issue #603).
-   * Reviews also record PR URLs (under `outcomes`), so only change runs'
-   * top-level `prUrl` counts.
-   */
-  listChangeRunPrs(sinceIso: string): Array<{
-    jobId: string;
-    channelId: string;
-    threadTs: string;
-    requestedBy?: string;
-    prUrl: string;
-    createdAt: string;
-  }> {
-    const rows = this.db
-      .prepare(
-        `SELECT id, channel_id, thread_ts, created_at,
-                json_extract(payload_json, '$.requestUserId') AS requested_by,
-                json_extract(result_json, '$.prUrl') AS pr_url
-         FROM jobs
-         WHERE created_at >= ?
-           AND COALESCE(executed_workflow, workflow) IN ('IMPLEMENTATION', 'OWNER_AUTOPILOT')
-           AND json_extract(result_json, '$.prUrl') LIKE 'https://github.com/%/pull/%'
-         ORDER BY created_at DESC`,
-      )
-      .all(sinceIso) as Array<{
-      id: string;
-      channel_id: string;
-      thread_ts: string;
-      created_at: string;
-      requested_by: string | null;
-      pr_url: string;
-    }>;
-    return rows.map(row => ({
-      jobId: row.id,
-      channelId: row.channel_id,
-      threadTs: row.thread_ts,
-      requestedBy: row.requested_by ?? undefined,
-      prUrl: row.pr_url,
-      createdAt: row.created_at,
-    }));
-  }
-
   listKnownThreadRefs(limit = 2000): Array<{ channelId: string; threadTs: string }> {
     return this.db
       .prepare(
@@ -2923,6 +2881,44 @@ export class JobStore {
          LIMIT ?`,
       )
       .all(limit) as Array<{ channelId: string; threadTs: string }>;
+  }
+
+  /**
+   * The PRs change runs opened since `sinceIso`, newest first (issue #603).
+   * Reviews also record PR URLs (under `outcomes`), so only change runs'
+   * top-level `prUrl` counts.
+   */
+  listChangeRunPrs(sinceIso: string): Array<{
+    jobId: string;
+    channelId: string;
+    threadTs: string;
+    prUrl: string;
+    createdAt: string;
+  }> {
+    const rows = this.db
+      .prepare(
+        `SELECT id, channel_id, thread_ts, created_at,
+                json_extract(result_json, '$.prUrl') AS pr_url
+         FROM jobs
+         WHERE created_at >= ?
+           AND COALESCE(executed_workflow, workflow) IN ('IMPLEMENTATION', 'OWNER_AUTOPILOT')
+           AND json_extract(result_json, '$.prUrl') LIKE 'https://github.com/%/pull/%'
+         ORDER BY created_at DESC`,
+      )
+      .all(sinceIso) as Array<{
+      id: string;
+      channel_id: string;
+      thread_ts: string;
+      created_at: string;
+      pr_url: string;
+    }>;
+    return rows.map(row => ({
+      jobId: row.id,
+      channelId: row.channel_id,
+      threadTs: row.thread_ts,
+      prUrl: row.pr_url,
+      createdAt: row.created_at,
+    }));
   }
 
   readVaultSettings(): { vaultPath: string; vaultEnabled: boolean } {

@@ -961,7 +961,7 @@ describe('listChangeRunPrs (issue #603)', () => {
       'https://github.com/Newton-School/newton-marketing-web/pull/3',
       'https://github.com/Newton-School/newton-web/pull/1',
     ]);
-    expect(rows[0]).toMatchObject({ jobId: 'change-2', channelId: 'C1', threadTs: 'change-2.1', requestedBy: 'UREQ' });
+    expect(rows[0]).toMatchObject({ jobId: 'change-2', channelId: 'C1', threadTs: 'change-2.1' });
     expect(store.listChangeRunPrs(new Date(Date.now() + 60_000).toISOString())).toEqual([]);
     store.close();
   });

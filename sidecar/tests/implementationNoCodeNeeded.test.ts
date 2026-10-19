@@ -492,7 +492,7 @@ describe('implementationWorkflow — quick-action merge needs the owner (#429)',
     const quickPrompt = vi.mocked(runCodex).mock.calls[1][0].prompt;
     expect(quickPrompt).toContain('Never submit an approving review');
     expect(quickPrompt).toContain(`Pull requests you may act on: ${PR_URL}.`);
-    expect(quickPrompt).toContain('Do not merge, close or revert any other pull request.');
+    expect(quickPrompt).toContain('Do not merge, close, revert or sync any other pull request.');
   });
 
   it('leaves other quick operations, such as re-running tests, unconfirmed', async () => {

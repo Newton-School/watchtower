@@ -1,6 +1,8 @@
 import type { WebClient } from '@slack/web-api';
 import { fetchPrFollowUpState, type Fetcher, type PrFollowUpState } from '../github/prFollowUp.js';
 import { logger } from '../logging/logger.js';
+import { extractPrContext } from '../router/intentParser.js';
+import type { PrContext } from '../types/contracts.js';
 
 /**
  * Once a day, each PR miniOG opened and nobody has closed gets one line in the
@@ -15,7 +17,6 @@ export interface TrackedPr {
   jobId: string;
   channelId: string;
   threadTs: string;
-  requestedBy?: string;
   prUrl: string;
   createdAt: string;
 }
@@ -23,19 +24,17 @@ export interface TrackedPr {
 /** How far back the job store is read for PRs to follow up. */
 export const FOLLOW_UP_WINDOW_DAYS = 21;
 
-const PR_URL_RE = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/;
-
-export function parsePrUrl(url: string): { owner: string; repo: string; number: number } | undefined {
-  const match = PR_URL_RE.exec(url.trim());
-  if (!match) return undefined;
-  return { owner: match[1], repo: match[2], number: Number(match[3]) };
+/** The same PR-URL grammar the router reads. */
+export function parsePrUrl(url: string): PrContext | undefined {
+  return extractPrContext([url.trim()]);
 }
 
-function daysBetween(fromIso: string, now: number): number {
-  const from = Date.parse(fromIso);
-  if (!Number.isFinite(from)) return 0;
-  // Rounded: a PR opened yesterday evening has waited "since yesterday", not "since today".
-  return Math.max(0, Math.round((now - from) / 86_400_000));
+/** Whole calendar days between two instants, in the host's time zone. */
+function calendarDaysBetween(fromIso: string, now: number): number {
+  const from = new Date(fromIso);
+  if (Number.isNaN(from.getTime())) return 0;
+  const start = (date: Date) => new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+  return Math.max(0, Math.round((start(new Date(now)) - start(from)) / 86_400_000));
 }
 
 function ageText(days: number): string {
@@ -46,28 +45,32 @@ function ageText(days: number): string {
 
 /**
  * The one line for the thread. Who it waits on comes from GitHub: a requested
- * reviewer, a reviewer who asked for changes, or, with an approval and a clean
- * merge, an admin to merge it.
+ * reviewer or team, a reviewer who asked for changes, or, with an approval and
+ * a clean merge, an admin to merge it. The replies it offers carry miniOG's
+ * mention: a bare reply in a thread whose job has ended is not read.
  */
 export function buildFollowUpLine(params: {
   prUrl: string;
   state: PrFollowUpState;
   now: number;
   mergeMention: string;
+  /** miniOG's own mention, e.g. `<@U0AG8P9B3FW>`. */
+  botMention: string;
 }): string | undefined {
-  const { prUrl, state, now, mergeMention } = params;
+  const { prUrl, state, now, mergeMention, botMention } = params;
   if (state.state !== 'open') return undefined;
   const number = parsePrUrl(prUrl)?.number;
   const name = number ? `PR #${number}` : 'The PR';
-  const age = state.createdAt ? ageText(daysBetween(state.createdAt, now)) : '';
+  const age = state.createdAt ? ageText(calendarDaysBetween(state.createdAt, now)) : '';
   const parts: string[] = [`${name} is still open${age ? ` ${age}` : ''}: ${prUrl}`];
 
   const changesRequested = state.reviews.filter(review => review.state === 'CHANGES_REQUESTED');
   const approved = state.reviews.filter(review => review.state === 'APPROVED');
-  const conflicts = state.mergeableState === 'dirty';
-  const behind = state.mergeableState === 'behind';
+  const base = state.baseRef ?? 'the base branch';
 
-  if (changesRequested.length > 0) {
+  if (state.draft) {
+    parts.push('It is still a draft.');
+  } else if (changesRequested.length > 0) {
     parts.push(`Changes were requested by ${changesRequested.map(review => review.login).join(', ')}.`);
   } else if (approved.length > 0) {
     parts.push(`Approved by ${approved.map(review => review.login).join(', ')}.`);
@@ -77,14 +80,12 @@ export function buildFollowUpLine(params: {
     parts.push('No review yet.');
   }
 
-  if (conflicts) {
-    parts.push(
-      `It conflicts with ${state.baseRef ?? 'the base branch'}; reply \`sync it\` and I'll merge ${state.baseRef ?? 'the base branch'} into it.`,
-    );
-  } else if (behind) {
-    parts.push(`It is behind ${state.baseRef ?? 'the base branch'}; reply \`sync it\` and I'll bring it up to date.`);
-  } else if (approved.length > 0 && changesRequested.length === 0) {
-    parts.push(`${mergeMention} it is ready to merge: reply \`merge it\` when you want it in.`);
+  if (state.mergeableState === 'dirty') {
+    parts.push(`It conflicts with ${base}; reply \`${botMention} sync it\` and I'll merge ${base} into it.`);
+  } else if (state.mergeableState === 'behind') {
+    parts.push(`It is behind ${base}; reply \`${botMention} sync it\` and I'll bring it up to date.`);
+  } else if (!state.draft && approved.length > 0 && changesRequested.length === 0 && state.mergeableState === 'clean') {
+    parts.push(`${mergeMention} it is ready to merge: reply \`${botMention} merge it\` when you want it in.`);
   }
   return parts.join(' ');
 }
@@ -101,18 +102,20 @@ export function followUpStateKey(prUrl: string): string {
 
 /**
  * One pass: every tracked PR not yet looked at today. A PR that is merged or
- * closed is marked done so it is never read again.
+ * closed is marked done so it is never read again; one GitHub could not
+ * describe is logged and left for the next day.
  */
 export async function runPrFollowUp(params: {
   store: FollowUpStore;
   slack: Pick<WebClient, 'chat'>;
   githubToken?: string;
   mergeMention: string;
+  botMention: string;
   now?: number;
   dateKey: string;
   fetcher?: Fetcher;
 }): Promise<{ posted: number; closed: number; skipped: number }> {
-  const { store, slack, githubToken, mergeMention, fetcher, dateKey } = params;
+  const { store, slack, githubToken, mergeMention, botMention, fetcher, dateKey } = params;
   const now = params.now ?? Date.now();
   const since = new Date(now - FOLLOW_UP_WINDOW_DAYS * 86_400_000).toISOString();
   const seen = new Set<string>();
@@ -133,7 +136,12 @@ export async function runPrFollowUp(params: {
       store.setState(key, 'done');
       continue;
     }
-    const state = await fetchPrFollowUpState({ ...target, githubToken, fetcher });
+    const state = await fetchPrFollowUpState({
+      ...target,
+      githubToken,
+      fetcher,
+      logStep: step => logger.warn({ prUrl: tracked.prUrl, ...step.data }, step.message),
+    });
     if (!state) {
       skipped += 1;
       continue;
@@ -143,7 +151,7 @@ export async function runPrFollowUp(params: {
       closed += 1;
       continue;
     }
-    const line = buildFollowUpLine({ prUrl: tracked.prUrl, state, now, mergeMention });
+    const line = buildFollowUpLine({ prUrl: tracked.prUrl, state, now, mergeMention, botMention });
     if (!line) continue;
     try {
       await slack.chat.postMessage({ channel: tracked.channelId, thread_ts: tracked.threadTs, text: line });

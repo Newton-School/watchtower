@@ -1993,18 +1993,21 @@ async function main(): Promise<void> {
   const prFollowUpTick = async (): Promise<void> => {
     if (process.env.WATCHTOWER_PR_FOLLOWUP === '0') return;
     const now = new Date();
-    if (now.getHours() !== 10) return;
+    // From 10 until the evening: a host asleep at 10 catches up on the next tick.
+    if (now.getHours() < 10 || now.getHours() >= 19) return;
     const dateKey = localDateKey(now);
     if (store.getState(PR_FOLLOWUP_LAST_RUN_KEY) === dateKey) return;
-    store.setState(PR_FOLLOWUP_LAST_RUN_KEY, dateKey);
     try {
       const summary = await runPrFollowUp({
         store,
         slack: client.webClient,
         githubToken: await resolveGithubTokenForCodex(),
         mergeMention: formatAdminMention(config) || 'Admins,',
+        botMention: `<@${config.botUserId}>`,
         dateKey,
       });
+      // Marked done only after a pass ran; a pass that threw is retried next tick.
+      store.setState(PR_FOLLOWUP_LAST_RUN_KEY, dateKey);
       logger.info(summary, 'pr follow-up: daily pass done');
     } catch (error) {
       logger.warn({ error: String(error) }, 'pr follow-up: daily pass failed');

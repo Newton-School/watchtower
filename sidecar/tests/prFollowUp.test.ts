@@ -11,6 +11,7 @@ import {
 
 const now = Date.parse('2026-10-19T04:30:00Z');
 const url = 'https://github.com/Newton-School/newton-marketing-web/pull/1406';
+const BOT = '<@UBOT>';
 
 function open(overrides: Partial<PrFollowUpState> = {}): PrFollowUpState {
   return {
@@ -28,7 +29,7 @@ function open(overrides: Partial<PrFollowUpState> = {}): PrFollowUpState {
 
 describe('parsePrUrl', () => {
   it('reads owner, repo and number, and refuses anything else', () => {
-    expect(parsePrUrl(url)).toEqual({ owner: 'Newton-School', repo: 'newton-marketing-web', number: 1406 });
+    expect(parsePrUrl(url)).toMatchObject({ owner: 'Newton-School', repo: 'newton-marketing-web', number: 1406 });
     expect(parsePrUrl('https://github.com/Newton-School/newton-web/pull/9354/files')).toMatchObject({ number: 9354 });
     expect(parsePrUrl('N/A')).toBeUndefined();
     expect(parsePrUrl('https://github.com/Newton-School/newton-web/issues/1')).toBeUndefined();
@@ -38,15 +39,27 @@ describe('parsePrUrl', () => {
 describe('buildFollowUpLine', () => {
   it('says how long it has waited, that nobody has reviewed, and offers a sync when it conflicts', () => {
     expect(
-      buildFollowUpLine({ prUrl: url, state: open({ mergeableState: 'dirty' }), now, mergeMention: '<!subteam^S1>' }),
+      buildFollowUpLine({
+        prUrl: url,
+        state: open({ mergeableState: 'dirty' }),
+        now,
+        mergeMention: '<!subteam^S1>',
+        botMention: BOT,
+      }),
     ).toBe(
-      `PR #1406 is still open for 2 days: ${url} No review yet. It conflicts with main; reply \`sync it\` and I'll merge main into it.`,
+      `PR #1406 is still open for 2 days: ${url} No review yet. It conflicts with main; reply \`<@UBOT> sync it\` and I'll merge main into it.`,
     );
   });
 
   it('names the reviewer it waits on', () => {
     expect(
-      buildFollowUpLine({ prUrl: url, state: open({ requestedReviewers: ['kapatia'] }), now, mergeMention: 'x' }),
+      buildFollowUpLine({
+        prUrl: url,
+        state: open({ requestedReviewers: ['kapatia'] }),
+        now,
+        mergeMention: 'x',
+        botMention: BOT,
+      }),
     ).toBe(`PR #1406 is still open for 2 days: ${url} Waiting on a review from kapatia.`);
   });
 
@@ -57,6 +70,7 @@ describe('buildFollowUpLine', () => {
         state: open({ reviews: [{ login: 'mihir', state: 'CHANGES_REQUESTED' }] }),
         now,
         mergeMention: 'x',
+        botMention: BOT,
       }),
     ).toBe(`PR #1406 is still open for 2 days: ${url} Changes were requested by mihir.`);
   });
@@ -68,21 +82,67 @@ describe('buildFollowUpLine', () => {
         state: open({ reviews: [{ login: 'kapatia', state: 'APPROVED' }], createdAt: '2026-10-18T09:00:00Z' }),
         now,
         mergeMention: '<!subteam^S1>',
+        botMention: BOT,
       }),
     ).toBe(
-      `PR #1406 is still open since yesterday: ${url} Approved by kapatia. <!subteam^S1> it is ready to merge: reply \`merge it\` when you want it in.`,
+      `PR #1406 is still open since yesterday: ${url} Approved by kapatia. <!subteam^S1> it is ready to merge: reply \`<@UBOT> merge it\` when you want it in.`,
     );
   });
 
   it('offers a sync when the branch is behind', () => {
     expect(
-      buildFollowUpLine({ prUrl: url, state: open({ mergeableState: 'behind' }), now, mergeMention: 'x' }),
-    ).toContain("It is behind main; reply `sync it` and I'll bring it up to date.");
+      buildFollowUpLine({
+        prUrl: url,
+        state: open({ mergeableState: 'behind' }),
+        now,
+        mergeMention: 'x',
+        botMention: BOT,
+      }),
+    ).toContain("It is behind main; reply `<@UBOT> sync it` and I'll bring it up to date.");
+  });
+
+  it('does not call a draft, a red, or a blocked PR ready to merge', () => {
+    const approved = [{ login: 'kapatia', state: 'APPROVED' as const }];
+    expect(
+      buildFollowUpLine({
+        prUrl: url,
+        state: open({ reviews: approved, draft: true }),
+        now,
+        mergeMention: 'x',
+        botMention: BOT,
+      }),
+    ).toBe(`PR #1406 is still open for 2 days: ${url} It is still a draft.`);
+    for (const mergeableState of ['unstable', 'blocked', 'unknown']) {
+      const text = buildFollowUpLine({
+        prUrl: url,
+        state: open({ reviews: approved, mergeableState }),
+        now,
+        mergeMention: 'x',
+        botMention: BOT,
+      });
+      expect(text).toBe(`PR #1406 is still open for 2 days: ${url} Approved by kapatia.`);
+    }
+  });
+
+  it('names a team the review was requested from', () => {
+    expect(
+      buildFollowUpLine({
+        prUrl: url,
+        state: open({ requestedReviewers: ['team core-dev'] }),
+        now,
+        mergeMention: 'x',
+        botMention: BOT,
+      }),
+    ).toContain('Waiting on a review from team core-dev.');
   });
 
   it('says nothing for a merged or closed PR', () => {
-    expect(buildFollowUpLine({ prUrl: url, state: open({ state: 'merged' }), now, mergeMention: 'x' })).toBeUndefined();
-    expect(buildFollowUpLine({ prUrl: url, state: open({ state: 'closed' }), now, mergeMention: 'x' })).toBeUndefined();
+    expect(
+      buildFollowUpLine({ prUrl: url, state: open({ state: 'merged' }), now, mergeMention: 'x', botMention: BOT }),
+    ).toBeUndefined();
+    expect(
+      buildFollowUpLine({ prUrl: url, state: open({ state: 'closed' }), now, mergeMention: 'x', botMention: BOT }),
+    ).toBeUndefined();
   });
 });
 
@@ -102,7 +162,6 @@ describe('runPrFollowUp', () => {
     jobId: `job-${threadTs}`,
     channelId: 'C1',
     threadTs,
-    requestedBy: 'UREQ',
     prUrl,
     createdAt: '2026-10-16T08:00:00Z',
   });
@@ -189,6 +248,27 @@ describe('runPrFollowUp', () => {
 });
 
 describe('fetchPrFollowUpState', () => {
+  it('reads again when GitHub has not computed mergeability yet, and names requested teams', async () => {
+    let reads = 0;
+    const fetcher = vi.fn(async (input: string) => {
+      if (input.endsWith('/reviews?per_page=100')) return Response.json([]);
+      reads += 1;
+      return Response.json({
+        state: 'open',
+        mergeable: reads === 1 ? null : false,
+        mergeable_state: reads === 1 ? 'unknown' : 'dirty',
+        requested_reviewers: [],
+        requested_teams: [{ slug: 'core-dev' }],
+        base: { ref: 'main' },
+      });
+    });
+
+    const state = await fetchPrFollowUpState({ owner: 'o', repo: 'r', number: 1, fetcher, retryDelayMs: 0 });
+
+    expect(reads).toBe(2);
+    expect(state).toMatchObject({ mergeableState: 'dirty', requestedReviewers: ['team core-dev'], draft: false });
+  });
+
   it('keeps the latest review per person, worst first, and the reviewers still asked', async () => {
     const fetcher = vi.fn(async (input: string) => {
       if (input.endsWith('/reviews?per_page=100')) {
