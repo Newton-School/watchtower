@@ -13,6 +13,7 @@ import type {
 } from '../types/contracts.js';
 import { formatAdminMention, getAdminUserIds } from '../access/control.js';
 import { composeChangeReply, requesterIsEngineer, sanitizeRequesterSummary } from './shared/changeReply.js';
+import { approvalBlocks, confirmationBlocks, postGatePrompt, yesNoBlocks } from '../slack/buttonReplies.js';
 import { connectorsFor, withConnectors } from '../backends/connectors.js';
 import { runCodex, getActiveBackendId, selectBackendForUser } from '../codex/runCodex.js';
 import { connectionLostReply, killedFromOutsideReply, runWithInfraRetry } from '../codex/infraRetry.js';
@@ -274,12 +275,13 @@ async function confirmQuickPrAction(params: {
       : '';
   let promptTs: string | undefined;
   try {
-    const prompt = await slack.chat.postMessage({
+    const confirmText = `<@${userId}> asked me to ${action} ${target}.${unresolvedNote} ${ownerMentions}, reply \`${phrase}\` within 10 minutes and I'll do it. Without that, nothing changes.`;
+    promptTs = await postGatePrompt(slack, {
       channel: channelId,
       thread_ts: threadTs,
-      text: `<@${userId}> asked me to ${action} ${target}.${unresolvedNote} ${ownerMentions}, reply \`${phrase}\` within 10 minutes and I'll do it. Without that, nothing changes.`,
+      text: confirmText,
+      blocks: () => confirmationBlocks(confirmText, phrase, `Confirm ${action}`),
     });
-    promptTs = typeof prompt.ts === 'string' ? prompt.ts : undefined;
   } catch {
     // Handled below: without an anchored prompt there is nothing safe to wait on.
   }
@@ -460,12 +462,12 @@ export async function runApprovalLoop(input: {
           : `Here's the revised plan. "yes" to proceed, "stop" to drop it, or reply with more changes.${requesterToConfirm ? ' I start once the requester confirms it and an admin approves.' : ''}`;
 
       try {
-        const promptResult = await slack.chat.postMessage({
+        approvalPromptTs = await postGatePrompt(slack, {
           channel: task.event.channelId,
           thread_ts: task.event.threadTs,
           text: promptText,
+          blocks: () => approvalBlocks(promptText),
         });
-        approvalPromptTs = promptResult.ts ?? undefined;
       } catch {
         // Non-fatal
       }
@@ -1317,12 +1319,14 @@ async function runImplementationWorkflowBody(params: {
 
         if (unresolvedCount > 0) {
           const confirmMsg = `This PR has ${unresolvedCount} unresolved review comment${unresolvedCount > 1 ? 's' : ''}. Should I still merge? Reply *yes* to proceed or *no* to cancel.`;
-          const confirmResult = await slack.chat.postMessage({
+          // Yes or No: a No turns the merge down, it does not stop the job.
+          const confirmTs = await postGatePrompt(slack, {
             channel: task.event.channelId,
             thread_ts: task.event.threadTs,
             text: confirmMsg,
+            blocks: () => yesNoBlocks(confirmMsg),
           });
-
+          const confirmResult = { ts: confirmTs };
           if (confirmResult.ts) {
             const approval = await waitForApproval({
               slack,
@@ -1336,12 +1340,17 @@ async function runImplementationWorkflowBody(params: {
               signal,
             });
 
-            // The job's abort: nothing to say. A "stop" or "cancel" by reply skips the merge like a "no".
+            // The job's abort: nothing to say. A "stop" or "cancel" by reply skips the merge like a "no",
+            // and so does a change of instructions: a merge with new conditions is a new ask.
             if (approval.outcome === 'cancelled' && !approval.approverId) {
               return cancelledResult('IMPLEMENTATION');
             }
 
-            if (approval.outcome === 'rejected' || approval.outcome === 'cancelled') {
+            if (
+              approval.outcome === 'rejected' ||
+              approval.outcome === 'cancelled' ||
+              approval.outcome === 'feedback'
+            ) {
               await slack.chat
                 .postMessage({
                   channel: task.event.channelId,

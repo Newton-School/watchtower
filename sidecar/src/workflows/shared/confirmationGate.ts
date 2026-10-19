@@ -1,6 +1,7 @@
 import { jobSlots } from '../../runtime/jobSlots.js';
 import type { WebClient } from '@slack/web-api';
 import { fetchThreadRepliesSince, type ThreadMessage } from '../../slack/threadContext.js';
+import { withButtonReplies, withRetire } from '../../slack/buttonReplies.js';
 import type { WorkflowStepLogger } from '../../types/contracts.js';
 
 /**
@@ -58,10 +59,31 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 export function waitForExactConfirmation(
   params: Parameters<typeof pollForExactConfirmation>[0],
 ): Promise<ConfirmationResult> {
-  return jobSlots.whileWaitingOnHuman(() => pollForExactConfirmation(params), {
-    signal: params.signal,
-    logStep: params.logStep,
-  });
+  return jobSlots.whileWaitingOnHuman(
+    // The prompt's buttons go when the wait ends, however it ended (suggestion 9).
+    () =>
+      withRetire(() => pollForExactConfirmation(params), {
+        slack: params.slack,
+        channelId: params.channelId,
+        promptTs: params.promptTs,
+        line: confirmationOutcomeLine,
+      }),
+    { signal: params.signal, logStep: params.logStep },
+  );
+}
+
+function confirmationOutcomeLine(result: ConfirmationResult): string {
+  const who = result.userId ? ` by <@${result.userId}>` : '';
+  switch (result.outcome) {
+    case 'confirmed':
+      return `Confirmed${who}.`;
+    case 'declined':
+      return `Declined${who}; nothing was done.`;
+    case 'expired':
+      return 'No confirmation in time; nothing was done.';
+    default:
+      return 'Cancelled; nothing was done.';
+  }
 }
 
 async function pollForExactConfirmation(params: {
@@ -111,7 +133,8 @@ async function pollForExactConfirmation(params: {
       continue;
     }
 
-    for (const reply of messages) {
+    // A button on the prompt counts as the typed phrase (suggestion 9).
+    for (const reply of withButtonReplies(messages, channelId, promptTs)) {
       if (!(Number(reply.ts) > Number(promptTs)) || reply.user === botUserId) continue;
       const text = normalizeConfirmationReply(reply.text);
       const allowed = allowedUserIds.includes(reply.user);

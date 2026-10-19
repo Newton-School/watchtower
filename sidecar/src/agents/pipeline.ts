@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
-import type { WebClient } from '@slack/web-api';
+import type { KnownBlock, WebClient } from '@slack/web-api';
 import { getAdminUserIds } from '../access/control.js';
 import type { AgentContext, AgentFinding, AgentRole, AgentStepResult, PipelineResult } from './types.js';
 import type { WorkflowStepLogger } from '../types/contracts.js';
@@ -21,6 +21,13 @@ import { REPO_KEYS, type RepoKey } from '../repos/registry.js';
 import { withAgentCallContext } from '../state/runContext.js';
 import { currentConnectors, NO_CONNECTORS, withConnectors } from '../backends/connectors.js';
 import { fetchThreadContext } from '../slack/threadContext.js';
+import {
+  approvalBlocks,
+  buttonsEnabled,
+  rememberPrompt,
+  withButtonReplies,
+  withRetire,
+} from '../slack/buttonReplies.js';
 import { isGateStop, normalizeControlText, slackMentionIds, stripSlackMentions } from '../router/stopIntent.js';
 import { createProgressMessage, formatElapsed, type ProgressMessage } from '../slack/progressMessage.js';
 import { currentHead, checkCoderProducedChanges, getDiffVsBase } from '../workspaces/gitState.js';
@@ -91,6 +98,7 @@ async function postSlackProgress(params: {
   slack: WebClient;
   ctx: AgentContext;
   text: string;
+  blocks?: KnownBlock[];
 }): Promise<string | undefined> {
   if (!params.ctx.pipelineConfig.slackProgressUpdates) return undefined;
   const { channelId, threadTs } = params.ctx.task.event;
@@ -99,6 +107,7 @@ async function postSlackProgress(params: {
       channel: channelId,
       thread_ts: threadTs,
       text: params.text,
+      ...(params.blocks ? { blocks: params.blocks } : {}),
     });
     return result.ts ?? undefined;
   } catch {
@@ -522,12 +531,39 @@ Return strict JSON:
 
 /** Waits for a plan to be approved. The job's slot is free while it waits (issue #434). */
 export function waitForApproval(params: Parameters<typeof pollForApproval>[0]): Promise<ApprovalResult> {
-  return jobSlots.whileWaitingOnHuman(() => pollForApproval(params), {
-    signal: params.signal,
-    logStep: params.logStep,
-    // A stop by reply leaves only a line to post: it must not queue for a slot (issue #598).
-    endsJob: result => result.outcome === 'cancelled',
-  });
+  return jobSlots.whileWaitingOnHuman(
+    // The prompt's buttons go when the wait ends, however it ended (suggestion 9).
+    () =>
+      withRetire(() => pollForApproval(params), {
+        slack: params.slack,
+        channelId: params.channelId,
+        promptTs: params.approvalPromptTs,
+        line: approvalOutcomeLine,
+      }),
+    {
+      signal: params.signal,
+      logStep: params.logStep,
+      // A stop by reply leaves only a line to post: it must not queue for a slot (issue #598).
+      endsJob: result => result.outcome === 'cancelled',
+    },
+  );
+}
+
+/** How the prompt ends. A pause keeps its buttons: the same prompt is resumed later. */
+function approvalOutcomeLine(result: ApprovalResult): string | undefined {
+  const who = result.approverId ? `<@${result.approverId}>` : '';
+  switch (result.outcome) {
+    case 'approved':
+      return `${who} approved.`;
+    case 'rejected':
+      return `${who} turned it down.`;
+    case 'feedback':
+      return `${who} asked for changes.`;
+    case 'paused':
+      return undefined;
+    default:
+      return who ? `Stopped by ${who}.` : 'Stopped.';
+  }
 }
 
 async function pollForApproval(params: {
@@ -683,8 +719,11 @@ async function pollForApproval(params: {
       continue;
     }
 
-    // Find messages newer than the approval prompt, excluding the bot itself
-    const candidateReplies = messages.filter(m => m.ts > approvalPromptTs && m.user !== botUserId);
+    // Find messages newer than the approval prompt, excluding the bot itself.
+    // Button clicks on the prompt count as replies (suggestion 9).
+    const candidateReplies = withButtonReplies(messages, channelId, approvalPromptTs).filter(
+      m => m.ts > approvalPromptTs && m.user !== botUserId,
+    );
 
     for (const reply of candidateReplies) {
       const text = reply.text.trim();
@@ -1923,11 +1962,18 @@ async function runAgentPipelineBody(
 
       // Approval gate: wait for an admin to confirm the plan before proceeding
       if (ctx.pipelineConfig.requireApproval && planMessageTs) {
+        const gatePrompt =
+          'Here\'s my plan. An admin needs to approve before I proceed:\n• "yes" or "go" — I\'ll start coding\n• "stop" or "cancel" — I\'ll drop it\n• "no", or changes you\'d like — I\'ll adjust the plan';
+        const gateButtons = buttonsEnabled();
         const approvalPromptTs = await postSlackProgress({
           slack,
           ctx,
-          text: 'Here\'s my plan. An admin needs to approve before I proceed:\n• "yes" or "go" — I\'ll start coding\n• "stop" or "cancel" — I\'ll drop it\n• "no", or changes you\'d like — I\'ll adjust the plan',
+          text: gatePrompt,
+          ...(gateButtons ? { blocks: approvalBlocks(gatePrompt) } : {}),
         });
+        if (gateButtons && approvalPromptTs) {
+          rememberPrompt({ channelId: ctx.task.event.channelId, ts: approvalPromptTs, text: gatePrompt });
+        }
 
         if (approvalPromptTs) {
           await progress?.hold('waiting for an admin to approve the plan');

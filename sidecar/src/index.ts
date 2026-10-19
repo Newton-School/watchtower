@@ -19,6 +19,7 @@ import {
 } from './launchpad/launchpadLifecycle.js';
 import { startLaunchpadRequestPoller } from './launchpad/launchpadIntake.js';
 import { logger } from './logging/logger.js';
+import { configureButtons } from './slack/buttonReplies.js';
 import { runPrFollowUp } from './workflows/prFollowUp.js';
 import { resolveGithubTokenForCodex } from './github/githubAuth.js';
 import { notifyDesktop } from './notify/desktopNotifier.js';
@@ -774,9 +775,6 @@ const handledStopMessages = new Set<string>();
  */
 async function tryHandleStopControl(event: SlackEventEnvelope, client: WebClient): Promise<boolean> {
   if (event.messageSubtype) return false;
-  const messageKey = `${event.channelId}:${event.eventTs}`;
-  if (handledStopMessages.has(messageKey)) return true;
-
   const active = activeJobForThread(event.channelId, event.threadTs);
   const decision = decideStop({
     isBotMention: detectMention(event.text, config, event.channelType).type === 'bot',
@@ -787,14 +785,32 @@ async function tryHandleStopControl(event: SlackEventEnvelope, client: WebClient
     ownerUserIds: config.ownerSlackUserIds,
   });
   if (!decision.stop || !active) return false;
+  return stopJobFromSlack(
+    { jobId: active.jobId, requestedBy: active.requestedBy, channelId: event.channelId, threadTs: event.threadTs },
+    { eventId: event.eventId, eventTs: event.eventTs, userId: event.userId },
+    client,
+  );
+}
 
+/**
+ * The stop itself, once a stop is known to be allowed: shared by the typed
+ * "@miniOG stop" and the Stop button (suggestion 9). True when this call
+ * stopped the job or a stop was already under way.
+ */
+async function stopJobFromSlack(
+  active: { jobId: string; requestedBy?: string; channelId: string; threadTs: string },
+  by: { eventId: string; eventTs: string; userId: string },
+  client: WebClient,
+): Promise<boolean> {
+  const messageKey = `${active.channelId}:${by.eventTs}`;
+  if (handledStopMessages.has(messageKey)) return true;
   handledStopMessages.add(messageKey);
   if (handledStopMessages.size > 500) {
     handledStopMessages.delete(handledStopMessages.values().next().value as string);
   }
-  store.recordEvent(event.eventId, event.channelId, event.threadTs);
+  store.recordEvent(by.eventId, active.channelId, active.threadTs);
 
-  const reason = { source: 'slack_stop' as const, message: `Stopped from Slack by <@${event.userId}>.` };
+  const reason = { source: 'slack_stop' as const, message: `Stopped from Slack by <@${by.userId}>.` };
   if (!cancelJob(active.jobId, reason)) {
     // Already stopping: a second "stop" needs no second reply.
     return true;
@@ -804,12 +820,12 @@ async function tryHandleStopControl(event: SlackEventEnvelope, client: WebClient
     jobId: active.jobId,
     stage: 'job.stopped_from_slack',
     level: 'WARN',
-    message: `Stopped from Slack by <@${event.userId}>.`,
-    data: { stoppedBy: event.userId, requestedBy: active.requestedBy ?? null, eventTs: event.eventTs },
+    message: `Stopped from Slack by <@${by.userId}>.`,
+    data: { stoppedBy: by.userId, requestedBy: active.requestedBy ?? null, eventTs: by.eventTs },
   });
-  logger.info({ jobId: active.jobId, stoppedBy: event.userId, eventId: event.eventId }, 'job stopped from Slack');
+  logger.info({ jobId: active.jobId, stoppedBy: by.userId, eventId: by.eventId }, 'job stopped from Slack');
   await client.chat
-    .postMessage({ channel: event.channelId, thread_ts: event.threadTs, text: 'Stopped.' })
+    .postMessage({ channel: active.channelId, thread_ts: active.threadTs, text: 'Stopped.' })
     .catch(() => {});
   return true;
 }
@@ -1869,6 +1885,39 @@ async function main(): Promise<void> {
     process.exit(0);
   });
 
+  // Buttons on the gates (suggestion 9) stay off until the Slack app has
+  // Interactivity enabled; the operator flips `slack_buttons` to `on` then.
+  // A Stop click takes the stop lane, like "@miniOG stop", so it works at any
+  // point in a job; when no job is running it is kept for a polling gate.
+  configureButtons({
+    isEnabled: () => store.getState('slack_buttons') === 'on',
+    onStopClick: async click => {
+      const active = activeJobForThread(click.channelId, click.threadTs);
+      const decision = decideStop({
+        isBotMention: true,
+        text: 'stop',
+        senderId: click.userId,
+        activeJob: active,
+        adminUserIds: getAdminUserIds(config),
+        ownerUserIds: config.ownerSlackUserIds,
+      });
+      if (!decision.stop || !active) return false;
+      return stopJobFromSlack(
+        { jobId: active.jobId, requestedBy: active.requestedBy, channelId: click.channelId, threadTs: click.threadTs },
+        { eventId: `button:${click.channelId}:${click.actionTs}`, eventTs: click.actionTs, userId: click.userId },
+        client.webClient,
+      );
+    },
+    hasListener: click => Boolean(activeJobForThread(click.channelId, click.threadTs)),
+    onOrphanClick: async click => {
+      await client.webClient.chat.postEphemeral({
+        channel: click.channelId,
+        user: click.userId,
+        thread_ts: click.threadTs,
+        text: 'That prompt has ended; nothing is waiting on it any more.',
+      });
+    },
+  });
   await client.start();
   logger.info('autonomous feed/digest/incident posting disabled; mention-triggered replies only');
 
