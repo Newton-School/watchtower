@@ -2,7 +2,13 @@ import type { WebClient } from '@slack/web-api';
 import { cancelledResult } from './shared/cancelState.js';
 import type { AppConfig, NormalizedTask, WorkflowResult, WorkflowStepLogger } from '../types/contracts.js';
 import { getActiveBackendId } from '../codex/runCodex.js';
-import { connectionLostReply, killedFromOutsideReply, runWithInfraRetry } from '../codex/infraRetry.js';
+import {
+  connectionLostReply,
+  killedFromOutsideReply,
+  runWithInfraRetry,
+  usageLimitReply,
+  cleanResetText,
+} from '../codex/infraRetry.js';
 import { READ_ONLY_RUN_NOTE } from '../agentic/runClaude.js';
 import { assembleRecall } from '../codex/recallAssembler.js';
 import { highReasoningProfile } from '../codex/modelProfiles.js';
@@ -245,6 +251,23 @@ Return strict JSON:
   // "couldn't complete" copy below would be wrong (issue #438).
   if (signal?.aborted) {
     return cancelledResult('INVESTIGATION');
+  }
+
+  // The Claude usage limit: asking for more context, as the generic failure
+  // below does, sends the requester off to explain a problem that was ours (issue #592).
+  if (!investigatorResult.ok && investigatorResult.errorKind === 'USAGE_LIMIT') {
+    const text = usageLimitReply('investigate this', investigatorResult.limitResetsAtText);
+    logStep?.({
+      stage: 'investigation.usage_limit',
+      message: 'Investigation stopped by the usage limit.',
+      level: 'ERROR',
+      data: { resetsAt: cleanResetText(investigatorResult.limitResetsAtText) ?? null },
+    });
+    const slackPosted = await slack.chat
+      .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text })
+      .then(() => true)
+      .catch(() => false);
+    return { workflow: 'INVESTIGATION', status: 'FAILED', message: text, notifyDesktop: true, slackPosted };
   }
 
   // The network or a kill from outside, not the report: say so instead of

@@ -181,6 +181,21 @@ describe('decideTool', () => {
     expect(outcome.ok).toBe(false);
   });
 
+  it('says when a failed call hit the usage limit, with the reset time (issue #592)', async () => {
+    const outcome = await decideTool({
+      facts,
+      runAgent: agent({
+        ok: false,
+        exitCode: 1,
+        errorKind: 'USAGE_LIMIT',
+        limitResetsAtText: '4:50pm (Asia/Calcutta)',
+      }) as never,
+    });
+    expect(outcome).toMatchObject({ ok: false, usageLimit: { resetsAtText: '4:50pm (Asia/Calcutta)' } });
+    const plain = await decideTool({ facts, runAgent: agent({ ok: false, exitCode: 1 }) as never });
+    expect(plain).not.toHaveProperty('usageLimit');
+  });
+
   it('reports failure when the call throws', async () => {
     const outcome = await decideTool({ facts, runAgent: vi.fn().mockRejectedValue(new Error('boom')) as never });
     expect(outcome).toMatchObject({ ok: false, error: 'Error: boom' });

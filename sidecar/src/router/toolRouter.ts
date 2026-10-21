@@ -58,7 +58,13 @@ export interface RouterFacts {
 
 export type RouterOutcome =
   | { ok: true; decision: RouterDecision; durationMs: number }
-  | { ok: false; error: string; durationMs: number };
+  | {
+      ok: false;
+      error: string;
+      durationMs: number;
+      /** The Claude account hit its usage limit: retrying before the reset fails the same way. */
+      usageLimit?: { resetsAtText?: string };
+    };
 
 /** Tools named in the prompt: every registry tool except the exact-syntax ones. */
 const PROMPT_TOOLS: ReadonlyArray<{ id: RouterTool; description: string }> = [
@@ -192,7 +198,12 @@ export async function decideTool(params: {
     );
     const durationMs = Date.now() - startedAt;
     if (!result.ok || !result.parsedJson) {
-      return { ok: false, error: `router call failed (exit ${result.exitCode})`, durationMs };
+      return {
+        ok: false,
+        error: `router call failed (exit ${result.exitCode})`,
+        durationMs,
+        ...(result.errorKind === 'USAGE_LIMIT' ? { usageLimit: { resetsAtText: result.limitResetsAtText } } : {}),
+      };
     }
     const decision = parseRouterDecision(result.parsedJson);
     if (!decision) {

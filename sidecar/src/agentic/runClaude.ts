@@ -1,5 +1,11 @@
 import { getActiveBackendId } from '../codex/runCodex.js';
-import { connectionLostReply, killedFromOutsideReply, runWithInfraRetry } from '../codex/infraRetry.js';
+import {
+  connectionLostReply,
+  killedFromOutsideReply,
+  usageLimitReply,
+  runWithInfraRetry,
+  cleanResetText,
+} from '../codex/infraRetry.js';
 import { highReasoningProfile, lightweightProfile } from '../codex/modelProfiles.js';
 import { extractReplyFromCodexResult } from '../workflows/shared/workflowUtils.js';
 import type { WorkflowStepLogger, CodexReasoningEffort } from '../types/contracts.js';
@@ -10,6 +16,9 @@ import type { AgentBackendId } from '../backends/types.js';
  * will be refused (issue #443). Matches `READ_ONLY_ALLOW_RULES`.
  */
 export const READ_ONLY_RUN_NOTE = `This run is read-only. You can read and search the repos under the current directory, run read-only commands there (grep, sed -n, cat, ls, find, git log / show / grep / diff, gh pr view), use the connectors you were given, and write files under /tmp to attach to your reply. Anything else is refused without asking: editing files in the repos, scripts (python, node), network calls (curl), reading outside the repos. If a command is refused, find a read-only way instead (for example \`cd newton-web && git log\`, not \`git -C newton-web log\`).`;
+
+/** A usage-limit notice is one line; a failed run that wrote more than this was answering. */
+const USAGE_LIMIT_LINE_MAX = 300;
 
 export interface RunClaudeAgenticRequest {
   systemPrompt: string;
@@ -60,8 +69,8 @@ export interface RunClaudeAgenticResult {
   /** Final reply text, ready to post to Slack. */
   reply: string;
   error?: string;
-  /** Set when the run died of something outside the agent: the network, or a kill from outside. */
-  interrupted?: 'API_ERROR' | 'EXTERNAL_KILL';
+  /** Set when the run died of something outside the agent: the network, a kill from outside, or the usage limit. */
+  interrupted?: 'API_ERROR' | 'EXTERNAL_KILL' | 'USAGE_LIMIT';
 }
 
 /**
@@ -138,6 +147,25 @@ export async function runClaudeAgentic(request: RunClaudeAgenticRequest): Promis
     }
 
     const reply = extractReplyFromCodexResult(result).trim();
+
+    // The account's usage limit: the CLI's own limit text is not an answer, and
+    // asking again before the reset fails the same way (issue #592). The limit
+    // detection reads the run's last words, so a long failed answer that only
+    // talks about rate limits is not taken for one: it needs a reset time, or
+    // nothing else said.
+    if (
+      !result.ok &&
+      result.errorKind === 'USAGE_LIMIT' &&
+      (result.limitResetsAtText || reply.length < USAGE_LIMIT_LINE_MAX)
+    ) {
+      return {
+        ok: false,
+        reason: 'error',
+        reply: usageLimitReply('do this', result.limitResetsAtText),
+        error: `USAGE_LIMIT${result.limitResetsAtText ? `; resets at ${cleanResetText(result.limitResetsAtText)}` : ''}`,
+        interrupted: 'USAGE_LIMIT',
+      };
+    }
 
     if (!result.ok) {
       return {

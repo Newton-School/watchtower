@@ -111,6 +111,8 @@ export interface RouterClassification {
   reasoning: string;
   /** The router could not decide, even on a second try. `intent` is then the low-risk fallback. */
   failed: boolean;
+  /** It failed because the Claude account hit its usage limit. */
+  usageLimit?: { resetsAtText?: string };
   /** What the router named, before it was mapped to an intent. Absent when it failed. */
   tool?: RouterTool;
   /** The question it wants put to the requester, for `ask_user`. */
@@ -162,7 +164,9 @@ export function startRouterShadow(params: {
     );
   // One more try: a failure here used to become a silent lookup or silence (issue #440).
   const pending = call().then(first => {
-    if (first.ok || signal?.aborted) return first;
+    // An account limit with a reset time fails the second call the same way:
+    // not retried. A passing rate limit (no reset time) gets its retry.
+    if (first.ok || signal?.aborted || first.usageLimit?.resetsAtText) return first;
     logStep?.({
       stage: 'router.decision.retry',
       message: 'Router call failed — trying once more.',
@@ -180,11 +184,13 @@ export function startRouterShadow(params: {
         const fallback = failedClassification(facts.addressing);
         logStep?.({
           stage: 'router.decision.fallback',
-          message: `Router call failed twice — using ${fallback.intent} fallback.`,
+          message: outcome.usageLimit
+            ? `Router call hit the Claude usage limit — using ${fallback.intent} fallback.`
+            : `Router call failed twice — using ${fallback.intent} fallback.`,
           level: 'WARN',
-          data: { error: outcome.error, durationMs: outcome.durationMs },
+          data: { error: outcome.error, durationMs: outcome.durationMs, usageLimit: outcome.usageLimit ?? null },
         });
-        return fallback;
+        return outcome.usageLimit ? { ...fallback, usageLimit: outcome.usageLimit } : fallback;
       }
       return {
         intent: outcomeToLegacyIntent(outcome, facts.addressing, { allowDeploy: deployAllowed }),
