@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { placesAllowingLevel, toResolvedAccessControlConfig } from '../src/access/control.js';
 import { channelDenialHint } from '../src/access/denialHint.js';
 import type { AppConfig } from '../src/types/contracts.js';
@@ -27,17 +27,6 @@ const accessControl = toResolvedAccessControlConfig(
 );
 const config = { ownerSlackUserIds: ['UOWNER'], accessControl } as unknown as AppConfig;
 
-const base = {
-  config,
-  channelType: 'channel',
-  ownerName: 'theOG',
-  delegable: true,
-  ownerInThread: false,
-};
-
-beforeEach(() => vi.stubEnv('WATCHTOWER_OWNER_TAG_DELEGATION', '1'));
-afterEach(() => vi.unstubAllEnvs());
-
 describe('placesAllowingLevel', () => {
   it('lists the channels of the bundles that grant the level, and whether one allows DMs', () => {
     expect(placesAllowingLevel({ config, userId: 'UDESIGNER', requiredLevel: 'reviewer' })).toEqual({
@@ -62,68 +51,55 @@ describe('placesAllowingLevel', () => {
 });
 
 describe('channelDenialHint', () => {
-  it('names where the person can ask, and the owner route by name, never as a mention', () => {
-    const hint = channelDenialHint({ ...base, userId: 'UDESIGNER', channelId: 'C-DEV', requiredLevel: 'reviewer' });
-    expect(hint).toBe(
-      'You can ask me in <#C-PM> or <#C-BUGS>, or post the same request here tagging theOG instead of me.',
-    );
-    expect(hint).not.toContain('<@');
+  const hint = (params: Partial<Parameters<typeof channelDenialHint>[0]>) =>
+    channelDenialHint({
+      config,
+      userId: 'UDESIGNER',
+      channelId: 'C-DEV',
+      channelType: 'channel',
+      requiredLevel: 'reviewer',
+      ...params,
+    })?.text;
+
+  it('names the channels the person can ask in, and never points at the owner', () => {
+    const text = hint({});
+    expect(text).toBe('You can ask me in <#C-PM> or <#C-BUGS>.');
+    expect(text).not.toContain('<@');
   });
 
   it('does not name the channel the person is already in', () => {
-    expect(channelDenialHint({ ...base, userId: 'UDESIGNER', channelId: 'C-BUGS', requiredLevel: 'reviewer' })).toBe(
-      'You can ask me in <#C-PM>, or post the same request here tagging theOG instead of me.',
-    );
+    expect(hint({ channelId: 'C-BUGS' })).toBe('You can ask me in <#C-PM>.');
   });
 
-  it('offers only the owner route when no other channel is open to the person', () => {
-    expect(channelDenialHint({ ...base, userId: 'UVIEWER', channelId: 'C-PM', requiredLevel: 'viewer' })).toBe(
-      'You can post the same request here tagging theOG instead of me.',
-    );
-  });
-
-  it('leaves out the owner route where it would not work', () => {
-    const cases = [
-      { label: 'delegation off', env: { WATCHTOWER_OWNER_TAG_DELEGATION: '0' } },
-      { label: 'not a full member', delegable: false },
-      { label: 'owner already in the thread', ownerInThread: true },
-      { label: 'owner name unknown', ownerName: undefined },
-    ];
-    for (const { label, ...override } of cases) {
-      expect(
-        channelDenialHint({ ...base, ...override, userId: 'UDESIGNER', channelId: 'C-DEV', requiredLevel: 'reviewer' }),
-        label,
-      ).toBe('You can ask me in <#C-PM> or <#C-BUGS>.');
-    }
-  });
-
-  it('never offers the owner route for a deploy, which checks the requester again', () => {
-    expect(channelDenialHint({ ...base, userId: 'UADMIN', channelId: 'C-DEV', requiredLevel: 'admin' })).toBe(
+  it('adds "DM me" when one of their groups allows DMs, including from a group DM', () => {
+    expect(hint({ userId: 'UADMIN', requiredLevel: 'admin' })).toBe('You can ask me in <#C-PM>, or DM me.');
+    expect(hint({ userId: 'UADMIN', requiredLevel: 'admin', channelId: 'G1', channelType: 'mpim' })).toBe(
       'You can ask me in <#C-PM>, or DM me.',
     );
   });
 
-  it('in a DM names the channels, and not the owner route', () => {
-    expect(
-      channelDenialHint({
-        ...base,
-        userId: 'UDESIGNER',
-        channelId: 'D1',
-        channelType: 'im',
-        requiredLevel: 'reviewer',
-      }),
-    ).toBe('You can ask me in <#C-PM> or <#C-BUGS>.');
+  it('does not offer a DM from inside one, even when the event has no type', () => {
+    expect(hint({ userId: 'UADMIN', requiredLevel: 'admin', channelId: 'D1', channelType: 'im' })).toBe(
+      'You can ask me in <#C-PM>.',
+    );
+    expect(hint({ userId: 'UADMIN', requiredLevel: 'admin', channelId: 'D1', channelType: undefined })).toBe(
+      'You can ask me in <#C-PM>.',
+    );
   });
 
   it('says nothing when there is nowhere else to go', () => {
+    expect(hint({ userId: 'UVIEWER', channelId: 'C-PM', requiredLevel: 'viewer' })).toBeUndefined();
+  });
+
+  it('reports what it offered, for the log', () => {
     expect(
       channelDenialHint({
-        ...base,
-        ownerName: undefined,
-        userId: 'UVIEWER',
-        channelId: 'C-PM',
-        requiredLevel: 'viewer',
+        config,
+        userId: 'UADMIN',
+        channelId: 'C-DEV',
+        channelType: 'channel',
+        requiredLevel: 'admin',
       }),
-    ).toBeUndefined();
+    ).toEqual({ text: 'You can ask me in <#C-PM>, or DM me.', channels: ['C-PM'], dm: true });
   });
 });
