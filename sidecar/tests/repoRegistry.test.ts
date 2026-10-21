@@ -141,18 +141,24 @@ describe('prompt blocks', () => {
     // The same steps the deploy workflow gives, since the router sends staging questions here.
     expect(marketingLine).toContain('Staging (staging-marketing-web.newtonschool.co): Staging deploys are manual');
     expect(marketingLine).toContain('gh workflow run deploy-staging.yml --ref YOUR_BRANCH');
+    expect(marketingLine).toContain('Point people to that workflow; never dispatch it yourself.');
     expect(marketingLine).not.toMatch(/[<>&]/);
     expect(three.split('\n').find(line => line.startsWith('- newton-web:'))).not.toContain('Staging');
   });
 });
 
 describe('marketingStagingReply', () => {
-  it('says miniOG runs no staging deploys, how to run one, and how to ask for production', () => {
+  it('says miniOG runs no staging deploys and how to run one, and nothing a viewer cannot do', () => {
     const reply = marketingStagingReply();
     expect(reply).toMatch(/^I don't run staging deploys\. Staging deploys are manual/);
     expect(reply).toContain('gh workflow run deploy-staging.yml --ref YOUR_BRANCH');
-    expect(reply).toMatch(/If you meant production, ask again and say prod\.$/);
+    // The router gate answers every tier; production is admin-only.
+    expect(reply).not.toContain('prod');
     // Posted to Slack as is: <, > or & would be read as markup.
     expect(reply).not.toMatch(/[<>&]/);
+  });
+
+  it('is backed by a planner and coder guardrail against dispatching any workflow', () => {
+    expect(guardrailBlockFor('newton-marketing-web')).toContain('Never dispatch a GitHub Actions workflow');
   });
 });

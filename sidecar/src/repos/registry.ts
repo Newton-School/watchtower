@@ -95,6 +95,7 @@ export const REPO_REGISTRY: Record<RepoKey, RepoDescriptor> = {
       'Images live on the CloudFront CDN (uploaded via the Django admin), never in `/public`. Always set explicit width/height on images — CLS must stay 0.',
       'This repo has NO test suite — do not add or run jest/vitest. Verification is `npm run typecheck` + `npm run lint` + `npm run build` (which must emit `out/`).',
       'Never run `npm run build` while a dev server is running — they share `.next` and corrupt each other.',
+      "Never dispatch a GitHub Actions workflow (`deploy-staging.yml`, `deploy-prod.yml` or any other): a staging deploy replaces what a teammate may be testing, and deploys are a person's to run. If staging was asked for, say in the report how to deploy it.",
     ],
     qaCaveats: [
       'Static-export site: there are no server routes; every page is pre-rendered HTML hydrated client-side.',
@@ -187,9 +188,7 @@ export function qaCaveatBlockFor(key: RepoKey): string {
 export function marketingStagingReply(): string {
   const deploy = REPO_REGISTRY['newton-marketing-web'].deploy;
   const note = deploy.method === 'github-actions' ? deploy.stagingNote : '';
-  return ["I don't run staging deploys.", note, 'If you meant production, ask again and say prod.']
-    .filter(Boolean)
-    .join(' ');
+  return ["I don't run staging deploys.", note].filter(Boolean).join(' ');
 }
 
 /**
@@ -204,7 +203,9 @@ export function describeEnabledRepos(config: AppConfig): string {
       const repo = REPO_REGISTRY[key];
       const deploy = repo.deploy;
       const staging =
-        deploy.method === 'github-actions' ? ` Staging (${deploy.stagingHost}): ${deploy.stagingNote}` : '';
+        deploy.method === 'github-actions'
+          ? ` Staging (${deploy.stagingHost}): ${deploy.stagingNote} Point people to that workflow; never dispatch it yourself.`
+          : '';
       return `- ${key}: ${repo.description}${staging}`;
     })
     .join('\n');

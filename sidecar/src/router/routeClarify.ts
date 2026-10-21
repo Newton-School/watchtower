@@ -88,6 +88,8 @@ export function decideClarify(params: {
   confidenceFloor: number;
   /** For `deploy`: code agrees a deploy may start. */
   deployAllowed?: boolean;
+  /** The message names staging as where the deploy goes: miniOG runs no staging deploys. */
+  stagingAsk?: boolean;
 }): ClarifyAction {
   const { tool, confidence, addressing, answering, heldByFloor, confidenceFloor } = params;
   if (addressing === 'owner_mention' && tool === 'change_code' && !answering) {
@@ -96,7 +98,11 @@ export function decideClarify(params: {
   if (addressing !== 'direct') return { kind: 'run' };
 
   let ask: { question: string; reason: ClarifyReason; park?: boolean } | undefined;
-  if (tool === 'deploy' && !params.deployAllowed) {
+  if (tool === 'deploy' && !params.deployAllowed && params.stagingAsk) {
+    // Not a production deploy to ask about: the lookup it falls back to has
+    // the staging steps.
+    return { kind: 'run' };
+  } else if (tool === 'deploy' && !params.deployAllowed) {
     // The model read a deploy ask where code found no target, or in a reply to
     // a question. Neither may deploy; say how to ask, and wait for nothing.
     ask = { question: DEPLOY_NEEDS_ONE_MESSAGE_REPLY, reason: 'deploy_without_target', park: false };

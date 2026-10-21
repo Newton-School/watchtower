@@ -284,6 +284,20 @@ describe('buildRouterFacts', () => {
       ...overrides,
     }) as never;
 
+  it('never offers a deploy target when staging is where the deploy goes, whatever the repo', () => {
+    const facts = (text: string) => buildRouterFacts(task({ event: { ...task({}).event, text } }), text);
+    expect(facts('<@UBOT1> deploy newton-web to staging')).not.toHaveProperty('deployTarget');
+    expect(facts('<@UBOT1> deploy marketing to stg')).not.toHaveProperty('deployTarget');
+    expect(facts('<@UBOT1> deploy newton-web to production')).toMatchObject({ deployTarget: 'newton-web' });
+    // Staging as context leaves a production ask alone; its prompt still needs `confirm deploy`.
+    expect(facts('<@UBOT1> deploy newton-web, it has been on staging all week')).toMatchObject({
+      deployTarget: 'newton-web',
+    });
+    expect(facts('<@UBOT1> deploy marketing to prod, it was fine on staging')).toMatchObject({
+      deployTarget: 'newton-marketing-web',
+    });
+  });
+
   it('carries what the job store knows about an earlier review, and only when there was one', () => {
     expect(buildRouterFacts(task({}), 'm', { reviewedPrInThread: true })).toMatchObject({ reviewedPrInThread: true });
     expect(buildRouterFacts(task({}), 'm', { reviewedPrInThread: false })).not.toHaveProperty('reviewedPrInThread');

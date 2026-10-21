@@ -774,32 +774,66 @@ describe('mentionsStagingNotProd', () => {
 });
 
 describe('isMarketingStagingDeployAsk', () => {
-  it('reads a message that only asks to deploy marketing to staging', async () => {
+  it('reads a message that is only an ask to deploy marketing to staging', async () => {
     const { isMarketingStagingDeployAsk } = await import('../src/router/intentParser.js');
     for (const text of [
       '<@UBOT1> deploy marketing to staging',
       '<@UBOT1> deploy marketing to staging *Sent using* <@UCLAUDE|Claude> [theOG <someone@example.com>]',
       '<@UBOT1> please deploy the marketing site to stg',
-      '<@UBOT1> can you deploy marketing staging',
+      '<@UBOT1> can you deploy marketing staging?',
       '<@UBOT1> deploy marketing branch fix/hero-v2.1 to staging',
-      '<@UBOT1> ship newton-marketing-web to staging so the PM can check it',
+      '<@UBOT1> deploy my branch fix/hero to marketing staging',
+      '<@UBOT1> push my branch onto marketing staging please',
     ]) {
       expect(isMarketingStagingDeployAsk(text), text).toBe(true);
     }
   });
 
-  it('leaves compound asks, questions, prod asks and other repos to the router', async () => {
+  it('leaves anything more than that to the router: reports, questions, second asks, prod, other repos', async () => {
     const { isMarketingStagingDeployAsk } = await import('../src/router/intentParser.js');
     for (const text of [
+      '<@UBOT1> deploy marketing to staging failed, can you check why?',
+      '<@UBOT1> deploy to marketing staging is stuck since morning',
+      '<@UBOT1> deploy marketing to staging? why does it keep failing',
+      '<@UBOT1> release notes for marketing staging?',
+      '<@UBOT1> deploy marketing to staging and test the hero banner on mobile',
+      '<@UBOT1> deploy marketing to staging and open a PR',
+      '<@UBOT1> deploy marketing to staging\n\nalso the footer links 404 on /about, please look',
       '<@UBOT1> fix the hero typo and deploy it to marketing staging',
-      '<@UBOT1> deploy marketing to staging and merge the PR after',
+      '<@UBOT1> ship newton-marketing-web to staging so the PM can check it',
       '<@UBOT1> how do I deploy marketing to staging?',
+      '<@UBOT1> deploy the cloudflare worker to staging',
       '<@UBOT1> deploy marketing to prod',
-      '<@UBOT1> deploy marketing to staging, then prod',
       '<@UBOT1> deploy newton-web to staging',
+      '<@UBOT1> deploy to staging',
       '<@UBOT1> deploy marketing',
     ]) {
       expect(isMarketingStagingDeployAsk(text), text).toBe(false);
+    }
+  });
+});
+
+describe('namesStagingAsTarget', () => {
+  it('reads staging named as where the deploy goes', async () => {
+    const { namesStagingAsTarget } = await import('../src/router/intentParser.js');
+    for (const text of [
+      '<@UBOT1> deploy newton-web to staging',
+      '<@UBOT1> deploy my branch to the marketing staging',
+      '<@UBOT1> push it onto stg',
+      '<@UBOT1> can you do a staging deploy of newton-web',
+    ]) {
+      expect(namesStagingAsTarget(text), text).toBe(true);
+    }
+  });
+
+  it('does not read staging as context, prod asks, or words inside links', async () => {
+    const { namesStagingAsTarget } = await import('../src/router/intentParser.js');
+    for (const text of [
+      '<@UBOT1> deploy newton-web, it has been on staging all week',
+      '<@UBOT1> deploy newton-web to prod, it was fine on staging',
+      '<@UBOT1> deploy newton-web — see <https://example.com/x|moved to staging>',
+    ]) {
+      expect(namesStagingAsTarget(text), text).toBe(false);
     }
   });
 });

@@ -98,6 +98,8 @@ describe('decideClarify', () => {
       park: false,
     });
     expect(decide({ tool: 'deploy', deployAllowed: true })).toEqual({ kind: 'run' });
+    // A staging ask is not a production deploy to ask about: it runs, and falls back to a lookup.
+    expect(decide({ tool: 'deploy', deployAllowed: false, stagingAsk: true })).toEqual({ kind: 'run' });
     // A deploy is never started from a reply to a question.
     expect(decide({ tool: 'deploy', deployAllowed: false, answering: true })).toEqual({
       kind: 'give_up',

@@ -44,7 +44,7 @@ import { cancelledResult } from '../workflows/shared/cancelState.js';
 import { cleanResetText, usageLimitReply } from '../codex/infraRetry.js';
 import { channelDenialHint } from '../access/denialHint.js';
 import { buildHelpReply, isHelpRequest } from './helpReply.js';
-import { isMarketingStagingDeployAsk } from './intentParser.js';
+import { isMarketingStagingDeployAsk, namesStagingAsTarget } from './intentParser.js';
 import { marketingStagingReply } from '../repos/registry.js';
 import { acknowledgementText, pickupDelayMs } from './acknowledgement.js';
 import { RESTART_EVENT_PREFIX } from '../runtime/restartRecovery.js';
@@ -245,27 +245,25 @@ export async function routeTask(params: {
     // advisory: the router decides without it
   }
   /**
-   * A bare "help", addressed to miniOG and not seeded by an exact-syntax or
-   * keyword gate: answered at once, for this person in this channel, with no
+   * Addressed to miniOG (not in passing) and not seeded by an exact-syntax or
+   * keyword gate: the only messages a fixed reply below may answer.
+   */
+  const directAsk =
+    task.mentionType === 'bot' &&
+    !task.mentionReference &&
+    !['DEV_ASSIST', 'MINIOG_DOSSIER', 'PR_REVIEW', 'WEBAPP_QA'].includes(task.intent);
+  /**
+   * A bare "help": answered at once, for this person in this channel, with no
    * model run. A mention in passing ("<@owner> cc <@miniOG> help") is not one.
    */
-  const helpRequested =
-    task.mentionType === 'bot' &&
-    !task.mentionReference &&
-    !['DEV_ASSIST', 'MINIOG_DOSSIER', 'PR_REVIEW', 'WEBAPP_QA'].includes(task.intent) &&
-    isHelpRequest(userMessage);
+  const helpRequested = directAsk && isHelpRequest(userMessage);
   /**
-   * "Deploy marketing to staging", addressed to miniOG and asking nothing
-   * else: miniOG runs no staging deploys, so the steps are posted at once, at
-   * every tier, with no model run. Left to the router, it once became a
-   * change_code question ("change something, or only look into it?").
+   * A message that is only "deploy marketing to staging": miniOG runs no
+   * staging deploys, so the steps are posted at once, at every tier, with no
+   * model run. Left to the router, it once became a change_code question
+   * ("change something, or only look into it?").
    */
-  const stagingAsked =
-    !helpRequested &&
-    task.mentionType === 'bot' &&
-    !task.mentionReference &&
-    !['DEV_ASSIST', 'MINIOG_DOSSIER', 'PR_REVIEW', 'WEBAPP_QA'].includes(task.intent) &&
-    isMarketingStagingDeployAsk(userMessage);
+  const stagingAsked = directAsk && !helpRequested && isMarketingStagingDeployAsk(userMessage);
   const routerShadow =
     helpRequested || stagingAsked
       ? undefined
@@ -388,6 +386,7 @@ export async function routeTask(params: {
           heldByFloor: holdOverride,
           confidenceFloor: CLASSIFIER_CONFIDENCE_FLOOR,
           deployAllowed: classification.deployAllowed,
+          stagingAsk: namesStagingAsTarget(task.event.text ?? ''),
         });
       }
 

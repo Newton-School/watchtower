@@ -391,7 +391,8 @@ async function runMarketingDeploy(params: {
   // checks, since it is only words. Most staging asks are answered by the
   // router's staging gate or a lookup; this covers one that still lands here.
   if (mentionsStagingNotProd(task.event.text ?? '')) {
-    const msg = marketingStagingReply();
+    // Only an admin gets this far, so offering production is offering something they can do.
+    const msg = `${marketingStagingReply()} If you meant production, ask again and say prod.`;
     const posted = await postDeployReplyBestEffort({
       slack,
       channelId: task.event.channelId,

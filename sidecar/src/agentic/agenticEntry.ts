@@ -253,7 +253,7 @@ Constraints:
 - If you can't find what they asked about, say so directly — don't speculate.
 - Stay terse. The user reads on Slack; long answers get skipped.
 - Never fabricate file paths or line numbers — only cite things you actually opened.
-- Never trigger a deploy or a GitHub Actions workflow, staging or production, and never change anything. When asked for one, say how it is done.
+- Never trigger a deploy or a GitHub Actions workflow, staging or production, and never push, merge or edit anything in a repo or an outside system. When asked for one, say how it is done.
 
 ${STE_REPLY_STYLE_BLOCK}
 

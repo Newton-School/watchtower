@@ -1868,7 +1868,12 @@ describe('a marketing staging deploy ask', () => {
   it('is answered at once with the steps, at viewer tier, with no router call and no agent', async () => {
     const slack = makeSlack();
     const logStep = vi.fn();
-    const task = makeTask({ userId: 'UVIEWER', channelId: 'C-VIEW', text: '<@UBOT1> deploy marketing to staging' });
+    const task = makeTask({
+      userId: 'UVIEWER',
+      channelId: 'C-VIEW',
+      text: '<@UBOT1> deploy marketing to staging',
+      intent: 'IMPLEMENTATION',
+    });
 
     const result = await routeTask({
       task,
@@ -1886,6 +1891,44 @@ describe('a marketing staging deploy ask', () => {
     );
     expect(result.status).toBe('SUCCESS');
     expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'router.staging_gate' }));
+  });
+
+  it('ignores a mention in passing', async () => {
+    const slack = makeSlack();
+    routerPicks('CONVERSATIONAL');
+    const passing = makeTask({
+      userId: 'UBUILDER',
+      channelId: 'C-BUILD',
+      text: '<@UOWNER1> cc <@UBOT1> deploy marketing to staging',
+      intent: 'IMPLEMENTATION',
+    });
+    passing.mentionReference = true;
+    await routeTask({ task: passing, config: makeConfig('enforce'), slack: slack as never, store: {} as never });
+    expect(decideTool).toHaveBeenCalled();
+    expect(repliesOf(slack).some(text => text.startsWith("I don't run staging deploys"))).toBe(false);
+  });
+
+  it('runs a lookup, never a deploy or a production question, when the router picks deploy for a staging ask', async () => {
+    const slack = makeSlack();
+    decideTool.mockResolvedValue({
+      ok: true,
+      decision: { tool: 'deploy', confidence: 0.9, reason: 'asks for a deploy' },
+      durationMs: 1,
+    });
+    await routeTask({
+      task: makeTask({
+        userId: 'UADMIN',
+        channelId: 'C-ADMIN',
+        text: '<@UBOT1> deploy newton-web to staging',
+        intent: 'IMPLEMENTATION',
+      }),
+      config: makeConfig('enforce'),
+      slack: slack as never,
+      store: {} as never,
+    });
+    expect(runDeployWorkflow).not.toHaveBeenCalled();
+    expect(runAgenticEntry).toHaveBeenCalled();
+    expect(repliesOf(slack).some(text => text.includes('production deploy'))).toBe(false);
   });
 
   it('leaves a change with a staging deploy attached to the router', async () => {
