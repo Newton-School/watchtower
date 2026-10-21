@@ -13,7 +13,7 @@ import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
 import { extractReplyFromCodexResult } from './shared/workflowUtils.js';
 import { waitForExactConfirmation } from './shared/confirmationGate.js';
 import { confirmationBlocks, postGatePrompt } from '../slack/buttonReplies.js';
-import { classifyDeployTarget } from '../router/intentParser.js';
+import { classifyDeployTarget, mentionsStagingNotProd } from '../router/intentParser.js';
 import { getRepo, isRepoEnabled, repoPathOrNull } from '../repos/registry.js';
 import { toolchainEnv } from '../backends/codexBackend.js';
 
@@ -363,8 +363,8 @@ export async function runDeployWorkflow(params: {
 
 /**
  * Marketing (newton-marketing-web) production deploy: a GitHub Actions
- * dispatch, not the newton-web prod skill. Staging needs no trigger at all
- * (it auto-deploys on every push to main). The workflow's `production`
+ * dispatch, not the newton-web prod skill. Staging is a manual dispatch that
+ * miniOG does not run: an ask for it gets the instructions. The workflow's `production`
  * GitHub Environment approval gate still applies — dispatching starts the
  * run; GitHub may hold it for a human approval.
  */
@@ -378,17 +378,40 @@ async function runMarketingDeploy(params: {
 }): Promise<WorkflowResult> {
   const { task, config, slack, store, logStep, signal } = params;
 
-  logStep?.({
-    stage: 'deploy.marketing.start',
-    message: 'Running marketing deploy workflow (GitHub Actions dispatch).',
-  });
-
   const skipped = (message: string): WorkflowResult => ({
     workflow: 'DEPLOY',
     status: 'SKIPPED',
     message,
     notifyDesktop: false,
     slackPosted: true,
+  });
+
+  // A staging ask gets the instructions first, before the start log (which
+  // shows "dispatching the deploy" in Slack) and before the access and clone
+  // checks, since it is only words. The router's deploy gate is admin-only, so
+  // a non-admin's staging ask usually becomes a lookup, which has the staging
+  // summary from the registry. Staging used to deploy on every push to main and
+  // this said "it ships itself"; it is a manual dispatch now.
+  if (mentionsStagingNotProd(task.event.text ?? '')) {
+    const deployMeta = getRepo('newton-marketing-web').deploy;
+    const note = deployMeta.method === 'github-actions' ? deployMeta.stagingNote : '';
+    const msg = ["I don't run staging deploys.", note, 'If you meant production, ask again and say prod.']
+      .filter(Boolean)
+      .join(' ');
+    const posted = await postDeployReplyBestEffort({
+      slack,
+      channelId: task.event.channelId,
+      threadTs: task.event.threadTs,
+      text: escapeForSlack(msg),
+      logStep,
+    });
+    logStep?.({ stage: 'deploy.staging_declined', message: msg });
+    return { ...skipped(msg), slackPosted: posted };
+  }
+
+  logStep?.({
+    stage: 'deploy.marketing.start',
+    message: 'Running marketing deploy workflow (GitHub Actions dispatch).',
   });
 
   // Same capability as the newton-web prod deploy — it goes live on
@@ -416,16 +439,6 @@ async function runMarketingDeploy(params: {
   if (!repoPath) {
     const msg =
       "The newton-marketing-web clone isn't configured on this host, so I can't trigger its deploy. Set newton_marketing_web_path in Watchtower settings.";
-    await slack.chat.postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: msg });
-    return skipped(msg);
-  }
-
-  const normalized = (task.event.text ?? '').toLowerCase();
-  const deployMeta = getRepo('newton-marketing-web').deploy;
-  const stagingNote =
-    deployMeta.method === 'github-actions' ? deployMeta.stagingNote : 'staging auto-deploys on push to main';
-  if (/\bstaging\b/.test(normalized) && !/\b(prod|production)\b/.test(normalized)) {
-    const msg = `Nothing to trigger — ${stagingNote}. Merge to \`main\` and it ships itself.`;
     await slack.chat.postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: msg });
     return skipped(msg);
   }
@@ -637,6 +650,11 @@ async function watchMarketingDeployRun(params: {
     url: runUrl,
     summary: `:hourglass: The marketing prod deploy is dispatched and still running.${runUrl ? ` Watch it here: ${runUrl}` : ''}`,
   };
+}
+
+/** Slack reads a bare <…> as a link or a mention, even inside code, so a literal placeholder is escaped. */
+function escapeForSlack(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 /**

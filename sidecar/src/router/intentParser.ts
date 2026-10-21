@@ -41,6 +41,22 @@ const NEWTON_WEB_REF_RE = /\bnewton[- ]?web\b/;
 // these must not deterministically fire EITHER prod deploy.
 const AMBIGUOUS_DEPLOY_TARGET_RE = /\b(landing([- ]?pages?)?|homepage|newton[- ]?school|nsat|nst)\b/;
 
+/**
+ * Whether a deploy ask mentions staging and never prod or production. Such an
+ * ask gets the staging instructions instead of a production deploy offer: if
+ * staging was only context, the cost is one re-ask that says prod; if it was
+ * the target, a production prompt would be in front of someone who wanted
+ * staging. Links, link labels, channel references and mentions are removed
+ * first, so their words never decide it, and "stage" does not count.
+ */
+export function mentionsStagingNotProd(text: string): boolean {
+  const plain = text
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/https?:\/\/\S+/g, ' ')
+    .toLowerCase();
+  return /\b(staging|stg)\b/.test(plain) && !/\b(prod|production)\b/.test(plain);
+}
+
 function normalizeDeployText(text: string): string {
   return (
     text
