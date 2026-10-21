@@ -57,6 +57,62 @@ export function mentionsStagingNotProd(text: string): boolean {
   return /\b(staging|stg)\b/.test(plain) && !/\b(prod|production)\b/.test(plain);
 }
 
+/**
+ * Whether the message names staging as where a deploy goes ("deploy
+ * newton-web to staging", "a staging deploy"), with no prod word. Narrower
+ * than `mentionsStagingNotProd` on purpose: it decides whether a deploy may
+ * start at all, for every repo, and "deploy newton-web, it has been on
+ * staging all week" is a production ask whose prompt still needs `confirm deploy`.
+ */
+export function namesStagingAsTarget(text: string): boolean {
+  const plain = text
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/https?:\/\/\S+/g, ' ')
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
+  if (/\b(prod|production)\b/.test(plain)) return false;
+  return (
+    /\b(?:to|onto) (?:the )?(?:[\w-]+ ){0,2}?(?:staging|stg)\b/.test(plain) ||
+    /\b(?:staging|stg) (?:deploy|deployment|release)\b/.test(plain)
+  );
+}
+
+const MARKETING_NAME = String.raw`(?:marketing(?: (?:site|web|website))?|newton-marketing-web|nmw|mweb)`;
+// The whole message has to be the staging ask, as with stop and help. One
+// that also reports a problem or asks for anything else goes to the router.
+const MARKETING_STAGING_ASK_RE = new RegExp(
+  [
+    String.raw`^(?:(?:hey|hi|please|pls|plz|kindly|can you|could you|would you|will you|can u) )*`,
+    String.raw`(?:deploy|ship|release|push|put) (?:(?:the|my|this) )?`,
+    String.raw`(?:${MARKETING_NAME} )?`,
+    String.raw`(?:(?:branch|pr|changes?)(?: [\w./-]+)? )?`,
+    String.raw`(?:(?:to|on|onto|in) (?:the )?)?`,
+    String.raw`(?:${MARKETING_NAME} )?`,
+    String.raw`(?:staging|stg)(?: (?:please|pls|now|thanks|thank you))?$`,
+  ].join(''),
+);
+
+/**
+ * A message that is only an ask to deploy the marketing site to staging:
+ * "deploy marketing to staging", "please deploy my branch fix/hero to
+ * marketing stg". miniOG runs no staging deploys, so this has a fixed answer
+ * and is settled before the router. Anything more ("…to staging failed, can
+ * you check?", "…and test the hero") is not this.
+ */
+export function isMarketingStagingDeployAsk(text: string): boolean {
+  const plain = text
+    .replace(/\*sent using\*.*$/is, ' ')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/https?:\/\/\S+/g, ' ')
+    .toLowerCase()
+    .replace(/[,;:]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[.!?]+$/, '')
+    .trim();
+  return MARKETING_STAGING_ASK_RE.test(plain) && new RegExp(String.raw`\b${MARKETING_NAME}\b`).test(plain);
+}
+
 function normalizeDeployText(text: string): string {
   return (
     text

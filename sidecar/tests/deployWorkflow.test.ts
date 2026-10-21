@@ -287,7 +287,7 @@ describe('runDeployWorkflow marketing branch', () => {
     expect(runCodex).not.toHaveBeenCalled();
   });
 
-  it('explains that staging is a manual deploy and how to run it, escaping the placeholder only for Slack', async () => {
+  it('explains that staging is a manual deploy and how to run it', async () => {
     const ghExec = vi.fn();
     __ghCli.exec = ghExec;
     const postMessage = vi.fn().mockResolvedValue({ ok: true, ts: '1.0' });
@@ -303,13 +303,13 @@ describe('runDeployWorkflow marketing branch', () => {
 
     expect(result.status).toBe('SKIPPED');
     expect(result.message).toMatch(/^I don't run staging deploys\. Staging deploys are manual/);
-    expect(result.message).toContain('gh workflow run deploy-staging.yml --ref <branch>');
+    expect(result.message).toContain('gh workflow run deploy-staging.yml --ref YOUR_BRANCH');
     expect(result.message).toContain('replaces whatever is on staging now');
     expect(result.message).toMatch(/If you meant production, ask again and say prod\.$/);
     expect(result.message).not.toContain('ships itself');
-    const posted = postMessage.mock.calls[0][0].text as string;
-    expect(posted).toContain('--ref &lt;branch&gt;');
-    expect(posted).not.toContain('<branch>');
+    // No placeholder in angle brackets, which Slack would read as a link.
+    expect(postMessage.mock.calls[0][0].text).toBe(result.message);
+    expect(result.message).not.toMatch(/[<>]/);
     expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'deploy.staging_declined' }));
     // Its start stage would show "dispatching the deploy" in the thread.
     expect(logStep).not.toHaveBeenCalledWith(expect.objectContaining({ stage: 'deploy.marketing.start' }));

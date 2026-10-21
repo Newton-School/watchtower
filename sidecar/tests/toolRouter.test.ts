@@ -67,6 +67,12 @@ describe('buildRouterPrompt', () => {
   it('carries the rules the misroutes came from', () => {
     expect(prompt).toContain('A link is not a request');
     expect(prompt).toContain('deploy only when this message itself tells you to deploy');
+    // "deploy marketing to staging" once went to change_code and got a clarifying question.
+    expect(prompt).toContain('asks only for a staging deploy is answer, not deploy or change_code');
+    expect(prompt).toContain('A staging deploy asked for together with a change, a fix or a merge is that change.');
+    expect(prompt).toContain(
+      'Asked of the owner instead of you, a staging deploy is for the owner to do: stay_silent.',
+    );
     expect(prompt).toContain('is ask_user, not a guess');
     expect(prompt).toContain('A message addressed to you directly is never stay_silent');
   });
@@ -277,6 +283,20 @@ describe('buildRouterFacts', () => {
       intent: 'IMPLEMENTATION',
       ...overrides,
     }) as never;
+
+  it('never offers a deploy target when staging is where the deploy goes, whatever the repo', () => {
+    const facts = (text: string) => buildRouterFacts(task({ event: { ...task({}).event, text } }), text);
+    expect(facts('<@UBOT1> deploy newton-web to staging')).not.toHaveProperty('deployTarget');
+    expect(facts('<@UBOT1> deploy marketing to stg')).not.toHaveProperty('deployTarget');
+    expect(facts('<@UBOT1> deploy newton-web to production')).toMatchObject({ deployTarget: 'newton-web' });
+    // Staging as context leaves a production ask alone; its prompt still needs `confirm deploy`.
+    expect(facts('<@UBOT1> deploy newton-web, it has been on staging all week')).toMatchObject({
+      deployTarget: 'newton-web',
+    });
+    expect(facts('<@UBOT1> deploy marketing to prod, it was fine on staging')).toMatchObject({
+      deployTarget: 'newton-marketing-web',
+    });
+  });
 
   it('carries what the job store knows about an earlier review, and only when there was one', () => {
     expect(buildRouterFacts(task({}), 'm', { reviewedPrInThread: true })).toMatchObject({ reviewedPrInThread: true });

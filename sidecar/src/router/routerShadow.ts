@@ -1,6 +1,6 @@
 import type { NormalizedTask, WorkflowIntent, WorkflowStepLogger } from '../types/contracts.js';
 import { formatThreadContextForClassifier, isPresencePing } from '../workflows/shared/workflowUtils.js';
-import { classifyDeployTarget, leadingDeployTarget } from './intentParser.js';
+import { classifyDeployTarget, leadingDeployTarget, namesStagingAsTarget } from './intentParser.js';
 import {
   decideTool,
   mayDeploy,
@@ -57,9 +57,11 @@ export function buildRouterFacts(
   const inTrigger = prs.some(pr => pr.source === 'trigger');
   // The deploy keywords do not seed a workflow; they are a hint, read from the
   // message as the old gate read it. The target that can allow a deploy is
-  // held to more: the message has to lead with the ask.
+  // held to more: the message has to lead with the ask, and must not name
+  // staging as where it goes. miniOG runs no staging deploys, and with no
+  // target a deploy pick falls back to a lookup, which has the staging steps.
   const text = task.event.text ?? '';
-  const deployTarget = leadingDeployTarget(text) ?? undefined;
+  const deployTarget = namesStagingAsTarget(text) ? undefined : (leadingDeployTarget(text) ?? undefined);
   const hint = GATE_HINTS[task.intent] ?? (classifyDeployTarget(text) ? DEPLOY_KEYWORDS_HINT : undefined);
   return {
     message: userMessage,
