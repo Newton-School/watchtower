@@ -38,7 +38,12 @@ export interface RepoDescriptor {
   /** How this repo ships to production — consumed by the deploy workflow. */
   deploy:
     | { method: 'deploy-prod-skill' }
-    | { method: 'github-actions'; stagingNote: string; prodCommand: string }
+    | {
+        method: 'github-actions';
+        /** How staging gets a build: told to whoever asks miniOG to deploy staging. */
+        stagingNote: string;
+        prodCommand: string;
+      }
     | { method: 'none' };
 }
 
@@ -98,7 +103,10 @@ export const REPO_REGISTRY: Record<RepoKey, RepoDescriptor> = {
     ],
     deploy: {
       method: 'github-actions',
-      stagingNote: 'staging auto-deploys on every push to `main` (staging-marketing-web.newtonschool.co)',
+      // Manual since early Oct 2026: deploy-staging.yml is workflow_dispatch only and
+      // takes any branch; staging keeps whatever was dispatched last.
+      stagingNote:
+        'Staging deploys are manual: run *Deploy → staging* in the repo’s GitHub Actions on the branch you want to preview (`gh workflow run deploy-staging.yml --ref <branch>`). staging-marketing-web.newtonschool.co keeps whatever was deployed last, so deploy `main` again after a preview.',
       prodCommand: 'gh workflow run deploy-prod.yml --ref main -f confirm=deploy',
     },
   },

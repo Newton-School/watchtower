@@ -363,8 +363,8 @@ export async function runDeployWorkflow(params: {
 
 /**
  * Marketing (newton-marketing-web) production deploy: a GitHub Actions
- * dispatch, not the newton-web prod skill. Staging needs no trigger at all
- * (it auto-deploys on every push to main). The workflow's `production`
+ * dispatch, not the newton-web prod skill. Staging is a manual dispatch that
+ * miniOG does not run: an ask for it gets the instructions. The workflow's `production`
  * GitHub Environment approval gate still applies — dispatching starts the
  * run; GitHub may hold it for a human approval.
  */
@@ -422,10 +422,11 @@ async function runMarketingDeploy(params: {
 
   const normalized = (task.event.text ?? '').toLowerCase();
   const deployMeta = getRepo('newton-marketing-web').deploy;
-  const stagingNote =
-    deployMeta.method === 'github-actions' ? deployMeta.stagingNote : 'staging auto-deploys on push to main';
+  const stagingNote = deployMeta.method === 'github-actions' ? deployMeta.stagingNote : '';
   if (/\bstaging\b/.test(normalized) && !/\b(prod|production)\b/.test(normalized)) {
-    const msg = `Nothing to trigger — ${stagingNote}. Merge to \`main\` and it ships itself.`;
+    // Staging used to deploy on every push to main, and this said so. It is a
+    // manual dispatch now, so "merge and it ships itself" sent people waiting.
+    const msg = `I don't trigger staging deploys.${stagingNote ? ` ${stagingNote}` : ''}`;
     await slack.chat.postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: msg });
     return skipped(msg);
   }

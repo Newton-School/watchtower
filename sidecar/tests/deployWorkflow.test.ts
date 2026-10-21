@@ -287,7 +287,7 @@ describe('runDeployWorkflow marketing branch', () => {
     expect(runCodex).not.toHaveBeenCalled();
   });
 
-  it('explains that staging needs no trigger', async () => {
+  it('explains that staging is a manual deploy, and how to run it', async () => {
     const ghExec = vi.fn();
     __ghCli.exec = ghExec;
     const postMessage = vi.fn().mockResolvedValue({ ok: true, ts: '1.0' });
@@ -300,7 +300,10 @@ describe('runDeployWorkflow marketing branch', () => {
     });
 
     expect(result.status).toBe('SKIPPED');
-    expect(result.message).toContain('Nothing to trigger');
+    expect(result.message).toContain("I don't trigger staging deploys. Staging deploys are manual");
+    expect(result.message).toContain('gh workflow run deploy-staging.yml --ref <branch>');
+    expect(result.message).not.toContain('ships itself');
+    expect(postMessage.mock.calls[0][0].text).toBe(result.message);
     expect(ghExec).not.toHaveBeenCalled();
   });
 
