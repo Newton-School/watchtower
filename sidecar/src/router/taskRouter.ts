@@ -41,6 +41,7 @@ import {
 } from './routerShadow.js';
 import { askRequester, decideClarify, giveUpOnClarify, type ClarifyAction } from './routeClarify.js';
 import { cancelledResult } from '../workflows/shared/cancelState.js';
+import { channelDenialHint } from '../access/denialHint.js';
 import { buildHelpReply, isHelpRequest } from './helpReply.js';
 import { acknowledgementText, pickupDelayMs } from './acknowledgement.js';
 import { RESTART_EVENT_PREFIX } from '../runtime/restartRecovery.js';
@@ -562,7 +563,27 @@ export async function routeTask(params: {
     });
 
     if (shouldBlock) {
-      const denialText = accessDecision.reason ?? "Sorry, you're not on the access list. Please contact an admin.";
+      const baseDenial = accessDecision.reason ?? "Sorry, you're not on the access list. Please contact an admin.";
+      // A channel that is not enabled for them: say where they can ask (issue #618).
+      const hint =
+        accessDecision.denyReason === 'CHANNEL_NOT_ENABLED'
+          ? channelDenialHint({
+              config,
+              accessControl,
+              userId: task.event.userId,
+              channelId: task.event.channelId,
+              channelType: task.event.channelType,
+              requiredLevel,
+            })
+          : undefined;
+      const denialText = hint ? `${baseDenial}\n${hint.text}` : baseDenial;
+      if (hint) {
+        logStep?.({
+          stage: 'access.denied.hint',
+          message: `Told the requester where they can ask instead: ${hint.text}`,
+          data: { channels: hint.channels, dm: hint.dm },
+        });
+      }
       await engage();
 
       await slack.chat.postMessage({
