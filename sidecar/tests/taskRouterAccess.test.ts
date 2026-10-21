@@ -1433,7 +1433,14 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
       );
 
       expect(result.status).toBe('SKIPPED');
-      expect(slack.chat.postMessage.mock.calls[0][0].text).toContain('not enabled for this kind of request');
+      const text = slack.chat.postMessage.mock.calls[0][0].text as string;
+      // The three deny reasons keep their copy word for word (PR #197); the next line says where to ask (#618).
+      expect(text.split('\n')[0]).toBe(
+        "Sorry, I'm not enabled for this kind of request in this channel. Please contact an admin.",
+      );
+      expect(text.split('\n')[1]).toMatch(
+        /^You can ask me in <#C-[A-Z]+>.*, or tag <@UOWNER1> here and I'll take it on for them\.$/,
+      );
       expect(onEngage).toHaveBeenCalledOnce();
     });
 

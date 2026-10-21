@@ -538,6 +538,28 @@ export function evaluateCapability(params: {
  * pass a one-off config without bundles still work via the
  * `getBundlesForConfig` legacy fallback).
  */
+/**
+ * The channels where this person may make a request that needs `requiredLevel`
+ * (issue #618): the allowed channels of each of their bundles that grants it.
+ * Used to say where to ask instead when a channel is not enabled for them.
+ */
+export function channelsAllowingLevel(params: {
+  config: AppConfig;
+  accessControl?: AccessControlConfig;
+  userId: string;
+  requiredLevel: AccessLevel;
+}): string[] {
+  const bundles = params.accessControl
+    ? deriveBundlesFromLegacy(params.accessControl)
+    : getBundlesForConfig(params.config);
+  const capability = LEVEL_TO_REPRESENTATIVE_CAPABILITY[params.requiredLevel];
+  const channels = bundles
+    .filter(bundle => bundle.name !== 'owner')
+    .filter(bundle => bundle.resolvedUserIds.includes(params.userId) && bundle.capabilities.includes(capability))
+    .flatMap(bundle => bundle.allowedChannelIds);
+  return [...new Set(channels.filter(Boolean))];
+}
+
 export function evaluateAccess(params: {
   config: AppConfig;
   accessControl?: AccessControlConfig;
