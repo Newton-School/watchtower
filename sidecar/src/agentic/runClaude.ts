@@ -1,5 +1,10 @@
 import { getActiveBackendId } from '../codex/runCodex.js';
-import { connectionLostReply, killedFromOutsideReply, runWithInfraRetry } from '../codex/infraRetry.js';
+import {
+  connectionLostReply,
+  killedFromOutsideReply,
+  usageLimitReply,
+  runWithInfraRetry,
+} from '../codex/infraRetry.js';
 import { highReasoningProfile, lightweightProfile } from '../codex/modelProfiles.js';
 import { extractReplyFromCodexResult } from '../workflows/shared/workflowUtils.js';
 import type { WorkflowStepLogger, CodexReasoningEffort } from '../types/contracts.js';
@@ -60,8 +65,8 @@ export interface RunClaudeAgenticResult {
   /** Final reply text, ready to post to Slack. */
   reply: string;
   error?: string;
-  /** Set when the run died of something outside the agent: the network, or a kill from outside. */
-  interrupted?: 'API_ERROR' | 'EXTERNAL_KILL';
+  /** Set when the run died of something outside the agent: the network, a kill from outside, or the usage limit. */
+  interrupted?: 'API_ERROR' | 'EXTERNAL_KILL' | 'USAGE_LIMIT';
 }
 
 /**
@@ -134,6 +139,18 @@ export async function runClaudeAgentic(request: RunClaudeAgenticRequest): Promis
             : killedFromOutsideReply('My run', { changesCode: false }),
         error: `${result.errorKind}: ${result.apiErrorDetail ?? result.killSignal ?? 'interrupted'} (after ${result.infraRetries} retries)`,
         interrupted: result.errorKind,
+      };
+    }
+
+    // The account's usage limit: the CLI's own limit text is not an answer, and
+    // asking again before the reset fails the same way (issue #592).
+    if (!result.ok && result.errorKind === 'USAGE_LIMIT') {
+      return {
+        ok: false,
+        reason: 'error',
+        reply: usageLimitReply('answer this', result.limitResetsAtText),
+        error: `USAGE_LIMIT${result.limitResetsAtText ? ` (resets ${result.limitResetsAtText})` : ''}`,
+        interrupted: 'USAGE_LIMIT',
       };
     }
 

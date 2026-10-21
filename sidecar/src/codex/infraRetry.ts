@@ -163,6 +163,17 @@ export function connectionLostReply(doing: string, options: { changesCode?: bool
   return `I lost my connection to the model while ${doing}, and retrying didn't bring it back.${merged} Mention me again in a few minutes and I'll pick it up.`;
 }
 
+/**
+ * What to tell a thread when the Claude account hit its usage limit. Asking
+ * again before the reset fails the same way, so it says when to come back
+ * instead of "send it again" or "share more context". `doing` reads after
+ * "can't": "answer this", "work out what you're asking".
+ */
+export function usageLimitReply(doing: string, resetsAtText?: string): string {
+  const when = resetsAtText ? `It resets ${resetsAtText}; ask me again after that.` : 'Ask me again in a few hours.';
+  return `I've hit my Claude usage limit, so I can't ${doing} right now. ${when}`;
+}
+
 /** What to tell a thread when a run was killed from outside twice. `what` names the run: "the coder". */
 export function killedFromOutsideReply(what: string, options: { changesCode?: boolean } = {}): string {
   if (options.changesCode === false) {

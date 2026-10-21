@@ -41,6 +41,7 @@ import {
 } from './routerShadow.js';
 import { askRequester, decideClarify, giveUpOnClarify, type ClarifyAction } from './routeClarify.js';
 import { cancelledResult } from '../workflows/shared/cancelState.js';
+import { usageLimitReply } from '../codex/infraRetry.js';
 import { buildHelpReply, isHelpRequest } from './helpReply.js';
 import { acknowledgementText, pickupDelayMs } from './acknowledgement.js';
 import { RESTART_EVENT_PREFIX } from '../runtime/restartRecovery.js';
@@ -255,6 +256,8 @@ export async function routeTask(params: {
     : startRouterShadow({ task, userMessage, reviewedPrInThread, logStep, signal });
   let legacyDecidedBy: LegacyDecidedBy = 'gate';
   let routerCouldNotDecide = false;
+  /** Set when the router failed on the Claude usage limit: the reply then says when to come back. */
+  let routerUsageLimit: { resetsAtText?: string } | undefined;
   let clarify: ClarifyAction = { kind: 'run' };
 
   // PR_REVIEW can only be seeded before this point by the deterministic gate
@@ -316,6 +319,7 @@ export async function routeTask(params: {
         : failedClassification(addressingOf(task));
       // An owner mention the router could not read stays unanswered.
       routerCouldNotDecide = classification.failed && classification.intent !== 'NONE';
+      routerUsageLimit = classification.usageLimit;
       classificationReasoning = classification.reasoning;
 
       // Confidence floor on DANGEROUS downgrades. RCA (Slack thread
@@ -601,26 +605,36 @@ export async function routeTask(params: {
   // their change from one that made it (issue #440). Placed after the access
   // check, so someone who would be denied gets the denial and nothing else.
   if (routerCouldNotDecide) {
+    // "Send it again" is wrong when the account hit its usage limit: a retry
+    // fails the same way until the reset. One requester sent the same lookup
+    // three times on 19 Oct (issue #592).
+    const replyText = routerUsageLimit
+      ? usageLimitReply("work out what you're asking", routerUsageLimit.resetsAtText)
+      : ROUTER_FAILED_REPLY;
     logStep?.({
-      stage: 'router.decision.failed',
+      stage: routerUsageLimit ? 'router.decision.usage_limit' : 'router.decision.failed',
       message: signal?.aborted
         ? 'Router call failed and the job was cancelled — ran nothing.'
-        : 'Router could not decide after two calls — told the requester and ran nothing.',
+        : routerUsageLimit
+          ? 'Router hit the Claude usage limit — told the requester when to come back and ran nothing.'
+          : 'Router could not decide after two calls — told the requester and ran nothing.',
       level: 'ERROR',
-      data: { seedIntent: task.intent, userMessage },
+      data: { seedIntent: task.intent, userMessage, usageLimit: routerUsageLimit ?? null },
     });
     if (!signal?.aborted) {
       await engage();
       await slack.chat.postMessage({
         channel: task.event.channelId,
         thread_ts: task.event.threadTs,
-        text: ROUTER_FAILED_REPLY,
+        text: replyText,
       });
     }
     return {
       workflow: 'UNKNOWN',
       status: 'FAILED',
-      message: 'The router could not decide what this message asks for (two failed calls); nothing was run.',
+      message: routerUsageLimit
+        ? `The Claude usage limit was hit while routing (resets ${routerUsageLimit.resetsAtText ?? 'later'}); nothing was run.`
+        : 'The router could not decide what this message asks for (two failed calls); nothing was run.',
       notifyDesktop: false,
       slackPosted: true,
     };

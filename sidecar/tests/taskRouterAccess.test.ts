@@ -991,6 +991,30 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
     );
   });
 
+  it('says the usage limit was hit and when it resets, without a second call or a "send it again" (issue #592)', async () => {
+    decideTool.mockResolvedValue({
+      ok: false,
+      error: 'router call failed (exit 1)',
+      durationMs: 3,
+      usageLimit: { resetsAtText: '4:50pm (Asia/Calcutta)' },
+    });
+
+    const { result, logStep, slack } = await route('<@UBOT1> list all the from sources on the DS page', {
+      intent: 'IMPLEMENTATION',
+    });
+
+    expect(decideTool).toHaveBeenCalledTimes(1);
+    expect(runAgenticEntry).not.toHaveBeenCalled();
+    expect(slack.chat.postMessage).toHaveBeenCalledExactlyOnceWith({
+      channel: 'C-VIEW',
+      thread_ts: '111.22',
+      text: "I've hit my Claude usage limit, so I can't work out what you're asking right now. It resets 4:50pm (Asia/Calcutta); ask me again after that.",
+    });
+    expect(result).toMatchObject({ workflow: 'UNKNOWN', status: 'FAILED' });
+    expect(result.message).toContain('usage limit');
+    expect(stageLog(logStep, 'router.decision.usage_limit')).toMatchObject({ level: 'ERROR' });
+  });
+
   it('gives a requester who would be denied the denial, not the could-not-read reply', async () => {
     decideTool.mockResolvedValue(routerFails);
 

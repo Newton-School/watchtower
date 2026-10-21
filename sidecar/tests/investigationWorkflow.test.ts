@@ -490,4 +490,33 @@ describe('runInvestigationWorkflow cancelled while asking which repo (issue #264
     expect(slack.chat.postMessage).not.toHaveBeenCalled();
     expect(runCodex).not.toHaveBeenCalled();
   });
+
+  it('says the usage limit was hit and when it resets, does not retry, and does not ask for more context (issue #592)', async () => {
+    runCodex.mockReset();
+    runCodex.mockResolvedValue({
+      ok: false,
+      exitCode: 1,
+      timedOut: false,
+      stdout: '',
+      stderr: '',
+      lastMessage: "You've hit your usage limit · resets 4:50pm (Asia/Calcutta)",
+      errorKind: 'USAGE_LIMIT',
+      limitResetsAtText: '4:50pm (Asia/Calcutta)',
+    });
+    const slack = slackStub();
+
+    const result = await runInvestigationWorkflow({
+      task: makeTask('button is misaligned'),
+      config,
+      slack: slack as any,
+    });
+
+    expect(runCodex).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ workflow: 'INVESTIGATION', status: 'FAILED' });
+    const posted = slack.chat.postMessage.mock.calls.map(c => c[0].text as string);
+    expect(posted).toContain(
+      "I've hit my Claude usage limit, so I can't investigate this right now. It resets 4:50pm (Asia/Calcutta); ask me again after that.",
+    );
+    expect(posted.some(t => t.includes('share more context'))).toBe(false);
+  });
 });
