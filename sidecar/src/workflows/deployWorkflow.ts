@@ -388,10 +388,10 @@ async function runMarketingDeploy(params: {
 
   // A staging ask gets the instructions first, before the start log (which
   // shows "dispatching the deploy" in Slack) and before the access and clone
-  // checks, since it is only words. The router's deploy gate is admin-only, so
-  // a non-admin's staging ask usually becomes a lookup, which has the staging
-  // summary from the registry. Staging used to deploy on every push to main and
-  // this said "it ships itself"; it is a manual dispatch now.
+  // checks, since it is only words. The router sends staging asks to a lookup,
+  // which has the same steps from the registry; this covers one that still
+  // lands here. Staging used to deploy on every push to main and this said "it
+  // ships itself"; it is a manual dispatch now.
   if (mentionsStagingNotProd(task.event.text ?? '')) {
     const deployMeta = getRepo('newton-marketing-web').deploy;
     const note = deployMeta.method === 'github-actions' ? deployMeta.stagingNote : '';

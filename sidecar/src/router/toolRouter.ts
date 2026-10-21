@@ -96,6 +96,7 @@ const RULES = `Rules:
 - Metabase cannot be edited from here. A question about a dashboard or query (a Metabase link) is answer; a request to fix or change one is investigate.
 - A request to merge, close or create a pull request, with no review asked for, is change_code when it is addressed to you directly.
 - deploy only when this message itself tells you to deploy to production now. Words like "deploy", "release" or "ship" in a description, a plan, a question or a link are not that.
+- A request to deploy to staging is answer, not deploy or change_code: miniOG does not run staging deploys, and the answer says how to do one.
 - qa_webapp only when the person asks you to test or QA a running app or a pull request in a browser.
 - unsupported is only for an action in a system these tools do not reach (file a ticket, schedule a meeting, send an email). A question is never unsupported.
 - A message with nothing to act on ("no", "check now", "cc", a bare "yes" with no pending question) is ask_user, not a guess.

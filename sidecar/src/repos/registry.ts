@@ -40,10 +40,10 @@ export interface RepoDescriptor {
     | { method: 'deploy-prod-skill' }
     | {
         method: 'github-actions';
-        /** How staging gets a build: told to whoever asks miniOG to deploy staging. Escaped for Slack where posted. */
+        /** Where staging is served. */
+        stagingHost: string;
+        /** How staging gets a build: told to whoever asks miniOG for a staging deploy, and to lookups. */
         stagingNote: string;
-        /** The same fact in one clause, for prompts that describe the repo. */
-        stagingSummary: string;
         prodCommand: string;
       }
     | { method: 'none' };
@@ -108,10 +108,9 @@ export const REPO_REGISTRY: Record<RepoKey, RepoDescriptor> = {
       method: 'github-actions',
       // Manual since early Oct 2026: deploy-staging.yml is workflow_dispatch only and
       // takes any branch; staging keeps whatever was dispatched last.
+      stagingHost: 'staging-marketing-web.newtonschool.co',
       stagingNote:
-        'Staging deploys are manual: run *Deploy → staging* in GitHub Actions on your branch (`gh workflow run deploy-staging.yml --ref <branch>`). It replaces whatever is on staging now, so check nobody is testing there, and deploy `main` again when you are done.',
-      stagingSummary:
-        'Its staging site (staging-marketing-web.newtonschool.co) is deployed by hand from GitHub Actions (*Deploy → staging*, on any branch) and shows whichever branch was deployed there last. Point people to that workflow; never dispatch it yourself.',
+        'Staging deploys are manual: run *Deploy → staging* in GitHub Actions on your branch (`gh workflow run deploy-staging.yml --ref your-branch`). It replaces whatever is on staging now, so check nobody is testing there, and deploy `main` again when you are done.',
       prodCommand: 'gh workflow run deploy-prod.yml --ref main -f confirm=deploy',
     },
   },
@@ -183,14 +182,19 @@ export function qaCaveatBlockFor(key: RepoKey): string {
 
 /**
  * One line per enabled repo, for prompts that enumerate the known repos. A
- * repo deployed through GitHub Actions also says how its staging works, so a
- * lookup asked about it answers from that rather than guessing.
+ * repo deployed through GitHub Actions also says how its staging works, in
+ * the words the deploy workflow uses, so a lookup asked about it (where the
+ * router sends staging deploy asks) answers from that rather than guessing.
  */
 export function describeEnabledRepos(config: AppConfig): string {
   return enabledRepoKeys(config)
     .map(key => {
       const repo = REPO_REGISTRY[key];
-      const staging = repo.deploy.method === 'github-actions' ? ` ${repo.deploy.stagingSummary}` : '';
+      const deploy = repo.deploy;
+      const staging =
+        deploy.method === 'github-actions'
+          ? ` Staging (${deploy.stagingHost}) shows whichever branch was deployed there last. ${deploy.stagingNote} Never run a staging deploy yourself.`
+          : '';
       return `- ${key}: ${repo.description}${staging}`;
     })
     .join('\n');

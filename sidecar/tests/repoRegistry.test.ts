@@ -137,9 +137,11 @@ describe('prompt blocks', () => {
     expect(three).toContain('newton-marketing-web:');
     // A lookup asked how marketing staging works reads the answer here, not a guess.
     const marketingLine = three.split('\n').find(line => line.startsWith('- newton-marketing-web:')) ?? '';
-    expect(marketingLine).toContain('deployed by hand from GitHub Actions');
-    expect(marketingLine).toContain('never dispatch it yourself');
-    expect(marketingLine).not.toContain('&lt;');
+    // The same steps the deploy workflow gives, since the router sends staging asks here.
+    expect(marketingLine).toContain('Staging (staging-marketing-web.newtonschool.co) shows whichever branch');
+    expect(marketingLine).toContain('gh workflow run deploy-staging.yml --ref your-branch');
+    expect(marketingLine).toContain('Never run a staging deploy yourself.');
+    expect(marketingLine).not.toMatch(/[<>]|&lt;/);
     expect(three.split('\n').find(line => line.startsWith('- newton-web:'))).not.toContain('Staging');
   });
 });

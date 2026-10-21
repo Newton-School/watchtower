@@ -67,6 +67,8 @@ describe('buildRouterPrompt', () => {
   it('carries the rules the misroutes came from', () => {
     expect(prompt).toContain('A link is not a request');
     expect(prompt).toContain('deploy only when this message itself tells you to deploy');
+    // "deploy marketing to staging" once went to change_code and got a clarifying question.
+    expect(prompt).toContain('A request to deploy to staging is answer, not deploy or change_code');
     expect(prompt).toContain('is ask_user, not a guess');
     expect(prompt).toContain('A message addressed to you directly is never stay_silent');
   });
