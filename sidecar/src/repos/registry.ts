@@ -111,7 +111,7 @@ export const REPO_REGISTRY: Record<RepoKey, RepoDescriptor> = {
       stagingNote:
         'Staging deploys are manual: run *Deploy → staging* in GitHub Actions on your branch (`gh workflow run deploy-staging.yml --ref <branch>`). It replaces whatever is on staging now, so check nobody is testing there, and deploy `main` again when you are done.',
       stagingSummary:
-        'Its staging site (staging-marketing-web.newtonschool.co) is deployed by hand from GitHub Actions and shows whichever branch was deployed there last.',
+        'Its staging site (staging-marketing-web.newtonschool.co) is deployed by hand from GitHub Actions (*Deploy → staging*, on any branch) and shows whichever branch was deployed there last. Point people to that workflow; never dispatch it yourself.',
       prodCommand: 'gh workflow run deploy-prod.yml --ref main -f confirm=deploy',
     },
   },

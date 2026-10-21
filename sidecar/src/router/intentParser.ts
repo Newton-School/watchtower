@@ -42,25 +42,19 @@ const NEWTON_WEB_REF_RE = /\bnewton[- ]?web\b/;
 const AMBIGUOUS_DEPLOY_TARGET_RE = /\b(landing([- ]?pages?)?|homepage|newton[- ]?school|nsat|nst)\b/;
 
 /**
- * Whether a deploy ask names staging as where it should go: "deploy
- * marketing to staging", "a staging deploy of the marketing site". Staging
- * mentioned as context ("it has been on staging all week", a staging link) is
- * not that, and neither is "stage" in "the last stage of the launch". Links,
- * link labels, channel references and mentions are removed first, so their
- * words never decide it. A message that also says prod or production is not
- * a staging ask.
+ * Whether a deploy ask mentions staging and never prod or production. Such an
+ * ask gets the staging instructions instead of a production deploy offer: if
+ * staging was only context, the cost is one re-ask that says prod; if it was
+ * the target, a production prompt would be in front of someone who wanted
+ * staging. Links, link labels, channel references and mentions are removed
+ * first, so their words never decide it, and "stage" does not count.
  */
-export function isStagingDeployAsk(text: string): boolean {
+export function mentionsStagingNotProd(text: string): boolean {
   const plain = text
     .replace(/<[^>]*>/g, ' ')
     .replace(/https?:\/\/\S+/g, ' ')
-    .replace(/\s+/g, ' ')
     .toLowerCase();
-  if (/\b(prod|production)\b/.test(plain)) return false;
-  return (
-    /\b(deploy|ship|push|release|put)\b[^.,;!?]{0,40}?\b(to|onto|on) (the )?(staging|stg)\b/.test(plain) ||
-    /\b(staging|stg) (deploy|deployment|release)\b/.test(plain)
-  );
+  return /\b(staging|stg)\b/.test(plain) && !/\b(prod|production)\b/.test(plain);
 }
 
 function normalizeDeployText(text: string): string {

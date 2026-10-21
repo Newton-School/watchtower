@@ -13,7 +13,7 @@ import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
 import { extractReplyFromCodexResult } from './shared/workflowUtils.js';
 import { waitForExactConfirmation } from './shared/confirmationGate.js';
 import { confirmationBlocks, postGatePrompt } from '../slack/buttonReplies.js';
-import { classifyDeployTarget, isStagingDeployAsk } from '../router/intentParser.js';
+import { classifyDeployTarget, mentionsStagingNotProd } from '../router/intentParser.js';
 import { getRepo, isRepoEnabled, repoPathOrNull } from '../repos/registry.js';
 import { toolchainEnv } from '../backends/codexBackend.js';
 
@@ -189,7 +189,6 @@ export async function runDeployWorkflow(params: {
   // else is the classic newton-web prod deploy. Never let one mechanism run
   // the other, and never GUESS between them on conflicting signals.
   const target = classifyDeployTarget(task.event.text ?? '');
-
   if (target === null) {
     // Reached without a deploy target in the message. Assuming newton-web here
     // is how a confirmed marketing deploy could ship the wrong site (#428).
@@ -379,11 +378,6 @@ async function runMarketingDeploy(params: {
 }): Promise<WorkflowResult> {
   const { task, config, slack, store, logStep, signal } = params;
 
-  logStep?.({
-    stage: 'deploy.marketing.start',
-    message: 'Running marketing deploy workflow (GitHub Actions dispatch).',
-  });
-
   const skipped = (message: string): WorkflowResult => ({
     workflow: 'DEPLOY',
     status: 'SKIPPED',
@@ -392,23 +386,33 @@ async function runMarketingDeploy(params: {
     slackPosted: true,
   });
 
-  // A staging ask gets the instructions before the clone and access checks:
-  // they are only words, and miniOG runs production deploys only. Staging used
-  // to deploy on every push to main and this said "it ships itself"; it is a
-  // manual dispatch now, and a dispatch replaces whatever preview is up.
-  const deployMeta = getRepo('newton-marketing-web').deploy;
-  if (deployMeta.method === 'github-actions' && isStagingDeployAsk(task.event.text ?? '')) {
-    const msg = `I don't run staging deploys. ${escapeForSlack(deployMeta.stagingNote)}`;
+  // A staging ask gets the instructions first, before the start log (which
+  // shows "dispatching the deploy" in Slack) and before the access and clone
+  // checks, since it is only words. The router's deploy gate is admin-only, so
+  // a non-admin's staging ask usually becomes a lookup, which has the staging
+  // summary from the registry. Staging used to deploy on every push to main and
+  // this said "it ships itself"; it is a manual dispatch now.
+  if (mentionsStagingNotProd(task.event.text ?? '')) {
+    const deployMeta = getRepo('newton-marketing-web').deploy;
+    const note = deployMeta.method === 'github-actions' ? deployMeta.stagingNote : '';
+    const msg = ["I don't run staging deploys.", note, 'If you meant production, ask again and say prod.']
+      .filter(Boolean)
+      .join(' ');
     const posted = await postDeployReplyBestEffort({
       slack,
       channelId: task.event.channelId,
       threadTs: task.event.threadTs,
-      text: msg,
+      text: escapeForSlack(msg),
       logStep,
     });
     logStep?.({ stage: 'deploy.staging_declined', message: msg });
     return { ...skipped(msg), slackPosted: posted };
   }
+
+  logStep?.({
+    stage: 'deploy.marketing.start',
+    message: 'Running marketing deploy workflow (GitHub Actions dispatch).',
+  });
 
   // Same capability as the newton-web prod deploy — it goes live on
   // newtonschool.co.
@@ -648,17 +652,17 @@ async function watchMarketingDeployRun(params: {
   };
 }
 
+/** Slack reads a bare <…> as a link or a mention, even inside code, so a literal placeholder is escaped. */
+function escapeForSlack(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 /**
  * Post the deploy outcome to Slack with a bounded internal retry. Never throws —
  * a final post failure is logged and returned as `false` so the workflow can still
  * return SUCCESS/FAILED for the deploy itself without triggering the index.ts
  * transient retry loop that would re-execute runCodex().
  */
-/** Slack reads a bare <…> as a link or a mention, even inside code, so a literal placeholder is escaped. */
-function escapeForSlack(text: string): string {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
 async function postDeployReplyBestEffort(params: {
   slack: WebClient;
   channelId: string;

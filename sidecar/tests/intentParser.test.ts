@@ -737,28 +737,38 @@ describe('the line miniOG offers for deferred PRs routes as a review (issue #442
   });
 });
 
-describe('isStagingDeployAsk', () => {
-  it('reads staging as the target of the deploy', async () => {
-    const { isStagingDeployAsk } = await import('../src/router/intentParser.js');
+describe('mentionsStagingNotProd', () => {
+  it('reads any staging mention without a prod word as staging, however it is phrased', async () => {
+    const { mentionsStagingNotProd } = await import('../src/router/intentParser.js');
     for (const text of [
       '<@UBOT1> deploy marketing to staging',
       '<@UBOT1> deploy the marketing site to stg',
-      '<@UBOT1> push my branch onto staging please',
+      '<@UBOT1> deploy marketing staging',
+      '<@UBOT1> deploy marketing in staging',
+      '<@UBOT1> deploy marketing (staging)',
+      '<@UBOT1> deploy marketing. staging only',
+      '<@UBOT1> deploy marketing branch fix/hero-v2.1 to staging',
+      '<@UBOT1> deploy the marketing hero banner fix from PR 123 to staging',
+      '<@UBOT1> deploy marketing &amp; blog changes to staging',
       '<@UBOT1> can you do a staging deploy of the marketing site',
+      // Staging as context counts too: the cost is a re-ask that says prod.
+      '<@UBOT1> deploy marketing, it looks good on staging',
     ]) {
-      expect(isStagingDeployAsk(text), text).toBe(true);
+      expect(mentionsStagingNotProd(text), text).toBe(true);
     }
   });
 
-  it('does not read staging mentioned as context, the word "stage", or words inside links', async () => {
-    const { isStagingDeployAsk } = await import('../src/router/intentParser.js');
+  it('does not read a prod ask, the word "stage", or words inside links and channel names as staging', async () => {
+    const { mentionsStagingNotProd } = await import('../src/router/intentParser.js');
     for (const text of [
-      '<@UBOT1> deploy newton-web, it has been on staging all week',
+      '<@UBOT1> deploy marketing to prod, it was fine on staging',
+      '<@UBOT1> deploy marketing to production',
       '<@UBOT1> ship marketing, last stage of the launch',
       '<@UBOT1> deploy marketing — checked <http://staging-marketing-web.newtonschool.co|staging-marketing-web.newtonschool.co>, looks good',
-      '<@UBOT1> deploy marketing to prod, it was fine on staging',
+      '<@UBOT1> deploy marketing, see https://staging-marketing-web.newtonschool.co/x',
+      '<@UBOT1> deploy marketing, details in <#C123|staging-notes>',
     ]) {
-      expect(isStagingDeployAsk(text), text).toBe(false);
+      expect(mentionsStagingNotProd(text), text).toBe(false);
     }
   });
 });
