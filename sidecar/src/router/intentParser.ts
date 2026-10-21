@@ -57,6 +57,33 @@ export function mentionsStagingNotProd(text: string): boolean {
   return /\b(staging|stg)\b/.test(plain) && !/\b(prod|production)\b/.test(plain);
 }
 
+// Words a person leads with before the ask itself.
+const POLITE_LEAD_RE = /^(?:(?:hey|hi|hello|please|pls|plz|kindly|can you|could you|would you|will you|can u)\s+)*/;
+// Something to do besides the deploy. A branch name like fix/hero does not count.
+const OTHER_ACTION_RE =
+  /(?<![\w/-])(fix|change|update|add|remove|delete|merge|build|implement|create|review|edit|revert|rename|replace)(?![\w/-])/;
+
+/**
+ * A message that only asks to deploy the marketing site to staging: it opens
+ * with the deploy verb, names marketing, mentions staging and never prod, and
+ * asks for nothing else ("fix the hero and deploy it to staging" is a change
+ * first). miniOG runs no staging deploys, so this has a fixed answer and is
+ * settled before the router.
+ */
+export function isMarketingStagingDeployAsk(text: string): boolean {
+  if (classifyDeployTarget(text) !== 'newton-marketing-web' || !mentionsStagingNotProd(text)) return false;
+  const plain = text
+    .replace(/\*sent using\*.*$/is, ' ')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/https?:\/\/\S+/g, ' ')
+    .toLowerCase()
+    .replace(/[^a-z0-9/ .-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const ask = plain.replace(POLITE_LEAD_RE, '');
+  return /^(deploy|ship|release)\b/.test(ask) && !OTHER_ACTION_RE.test(ask);
+}
+
 function normalizeDeployText(text: string): string {
   return (
     text

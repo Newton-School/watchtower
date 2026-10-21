@@ -44,6 +44,8 @@ import { cancelledResult } from '../workflows/shared/cancelState.js';
 import { cleanResetText, usageLimitReply } from '../codex/infraRetry.js';
 import { channelDenialHint } from '../access/denialHint.js';
 import { buildHelpReply, isHelpRequest } from './helpReply.js';
+import { isMarketingStagingDeployAsk } from './intentParser.js';
+import { marketingStagingReply } from '../repos/registry.js';
 import { acknowledgementText, pickupDelayMs } from './acknowledgement.js';
 import { RESTART_EVENT_PREFIX } from '../runtime/restartRecovery.js';
 import { looksLikeFixAffirmation } from './resumeIntentParser.js';
@@ -252,9 +254,22 @@ export async function routeTask(params: {
     !task.mentionReference &&
     !['DEV_ASSIST', 'MINIOG_DOSSIER', 'PR_REVIEW', 'WEBAPP_QA'].includes(task.intent) &&
     isHelpRequest(userMessage);
-  const routerShadow = helpRequested
-    ? undefined
-    : startRouterShadow({ task, userMessage, reviewedPrInThread, logStep, signal });
+  /**
+   * "Deploy marketing to staging", addressed to miniOG and asking nothing
+   * else: miniOG runs no staging deploys, so the steps are posted at once, at
+   * every tier, with no model run. Left to the router, it once became a
+   * change_code question ("change something, or only look into it?").
+   */
+  const stagingAsked =
+    !helpRequested &&
+    task.mentionType === 'bot' &&
+    !task.mentionReference &&
+    !['DEV_ASSIST', 'MINIOG_DOSSIER', 'PR_REVIEW', 'WEBAPP_QA'].includes(task.intent) &&
+    isMarketingStagingDeployAsk(userMessage);
+  const routerShadow =
+    helpRequested || stagingAsked
+      ? undefined
+      : startRouterShadow({ task, userMessage, reviewedPrInThread, logStep, signal });
   let legacyDecidedBy: LegacyDecidedBy = 'gate';
   let routerCouldNotDecide = false;
   /** Set when the router failed on the Claude usage limit: the reply then says when to come back. */
@@ -288,6 +303,13 @@ export async function routeTask(params: {
       logStep?.({
         stage: 'router.help_gate',
         message: 'A bare help request — answering with what miniOG can do here, no model run.',
+        data: { userMessage },
+      });
+    } else if (stagingAsked) {
+      resolvedIntent = 'CONVERSATIONAL';
+      logStep?.({
+        stage: 'router.staging_gate',
+        message: 'A marketing staging deploy ask — answering with the steps, no model run.',
         data: { userMessage },
       });
     } else if (
@@ -695,6 +717,21 @@ export async function routeTask(params: {
       workflow: 'CONVERSATIONAL',
       status: 'SUCCESS',
       message: 'Answered a help request with what miniOG can do here.',
+      notifyDesktop: false,
+      slackPosted: true,
+    };
+  }
+  if (stagingAsked) {
+    if (signal?.aborted) return cancelledResult('CONVERSATIONAL');
+    await slack.chat.postMessage({
+      channel: task.event.channelId,
+      thread_ts: task.event.threadTs,
+      text: marketingStagingReply(),
+    });
+    return {
+      workflow: 'CONVERSATIONAL',
+      status: 'SUCCESS',
+      message: 'Answered a marketing staging deploy ask with the steps.',
       notifyDesktop: false,
       slackPosted: true,
     };

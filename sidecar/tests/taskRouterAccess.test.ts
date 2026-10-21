@@ -1864,6 +1864,56 @@ describe('the opening line (issue #588)', () => {
   });
 });
 
+describe('a marketing staging deploy ask', () => {
+  it('is answered at once with the steps, at viewer tier, with no router call and no agent', async () => {
+    const slack = makeSlack();
+    const logStep = vi.fn();
+    const task = makeTask({ userId: 'UVIEWER', channelId: 'C-VIEW', text: '<@UBOT1> deploy marketing to staging' });
+
+    const result = await routeTask({
+      task,
+      config: makeConfig('enforce'),
+      slack: slack as never,
+      store: {} as never,
+      logStep,
+    });
+
+    expect(decideTool).not.toHaveBeenCalled();
+    expect(runAgenticEntry).not.toHaveBeenCalled();
+    expect(slack.chat.postMessage).toHaveBeenCalledTimes(1);
+    expect(slack.chat.postMessage.mock.calls[0][0].text).toMatch(
+      /^I don't run staging deploys\. Staging deploys are manual/,
+    );
+    expect(result.status).toBe('SUCCESS');
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'router.staging_gate' }));
+  });
+
+  it('leaves a change with a staging deploy attached to the router', async () => {
+    const slack = makeSlack();
+    routerPicks('IMPLEMENTATION');
+    const task = makeTask({
+      userId: 'UBUILDER',
+      channelId: 'C-BUILD',
+      text: '<@UBOT1> fix the hero typo and deploy it to marketing staging',
+    });
+
+    await routeTask({ task, config: makeConfig('enforce'), slack: slack as never, store: {} as never });
+
+    expect(decideTool).toHaveBeenCalled();
+    expect(repliesOf(slack).some(text => text.startsWith("I don't run staging deploys"))).toBe(false);
+  });
+
+  it('still tells someone who is not on the access list that they are not', async () => {
+    const slack = makeSlack();
+    const task = makeTask({ userId: 'USTRANGER', channelId: 'C-BUILD', text: '<@UBOT1> deploy marketing to staging' });
+
+    await routeTask({ task, config: makeConfig('enforce'), slack: slack as never, store: {} as never });
+
+    expect(slack.chat.postMessage).toHaveBeenCalledTimes(1);
+    expect(slack.chat.postMessage.mock.calls[0][0].text).toContain("you're not on the access list");
+  });
+});
+
 describe('a bare help request (suggestion 13)', () => {
   it('is answered at once with what miniOG can do here, with no router call and no agent', async () => {
     const slack = makeSlack();

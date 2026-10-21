@@ -71,4 +71,10 @@ describe('agentic Slack prompts use ASD-STE100', () => {
     expect(prompt).toContain('[redacted]');
     expect(prompt).toContain('Never change a file path.');
   });
+
+  it('informational prompt never lets a lookup start a deploy or a workflow', () => {
+    expect(informationalSystemPrompt(config)).toContain(
+      'Never trigger a deploy or a GitHub Actions workflow, staging or production, and never change anything.',
+    );
+  });
 });

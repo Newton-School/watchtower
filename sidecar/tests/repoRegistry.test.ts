@@ -4,6 +4,7 @@ import {
   REPO_REGISTRY,
   RepoNotConfiguredError,
   describeEnabledRepos,
+  marketingStagingReply,
   enabledRepoKeys,
   enabledRepoPaths,
   guardrailBlockFor,
@@ -137,11 +138,21 @@ describe('prompt blocks', () => {
     expect(three).toContain('newton-marketing-web:');
     // A lookup asked how marketing staging works reads the answer here, not a guess.
     const marketingLine = three.split('\n').find(line => line.startsWith('- newton-marketing-web:')) ?? '';
-    // The same steps the deploy workflow gives, since the router sends staging asks here.
-    expect(marketingLine).toContain('Staging (staging-marketing-web.newtonschool.co) shows whichever branch');
-    expect(marketingLine).toContain('gh workflow run deploy-staging.yml --ref your-branch');
-    expect(marketingLine).toContain('Never run a staging deploy yourself.');
-    expect(marketingLine).not.toMatch(/[<>]|&lt;/);
+    // The same steps the deploy workflow gives, since the router sends staging questions here.
+    expect(marketingLine).toContain('Staging (staging-marketing-web.newtonschool.co): Staging deploys are manual');
+    expect(marketingLine).toContain('gh workflow run deploy-staging.yml --ref YOUR_BRANCH');
+    expect(marketingLine).not.toMatch(/[<>&]/);
     expect(three.split('\n').find(line => line.startsWith('- newton-web:'))).not.toContain('Staging');
+  });
+});
+
+describe('marketingStagingReply', () => {
+  it('says miniOG runs no staging deploys, how to run one, and how to ask for production', () => {
+    const reply = marketingStagingReply();
+    expect(reply).toMatch(/^I don't run staging deploys\. Staging deploys are manual/);
+    expect(reply).toContain('gh workflow run deploy-staging.yml --ref YOUR_BRANCH');
+    expect(reply).toMatch(/If you meant production, ask again and say prod\.$/);
+    // Posted to Slack as is: <, > or & would be read as markup.
+    expect(reply).not.toMatch(/[<>&]/);
   });
 });

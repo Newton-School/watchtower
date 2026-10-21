@@ -96,13 +96,13 @@ const RULES = `Rules:
 - Metabase cannot be edited from here. A question about a dashboard or query (a Metabase link) is answer; a request to fix or change one is investigate.
 - A request to merge, close or create a pull request, with no review asked for, is change_code when it is addressed to you directly.
 - deploy only when this message itself tells you to deploy to production now. Words like "deploy", "release" or "ship" in a description, a plan, a question or a link are not that.
-- A request to deploy to staging is answer, not deploy or change_code: miniOG does not run staging deploys, and the answer says how to do one.
+- A message addressed to you that asks only for a staging deploy is answer, not deploy or change_code: miniOG does not run staging deploys, and the answer says how to do one. A staging deploy asked for together with a change, a fix or a merge is that change. Asked of the owner instead of you, a staging deploy is for the owner to do: stay_silent.
 - qa_webapp only when the person asks you to test or QA a running app or a pull request in a browser.
 - unsupported is only for an action in a system these tools do not reach (file a ticket, schedule a meeting, send an email). A question is never unsupported.
 - A message with nothing to act on ("no", "check now", "cc", a bare "yes" with no pending question) is ask_user, not a guess.
 - When a message is addressed to the owner instead of you, you act for the owner: a request in it that one of these tools can do is yours to route. A pull request posted for review is review_pr, and so is a request to merge one (the owner decides the merge; your review is what helps).
 - When you are tagged only in passing, route the message if it asks you for something. If it talks about you, or copies you in, without asking anything of you, choose stay_silent.
-- Otherwise stay_silent is only for a message addressed to the owner that asks for nothing these tools can do: an FYI, a status update, scheduling, thanks, or a decision only a person can make. A message addressed to you directly is never stay_silent.`;
+- Otherwise stay_silent is only for a message addressed to the owner that asks for nothing these tools can do: an FYI, a status update, scheduling, thanks, a staging deploy, or a decision only a person can make. A message addressed to you directly is never stay_silent.`;
 
 const ADDRESSED: Record<RouterFacts['addressing'], string> = {
   direct: 'directly to miniOG',

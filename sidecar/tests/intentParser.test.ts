@@ -772,3 +772,34 @@ describe('mentionsStagingNotProd', () => {
     }
   });
 });
+
+describe('isMarketingStagingDeployAsk', () => {
+  it('reads a message that only asks to deploy marketing to staging', async () => {
+    const { isMarketingStagingDeployAsk } = await import('../src/router/intentParser.js');
+    for (const text of [
+      '<@UBOT1> deploy marketing to staging',
+      '<@UBOT1> deploy marketing to staging *Sent using* <@UCLAUDE|Claude> [theOG <someone@example.com>]',
+      '<@UBOT1> please deploy the marketing site to stg',
+      '<@UBOT1> can you deploy marketing staging',
+      '<@UBOT1> deploy marketing branch fix/hero-v2.1 to staging',
+      '<@UBOT1> ship newton-marketing-web to staging so the PM can check it',
+    ]) {
+      expect(isMarketingStagingDeployAsk(text), text).toBe(true);
+    }
+  });
+
+  it('leaves compound asks, questions, prod asks and other repos to the router', async () => {
+    const { isMarketingStagingDeployAsk } = await import('../src/router/intentParser.js');
+    for (const text of [
+      '<@UBOT1> fix the hero typo and deploy it to marketing staging',
+      '<@UBOT1> deploy marketing to staging and merge the PR after',
+      '<@UBOT1> how do I deploy marketing to staging?',
+      '<@UBOT1> deploy marketing to prod',
+      '<@UBOT1> deploy marketing to staging, then prod',
+      '<@UBOT1> deploy newton-web to staging',
+      '<@UBOT1> deploy marketing',
+    ]) {
+      expect(isMarketingStagingDeployAsk(text), text).toBe(false);
+    }
+  });
+});

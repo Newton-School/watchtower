@@ -14,7 +14,7 @@ import { extractReplyFromCodexResult } from './shared/workflowUtils.js';
 import { waitForExactConfirmation } from './shared/confirmationGate.js';
 import { confirmationBlocks, postGatePrompt } from '../slack/buttonReplies.js';
 import { classifyDeployTarget, mentionsStagingNotProd } from '../router/intentParser.js';
-import { getRepo, isRepoEnabled, repoPathOrNull } from '../repos/registry.js';
+import { isRepoEnabled, marketingStagingReply, repoPathOrNull } from '../repos/registry.js';
 import { toolchainEnv } from '../backends/codexBackend.js';
 
 const execFileAsync = promisify(execFile);
@@ -388,21 +388,15 @@ async function runMarketingDeploy(params: {
 
   // A staging ask gets the instructions first, before the start log (which
   // shows "dispatching the deploy" in Slack) and before the access and clone
-  // checks, since it is only words. The router sends staging asks to a lookup,
-  // which has the same steps from the registry; this covers one that still
-  // lands here. Staging used to deploy on every push to main and this said "it
-  // ships itself"; it is a manual dispatch now.
+  // checks, since it is only words. Most staging asks are answered by the
+  // router's staging gate or a lookup; this covers one that still lands here.
   if (mentionsStagingNotProd(task.event.text ?? '')) {
-    const deployMeta = getRepo('newton-marketing-web').deploy;
-    const note = deployMeta.method === 'github-actions' ? deployMeta.stagingNote : '';
-    const msg = ["I don't run staging deploys.", note, 'If you meant production, ask again and say prod.']
-      .filter(Boolean)
-      .join(' ');
+    const msg = marketingStagingReply();
     const posted = await postDeployReplyBestEffort({
       slack,
       channelId: task.event.channelId,
       threadTs: task.event.threadTs,
-      text: escapeForSlack(msg),
+      text: msg,
       logStep,
     });
     logStep?.({ stage: 'deploy.staging_declined', message: msg });
@@ -650,11 +644,6 @@ async function watchMarketingDeployRun(params: {
     url: runUrl,
     summary: `:hourglass: The marketing prod deploy is dispatched and still running.${runUrl ? ` Watch it here: ${runUrl}` : ''}`,
   };
-}
-
-/** Slack reads a bare <…> as a link or a mention, even inside code, so a literal placeholder is escaped. */
-function escapeForSlack(text: string): string {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 /**

@@ -303,7 +303,7 @@ describe('runDeployWorkflow marketing branch', () => {
 
     expect(result.status).toBe('SKIPPED');
     expect(result.message).toMatch(/^I don't run staging deploys\. Staging deploys are manual/);
-    expect(result.message).toContain('gh workflow run deploy-staging.yml --ref your-branch');
+    expect(result.message).toContain('gh workflow run deploy-staging.yml --ref YOUR_BRANCH');
     expect(result.message).toContain('replaces whatever is on staging now');
     expect(result.message).toMatch(/If you meant production, ask again and say prod\.$/);
     expect(result.message).not.toContain('ships itself');
