@@ -50,3 +50,61 @@ describe('runClaudeAgentic tier/effort resolution (live claude-code backend)', (
     expect(runCodex.mock.calls[0][0]).toMatchObject({ model: 'claude-sonnet-5-5', reasoningEffort: 'medium' });
   });
 });
+
+describe('runClaudeAgentic on the usage limit (issue #592)', () => {
+  beforeEach(() => runCodex.mockReset());
+
+  it('replies with the limit and the reset time instead of the CLI text, and does not retry', async () => {
+    runCodex.mockResolvedValue({
+      ok: false,
+      exitCode: 1,
+      timedOut: false,
+      cancelled: false,
+      stdout: '',
+      stderr: '',
+      lastMessage: "You've hit your usage limit · resets 4:50pm (Asia/Calcutta)",
+      errorKind: 'USAGE_LIMIT',
+      limitResetsAtText: '4:50pm (Asia/Calcutta)',
+    });
+
+    const result = await runClaudeAgentic({ systemPrompt: 's', userMessage: 'u', cwd: '/tmp' });
+
+    expect(runCodex).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ ok: false, reason: 'error', interrupted: 'USAGE_LIMIT' });
+    expect(result.reply).toBe(
+      "I've hit my usage limit, so I can't do this right now. It resets 4:50pm (Asia/Calcutta); ask me again after that.",
+    );
+  });
+
+  it('still says when to come back without a reset time', async () => {
+    runCodex.mockResolvedValue({
+      ok: false,
+      exitCode: 1,
+      timedOut: false,
+      cancelled: false,
+      stdout: '',
+      stderr: '',
+      lastMessage: 'usage limit reached',
+      errorKind: 'USAGE_LIMIT',
+    });
+    const result = await runClaudeAgentic({ systemPrompt: 's', userMessage: 'u', cwd: '/tmp' });
+    expect(result.reply).toBe("I've hit my usage limit, so I can't do this right now. Ask me again once it resets.");
+  });
+
+  it('does not take a long failed answer that only talks about rate limits for the account limit', async () => {
+    const prose = 'Users are rate-limited on OTP after five tries. '.repeat(10);
+    runCodex.mockResolvedValue({
+      ok: false,
+      exitCode: 1,
+      timedOut: false,
+      cancelled: false,
+      stdout: prose,
+      stderr: '',
+      lastMessage: prose,
+      errorKind: 'USAGE_LIMIT',
+    });
+    const result = await runClaudeAgentic({ systemPrompt: 's', userMessage: 'u', cwd: '/tmp' });
+    expect(result.interrupted).toBeUndefined();
+    expect(result.reply).toContain('rate-limited on OTP');
+  });
+});

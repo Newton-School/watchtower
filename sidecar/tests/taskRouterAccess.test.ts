@@ -339,7 +339,8 @@ describe('routeTask access control', () => {
     expect(slack.chat.postMessage).toHaveBeenCalledWith(
       expect.objectContaining({
         channel: 'D-REVIEW',
-        text: "Sorry, DMs aren't enabled for your role. Please contact an admin.",
+        // The deny copy stays word for word; the next line says where the person can ask (#618).
+        text: "Sorry, DMs aren't enabled for your role. Please contact an admin.\nYou can ask me in <#C-REVIEW>.",
       }),
     );
     expect(logStep).toHaveBeenCalledWith(
@@ -991,6 +992,45 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
     );
   });
 
+  it('says the usage limit was hit and when it resets, without a second call or a "send it again" (issue #592)', async () => {
+    decideTool.mockResolvedValue({
+      ok: false,
+      error: 'router call failed (exit 1)',
+      durationMs: 3,
+      usageLimit: { resetsAtText: '4:50pm (Asia/Calcutta)' },
+    });
+
+    const { result, logStep, slack } = await route('<@UBOT1> list all the from sources on the DS page', {
+      intent: 'IMPLEMENTATION',
+    });
+
+    expect(decideTool).toHaveBeenCalledTimes(1);
+    expect(runAgenticEntry).not.toHaveBeenCalled();
+    expect(slack.chat.postMessage).toHaveBeenCalledExactlyOnceWith({
+      channel: 'C-VIEW',
+      thread_ts: '111.22',
+      text: "I've hit my usage limit, so I can't work out what you're asking right now. It resets 4:50pm (Asia/Calcutta); ask me again after that.",
+    });
+    expect(result).toMatchObject({ workflow: 'UNKNOWN', status: 'FAILED' });
+    expect(result.message).toContain('usage limit');
+    expect(stageLog(logStep, 'router.decision.usage_limit')).toMatchObject({ level: 'ERROR' });
+  });
+
+  it('still retries a passing rate limit that names no reset time', async () => {
+    routerSays('answer');
+    decideTool.mockResolvedValueOnce({
+      ok: false,
+      error: 'router call failed (exit 1)',
+      durationMs: 3,
+      usageLimit: {},
+    });
+
+    const { result } = await route('<@UBOT1> how does login work?');
+
+    expect(decideTool).toHaveBeenCalledTimes(2);
+    expect(result.workflow).toBe('INFORMATIONAL');
+  });
+
   it('gives a requester who would be denied the denial, not the could-not-read reply', async () => {
     decideTool.mockResolvedValue(routerFails);
 
@@ -1433,7 +1473,14 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
       );
 
       expect(result.status).toBe('SKIPPED');
-      expect(slack.chat.postMessage.mock.calls[0][0].text).toContain('not enabled for this kind of request');
+      const text = slack.chat.postMessage.mock.calls[0][0].text as string;
+      // The three deny reasons keep their copy word for word (PR #197); the next line says where to ask (#618).
+      expect(text.split('\n')[0]).toBe(
+        "Sorry, I'm not enabled for this kind of request in this channel. Please contact an admin.",
+      );
+      // No dossier in this fixture, so the owner is not named and only the channels are offered.
+      expect(text.split('\n')[1]).toMatch(/^You can ask me in <#C-[A-Z]+>.*\.$/);
+      expect(text).not.toContain('<@UOWNER1>');
       expect(onEngage).toHaveBeenCalledOnce();
     });
 

@@ -225,3 +225,15 @@ describe('runWithInfraRetry (issue #439)', () => {
     );
   });
 });
+
+describe('usageLimitReply (issue #592)', () => {
+  it('says when to come back, without the CLI sentence’s own punctuation', async () => {
+    const { usageLimitReply } = await import('../src/codex/infraRetry.js');
+    expect(usageLimitReply('do this', '4pm (Asia/Calcutta).')).toBe(
+      "I've hit my usage limit, so I can't do this right now. It resets 4pm (Asia/Calcutta); ask me again after that.",
+    );
+    expect(usageLimitReply('do this', '  ')).toBe(
+      "I've hit my usage limit, so I can't do this right now. Ask me again once it resets.",
+    );
+  });
+});
