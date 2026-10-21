@@ -311,45 +311,30 @@ describe('runDeployWorkflow marketing branch', () => {
     expect(ghExec).not.toHaveBeenCalled();
   });
 
-  it('answers a staging ask before the access and clone checks, and for any target', async () => {
-    const postMessage = vi.fn().mockResolvedValue({ ok: true, ts: '1.0' });
-    const slack = { chat: { postMessage } } as any;
-    const builder = { ...marketingTask('<@UBOT1> deploy marketing to stg'), isOwnerAuthor: false };
-    builder.event = { ...builder.event, userId: 'USOMEONE' };
-
-    // No marketing clone configured, and a requester who may not deploy to production.
-    const marketing = await runDeployWorkflow({ task: builder, config, slack });
-    expect(marketing.message).toMatch(/^I don't run staging deploys\./);
-
-    const web = await runDeployWorkflow({
-      task: marketingTask('<@UBOT1> deploy newton-web to staging'),
-      config: marketingConfig,
-      slack,
-    });
-    expect(web.status).toBe('SKIPPED');
-    expect(web.message).toBe("I only run production deploys, so I haven't started anything for staging.");
-    expect(runCodex).not.toHaveBeenCalled();
-  });
-
-  it('does not read "staging" or "production" out of a link', async () => {
+  it('answers a marketing staging ask even on a host without the clone', async () => {
     const postMessage = vi.fn().mockResolvedValue({ ok: true, ts: '1.0' });
     const slack = { chat: { postMessage } } as any;
     const result = await runDeployWorkflow({
-      task: marketingTask(
-        '<@UBOT1> deploy marketing to staging for <https://github.com/Newton-School/newton-marketing-web/pull/12|fix production banner>',
-      ),
-      config: marketingConfig,
+      task: marketingTask('<@UBOT1> deploy the marketing site to stg'),
+      config,
       slack,
     });
-    // The link's label keeps its words (a label is text someone wrote), so this one says production.
-    expect(result.message).not.toMatch(/^I don't run staging deploys/);
+    expect(result.message).toMatch(/^I don't run staging deploys\./);
+  });
 
-    const plain = await runDeployWorkflow({
-      task: marketingTask('<@UBOT1> deploy marketing to staging <https://staging-marketing-web.newtonschool.co/ai>'),
-      config: marketingConfig,
-      slack,
-    });
-    expect(plain.message).toMatch(/^I don't run staging deploys/);
+  it('reads a staging ask whose link label says production as staging, and never dispatches prod', async () => {
+    const ghExec = vi.fn();
+    __ghCli.exec = ghExec;
+    const postMessage = vi.fn().mockResolvedValue({ ok: true, ts: '1.0' });
+    const slack = { chat: { postMessage } } as any;
+    for (const text of [
+      '<@UBOT1> deploy marketing to staging for <https://github.com/Newton-School/newton-marketing-web/pull/12|fix production banner>',
+      '<@UBOT1> deploy marketing to staging, ping <#C123|prod-alerts> when done',
+    ]) {
+      const result = await runDeployWorkflow({ task: marketingTask(text), config: marketingConfig, slack });
+      expect(result.message, text).toMatch(/^I don't run staging deploys/);
+    }
+    expect(ghExec).not.toHaveBeenCalled();
   });
 
   it('dispatches the GitHub Actions prod deploy and reports the completed run', async () => {

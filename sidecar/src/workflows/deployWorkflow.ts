@@ -13,7 +13,7 @@ import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
 import { extractReplyFromCodexResult } from './shared/workflowUtils.js';
 import { waitForExactConfirmation } from './shared/confirmationGate.js';
 import { confirmationBlocks, postGatePrompt } from '../slack/buttonReplies.js';
-import { classifyDeployTarget, normalizeDeployText } from '../router/intentParser.js';
+import { classifyDeployTarget, isStagingDeployAsk } from '../router/intentParser.js';
 import { getRepo, isRepoEnabled, repoPathOrNull } from '../repos/registry.js';
 import { toolchainEnv } from '../backends/codexBackend.js';
 
@@ -189,30 +189,6 @@ export async function runDeployWorkflow(params: {
   // else is the classic newton-web prod deploy. Never let one mechanism run
   // the other, and never GUESS between them on conflicting signals.
   const target = classifyDeployTarget(task.event.text ?? '');
-
-  // A staging ask is answered before any access, clone or target check: miniOG
-  // runs production deploys only, and the answer is instructions anyone may
-  // read. Read on the text without links, so a hostname or a PR title saying
-  // "staging" or "production" does not decide it.
-  const deployText = normalizeDeployText(task.event.text ?? '');
-  if (/\b(staging|stage|stg)\b/.test(deployText) && !/\b(prod|production)\b/.test(deployText)) {
-    const marketingDeploy = getRepo('newton-marketing-web').deploy;
-    const aboutMarketing =
-      target === 'newton-marketing-web' || (target === 'ambiguous' && isRepoEnabled(config, 'newton-marketing-web'));
-    const msg =
-      aboutMarketing && marketingDeploy.method === 'github-actions'
-        ? `I don't run staging deploys. ${marketingDeploy.stagingNote}`
-        : "I only run production deploys, so I haven't started anything for staging.";
-    const posted = await postDeployReplyBestEffort({
-      slack,
-      channelId: task.event.channelId,
-      threadTs: task.event.threadTs,
-      text: msg,
-      logStep,
-    });
-    logStep?.({ stage: 'deploy.staging_declined', message: msg, data: { target } });
-    return { workflow: 'DEPLOY', status: 'SKIPPED', message: msg, notifyDesktop: false, slackPosted: posted };
-  }
 
   if (target === null) {
     // Reached without a deploy target in the message. Assuming newton-web here
@@ -415,6 +391,24 @@ async function runMarketingDeploy(params: {
     notifyDesktop: false,
     slackPosted: true,
   });
+
+  // A staging ask gets the instructions before the clone and access checks:
+  // they are only words, and miniOG runs production deploys only. Staging used
+  // to deploy on every push to main and this said "it ships itself"; it is a
+  // manual dispatch now, and a dispatch replaces whatever preview is up.
+  const deployMeta = getRepo('newton-marketing-web').deploy;
+  if (deployMeta.method === 'github-actions' && isStagingDeployAsk(task.event.text ?? '')) {
+    const msg = `I don't run staging deploys. ${escapeForSlack(deployMeta.stagingNote)}`;
+    const posted = await postDeployReplyBestEffort({
+      slack,
+      channelId: task.event.channelId,
+      threadTs: task.event.threadTs,
+      text: msg,
+      logStep,
+    });
+    logStep?.({ stage: 'deploy.staging_declined', message: msg });
+    return { ...skipped(msg), slackPosted: posted };
+  }
 
   // Same capability as the newton-web prod deploy — it goes live on
   // newtonschool.co.
@@ -660,6 +654,11 @@ async function watchMarketingDeployRun(params: {
  * return SUCCESS/FAILED for the deploy itself without triggering the index.ts
  * transient retry loop that would re-execute runCodex().
  */
+/** Slack reads a bare <…> as a link or a mention, even inside code, so a literal placeholder is escaped. */
+function escapeForSlack(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 async function postDeployReplyBestEffort(params: {
   slack: WebClient;
   channelId: string;
