@@ -164,8 +164,9 @@ export function startRouterShadow(params: {
     );
   // One more try: a failure here used to become a silent lookup or silence (issue #440).
   const pending = call().then(first => {
-    // A usage limit fails the second call the same way: not retried.
-    if (first.ok || signal?.aborted || first.usageLimit) return first;
+    // An account limit with a reset time fails the second call the same way:
+    // not retried. A passing rate limit (no reset time) gets its retry.
+    if (first.ok || signal?.aborted || first.usageLimit?.resetsAtText) return first;
     logStep?.({
       stage: 'router.decision.retry',
       message: 'Router call failed — trying once more.',

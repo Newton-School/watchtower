@@ -72,7 +72,7 @@ describe('runClaudeAgentic on the usage limit (issue #592)', () => {
     expect(runCodex).toHaveBeenCalledTimes(1);
     expect(result).toMatchObject({ ok: false, reason: 'error', interrupted: 'USAGE_LIMIT' });
     expect(result.reply).toBe(
-      "I've hit my Claude usage limit, so I can't answer this right now. It resets 4:50pm (Asia/Calcutta); ask me again after that.",
+      "I've hit my usage limit, so I can't do this right now. It resets 4:50pm (Asia/Calcutta); ask me again after that.",
     );
   });
 
@@ -88,8 +88,23 @@ describe('runClaudeAgentic on the usage limit (issue #592)', () => {
       errorKind: 'USAGE_LIMIT',
     });
     const result = await runClaudeAgentic({ systemPrompt: 's', userMessage: 'u', cwd: '/tmp' });
-    expect(result.reply).toBe(
-      "I've hit my Claude usage limit, so I can't answer this right now. Ask me again in a few hours.",
-    );
+    expect(result.reply).toBe("I've hit my usage limit, so I can't do this right now. Ask me again once it resets.");
+  });
+
+  it('does not take a long failed answer that only talks about rate limits for the account limit', async () => {
+    const prose = 'Users are rate-limited on OTP after five tries. '.repeat(10);
+    runCodex.mockResolvedValue({
+      ok: false,
+      exitCode: 1,
+      timedOut: false,
+      cancelled: false,
+      stdout: prose,
+      stderr: '',
+      lastMessage: prose,
+      errorKind: 'USAGE_LIMIT',
+    });
+    const result = await runClaudeAgentic({ systemPrompt: 's', userMessage: 'u', cwd: '/tmp' });
+    expect(result.interrupted).toBeUndefined();
+    expect(result.reply).toContain('rate-limited on OTP');
   });
 });

@@ -1008,11 +1008,26 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
     expect(slack.chat.postMessage).toHaveBeenCalledExactlyOnceWith({
       channel: 'C-VIEW',
       thread_ts: '111.22',
-      text: "I've hit my Claude usage limit, so I can't work out what you're asking right now. It resets 4:50pm (Asia/Calcutta); ask me again after that.",
+      text: "I've hit my usage limit, so I can't work out what you're asking right now. It resets 4:50pm (Asia/Calcutta); ask me again after that.",
     });
     expect(result).toMatchObject({ workflow: 'UNKNOWN', status: 'FAILED' });
     expect(result.message).toContain('usage limit');
     expect(stageLog(logStep, 'router.decision.usage_limit')).toMatchObject({ level: 'ERROR' });
+  });
+
+  it('still retries a passing rate limit that names no reset time', async () => {
+    routerSays('answer');
+    decideTool.mockResolvedValueOnce({
+      ok: false,
+      error: 'router call failed (exit 1)',
+      durationMs: 3,
+      usageLimit: {},
+    });
+
+    const { result } = await route('<@UBOT1> how does login work?');
+
+    expect(decideTool).toHaveBeenCalledTimes(2);
+    expect(result.workflow).toBe('INFORMATIONAL');
   });
 
   it('gives a requester who would be denied the denial, not the could-not-read reply', async () => {

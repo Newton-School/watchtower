@@ -164,14 +164,25 @@ export function connectionLostReply(doing: string, options: { changesCode?: bool
 }
 
 /**
- * What to tell a thread when the Claude account hit its usage limit. Asking
+ * What to tell a thread when the model account hit its usage limit. Asking
  * again before the reset fails the same way, so it says when to come back
  * instead of "send it again" or "share more context". `doing` reads after
- * "can't": "answer this", "work out what you're asking".
+ * "can't": "do this", "work out what you're asking". The backend is not
+ * named: the same detection runs on Claude Code and on Codex.
  */
 export function usageLimitReply(doing: string, resetsAtText?: string): string {
-  const when = resetsAtText ? `It resets ${resetsAtText}; ask me again after that.` : 'Ask me again in a few hours.';
-  return `I've hit my Claude usage limit, so I can't ${doing} right now. ${when}`;
+  const resets = cleanResetText(resetsAtText);
+  const when = resets ? `It resets ${resets}; ask me again after that.` : 'Ask me again once it resets.';
+  return `I've hit my usage limit, so I can't ${doing} right now. ${when}`;
+}
+
+/** The reset time as the CLI wrote it, without the sentence's own closing punctuation. */
+export function cleanResetText(resetsAtText?: string): string | undefined {
+  const text = resetsAtText
+    ?.trim()
+    .replace(/[.;,!]+$/, '')
+    .trim();
+  return text ? text : undefined;
 }
 
 /** What to tell a thread when a run was killed from outside twice. `what` names the run: "the coder". */

@@ -41,7 +41,7 @@ import {
 } from './routerShadow.js';
 import { askRequester, decideClarify, giveUpOnClarify, type ClarifyAction } from './routeClarify.js';
 import { cancelledResult } from '../workflows/shared/cancelState.js';
-import { usageLimitReply } from '../codex/infraRetry.js';
+import { cleanResetText, usageLimitReply } from '../codex/infraRetry.js';
 import { buildHelpReply, isHelpRequest } from './helpReply.js';
 import { acknowledgementText, pickupDelayMs } from './acknowledgement.js';
 import { RESTART_EVENT_PREFIX } from '../runtime/restartRecovery.js';
@@ -633,7 +633,7 @@ export async function routeTask(params: {
       workflow: 'UNKNOWN',
       status: 'FAILED',
       message: routerUsageLimit
-        ? `The Claude usage limit was hit while routing (resets ${routerUsageLimit.resetsAtText ?? 'later'}); nothing was run.`
+        ? `The usage limit was hit while routing${routerUsageLimit.resetsAtText ? `; it resets at ${cleanResetText(routerUsageLimit.resetsAtText)}` : ''}. Nothing was run.`
         : 'The router could not decide what this message asks for (two failed calls); nothing was run.',
       notifyDesktop: false,
       slackPosted: true,

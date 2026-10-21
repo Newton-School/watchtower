@@ -7,6 +7,7 @@ import {
   killedFromOutsideReply,
   runWithInfraRetry,
   usageLimitReply,
+  cleanResetText,
 } from '../codex/infraRetry.js';
 import { READ_ONLY_RUN_NOTE } from '../agentic/runClaude.js';
 import { assembleRecall } from '../codex/recallAssembler.js';
@@ -258,13 +259,15 @@ Return strict JSON:
     const text = usageLimitReply('investigate this', investigatorResult.limitResetsAtText);
     logStep?.({
       stage: 'investigation.usage_limit',
-      message: `Investigation stopped by the Claude usage limit${investigatorResult.limitResetsAtText ? ` (resets ${investigatorResult.limitResetsAtText})` : ''}.`,
+      message: 'Investigation stopped by the usage limit.',
       level: 'ERROR',
+      data: { resetsAt: cleanResetText(investigatorResult.limitResetsAtText) ?? null },
     });
-    await slack.chat
+    const slackPosted = await slack.chat
       .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text })
-      .catch(() => {});
-    return { workflow: 'INVESTIGATION', status: 'FAILED', message: text, notifyDesktop: true, slackPosted: true };
+      .then(() => true)
+      .catch(() => false);
+    return { workflow: 'INVESTIGATION', status: 'FAILED', message: text, notifyDesktop: true, slackPosted };
   }
 
   // The network or a kill from outside, not the report: say so instead of
