@@ -339,7 +339,8 @@ describe('routeTask access control', () => {
     expect(slack.chat.postMessage).toHaveBeenCalledWith(
       expect.objectContaining({
         channel: 'D-REVIEW',
-        text: "Sorry, DMs aren't enabled for your role. Please contact an admin.",
+        // The deny copy stays word for word; the next line says where the person can ask (#618).
+        text: "Sorry, DMs aren't enabled for your role. Please contact an admin.\nYou can ask me in <#C-REVIEW>.",
       }),
     );
     expect(logStep).toHaveBeenCalledWith(
@@ -1438,9 +1439,9 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
       expect(text.split('\n')[0]).toBe(
         "Sorry, I'm not enabled for this kind of request in this channel. Please contact an admin.",
       );
-      expect(text.split('\n')[1]).toMatch(
-        /^You can ask me in <#C-[A-Z]+>.*, or tag <@UOWNER1> here and I'll take it on for them\.$/,
-      );
+      // No dossier in this fixture, so the owner is not named and only the channels are offered.
+      expect(text.split('\n')[1]).toMatch(/^You can ask me in <#C-[A-Z]+>.*\.$/);
+      expect(text).not.toContain('<@UOWNER1>');
       expect(onEngage).toHaveBeenCalledOnce();
     });
 

@@ -538,28 +538,6 @@ export function evaluateCapability(params: {
  * pass a one-off config without bundles still work via the
  * `getBundlesForConfig` legacy fallback).
  */
-/**
- * The channels where this person may make a request that needs `requiredLevel`
- * (issue #618): the allowed channels of each of their bundles that grants it.
- * Used to say where to ask instead when a channel is not enabled for them.
- */
-export function channelsAllowingLevel(params: {
-  config: AppConfig;
-  accessControl?: AccessControlConfig;
-  userId: string;
-  requiredLevel: AccessLevel;
-}): string[] {
-  const bundles = params.accessControl
-    ? deriveBundlesFromLegacy(params.accessControl)
-    : getBundlesForConfig(params.config);
-  const capability = LEVEL_TO_REPRESENTATIVE_CAPABILITY[params.requiredLevel];
-  const channels = bundles
-    .filter(bundle => bundle.name !== 'owner')
-    .filter(bundle => bundle.resolvedUserIds.includes(params.userId) && bundle.capabilities.includes(capability))
-    .flatMap(bundle => bundle.allowedChannelIds);
-  return [...new Set(channels.filter(Boolean))];
-}
-
 export function evaluateAccess(params: {
   config: AppConfig;
   accessControl?: AccessControlConfig;
@@ -587,4 +565,27 @@ export function evaluateAccess(params: {
   // Preserve the legacy `requiredLevel` field on the returned decision —
   // tests and `taskRouter.ts` both inspect it.
   return { ...decision, requiredLevel: params.requiredLevel };
+}
+
+/**
+ * Where this person may make a request that needs `requiredLevel`
+ * (issue #618): the allowed channels of each of their bundles that grants it,
+ * and whether one of those bundles lets them DM miniOG. Used to say where to
+ * ask instead when a channel is not enabled for them.
+ */
+export function placesAllowingLevel(params: {
+  config: AppConfig;
+  accessControl?: AccessControlConfig;
+  userId: string;
+  requiredLevel: AccessLevel;
+}): { channels: string[]; dm: boolean } {
+  const bundles = params.accessControl
+    ? deriveBundlesFromLegacy(params.accessControl)
+    : getBundlesForConfig(params.config);
+  const capability = LEVEL_TO_REPRESENTATIVE_CAPABILITY[params.requiredLevel];
+  const granting = bundles
+    .filter(bundle => bundle.name !== 'owner')
+    .filter(bundle => bundle.resolvedUserIds.includes(params.userId) && bundle.capabilities.includes(capability));
+  const channels = [...new Set(granting.flatMap(bundle => bundle.allowedChannelIds).filter(Boolean))];
+  return { channels, dm: granting.some(bundle => bundle.allowIm) };
 }

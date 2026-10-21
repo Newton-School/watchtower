@@ -21,6 +21,7 @@ import {
   isPureOwnerTag,
   ownerInThread,
   type OwnerDelegationDecision,
+  isDelegableChannel,
 } from '../access/ownerDelegation.js';
 import { resolveWorkspaceMembership, type WorkspaceMembership } from '../slack/workspaceMembership.js';
 import { fetchThreadRepliesSince } from '../slack/threadContext.js';
@@ -133,6 +134,17 @@ export const ROUTER_FAILED_REPLY =
 
 /** Intents routeTask can start a workflow for. */
 export const ROUTED_INTENTS = Object.keys(WORKFLOW_RUNNERS) as WorkflowIntent[];
+
+/** The owner's name as people see it, for copy that must not @-mention them. */
+function ownerDisplayName(store: JobStore, ownerId: string | undefined): string | undefined {
+  if (!ownerId) return undefined;
+  try {
+    const profile = store.dossierStore().getDossier(ownerId).profile;
+    return profile?.displayName || profile?.realName || undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 export async function routeTask(params: {
   task: NormalizedTask;
@@ -473,6 +485,16 @@ export async function routeTask(params: {
 
   const accessControl = getConfiguredAccessControl(config);
   const requiredLevel = resolveRequiredAccessLevel(resolvedIntent);
+  const resolveMembership =
+    deps?.resolveMembership ?? ((userId: string) => resolveWorkspaceMembership({ slack, userId }));
+  /** A full workspace member: an owner tag from them would be delegated (issue #618's hint). */
+  const isDelegable = async (userId: string): Promise<boolean> => {
+    try {
+      return (await resolveMembership(userId)).eligible;
+    } catch {
+      return false;
+    }
+  };
   const accessDecision = evaluateAccess({
     config,
     accessControl,
@@ -492,7 +514,7 @@ export async function routeTask(params: {
     delegation = await decideOwnerDelegation({
       task,
       ownerIds: config.ownerSlackUserIds,
-      resolveMembership: deps?.resolveMembership ?? (userId => resolveWorkspaceMembership({ slack, userId })),
+      resolveMembership,
     });
   }
   if (delegation.kind === 'delegate') {
@@ -574,6 +596,13 @@ export async function routeTask(params: {
               channelId: task.event.channelId,
               channelType: task.event.channelType,
               requiredLevel,
+              ownerName: ownerDisplayName(store, config.ownerSlackUserIds[0]),
+              delegable:
+                isOwnerTagDelegationEnabled() &&
+                isDelegableChannel(task.event.channelType, task.event.channelId) &&
+                (await isDelegable(task.event.userId)),
+              ownerInThread: ownerInThread(task.threadMessages ?? [], task.event.eventTs, config.ownerSlackUserIds)
+                .present,
             })
           : undefined;
       const denialText = hint ? `${baseDenial}\n${hint}` : baseDenial;
