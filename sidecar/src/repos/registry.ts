@@ -100,13 +100,15 @@ export const REPO_REGISTRY: Record<RepoKey, RepoDescriptor> = {
       '`*-temp` routes are deliberate noindex preview twins of live Webflow pages — not duplicates, not bugs.',
       'The Cloudflare Worker path-router is absent under `npm run dev`: every route serves locally even if not yet cut over in `worker/paths.js`. Changes under `worker/**` cannot be validated locally — say so in the report instead of guessing.',
       'These are conversion-critical landing pages — flag layout shift (CLS), broken mobile layouts, and obvious performance regressions.',
+      'staging-marketing-web.newtonschool.co serves whatever branch was deployed there last, not necessarily `main`: find out which before reading a difference from the main clone as a bug.',
     ],
     deploy: {
       method: 'github-actions',
       // Manual since early Oct 2026: deploy-staging.yml is workflow_dispatch only and
       // takes any branch; staging keeps whatever was dispatched last.
+      // `&lt;branch&gt;`: Slack reads a bare <…> as a link or a mention, even in code.
       stagingNote:
-        'Staging deploys are manual: run *Deploy → staging* in the repo’s GitHub Actions on the branch you want to preview (`gh workflow run deploy-staging.yml --ref <branch>`). staging-marketing-web.newtonschool.co keeps whatever was deployed last, so deploy `main` again after a preview.',
+        'Staging deploys are manual: run *Deploy → staging* in GitHub Actions on your branch (`gh workflow run deploy-staging.yml --ref &lt;branch&gt;`). It replaces whatever is on staging now, so check nobody is testing there, and deploy `main` again when you are done.',
       prodCommand: 'gh workflow run deploy-prod.yml --ref main -f confirm=deploy',
     },
   },
@@ -176,10 +178,18 @@ export function qaCaveatBlockFor(key: RepoKey): string {
   return [`Repo-specific QA context for ${key}:`, ...caveats.map(caveat => `- ${caveat}`)].join('\n');
 }
 
-/** One line per enabled repo, for prompts that enumerate the known repos. */
+/**
+ * One line per enabled repo, for prompts that enumerate the known repos. A
+ * repo deployed through GitHub Actions also says how its staging works, so a
+ * lookup asked about it answers from that rather than guessing.
+ */
 export function describeEnabledRepos(config: AppConfig): string {
   return enabledRepoKeys(config)
-    .map(key => `- ${key}: ${REPO_REGISTRY[key].description}`)
+    .map(key => {
+      const repo = REPO_REGISTRY[key];
+      const staging = repo.deploy.method === 'github-actions' ? ` ${repo.deploy.stagingNote}` : '';
+      return `- ${key}: ${repo.description}${staging}`;
+    })
     .join('\n');
 }
 

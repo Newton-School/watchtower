@@ -13,7 +13,7 @@ import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
 import { extractReplyFromCodexResult } from './shared/workflowUtils.js';
 import { waitForExactConfirmation } from './shared/confirmationGate.js';
 import { confirmationBlocks, postGatePrompt } from '../slack/buttonReplies.js';
-import { classifyDeployTarget } from '../router/intentParser.js';
+import { classifyDeployTarget, normalizeDeployText } from '../router/intentParser.js';
 import { getRepo, isRepoEnabled, repoPathOrNull } from '../repos/registry.js';
 import { toolchainEnv } from '../backends/codexBackend.js';
 
@@ -189,6 +189,31 @@ export async function runDeployWorkflow(params: {
   // else is the classic newton-web prod deploy. Never let one mechanism run
   // the other, and never GUESS between them on conflicting signals.
   const target = classifyDeployTarget(task.event.text ?? '');
+
+  // A staging ask is answered before any access, clone or target check: miniOG
+  // runs production deploys only, and the answer is instructions anyone may
+  // read. Read on the text without links, so a hostname or a PR title saying
+  // "staging" or "production" does not decide it.
+  const deployText = normalizeDeployText(task.event.text ?? '');
+  if (/\b(staging|stage|stg)\b/.test(deployText) && !/\b(prod|production)\b/.test(deployText)) {
+    const marketingDeploy = getRepo('newton-marketing-web').deploy;
+    const aboutMarketing =
+      target === 'newton-marketing-web' || (target === 'ambiguous' && isRepoEnabled(config, 'newton-marketing-web'));
+    const msg =
+      aboutMarketing && marketingDeploy.method === 'github-actions'
+        ? `I don't run staging deploys. ${marketingDeploy.stagingNote}`
+        : "I only run production deploys, so I haven't started anything for staging.";
+    const posted = await postDeployReplyBestEffort({
+      slack,
+      channelId: task.event.channelId,
+      threadTs: task.event.threadTs,
+      text: msg,
+      logStep,
+    });
+    logStep?.({ stage: 'deploy.staging_declined', message: msg, data: { target } });
+    return { workflow: 'DEPLOY', status: 'SKIPPED', message: msg, notifyDesktop: false, slackPosted: posted };
+  }
+
   if (target === null) {
     // Reached without a deploy target in the message. Assuming newton-web here
     // is how a confirmed marketing deploy could ship the wrong site (#428).
@@ -416,17 +441,6 @@ async function runMarketingDeploy(params: {
   if (!repoPath) {
     const msg =
       "The newton-marketing-web clone isn't configured on this host, so I can't trigger its deploy. Set newton_marketing_web_path in Watchtower settings.";
-    await slack.chat.postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: msg });
-    return skipped(msg);
-  }
-
-  const normalized = (task.event.text ?? '').toLowerCase();
-  const deployMeta = getRepo('newton-marketing-web').deploy;
-  const stagingNote = deployMeta.method === 'github-actions' ? deployMeta.stagingNote : '';
-  if (/\bstaging\b/.test(normalized) && !/\b(prod|production)\b/.test(normalized)) {
-    // Staging used to deploy on every push to main, and this said so. It is a
-    // manual dispatch now, so "merge and it ships itself" sent people waiting.
-    const msg = `I don't trigger staging deploys.${stagingNote ? ` ${stagingNote}` : ''}`;
     await slack.chat.postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: msg });
     return skipped(msg);
   }

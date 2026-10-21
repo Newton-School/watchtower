@@ -41,7 +41,7 @@ const NEWTON_WEB_REF_RE = /\bnewton[- ]?web\b/;
 // these must not deterministically fire EITHER prod deploy.
 const AMBIGUOUS_DEPLOY_TARGET_RE = /\b(landing([- ]?pages?)?|homepage|newton[- ]?school|nsat|nst)\b/;
 
-function normalizeDeployText(text: string): string {
+export function normalizeDeployText(text: string): string {
   return (
     text
       .replace(/<@[^>]+>/g, ' ')

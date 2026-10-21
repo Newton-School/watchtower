@@ -135,5 +135,9 @@ describe('prompt blocks', () => {
     expect(two).not.toContain('newton-marketing-web:');
     const three = describeEnabledRepos(THREE_REPO_CONFIG);
     expect(three).toContain('newton-marketing-web:');
+    // A lookup asked how marketing staging works reads the answer here, not a guess.
+    const marketingLine = three.split('\n').find(line => line.startsWith('- newton-marketing-web:')) ?? '';
+    expect(marketingLine).toContain('Staging deploys are manual');
+    expect(three.split('\n').find(line => line.startsWith('- newton-web:'))).not.toContain('Staging');
   });
 });
