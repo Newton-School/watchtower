@@ -40,6 +40,8 @@ function makeThread(overrides: Partial<RunThread> = {}): RunThread {
 function respondWith(thread: RunThread) {
   invoke.mockImplementation((command: string) => {
     if (command === 'get_run_thread') return Promise.resolve(thread);
+    if (command === 'get_slack_directory') return Promise.resolve({ people: [], groups: [] });
+    if (command === 'get_slack_image') return Promise.resolve('data:image/png;base64,AAAA');
     return Promise.resolve(undefined);
   });
 }
@@ -84,7 +86,7 @@ describe('SlackThread', () => {
     fireEvent.keyDown(box, { key: 'Enter' });
 
     await waitFor(() => {
-      expect(invoke).toHaveBeenCalledWith('post_as_miniog', { jobId: 'job-1', text: 'On it.' });
+      expect(invoke).toHaveBeenCalledWith('post_as_miniog', { jobId: 'job-1', text: 'On it.', broadcast: false });
     });
     await waitFor(() => expect((box as HTMLTextAreaElement).value).toBe(''));
   });
@@ -104,7 +106,7 @@ describe('SlackThread', () => {
     });
 
     fireEvent.click(within(messageRow('1000.000002')).getByRole('button', { name: 'React as miniOG' }));
-    fireEvent.click(screen.getByRole('button', { name: ':eyes:' }));
+    fireEvent.click(screen.getAllByRole('button', { name: ':eyes:' })[0]);
     await waitFor(() => {
       expect(invoke).toHaveBeenCalledWith('set_miniog_reaction', {
         jobId: 'job-1',
@@ -235,7 +237,11 @@ describe('SlackThread', () => {
     fireEvent.change(box, { target: { value: 'a < b & c, ask <@UOG>' } });
     fireEvent.keyDown(box, { key: 'Enter' });
     await waitFor(() => {
-      expect(invoke).toHaveBeenCalledWith('post_as_miniog', { jobId: 'job-1', text: 'a &lt; b &amp; c, ask <@UOG>' });
+      expect(invoke).toHaveBeenCalledWith('post_as_miniog', {
+        jobId: 'job-1',
+        text: 'a &lt; b &amp; c, ask <@UOG>',
+        broadcast: false,
+      });
     });
   });
 
@@ -245,7 +251,7 @@ describe('SlackThread', () => {
     await screen.findByText('#miniog-testing');
 
     fireEvent.click(within(messageRow('1000.000002')).getByRole('button', { name: 'React as miniOG' }));
-    const search = screen.getByPlaceholderText('Search emoji');
+    const search = screen.getByPlaceholderText('Search all emoji');
     await waitFor(() => expect(document.activeElement).toBe(search));
     fireEvent.change(search, { target: { value: 'fire' } });
     fireEvent.keyDown(search, { key: 'Enter' });
@@ -284,10 +290,39 @@ describe('SlackThread', () => {
 
     const button = within(messageRow('1000.000002')).getByRole('button', { name: 'React as miniOG' });
     fireEvent.click(button);
-    expect(screen.getByRole('dialog', { name: 'Pick a reaction' })).toBeTruthy();
+    expect(screen.getByRole('dialog', { name: 'Pick an emoji' })).toBeTruthy();
     fireEvent.pointerDown(button);
     fireEvent.click(button);
-    expect(screen.queryByRole('dialog', { name: 'Pick a reaction' })).toBeNull();
+    expect(screen.queryByRole('dialog', { name: 'Pick an emoji' })).toBeNull();
+  });
+
+  it('shows Slack images inline and other files as chips', async () => {
+    const thread = makeThread();
+    thread.messages[1] = {
+      ...thread.messages[1],
+      files: [
+        {
+          id: 'F1',
+          name: 'shot.png',
+          mimetype: 'image/png',
+          thumb_360: 'https://files.slack.com/files-tmb/T1-F1/shot_360.png',
+          thumb_360_w: 360,
+          thumb_360_h: 180,
+          permalink: 'https://example.slack.com/files/F1',
+        },
+        { id: 'F2', name: 'notes.pdf', mimetype: 'application/pdf', permalink: 'https://example.slack.com/files/F2' },
+      ],
+    };
+    respondWith(thread);
+    render(<SlackThread jobId="job-1" />);
+
+    const image = await screen.findByRole('img', { name: 'shot.png' });
+    expect(image.getAttribute('src')).toBe('data:image/png;base64,AAAA');
+    expect(invoke).toHaveBeenCalledWith('get_slack_image', {
+      url: 'https://files.slack.com/files-tmb/T1-F1/shot_360.png',
+      mimetype: 'image/png',
+    });
+    expect(screen.getByRole('link', { name: '📎 notes.pdf' })).toBeTruthy();
   });
 
   it('renders nothing for a run without a Slack thread', async () => {

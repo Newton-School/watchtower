@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import type { RemoveReactionsResult, RunThread, SlackMessage, SlackUser } from '../types';
+import type { RemoveReactionsResult, RunThread, SlackFile, SlackMessage, SlackUser } from '../types';
 import { emojiChar } from '../lib/emoji';
 import { SlackText, fromSlackText, toSlackText } from '../lib/slackText';
+import { loadSlackImage } from '../lib/slackCache';
 import { EmojiPicker } from './EmojiPicker';
+import { SlackComposer } from './SlackComposer';
+import type { ComposedMessage } from './SlackComposer';
 import { SectionCard } from './primitives';
 
 const REFRESH_MS = 5000;
@@ -54,6 +57,50 @@ function submitOnEnter(e: ReactKeyboardEvent<HTMLTextAreaElement>, submit: () =>
   }
 }
 
+function readAsBase64(file: File): Promise<{ name: string; dataBase64: string }> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve({ name: file.name, dataBase64: String(reader.result).replace(/^data:[^,]*,/, '') });
+    reader.onerror = () => reject(new Error(`${file.name} could not be read.`));
+    reader.readAsDataURL(file);
+  });
+}
+
+function isImage(file: SlackFile): boolean {
+  return Boolean(file.mimetype?.startsWith('image/') && (file.thumb_360 || file.url_private));
+}
+
+/** A Slack-hosted image, fetched through the app (the file is private to the workspace). */
+function SlackImage({ file }: { file: SlackFile }) {
+  const url = file.thumb_720 ?? file.thumb_480 ?? file.thumb_360 ?? file.url_private ?? '';
+  const [src, setSrc] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let current = true;
+    loadSlackImage(url, file.mimetype ?? '')
+      .then(data => current && setSrc(data))
+      .catch(() => current && setFailed(true));
+    return () => {
+      current = false;
+    };
+  }, [url, file.mimetype]);
+  const name = file.title || file.name || 'Image';
+  if (failed) {
+    return (
+      <a className="slack-file" href={file.permalink} target="_blank" rel="noopener noreferrer">
+        🖼 {name}
+      </a>
+    );
+  }
+  const width = Math.min(file.thumb_360_w ?? 360, 360);
+  const height = file.thumb_360_w && file.thumb_360_h ? Math.round((width / file.thumb_360_w) * file.thumb_360_h) : 200;
+  return (
+    <a className="slack-image" href={file.permalink} target="_blank" rel="noopener noreferrer" title={name}>
+      {src ? <img src={src} alt={name} /> : <span className="slack-image-loading" style={{ width, height }} />}
+    </a>
+  );
+}
+
 type SlackThreadProps = {
   jobId: string;
 };
@@ -69,7 +116,6 @@ export function SlackThread({ jobId }: SlackThreadProps) {
   const [actionError, setActionError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [draft, setDraft] = useState('');
   const [editing, setEditing] = useState<{ ts: string; text: string } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [pickerFor, setPickerFor] = useState<{ ts: string; anchor: HTMLElement } | null>(null);
@@ -162,12 +208,14 @@ export function SlackThread({ jobId }: SlackThreadProps) {
 
   if (thread && !thread.hasThread) return null;
 
-  const send = async () => {
-    const typed = draft;
-    if (!typed.trim() || busy) return;
-    // Keep anything typed while the send was in flight.
-    if (await act('post_as_miniog', { text: toSlackText(typed) }))
-      setDraft(current => (current === typed ? '' : current));
+  const sendMessage = async ({ text, broadcast, files }: ComposedMessage): Promise<boolean> => {
+    if (files.length === 0) return act('post_as_miniog', { text, broadcast });
+    try {
+      return act('upload_as_miniog', { text, files: await Promise.all(files.map(readAsBase64)) });
+    } catch (err) {
+      setActionError(String(err));
+      return false;
+    }
   };
 
   const saveEdit = async () => {
@@ -288,28 +336,11 @@ export function SlackThread({ jobId }: SlackThreadProps) {
             })}
           </div>
           {actionError ? <p className="slack-thread-error slack-thread-action-error">{actionError}</p> : null}
-          <form
-            className="slack-composer"
-            onSubmit={e => {
-              e.preventDefault();
-              void send();
-            }}
-          >
-            <textarea
-              aria-label="Reply as miniOG"
-              placeholder="Reply as miniOG…"
-              rows={2}
-              value={draft}
-              onChange={e => setDraft(e.target.value)}
-              onKeyDown={e => submitOnEnter(e, () => void send())}
-            />
-            <div className="slack-composer-footer">
-              <span className="muted">Posts in this thread as miniOG. Shift+Enter for a new line.</span>
-              <button className="primary-button" type="submit" disabled={busy || !draft.trim()}>
-                Send
-              </button>
-            </div>
-          </form>
+          <SlackComposer
+            busy={busy}
+            participants={[...new Set(thread.messages.map(message => message.user ?? ''))].filter(Boolean)}
+            onSend={sendMessage}
+          />
         </div>
       )}
     </SectionCard>
@@ -421,18 +452,22 @@ function MessageRow({
 
         {message.files && message.files.length > 0 ? (
           <div className="slack-files">
-            {message.files.map(file => (
-              <a
-                key={file.id}
-                className="slack-file"
-                href={file.permalink}
-                target="_blank"
-                rel="noopener noreferrer"
-                title={file.mimetype}
-              >
-                📎 {file.title || file.name || 'File'}
-              </a>
-            ))}
+            {message.files.map(file =>
+              isImage(file) ? (
+                <SlackImage key={file.id} file={file} />
+              ) : (
+                <a
+                  key={file.id}
+                  className="slack-file"
+                  href={file.permalink}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  title={file.mimetype}
+                >
+                  📎 {file.title || file.name || 'File'}
+                </a>
+              ),
+            )}
           </div>
         ) : null}
 

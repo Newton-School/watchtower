@@ -171,6 +171,31 @@ export type SlackFile = {
   title?: string;
   mimetype?: string;
   permalink?: string;
+  url_private?: string;
+  thumb_360?: string;
+  thumb_480?: string;
+  thumb_720?: string;
+  thumb_360_w?: number;
+  thumb_360_h?: number;
+};
+
+export type DirectoryPerson = {
+  id: string;
+  name: string;
+  realName: string | null;
+  avatarUrl: string | null;
+};
+
+export type DirectoryGroup = {
+  id: string;
+  handle: string;
+  name: string;
+};
+
+/** The workspace's people and user groups, for @mention suggestions. */
+export type SlackDirectory = {
+  people: DirectoryPerson[];
+  groups: DirectoryGroup[];
 };
 
 /** A Slack message object as conversations.replies returns it (the fields the app reads). */

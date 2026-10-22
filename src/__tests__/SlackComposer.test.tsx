@@ -1,0 +1,111 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+
+const invoke = vi.fn();
+vi.mock('@tauri-apps/api/core', () => ({ invoke: (...args: unknown[]) => invoke(...args) }));
+
+import { SlackComposer, applyMentions } from '../components/SlackComposer';
+
+const directory = {
+  people: [
+    { id: 'U1', name: 'Aditya Sisodia', realName: 'Aditya Sisodia', avatarUrl: null },
+    { id: 'U2', name: 'theOG', realName: 'Dipesh Rajoria', avatarUrl: null },
+    { id: 'U3', name: 'Adi K', realName: 'Aditi Kumar', avatarUrl: null },
+  ],
+  groups: [{ id: 'S1', handle: 'core-dev', name: 'Core dev' }],
+};
+
+function setup(participants: string[] = []) {
+  const onSend = vi.fn().mockResolvedValue(true);
+  render(<SlackComposer busy={false} participants={participants} onSend={onSend} />);
+  return { onSend, box: screen.getByRole('textbox', { name: 'Reply as miniOG' }) as HTMLTextAreaElement };
+}
+
+function type(box: HTMLTextAreaElement, value: string) {
+  fireEvent.change(box, { target: { value, selectionStart: value.length, selectionEnd: value.length } });
+}
+
+describe('SlackComposer', () => {
+  beforeEach(() => {
+    invoke.mockReset();
+    invoke.mockImplementation((command: string) =>
+      command === 'get_slack_directory' ? Promise.resolve(directory) : Promise.resolve(undefined),
+    );
+  });
+
+  it('suggests people as you type @, thread people first, and posts a real mention', async () => {
+    const { onSend, box } = setup(['U3']);
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('get_slack_directory'));
+
+    type(box, 'thanks @adi');
+    const options = await screen.findAllByRole('option');
+    expect(options.map(option => option.textContent)).toEqual(['@Adi KAditi Kumar', '@Aditya Sisodia']);
+
+    fireEvent.keyDown(box, { key: 'ArrowDown' });
+    fireEvent.keyDown(box, { key: 'Enter' });
+    expect(box.value).toBe('thanks @Aditya Sisodia ');
+    expect(screen.queryByRole('listbox')).toBeNull();
+
+    type(box, 'thanks @Aditya Sisodia for this');
+    fireEvent.keyDown(box, { key: 'Enter' });
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith({ text: 'thanks <@U1> for this', broadcast: false, files: [] });
+    });
+  });
+
+  it('mentions user groups by handle', async () => {
+    // The directory read in the first test is shared, as in the app.
+    const { onSend, box } = setup();
+
+    type(box, 'cc @core');
+    fireEvent.click(await screen.findByRole('button', { name: /core-dev/ }));
+    fireEvent.keyDown(box, { key: 'Enter' });
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith({ text: 'cc <!subteam^S1|@core-dev>', broadcast: false, files: [] });
+    });
+  });
+
+  it('sends to the channel too when asked, and attaches files without that option', async () => {
+    const { onSend, box } = setup();
+    type(box, 'heads up');
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Also send to channel' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith({ text: 'heads up', broadcast: true, files: [] }));
+
+    const file = new File(['hello'], 'notes.txt', { type: 'text/plain' });
+    fireEvent.change(screen.getByLabelText('Files to attach'), { target: { files: [file] } });
+    expect(screen.getByText('notes.txt')).toBeTruthy();
+    expect((screen.getByRole('checkbox', { name: 'Also send to channel' }) as HTMLInputElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+    await waitFor(() => expect(onSend).toHaveBeenLastCalledWith({ text: '', broadcast: false, files: [file] }));
+  });
+
+  it('refuses files over 20 MB', () => {
+    setup();
+    const big = new File(['x'], 'huge.mov');
+    Object.defineProperty(big, 'size', { value: 21 * 1024 * 1024 });
+    fireEvent.change(screen.getByLabelText('Files to attach'), { target: { files: [big] } });
+
+    expect(screen.getByText("huge.mov is over 20 MB, so it can't be attached.")).toBeTruthy();
+  });
+
+  it('inserts an emoji from the picker', async () => {
+    const { box } = setup();
+    type(box, 'done ');
+    fireEvent.click(screen.getByRole('button', { name: 'Insert emoji' }));
+    fireEvent.click(screen.getAllByRole('button', { name: ':tada:' })[0]);
+
+    expect(box.value).toBe('done :tada: ');
+  });
+});
+
+describe('applyMentions', () => {
+  it('swaps labels for mention markup, longest label first', () => {
+    const text = applyMentions('ask @Sam K and @Sam &amp; co', [
+      { label: '@Sam', token: '<@U1>' },
+      { label: '@Sam K', token: '<@U2>' },
+    ]);
+    expect(text).toBe('ask <@U2> and <@U1> &amp; co');
+  });
+});
