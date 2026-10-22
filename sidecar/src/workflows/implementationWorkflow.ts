@@ -39,6 +39,7 @@ import { inferRepoFromAffectedFiles, readRepoAffinity, repoPathFor, resolveRepoO
 import { enabledRepoKeys, getRepo, repoKeyForWorkspacePath } from '../repos/registry.js';
 import type { RepoAffinity } from '../router/repoClassifier.js';
 import { waitForClarificationWithIdle, detectClarificationLoop } from './shared/clarificationGuards.js';
+import { requesterOf } from './shared/requester.js';
 import type { ClarificationRound } from './shared/clarificationGuards.js';
 import { profileForAgentRole } from '../codex/modelProfiles.js';
 import { buildPlannerPrompt, buildPlannerPlanModePrompt } from '../agents/prompts.js';
@@ -244,7 +245,8 @@ async function confirmQuickPrAction(params: {
   signal?: AbortSignal;
 }): Promise<{ confirmedBy: string } | { result: WorkflowResult }> {
   const { task, config, slack, action, prUrls, unresolvedCount, logStep, signal } = params;
-  const { channelId, threadTs, userId } = task.event;
+  const { channelId, threadTs } = task.event;
+  const userId = requesterOf(task);
   const phrase = `confirm ${action}`;
   const owners = config.ownerSlackUserIds;
   const ownerMentions = owners.map(id => `<@${id}>`).join(' or ');
@@ -446,7 +448,7 @@ export async function runApprovalLoop(input: {
 
   for (let iteration = iterationStart; iteration < MAX_FEEDBACK_ITERATIONS; iteration++) {
     // Worked out for each version of the plan: a revision can add or remove a behaviour change.
-    const requesterToConfirm = requesterToConfirmFor(planMarkdown, config, task.event.userId);
+    const requesterToConfirm = requesterToConfirmFor(planMarkdown, config, requesterOf(task));
     let approvalPromptTs: string | undefined;
     if (iteration === iterationStart && resumeApprovalPromptTs) {
       // Resuming: the prompt is already posted; the resume mention is the next reply we want to classify.
@@ -487,14 +489,14 @@ export async function runApprovalLoop(input: {
       channelId: task.event.channelId,
       threadTs: task.event.threadTs,
       approverUserIds: adminUserIds,
-      triggerUserId: task.event.userId,
+      triggerUserId: requesterOf(task),
       approvalPromptTs,
       logStep: logStep ?? (() => {}),
       botUserId: config.botUserId,
       signal,
       reminders: {
         afterMs: PLAN_APPROVAL_REMINDERS_MS,
-        text: `${approverMention} <@${task.event.userId}>'s plan above still needs a yes or no.`,
+        text: `${approverMention} <@${requesterOf(task)}>'s plan above still needs a yes or no.`,
       },
       approverMention,
       requesterToConfirm,
@@ -563,7 +565,7 @@ export async function runApprovalLoop(input: {
         channelId: task.event.channelId,
         threadTs: task.event.threadTs,
         approverUserIds: adminUserIds,
-        triggerUserId: task.event.userId,
+        triggerUserId: requesterOf(task),
         approvalPromptTs: askReviseTs,
         logStep: logStep ?? (() => {}),
         botUserId: config.botUserId,
@@ -791,7 +793,7 @@ Return the JSON now.`;
           affectedFiles: planAffectedFiles,
           scope: planScope,
           repoPath: pipelineCwd,
-          requesterToConfirm: requesterToConfirmFor(planMarkdown, config, task.event.userId),
+          requesterToConfirm: requesterToConfirmFor(planMarkdown, config, requesterOf(task)),
           logStep,
         });
         planMessageTs = revisedTs ?? planMessageTs;
@@ -861,7 +863,8 @@ export function plannerFailureReply(
 export async function runImplementationWorkflow(
   params: Parameters<typeof runImplementationWorkflowBody>[0],
 ): Promise<WorkflowResult> {
-  const isAdmin = getAdminUserIds(params.config).includes(params.task.event.userId);
+  // The person the change is for, not the owner it may run on behalf of (issue #443).
+  const isAdmin = getAdminUserIds(params.config).includes(requesterOf(params.task));
   const connectors = connectorsFor(isAdmin ? 'code_change_admin' : 'code_change', params.config);
   params.logStep?.({
     stage: 'workflow.connectors',
@@ -1198,7 +1201,7 @@ async function runImplementationWorkflowBody(params: {
       }
       if (!clarificationTs) break;
 
-      const allowedAnswerers = [...new Set([task.event.userId, ...getAdminUserIds(config)])];
+      const allowedAnswerers = [...new Set([requesterOf(task), ...getAdminUserIds(config)])];
       const outcome = await waitForClarificationWithIdle({
         slack,
         channelId: task.event.channelId,
@@ -1333,7 +1336,7 @@ async function runImplementationWorkflowBody(params: {
               channelId: task.event.channelId,
               threadTs: task.event.threadTs,
               approverUserIds: adminUserIds,
-              triggerUserId: task.event.userId,
+              triggerUserId: requesterOf(task),
               approvalPromptTs: confirmResult.ts,
               logStep: logStep ?? (() => {}),
               botUserId: config.botUserId,
@@ -1481,7 +1484,10 @@ async function runImplementationWorkflowBody(params: {
 
       if (prAction) {
         let confirmedBy = task.event.userId;
-        if (!task.isOwnerAuthor) {
+        // A run the owner started or picked up for someone else still needs
+        // the phrase: answering their question isn't saying yes to a merge.
+        const forSomeoneElse = requesterOf(task) !== task.event.userId;
+        if (!task.isOwnerAuthor || forSomeoneElse) {
           let unresolvedCount: number | undefined;
           if (prAction === 'merge' && task.prContext && ctx.githubToken) {
             unresolvedCount = await fetchUnresolvedReviewThreadCount({
@@ -1508,8 +1514,8 @@ async function runImplementationWorkflowBody(params: {
         }
         logStep?.({
           stage: 'implementation.quick_action.pr_action',
-          message: `Running quick action "${prAction}" requested by <@${task.event.userId}>, confirmed by <@${confirmedBy}>.`,
-          data: { action: prAction, prUrls, requestedBy: task.event.userId, confirmedBy },
+          message: `Running quick action "${prAction}" requested by <@${requesterOf(task)}>, confirmed by <@${confirmedBy}>.`,
+          data: { action: prAction, prUrls, requestedBy: requesterOf(task), confirmedBy },
         });
       }
 
@@ -1689,7 +1695,7 @@ Write your response as a ready-to-post Slack message describing what you did.
           affectedFiles: planAffectedFiles,
           scope: planScope,
           repoPath: pipelineCwd,
-          requesterToConfirm: requesterToConfirmFor(planMarkdown, config, task.event.userId),
+          requesterToConfirm: requesterToConfirmFor(planMarkdown, config, requesterOf(task)),
           logStep,
         });
       } catch (error) {
@@ -1924,7 +1930,7 @@ Write your response as a ready-to-post Slack message describing what you did.
       const promptTs = askResp.ts;
 
       const adminUserIds = getAdminUserIds(config);
-      const allowedIds = Array.from(new Set([task.event.userId, ...adminUserIds, ...config.coreDevSlackUserIds]));
+      const allowedIds = Array.from(new Set([requesterOf(task), ...adminUserIds, ...config.coreDevSlackUserIds]));
 
       if (!promptTs) {
         logStep?.({

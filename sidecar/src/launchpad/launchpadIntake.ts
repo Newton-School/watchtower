@@ -2,7 +2,7 @@ import type { WebClient } from '@slack/web-api';
 import { logger } from '../logging/logger.js';
 import { notifyDesktop } from '../notify/desktopNotifier.js';
 import type { JobStore } from '../state/jobStore.js';
-import type { AppConfig, SlackEventEnvelope } from '../types/contracts.js';
+import type { AppConfig, LaunchpadRequestRecord, SlackEventEnvelope } from '../types/contracts.js';
 
 const LAUNCHPAD_POLL_INTERVAL_MS = 5_000;
 
@@ -13,6 +13,7 @@ export function buildLaunchpadEnvelope(params: {
     ownerUserId: string;
     prompt: string;
     requestedForUserId?: string;
+    answerForJobId?: string;
   };
   channelId: string;
   anchorTs: string;
@@ -36,6 +37,7 @@ export function buildLaunchpadEnvelope(params: {
     // requester travels separately for attribution + dossier recall.
     userId: request.ownerUserId,
     requestedForUserId: request.requestedForUserId,
+    answersJobId: request.answerForJobId,
     text: `<@${config.botUserId}> ${request.prompt}`.trim(),
     ingestSource: 'launchpad',
     launchpadRequestId: request.id,
@@ -45,6 +47,7 @@ export function buildLaunchpadEnvelope(params: {
       requestId: request.id,
       ownerUserId: request.ownerUserId,
       requestedForUserId: request.requestedForUserId,
+      answersJobId: request.answerForJobId,
       prompt: request.prompt,
       anchorTs,
       eventTs,
@@ -162,14 +165,15 @@ async function postLaunchpadAnchor(params: {
   }
 }
 
-export async function runLaunchpadRequestPoller(params: {
+export interface LaunchpadIntake {
   webClient: WebClient;
   config: AppConfig;
   store: JobStore;
   enqueue: (event: SlackEventEnvelope, client: WebClient, source: 'launchpad') => Promise<void>;
-}): Promise<void> {
-  const { webClient, config, store, enqueue } = params;
-  const requests = store.claimPendingLaunchpadRequests();
+}
+
+export async function runLaunchpadRequestPoller(params: LaunchpadIntake): Promise<void> {
+  const requests = params.store.claimPendingLaunchpadRequests();
 
   if (requests.length === 0) {
     return;
@@ -178,76 +182,76 @@ export async function runLaunchpadRequestPoller(params: {
   logger.info({ count: requests.length }, 'processing pending launchpad requests');
 
   for (const request of requests) {
-    try {
-      // Origin-thread anchoring (issue #343): when the request names the
-      // thread it came from, run there — progress, approvals, and the PR
-      // link land where the original requester is, and no DM anchor is
-      // posted. Falls back to the legacy owner-DM anchor otherwise.
-      const inThread = Boolean(request.originChannelId && request.originThreadTs);
-      const { channelId, anchorTs } =
-        request.originChannelId && request.originThreadTs
-          ? { channelId: request.originChannelId, anchorTs: request.originThreadTs }
-          : await postLaunchpadAnchor({
-              webClient,
-              request,
-            });
-
-      store.markLaunchpadRequestQueued({
-        id: request.id,
-        slackChannelId: channelId,
-        anchorTs,
-      });
-
-      const event = buildLaunchpadEnvelope({
-        config,
-        request,
-        channelId,
-        anchorTs,
-        // A run started from the app's thread view starts from its posted ask,
-        // or, when silent, from a timestamp of its own.
-        eventTs: inThread ? request.originEventTs : undefined,
-        originThread: inThread,
-      });
-
-      await enqueue(event, webClient, 'launchpad');
-
-      logger.info(
-        {
-          requestId: request.id,
-          channelId,
-          anchorTs,
-        },
-        'launchpad request converted into synthetic slack event',
-      );
-    } catch (error) {
-      await takeBackPostedAsk(webClient, request);
-      const errorMessage = `Launchpad request failed before execution: ${String(error)}`;
-      store.markLaunchpadRequestFinished({
-        id: request.id,
-        status: 'FAILED',
-        errorMessage,
-      });
-
-      logger.error(
-        {
-          requestId: request.id,
-          error: String(error),
-        },
-        'launchpad request intake failed',
-      );
-
-      notifyDesktop('Watchtower miniOG launch failed', errorMessage);
-    }
+    await startLaunchpadRequest(params, request);
   }
 }
 
-export function startLaunchpadRequestPoller(params: {
-  webClient: WebClient;
-  config: AppConfig;
-  store: JobStore;
-  enqueue: (event: SlackEventEnvelope, client: WebClient, source: 'launchpad') => Promise<void>;
-  pollIntervalMs?: number;
-}): void {
+/** Turns a claimed request into a mention of miniOG and queues it. */
+export async function startLaunchpadRequest(params: LaunchpadIntake, request: LaunchpadRequestRecord): Promise<void> {
+  const { webClient, config, store, enqueue } = params;
+  try {
+    // Origin-thread anchoring (issue #343): when the request names the
+    // thread it came from, run there — progress, approvals, and the PR
+    // link land where the original requester is, and no DM anchor is
+    // posted. Falls back to the legacy owner-DM anchor otherwise.
+    const inThread = Boolean(request.originChannelId && request.originThreadTs);
+    const { channelId, anchorTs } =
+      request.originChannelId && request.originThreadTs
+        ? { channelId: request.originChannelId, anchorTs: request.originThreadTs }
+        : await postLaunchpadAnchor({
+            webClient,
+            request,
+          });
+
+    store.markLaunchpadRequestQueued({
+      id: request.id,
+      slackChannelId: channelId,
+      anchorTs,
+    });
+
+    const event = buildLaunchpadEnvelope({
+      config,
+      request,
+      channelId,
+      anchorTs,
+      // A run started from the app's thread view starts from its posted ask,
+      // or, when silent, from a timestamp of its own.
+      eventTs: inThread ? request.originEventTs : undefined,
+      originThread: inThread,
+    });
+
+    await enqueue(event, webClient, 'launchpad');
+
+    logger.info(
+      {
+        requestId: request.id,
+        channelId,
+        anchorTs,
+      },
+      'launchpad request converted into synthetic slack event',
+    );
+  } catch (error) {
+    await takeBackPostedAsk(webClient, request);
+    const errorMessage = `Launchpad request failed before execution: ${String(error)}`;
+    store.markLaunchpadRequestFinished({
+      id: request.id,
+      status: 'FAILED',
+      errorMessage,
+    });
+
+    logger.error(
+      {
+        requestId: request.id,
+        error: String(error),
+      },
+      'launchpad request intake failed',
+    );
+
+    notifyDesktop('Watchtower miniOG launch failed', errorMessage);
+  }
+}
+
+export function startLaunchpadRequestPoller(params: LaunchpadIntake & { pollIntervalMs?: number }): void {
   const poll = async (): Promise<void> => {
     try {
       await runLaunchpadRequestPoller(params);

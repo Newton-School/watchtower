@@ -11,6 +11,7 @@ import {
 } from '../../repos/registry.js';
 import { getAdminUserIds } from '../../access/control.js';
 import { waitForRepoChoice } from '../../agents/pipeline.js';
+import { requesterOf } from './requester.js';
 
 /** Canonical repo union — re-exported so the ~6 importers keep compiling. */
 export type RepoName = RepoKey;
@@ -168,7 +169,7 @@ export async function resolveRepoOrAsk(params: {
   // Ask the person who made the request: they know which product they mean,
   // and the admin group was being paged for what was often not a task at all
   // (issue #431). An admin's answer still counts.
-  const requesterId = task.event.userId;
+  const requesterId = requesterOf(task);
   const enabled = enabledRepoKeys(config);
   const repoListInline = enabled.map(key => `*${key}*`).join(' / ');
   const replyOptions = enabled.map(key => `"${REPO_SHORT_REPLY[key]}"`).join(' or ');

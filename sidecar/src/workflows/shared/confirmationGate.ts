@@ -2,6 +2,7 @@ import { jobSlots } from '../../runtime/jobSlots.js';
 import type { WebClient } from '@slack/web-api';
 import { fetchThreadRepliesSince, type ThreadMessage } from '../../slack/threadContext.js';
 import { withButtonReplies, withRetire } from '../../slack/buttonReplies.js';
+import { whileWaitingForAnswer } from '../../runtime/humanWaits.js';
 import type { WorkflowStepLogger } from '../../types/contracts.js';
 
 /**
@@ -62,7 +63,7 @@ export function waitForExactConfirmation(
   return jobSlots.whileWaitingOnHuman(
     // The prompt's buttons go when the wait ends, however it ended (suggestion 9).
     () =>
-      withRetire(() => pollForExactConfirmation(params), {
+      withRetire(() => whileWaitingForAnswer(confirmationWait(params), () => pollForExactConfirmation(params)), {
         slack: params.slack,
         channelId: params.channelId,
         promptTs: params.promptTs,
@@ -70,6 +71,17 @@ export function waitForExactConfirmation(
       }),
     { signal: params.signal, logStep: params.logStep },
   );
+}
+
+function confirmationWait(params: Parameters<typeof pollForExactConfirmation>[0]) {
+  return {
+    kind: 'confirm' as const,
+    channelId: params.channelId,
+    threadTs: params.threadTs,
+    promptTs: params.promptTs,
+    allowedUserIds: [...params.allowedUserIds],
+    expects: params.phrase,
+  };
 }
 
 function confirmationOutcomeLine(result: ConfirmationResult): string {

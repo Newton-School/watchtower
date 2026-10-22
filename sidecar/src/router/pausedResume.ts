@@ -68,11 +68,27 @@ export function decidePausedResume(params: {
   routeQuestion?: PendingRouteQuestion;
   senderId?: string;
   nowMs?: number;
+  /**
+   * The owner answered from the app's thread view: whatever they wrote is the
+   * reply the job waits for, on their authority, even where a reply in the
+   * thread would have to say something in particular or come from the
+   * requester.
+   */
+  answeredFromApp?: boolean;
 }): PausedResumeDecision {
   const { pausedJob, pauseSignal, eventText } = params;
 
   if (!pausedJob) {
     return { resume: false, reason: 'no_paused_job' };
+  }
+
+  if (params.answeredFromApp) {
+    return {
+      resume: true,
+      reason: 'watchtower_answer',
+      paused: pausedJob,
+      ...(pauseSignal === 'pr_review_target_choice' ? { forceIntent: 'PR_REVIEW' as const } : {}),
+    };
   }
 
   if (pauseSignal === 'pr_review_awaiting_url') {

@@ -211,9 +211,31 @@ export type RunControls = {
   busyWaiting: boolean;
   /** A run started from the app that miniOG hasn't picked up yet. */
   starting: boolean;
+  /** The run waiting for an answer in this thread, when one is. */
+  answer: AnswerTarget | null;
 };
 
-export type StartedRun = { requestId: string; askTs: string | null };
+/** What a waiting run waits for: a gate mid-run, or "paused" once it stopped to wait. */
+export type AnswerKind = 'approval' | 'question' | 'repo_choice' | 'confirm' | 'paused';
+
+export type AnswerTarget = {
+  /** This run or another in the thread. */
+  jobId: string;
+  kind: AnswerKind;
+  /** The question it waits on, when it waits mid-run. */
+  promptTs: string | null;
+  /** Who it takes an answer from, when the owner isn't one of them. */
+  answerBy: string[];
+  /** The exact phrase a confirm takes, when it takes nothing else. */
+  expects: string | null;
+};
+
+export type StartedRun = {
+  requestId: string;
+  askTs: string | null;
+  /** For an answer: the run it answers. */
+  answersJobId: string | null;
+};
 
 /** A run started from the thread view, as its launchpad request tracks it. */
 export type StartedRunStatus = { status: string; jobId: string | null; error: string | null };

@@ -1,10 +1,12 @@
-//! Run controls in a run's thread view: stop the run, run its ask again, or
-//! ask miniOG something new in the thread. New runs are launchpad requests,
-//! which the sidecar turns into a mention of miniOG on the owner's authority.
-//! Either the ask is posted in the thread first, as miniOG, so people can see
-//! what was asked (the run's emojis then go on that post), or the run starts
-//! without a word or an emoji. Every control is logged in the trace of the run
-//! it was used from.
+//! Run controls in a run's thread view: stop the run, run its ask again, ask
+//! miniOG something new in the thread, or answer miniOG while a run waits on a
+//! person. New runs are launchpad requests, which the sidecar turns into a
+//! mention of miniOG on the owner's authority. Either the ask is posted in the
+//! thread first, as miniOG, so people can see what was asked (the run's emojis
+//! then go on that post), or the run starts without a word or an emoji. An
+//! answer is a launchpad request too: the sidecar hands it to the gate the run
+//! waits at, as the owner's reply, or picks a paused run up again with it.
+//! Every control is logged in the trace of the run it was used from.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -43,7 +45,29 @@ pub(crate) struct RunControls {
     busy_waiting: bool,
     /// A run started from the app that miniOG has not picked up yet.
     starting: bool,
+    /// The run waiting for an answer in this thread, when one is.
+    answer: Option<AnswerTarget>,
 }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AnswerTarget {
+    /// This run or another in the thread.
+    job_id: String,
+    /// What it waits for mid-run: approval, question, repo_choice or confirm.
+    /// "paused" once the run has stopped to wait.
+    kind: String,
+    /// The question it waits on, when it waits mid-run.
+    prompt_ts: Option<String>,
+    /// Who it takes an answer from when the owner isn't one of them, so the
+    /// app can't answer it.
+    answer_by: Vec<String>,
+    /// The exact phrase a confirm takes, when it takes nothing else.
+    expects: Option<String>,
+}
+
+/// The run an answer is for and the question it was written to.
+type Answering = (String, Option<String>);
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +75,8 @@ pub(crate) struct StartedRun {
     request_id: String,
     /// The posted ask, when the ask was posted.
     ask_ts: Option<String>,
+    /// For an answer: the run it answers.
+    answers_job_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -206,22 +232,85 @@ fn now_iso() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-/// The run holding the thread, and whether it is waiting for an answer. A
-/// paused run counts: a new ask would be taken as its answer.
+/// The run holding the thread, and whether it is waiting for an answer:
+/// paused, or at a gate waiting on a person. A paused run counts: a new ask
+/// would be taken as its answer.
 fn busy_job(
     connection: &Connection,
     target: &JobSlackTarget,
 ) -> Result<Option<(String, bool)>, String> {
     connection
         .query_row(
-            "SELECT id, status = 'PAUSED' FROM jobs
-             WHERE channel_id = ? AND thread_ts = ? AND status IN ('RUNNING', 'PAUSED')
-             ORDER BY status = 'PAUSED', created_at DESC LIMIT 1",
+            "SELECT j.id, j.status = 'PAUSED' OR w.job_id IS NOT NULL FROM jobs j
+             LEFT JOIN human_waits w ON w.job_id = j.id
+             WHERE j.channel_id = ? AND j.thread_ts = ? AND j.status IN ('RUNNING', 'PAUSED')
+             ORDER BY j.status = 'PAUSED', j.created_at DESC LIMIT 1",
             params![target.channel, target.thread_ts],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(|err| format!("db query busy job failed: {err}"))
+}
+
+/// What a waiting run waits for, and whether the owner may answer it.
+fn answer_target(
+    connection: &Connection,
+    job_id: &str,
+    owner: Option<&str>,
+) -> Result<Option<AnswerTarget>, String> {
+    type Wait = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let found: Option<Wait> = connection
+        .query_row(
+            "SELECT j.status, w.kind, w.prompt_ts, w.allowed_user_ids, w.expects FROM jobs j
+             LEFT JOIN human_waits w ON w.job_id = j.id
+             WHERE j.id = ?",
+            params![job_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|err| format!("db query waiting run failed: {err}"))?;
+    let Some((status, kind, prompt_ts, allowed, expects)) = found else {
+        return Ok(None);
+    };
+    // A paused run waits for any reply; a wait left from before it paused is not its question.
+    if status == "PAUSED" {
+        return Ok(Some(AnswerTarget {
+            job_id: job_id.to_string(),
+            kind: "paused".to_string(),
+            prompt_ts: None,
+            answer_by: Vec::new(),
+            expects: None,
+        }));
+    }
+    let (Some(kind), true) = (kind, status == "RUNNING") else {
+        return Ok(None);
+    };
+    let allowed: Vec<String> = allowed
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
+    let owner_may =
+        allowed.is_empty() || owner.is_some_and(|owner| allowed.iter().any(|id| id == owner));
+    Ok(Some(AnswerTarget {
+        job_id: job_id.to_string(),
+        kind,
+        prompt_ts,
+        answer_by: if owner_may { Vec::new() } else { allowed },
+        expects,
+    }))
 }
 
 fn starting_in(connection: &Connection, target: &JobSlackTarget) -> Result<bool, String> {
@@ -258,6 +347,12 @@ fn run_controls(
         None => (None, false),
     };
     let busy_waiting = busy.as_ref().is_some_and(|(_, waiting)| *waiting);
+    let answer = match &busy {
+        Some((busy_id, true)) => {
+            answer_target(connection, busy_id, owners.first().map(String::as_str))?
+        }
+        _ => None,
+    };
     let rerun_ask = target.as_ref().and_then(|_| {
         job.payload
             .get("text")
@@ -275,6 +370,7 @@ fn run_controls(
         busy_job_id: busy.map(|(id, _)| id),
         busy_waiting,
         starting,
+        answer,
     })
 }
 
@@ -335,6 +431,7 @@ fn request_stop(db_path: &Path, job_id: &str) -> Result<(), String> {
 enum Start {
     Rerun,
     Ask,
+    Answer,
 }
 
 impl Start {
@@ -342,6 +439,7 @@ impl Start {
         match self {
             Start::Rerun => "watchtower.run.rerun",
             Start::Ask => "watchtower.run.ask",
+            Start::Answer => "watchtower.run.answer",
         }
     }
 
@@ -352,6 +450,8 @@ impl Start {
             (Start::Rerun, None) => format!("Re-ran from Watchtower: {ask}"),
             (Start::Ask, Some(name)) => format!("{name} asked from Watchtower: {ask}"),
             (Start::Ask, None) => format!("Asked from Watchtower: {ask}"),
+            (Start::Answer, Some(name)) => format!("{name} answered from Watchtower: {ask}"),
+            (Start::Answer, None) => format!("Answered from Watchtower: {ask}"),
         }
     }
 }
@@ -362,7 +462,7 @@ pub(crate) async fn rerun_in_thread(
     post_ask: bool,
     state: State<'_, AppState>,
 ) -> Result<StartedRun, String> {
-    start_run(&state.db_path, &job_id, Start::Rerun, None, post_ask).await
+    start_run(&state.db_path, &job_id, Start::Rerun, None, post_ask, None).await
 }
 
 #[tauri::command]
@@ -372,7 +472,38 @@ pub(crate) async fn ask_miniog_in_thread(
     post_ask: bool,
     state: State<'_, AppState>,
 ) -> Result<StartedRun, String> {
-    start_run(&state.db_path, &job_id, Start::Ask, Some(text), post_ask).await
+    start_run(
+        &state.db_path,
+        &job_id,
+        Start::Ask,
+        Some(text),
+        post_ask,
+        None,
+    )
+    .await
+}
+
+/// Answers the run waiting in this thread. Mid-run, the gate takes it as the
+/// owner's reply and applies its own rules; a paused run is picked up again.
+#[tauri::command]
+pub(crate) async fn answer_miniog(
+    job_id: String,
+    text: String,
+    post_answer: bool,
+    answers_job_id: String,
+    prompt_ts: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<StartedRun, String> {
+    let written_for = (answers_job_id, prompt_ts);
+    start_run(
+        &state.db_path,
+        &job_id,
+        Start::Answer,
+        Some(text),
+        post_answer,
+        Some(&written_for),
+    )
+    .await
 }
 
 struct Prepared {
@@ -381,6 +512,8 @@ struct Prepared {
     owner: String,
     ask: String,
     requested_for: Option<String>,
+    /// For an answer: the run it answers and the question it waits on.
+    answering: Option<Answering>,
 }
 
 async fn start_run(
@@ -389,12 +522,17 @@ async fn start_run(
     start: Start,
     text: Option<String>,
     post_ask: bool,
+    written_for: Option<&Answering>,
 ) -> Result<StartedRun, String> {
-    let prepared = prepare_start(db_path, job_id, start, text.as_deref());
+    let prepared = prepare_start(db_path, job_id, start, text.as_deref(), written_for);
     let mut data = serde_json::json!({ "postAsk": post_ask });
     if let Ok(prepared) = &prepared {
         data["ask"] = serde_json::json!(prepared.ask);
         data["requestedFor"] = serde_json::json!(prepared.requested_for);
+        if let Some((answers, prompt_ts)) = &prepared.answering {
+            data["answersJobId"] = serde_json::json!(answers);
+            data["promptTs"] = serde_json::json!(prompt_ts);
+        }
     }
     let result = match prepared {
         Ok(prepared) => queue_run(db_path, start, prepared, post_ask).await,
@@ -413,6 +551,10 @@ async fn start_run(
             "Asked miniOG in this thread from Watchtower.",
             "Asking miniOG from Watchtower failed.",
         ),
+        Start::Answer => (
+            "Answered miniOG in this thread from Watchtower.",
+            "Answering miniOG from Watchtower failed.",
+        ),
     };
     slack::traced(db_path, job_id, start.stage(), done, failed, data, result)
 }
@@ -422,6 +564,7 @@ fn prepare_start(
     job_id: &str,
     start: Start,
     text: Option<&str>,
+    written_for: Option<&Answering>,
 ) -> Result<Prepared, String> {
     let connection = Connection::open(db_path).map_err(|err| format!("db open failed: {err}"))?;
     let settings = read_app_settings(&connection)?;
@@ -434,6 +577,18 @@ fn prepare_start(
         .cloned()
         .ok_or_else(|| "No owner Slack user IDs are configured.".to_string())?;
     let target = slack::require_target(slack::job_slack_target(&connection, job_id)?)?;
+    if let Start::Answer = start {
+        let written_for =
+            written_for.ok_or_else(|| "Say which question this answers.".to_string())?;
+        return prepare_answer(
+            &connection,
+            settings.slack_bot_token,
+            owner,
+            target,
+            text,
+            written_for,
+        );
+    }
     if let Some((busy, waiting)) = busy_job(&connection, &target)? {
         return Err(match (busy == job_id, waiting) {
             (true, false) => "This run is still going. Stop it first.",
@@ -446,10 +601,10 @@ fn prepare_start(
         .to_string());
     }
     if starting_in(&connection, &target)? {
-        return Err("A run in this thread is waiting to be picked up.".to_string());
+        return Err(STARTING.to_string());
     }
     let (ask, requested_for) = match start {
-        Start::Ask => {
+        Start::Ask | Start::Answer => {
             let ask = text.unwrap_or("").trim();
             if ask.is_empty() {
                 return Err("Write what to ask first.".to_string());
@@ -470,6 +625,90 @@ fn prepare_start(
         owner,
         ask,
         requested_for,
+        answering: None,
+    })
+}
+
+/// A reply as a confirm reads it: no mentions, formatting marks or trailing
+/// punctuation, any case. Mirrors normalizeConfirmationReply in the sidecar.
+fn confirmation_text(text: &str) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("<@") {
+        plain.push_str(&rest[..start]);
+        match rest[start..].find('>') {
+            Some(end) => {
+                plain.push(' ');
+                rest = &rest[start + end + 1..];
+            }
+            None => {
+                rest = &rest[start..];
+                break;
+            }
+        }
+    }
+    plain.push_str(rest);
+    plain
+        .chars()
+        .filter(|c| !"`*_~\"'“”‘’.!,".contains(*c))
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Why nothing new can go to miniOG from here yet.
+const STARTING: &str = "miniOG hasn't picked up the last thing sent from here yet.";
+
+fn prepare_answer(
+    connection: &Connection,
+    token: String,
+    owner: String,
+    target: JobSlackTarget,
+    text: Option<&str>,
+    written_for: &Answering,
+) -> Result<Prepared, String> {
+    let waiting = match busy_job(connection, &target)? {
+        Some((busy, true)) => answer_target(connection, &busy, Some(&owner))?,
+        _ => None,
+    }
+    .ok_or_else(|| "miniOG isn't waiting for an answer in this thread.".to_string())?;
+    // Only the question that was read: miniOG may have moved on since.
+    if (&waiting.job_id, &waiting.prompt_ts) != (&written_for.0, &written_for.1) {
+        return Err("miniOG asked something new. Read it, then answer again.".to_string());
+    }
+    if !waiting.answer_by.is_empty() {
+        return Err("Only the person miniOG asked can answer this, in Slack.".to_string());
+    }
+    if starting_in(connection, &target)? {
+        return Err(STARTING.to_string());
+    }
+    let answer = text.unwrap_or("").trim();
+    if answer.is_empty() {
+        return Err("Write the answer first.".to_string());
+    }
+    if let Some(phrase) = &waiting.expects {
+        let said = confirmation_text(answer);
+        // The phrase, or a no: the confirm takes both.
+        let declines = matches!(
+            said.as_str(),
+            "no" | "nope" | "cancel" | "stop" | "abort" | "dont"
+        );
+        if said != *phrase && !declines {
+            return Err(format!("miniOG takes exactly \"{phrase}\" here."));
+        }
+    }
+    // A paused run picked up again stays the requester's.
+    let requested_for = requester(connection, &job_row(connection, &waiting.job_id)?.payload)
+        .filter(|user| *user != owner);
+    Ok(Prepared {
+        target,
+        token,
+        owner,
+        ask: answer.to_string(),
+        requested_for,
+        answering: Some((waiting.job_id, waiting.prompt_ts)),
     })
 }
 
@@ -507,10 +746,15 @@ async fn queue_run(
                 prepared.requested_for.as_deref(),
                 &prepared.target,
                 Some(&event_ts),
+                prepared.answering.as_ref(),
             )
         });
     match queued {
-        Ok(request_id) => Ok(StartedRun { request_id, ask_ts }),
+        Ok(request_id) => Ok(StartedRun {
+            request_id,
+            ask_ts,
+            answers_job_id: prepared.answering.map(|(job_id, _)| job_id),
+        }),
         Err(err) => {
             // An ask with no run behind it would wait for an answer forever.
             if let Some(ts) = &ask_ts {
@@ -533,15 +777,21 @@ fn insert_request(
     requested_for: Option<&str>,
     target: &JobSlackTarget,
     event_ts: Option<&str>,
+    answering: Option<&(String, Option<String>)>,
 ) -> Result<String, String> {
     let id = Uuid::new_v4().to_string();
     let now = now_iso();
+    let (answer_for, answer_prompt) = match answering {
+        Some((job_id, prompt_ts)) => (Some(job_id.as_str()), prompt_ts.as_deref()),
+        None => (None, None),
+    };
     connection
         .execute(
             "INSERT INTO launchpad_requests (
                id, target, prompt, owner_user_id, status, requested_for_user_id,
-               origin_channel_id, origin_thread_ts, origin_event_ts, created_at, updated_at
-             ) VALUES (?, 'miniog', ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?)",
+               origin_channel_id, origin_thread_ts, origin_event_ts,
+               answer_for_job_id, answer_prompt_ts, created_at, updated_at
+             ) VALUES (?, 'miniog', ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 id,
                 ask,
@@ -550,6 +800,8 @@ fn insert_request(
                 target.channel,
                 target.thread_ts,
                 event_ts,
+                answer_for,
+                answer_prompt,
                 now,
                 now
             ],
@@ -583,12 +835,12 @@ async fn cancel_request(db_path: &Path, job_id: &str, request_id: &str) -> Resul
         let connection =
             Connection::open(db_path).map_err(|err| format!("db open failed: {err}"))?;
         let target = slack::require_target(slack::job_slack_target(&connection, job_id)?)?;
-        let ask_ts: Option<String> = connection
+        let (ask_ts, is_answer): (Option<String>, bool) = connection
             .query_row(
-                "SELECT origin_event_ts FROM launchpad_requests
+                "SELECT origin_event_ts, answer_for_job_id IS NOT NULL FROM launchpad_requests
                  WHERE id = ? AND origin_channel_id = ? AND origin_thread_ts = ?",
                 params![request_id, target.channel, target.thread_ts],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|err| format!("db query launchpad request failed: {err}"))?
@@ -602,9 +854,12 @@ async fn cancel_request(db_path: &Path, job_id: &str, request_id: &str) -> Resul
             )
             .map_err(|err| format!("db cancel launchpad request failed: {err}"))?;
         if cancelled == 0 {
-            return Err(
-                "miniOG is picking it up right now. Stop the run once it starts.".to_string(),
-            );
+            return Err(if is_answer {
+                "Too late: miniOG already has your answer."
+            } else {
+                "miniOG is picking it up right now. Stop the run once it starts."
+            }
+            .to_string());
         }
         let token = read_app_settings(&connection)?.slack_bot_token;
         (token, target.channel, ask_ts)
@@ -807,7 +1062,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let request_id =
-            insert_request(&connection, OWNER, "deploy it", None, &target, None).unwrap();
+            insert_request(&connection, OWNER, "deploy it", None, &target, None, None).unwrap();
         assert!(controls(&connection, "mine").starting);
         connection
             .execute(
@@ -836,6 +1091,7 @@ mod tests {
             Some("UASKER"),
             &target,
             Some("1.2"),
+            None,
         )
         .unwrap();
         insert_job(
@@ -890,7 +1146,7 @@ mod tests {
             serde_json::json!({ "eventTs": "1.0" }),
         );
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let waiting = insert_request(&connection, OWNER, "a", None, &target, None).unwrap();
+        let waiting = insert_request(&connection, OWNER, "a", None, &target, None, None).unwrap();
         runtime
             .block_on(cancel_request(&db_path, "thread", &waiting))
             .unwrap();
@@ -899,7 +1155,7 @@ mod tests {
             (status.status.as_str(), status.error.as_deref()),
             ("FAILED", Some("Cancelled from Watchtower."))
         );
-        let taken = insert_request(&connection, OWNER, "b", None, &target, None).unwrap();
+        let taken = insert_request(&connection, OWNER, "b", None, &target, None, None).unwrap();
         connection
             .execute(
                 "UPDATE launchpad_requests SET status = 'QUEUED' WHERE id = ?",
@@ -951,6 +1207,247 @@ mod tests {
         let _ = fs::remove_file(db_path);
     }
 
+    fn wait_at(
+        connection: &Connection,
+        job_id: &str,
+        kind: &str,
+        allowed: &[&str],
+        expects: Option<&str>,
+    ) {
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO human_waits (job_id, kind, channel_id, thread_ts, prompt_ts, allowed_user_ids, expects, started_at)
+                 VALUES (?, ?, 'C0B5ZVDM7GU', '1.0', '1.5', ?, ?, '2026-10-23T00:00:00Z')",
+                params![job_id, kind, serde_json::json!(allowed).to_string(), expects],
+            )
+            .expect("insert wait");
+    }
+
+    /// The owner answers the run waiting in `job_id`'s thread, written for `written_for`.
+    fn answer(
+        connection: &Connection,
+        job_id: &str,
+        text: &str,
+        written_for: (&str, Option<&str>),
+    ) -> Result<Prepared, String> {
+        let target = slack::job_slack_target(connection, job_id)
+            .unwrap()
+            .unwrap();
+        let written_for = (written_for.0.to_string(), written_for.1.map(str::to_string));
+        prepare_answer(
+            connection,
+            "xoxb".into(),
+            OWNER.into(),
+            target,
+            Some(text),
+            &written_for,
+        )
+    }
+
+    #[test]
+    fn a_run_waiting_on_a_person_can_be_answered() {
+        let (db_path, connection) = test_db();
+        insert_job(
+            &connection,
+            "planning",
+            "Ev1",
+            "RUNNING",
+            "1.0",
+            serde_json::json!({ "requestUserId": "UASKER" }),
+        );
+
+        // Working, not waiting: nothing to answer.
+        let working = controls(&connection, "planning");
+        assert!(!working.busy_waiting);
+        assert!(working.answer.is_none());
+
+        wait_at(
+            &connection,
+            "planning",
+            "approval",
+            &[OWNER, "UADMIN"],
+            None,
+        );
+        let waiting = controls(&connection, "planning");
+        assert!(waiting.busy_waiting);
+        let target = waiting.answer.expect("answerable");
+        assert_eq!(target.job_id, "planning");
+        assert_eq!(target.kind, "approval");
+        assert_eq!(target.prompt_ts.as_deref(), Some("1.5"));
+        assert!(target.answer_by.is_empty());
+
+        let prepared = answer(
+            &connection,
+            "planning",
+            "  yes  ",
+            ("planning", Some("1.5")),
+        )
+        .unwrap();
+        assert_eq!(prepared.ask, "yes");
+        assert_eq!(prepared.requested_for.as_deref(), Some("UASKER"));
+        assert_eq!(
+            prepared.answering,
+            Some(("planning".to_string(), Some("1.5".to_string())))
+        );
+        let request_id = insert_request(
+            &connection,
+            OWNER,
+            &prepared.ask,
+            prepared.requested_for.as_deref(),
+            &prepared.target,
+            Some("1.6"),
+            prepared.answering.as_ref(),
+        )
+        .unwrap();
+        let (answer_for, answer_prompt): (Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT answer_for_job_id, answer_prompt_ts FROM launchpad_requests WHERE id = ?",
+                params![request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(answer_for.as_deref(), Some("planning"));
+        assert_eq!(answer_prompt.as_deref(), Some("1.5"));
+
+        // One thing at a time: the answer not yet taken holds the thread.
+        assert!(answer(&connection, "planning", "no", ("planning", Some("1.5"))).is_err());
+
+        drop(connection);
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn an_answer_only_goes_to_the_question_it_was_written_for() {
+        let (db_path, connection) = test_db();
+        insert_job(
+            &connection,
+            "planning",
+            "Ev1",
+            "RUNNING",
+            "1.0",
+            serde_json::json!({}),
+        );
+        wait_at(&connection, "planning", "approval", &[OWNER], None);
+
+        let moved_on = answer(&connection, "planning", "yes", ("planning", Some("1.4")));
+        assert_eq!(
+            moved_on.err().as_deref(),
+            Some("miniOG asked something new. Read it, then answer again.")
+        );
+        assert!(answer(&connection, "planning", "yes", ("other-run", Some("1.5"))).is_err());
+
+        drop(connection);
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn a_confirm_takes_only_its_phrase() {
+        let (db_path, connection) = test_db();
+        insert_job(
+            &connection,
+            "merging",
+            "Ev1",
+            "RUNNING",
+            "1.0",
+            serde_json::json!({}),
+        );
+        wait_at(
+            &connection,
+            "merging",
+            "confirm",
+            &[OWNER],
+            Some("confirm merge"),
+        );
+        let target = controls(&connection, "merging").answer.expect("waiting");
+        assert_eq!(target.expects.as_deref(), Some("confirm merge"));
+
+        let written_for = ("merging", Some("1.5"));
+        assert_eq!(
+            answer(&connection, "merging", "yes", written_for)
+                .err()
+                .as_deref(),
+            Some("miniOG takes exactly \"confirm merge\" here.")
+        );
+        assert!(answer(&connection, "merging", "*Confirm  merge!*", written_for).is_ok());
+        assert!(answer(&connection, "merging", "No.", written_for).is_ok());
+        assert_eq!(confirmation_text("<@U1> `Confirm` merge."), "confirm merge");
+
+        drop(connection);
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn a_paused_run_is_answered_without_a_question_on_record() {
+        let (db_path, connection) = test_db();
+        insert_job(
+            &connection,
+            "parked",
+            "Ev1",
+            "PAUSED",
+            "1.0",
+            serde_json::json!({ "requestUserId": OWNER }),
+        );
+        // A wait left from before it paused is not its question, nor who may answer.
+        wait_at(
+            &connection,
+            "parked",
+            "confirm",
+            &["UASKER"],
+            Some("confirm deploy"),
+        );
+        let target = controls(&connection, "parked").answer.expect("answerable");
+        assert_eq!(target.kind, "paused");
+        assert_eq!(target.prompt_ts, None);
+        assert!(target.answer_by.is_empty());
+        assert_eq!(target.expects, None);
+
+        let prepared = answer(&connection, "parked", "go on", ("parked", None)).unwrap();
+        // The owner's own run stays theirs: no one else to run it for.
+        assert_eq!(prepared.requested_for, None);
+        assert_eq!(prepared.answering, Some(("parked".to_string(), None)));
+        assert!(answer(&connection, "parked", "   ", ("parked", None)).is_err());
+
+        drop(connection);
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn a_question_for_someone_else_is_answered_in_slack() {
+        let (db_path, connection) = test_db();
+        insert_job(
+            &connection,
+            "deploying",
+            "Ev1",
+            "RUNNING",
+            "1.0",
+            serde_json::json!({}),
+        );
+        wait_at(
+            &connection,
+            "deploying",
+            "confirm",
+            &["UASKER"],
+            Some("confirm deploy"),
+        );
+        let target = controls(&connection, "deploying").answer.expect("waiting");
+        assert_eq!(target.answer_by, vec!["UASKER".to_string()]);
+        let written_for = ("deploying", Some("1.5"));
+        assert!(answer(&connection, "deploying", "confirm deploy", written_for).is_err());
+
+        // Nothing waits in a finished run's thread.
+        connection
+            .execute(
+                "UPDATE jobs SET status = 'SUCCESS' WHERE id = 'deploying'",
+                [],
+            )
+            .unwrap();
+        assert!(controls(&connection, "deploying").answer.is_none());
+        assert!(answer(&connection, "deploying", "yes", written_for).is_err());
+
+        drop(connection);
+        let _ = fs::remove_file(db_path);
+    }
+
     #[test]
     fn the_posted_ask_names_who_asked() {
         assert_eq!(
@@ -960,6 +1457,10 @@ mod tests {
         assert_eq!(
             Start::Rerun.announcement(None, "check the logs"),
             "Re-ran from Watchtower: check the logs"
+        );
+        assert_eq!(
+            Start::Answer.announcement(Some("theOG"), "yes, go ahead"),
+            "theOG answered from Watchtower: yes, go ahead"
         );
     }
 }

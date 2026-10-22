@@ -206,3 +206,38 @@ describe('decidePausedResume for a parked question (issue #431)', () => {
     expect(decide('UREQ', 1_060_000).forceIntent).toBeUndefined();
   });
 });
+
+describe('decidePausedResume — an answer from the app', () => {
+  const paused = { id: 'job-paused', workflow: 'IMPLEMENTATION' as const };
+
+  it('resumes whatever the job paused on, with no mention and from the owner', () => {
+    for (const pauseSignal of [undefined, 'route_clarify', 'pr_review_awaiting_url', 'usage_limit_retry'] as const) {
+      expect(
+        decidePausedResume({
+          pausedJob: paused,
+          pauseSignal,
+          eventText: 'go with the smaller change',
+          senderId: 'UOWNER',
+          answeredFromApp: true,
+        }),
+      ).toEqual({ resume: true, reason: 'watchtower_answer', paused });
+    }
+  });
+
+  it('still forces PR_REVIEW for a choice between PRs', () => {
+    expect(
+      decidePausedResume({
+        pausedJob: paused,
+        pauseSignal: 'pr_review_target_choice',
+        eventText: 'the second one',
+        answeredFromApp: true,
+      }).forceIntent,
+    ).toBe('PR_REVIEW');
+  });
+
+  it('resumes nothing when no job is paused', () => {
+    expect(
+      decidePausedResume({ pausedJob: undefined, pauseSignal: undefined, eventText: 'yes', answeredFromApp: true }),
+    ).toEqual({ resume: false, reason: 'no_paused_job' });
+  });
+});

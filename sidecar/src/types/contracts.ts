@@ -224,6 +224,27 @@ export interface AppConfig {
   bundles?: Bundle[];
 }
 
+/** What a gate waiting on a person mid-run asked for. */
+export type HumanWaitKind = 'approval' | 'question' | 'repo_choice' | 'confirm';
+
+/**
+ * A gate waiting on a person while its job runs. Kept in `human_waits` for
+ * the length of the wait, so the app can show the run waits and answer it.
+ */
+export interface HumanWait {
+  jobId: string;
+  kind: HumanWaitKind;
+  channelId: string;
+  threadTs: string;
+  /** The question the gate posted; only replies after it count. */
+  promptTs: string;
+  /** Who the gate takes an answer from. */
+  allowedUserIds: string[];
+  /** The exact phrase a confirm gate takes, when it takes nothing else. */
+  expects?: string;
+  startedAt: string;
+}
+
 export interface SlackEventEnvelope {
   eventId: string;
   channelId: string;
@@ -242,6 +263,11 @@ export interface SlackEventEnvelope {
    * this; permissions still evaluate `userId` (the owner who retriggered).
    */
   requestedForUserId?: string;
+  /**
+   * The paused job an answer from the app picks up again. Whatever the answer
+   * says, it is the reply that job waits for.
+   */
+  answersJobId?: string;
   /**
    * For `message_deleted` subtypes: the ts of the message that was deleted
    * (Slack puts the deletion event itself in `event.ts`, and the original
@@ -292,6 +318,15 @@ export interface LaunchpadRequestRecord {
    * message when unset.
    */
   originEventTs?: string;
+  /**
+   * Not a new run but the owner's answer, from the app's thread view, to this
+   * run waiting on a person; the prompt is the answer. A run paused on its
+   * question is picked up again with it, and a gate waiting mid-run takes it
+   * as the owner's reply.
+   */
+  answerForJobId?: string;
+  /** The question the answer was written for, when the run waits mid-run. */
+  answerPromptTs?: string;
   resultJson?: string;
   errorMessage?: string;
   createdAt: string;

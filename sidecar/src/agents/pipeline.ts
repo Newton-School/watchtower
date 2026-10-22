@@ -10,6 +10,7 @@ import { lightweightProfile, profileForAgentRole } from '../codex/modelProfiles.
 import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
 import { isInterruption, runWithInfraRetry, type InterruptionKind } from '../codex/infraRetry.js';
 import { jobSlots } from '../runtime/jobSlots.js';
+import { whileWaitingForAnswer } from '../runtime/humanWaits.js';
 import {
   isNone,
   normalizePlannerOutput,
@@ -534,7 +535,7 @@ export function waitForApproval(params: Parameters<typeof pollForApproval>[0]): 
   return jobSlots.whileWaitingOnHuman(
     // The prompt's buttons go when the wait ends, however it ended (suggestion 9).
     () =>
-      withRetire(() => pollForApproval(params), {
+      withRetire(() => whileWaitingForAnswer(approvalWait(params), () => pollForApproval(params)), {
         slack: params.slack,
         channelId: params.channelId,
         promptTs: params.approvalPromptTs,
@@ -547,6 +548,17 @@ export function waitForApproval(params: Parameters<typeof pollForApproval>[0]): 
       endsJob: result => result.outcome === 'cancelled',
     },
   );
+}
+
+/** The approval wait as the app sees it: approvers decide, the requester may stop or confirm. */
+function approvalWait(params: Parameters<typeof pollForApproval>[0]) {
+  return {
+    kind: 'approval' as const,
+    channelId: params.channelId,
+    threadTs: params.threadTs,
+    promptTs: params.approvalPromptTs,
+    allowedUserIds: [...params.approverUserIds],
+  };
 }
 
 /** How the prompt ends. A pause keeps its buttons: the same prompt is resumed later. */
@@ -1111,7 +1123,14 @@ Return strict JSON:
  */
 /** Waits for someone to say which repo. The job's slot is free while it waits (issue #434). */
 export function waitForRepoChoice(params: Parameters<typeof pollForRepoChoice>[0]): Promise<RepoChoiceResult> {
-  return jobSlots.whileWaitingOnHuman(() => pollForRepoChoice(params), {
+  const wait = {
+    kind: 'repo_choice' as const,
+    channelId: params.channelId,
+    threadTs: params.threadTs,
+    promptTs: params.promptTs,
+    allowedUserIds: [...params.approverUserIds],
+  };
+  return jobSlots.whileWaitingOnHuman(() => whileWaitingForAnswer(wait, () => pollForRepoChoice(params)), {
     signal: params.signal,
     logStep: params.logStep,
   });
@@ -1199,7 +1218,10 @@ async function pollForRepoChoice(params: {
       continue;
     }
 
-    const candidateReplies = messages.filter(m => m.ts > promptTs && m.user !== botUserId);
+    // An answer from the app arrives beside the thread's replies.
+    const candidateReplies = withButtonReplies(messages, channelId, promptTs).filter(
+      m => m.ts > promptTs && m.user !== botUserId,
+    );
 
     for (const reply of candidateReplies) {
       const text = reply.text.trim();

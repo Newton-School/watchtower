@@ -18,6 +18,7 @@ import {
   markLaunchpadJobCreated,
 } from './launchpad/launchpadLifecycle.js';
 import { startLaunchpadRequestPoller, takeBackPostedAsk } from './launchpad/launchpadIntake.js';
+import { startAppAnswerPoller } from './launchpad/appAnswers.js';
 import { logger } from './logging/logger.js';
 import { configureButtons } from './slack/buttonReplies.js';
 import { runPrFollowUp } from './workflows/prFollowUp.js';
@@ -931,10 +932,11 @@ async function closeLaunchpadRequest(
   if (!event.launchpadRequestId) return;
   const request = store.getLaunchpadRequest(event.launchpadRequestId);
   const takenBack = request ? await takeBackPostedAsk(client, request) : false;
+  const posted = request?.answerForJobId ? 'answer' : 'ask';
   store.markLaunchpadRequestFinished({
     id: event.launchpadRequestId,
     status,
-    errorMessage: takenBack ? `${reason} The posted ask was taken back.` : reason,
+    errorMessage: takenBack ? `${reason} The posted ${posted} was taken back.` : reason,
   });
 }
 
@@ -992,9 +994,20 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
   // that column as OWNER_AUTOPILOT even when the classifier later routed
   // them to PR_REVIEW. Read the actual pause cause from job_logs instead.
   const pausedJob = store.pausedJobForThread(event.channelId, event.threadTs);
-  // A run started from the app is never the answer to a question miniOG
-  // asked: answering is for a reply in the thread.
-  if (pausedJob && event.launchpadRequestId) {
+  // An answer from the app picks up the paused run it was written for, and
+  // nothing else.
+  if (event.answersJobId && pausedJob?.id !== event.answersJobId) {
+    store.recordEvent(event.eventId, event.channelId, event.threadTs);
+    logger.info(
+      { eventId: event.eventId, answersJobId: event.answersJobId, pausedJobId: pausedJob?.id ?? null },
+      'answer from the app skipped: its run no longer waits',
+    );
+    await closeLaunchpadRequest(event, client, 'SKIPPED', "That run isn't waiting for an answer anymore.");
+    return;
+  }
+  // Any other run started from the app is never the answer to a question
+  // miniOG asked.
+  if (pausedJob && event.launchpadRequestId && !event.answersJobId) {
     store.recordEvent(event.eventId, event.channelId, event.threadTs);
     logger.info(
       { eventId: event.eventId, pausedJobId: pausedJob.id },
@@ -1021,6 +1034,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     eventText: event.text ?? '',
     routeQuestion,
     senderId: event.userId,
+    answeredFromApp: Boolean(event.answersJobId),
   });
 
   const eventClient = buildEventAwareClient(client, event);
@@ -1062,7 +1076,8 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
       mentionType: 'bot',
       ...(resumeDecision.forceIntent ? { intent: resumeDecision.forceIntent } : {}),
       // The reply to a question miniOG asked: the router reads the two together (issue #431).
-      ...(resumeDecision.reason === 'route_clarify_answer' && routeQuestion
+      ...((resumeDecision.reason === 'route_clarify_answer' || resumeDecision.reason === 'watchtower_answer') &&
+      routeQuestion
         ? { clarification: { question: routeQuestion.question, askedText: routeQuestion.askedText } }
         : {}),
       // A question asked on an owner's authority is answered on it too (issue #398).
@@ -1883,6 +1898,9 @@ async function main(): Promise<void> {
     }
   }
 
+  // No gate waits on a person yet: the jobs that did ended with the last sidecar.
+  store.clearHumanWaits();
+
   // Revert launchpad requests stranded in CLAIMED/QUEUED back to PENDING so
   // the intake poller picks them up again. Without this, a sidecar crash
   // between claim and job-link leaves the desktop-originated request
@@ -2275,14 +2293,17 @@ async function main(): Promise<void> {
     );
   }
 
-  startLaunchpadRequestPoller({
+  const launchpadIntake = {
     webClient: client.webClient,
     config,
     store,
-    enqueue: async (event, webClient) => {
+    enqueue: async (event: SlackEventEnvelope, webClient: WebClient) => {
       await enqueueSlackEvent(event, webClient, 'launchpad');
     },
-  });
+  };
+  startLaunchpadRequestPoller(launchpadIntake);
+  // Answers from the app's thread view to a run waiting on a person.
+  startAppAnswerPoller(launchpadIntake);
 }
 
 main().catch(error => {

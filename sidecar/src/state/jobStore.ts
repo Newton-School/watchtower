@@ -14,6 +14,8 @@ import type {
   JobLogLevel,
   JobLogRecord,
   JobRecord,
+  HumanWait,
+  HumanWaitKind,
   LaunchpadRequestRecord,
   LaunchpadRequestStatus,
   PersonalityMode,
@@ -90,6 +92,54 @@ const resumeContextSchema = z.discriminatedUnion('stage', [
   implementationRevisionChoiceResumeSchema,
   implementationRepoChoiceResumeSchema,
 ]);
+
+const LAUNCHPAD_COLUMNS = `id, target, prompt, owner_user_id, status, job_id, slack_channel_id, anchor_ts,
+  requested_for_user_id, origin_channel_id, origin_thread_ts, origin_event_ts, answer_for_job_id, answer_prompt_ts,
+  result_json, error_message, created_at, updated_at`;
+
+interface LaunchpadRow {
+  id: string;
+  target: LaunchpadTarget;
+  prompt: string;
+  owner_user_id: string;
+  status: LaunchpadRequestStatus;
+  job_id?: string | null;
+  slack_channel_id?: string | null;
+  anchor_ts?: string | null;
+  requested_for_user_id?: string | null;
+  origin_channel_id?: string | null;
+  origin_thread_ts?: string | null;
+  origin_event_ts?: string | null;
+  answer_for_job_id?: string | null;
+  answer_prompt_ts?: string | null;
+  result_json?: string | null;
+  error_message?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+function launchpadRecord(row: LaunchpadRow): LaunchpadRequestRecord {
+  return {
+    id: row.id,
+    target: row.target,
+    prompt: row.prompt,
+    ownerUserId: row.owner_user_id,
+    status: row.status,
+    jobId: row.job_id ?? undefined,
+    slackChannelId: row.slack_channel_id ?? undefined,
+    anchorTs: row.anchor_ts ?? undefined,
+    requestedForUserId: row.requested_for_user_id ?? undefined,
+    originChannelId: row.origin_channel_id ?? undefined,
+    originThreadTs: row.origin_thread_ts ?? undefined,
+    originEventTs: row.origin_event_ts ?? undefined,
+    answerForJobId: row.answer_for_job_id ?? undefined,
+    answerPromptTs: row.answer_prompt_ts ?? undefined,
+    resultJson: row.result_json ?? undefined,
+    errorMessage: row.error_message ?? undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
 
 function parseResumeContext(raw: unknown): ResumeContext | undefined {
   // Resume contexts are persisted as the top-level result_json. Tolerate
@@ -420,6 +470,19 @@ export class JobStore {
       CREATE TABLE IF NOT EXISTS pending_cancel_jobs (
         job_id TEXT PRIMARY KEY,
         created_at TEXT NOT NULL
+      );
+
+      -- A gate waiting on a person while its job runs; the app answers it from
+      -- the run's thread view. The Tauri app creates the same table.
+      CREATE TABLE IF NOT EXISTS human_waits (
+        job_id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        thread_ts TEXT NOT NULL,
+        prompt_ts TEXT NOT NULL,
+        allowed_user_ids TEXT NOT NULL DEFAULT '[]',
+        expects TEXT,
+        started_at TEXT NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS agent_calls (
@@ -826,6 +889,22 @@ export class JobStore {
     } catch {
       /* column already exists */
     }
+    try {
+      this.db.exec(`ALTER TABLE human_waits ADD COLUMN expects TEXT`);
+    } catch {
+      /* column already exists */
+    }
+    // Answers from the app's thread view to a run waiting on a person.
+    try {
+      this.db.exec(`ALTER TABLE launchpad_requests ADD COLUMN answer_for_job_id TEXT`);
+    } catch {
+      /* column already exists */
+    }
+    try {
+      this.db.exec(`ALTER TABLE launchpad_requests ADD COLUMN answer_prompt_ts TEXT`);
+    } catch {
+      /* column already exists */
+    }
 
     try {
       // Slack ts of the "Want me to fix this?" prompt — needed so the reaction
@@ -1198,14 +1277,17 @@ export class JobStore {
     originChannelId?: string;
     originThreadTs?: string;
     originEventTs?: string;
+    answerForJobId?: string;
+    answerPromptTs?: string;
   }): void {
     const now = new Date().toISOString();
     this.db
       .prepare(
         `INSERT INTO launchpad_requests(
            id, target, prompt, owner_user_id, status, slack_channel_id, anchor_ts,
-           requested_for_user_id, origin_channel_id, origin_thread_ts, origin_event_ts, created_at, updated_at
-         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           requested_for_user_id, origin_channel_id, origin_thread_ts, origin_event_ts,
+           answer_for_job_id, answer_prompt_ts, created_at, updated_at
+         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.id,
@@ -1219,6 +1301,8 @@ export class JobStore {
         input.originChannelId ?? null,
         input.originThreadTs ?? null,
         input.originEventTs ?? null,
+        input.answerForJobId ?? null,
+        input.answerPromptTs ?? null,
         now,
         now,
       );
@@ -1227,72 +1311,133 @@ export class JobStore {
   claimPendingLaunchpadRequests(limit = 10): LaunchpadRequestRecord[] {
     const safeLimit = Math.min(Math.max(limit, 1), 50);
     const now = new Date().toISOString();
-    const rows = (
-      this.db.prepare(
-        `SELECT id, target, prompt, owner_user_id, status, job_id, slack_channel_id, anchor_ts,
-                requested_for_user_id, origin_channel_id, origin_thread_ts, origin_event_ts,
-                result_json, error_message, created_at, updated_at
+    // Answers to a waiting run have a poller of their own.
+    const rows = this.db
+      .prepare(
+        `SELECT ${LAUNCHPAD_COLUMNS}
          FROM launchpad_requests
-         WHERE status = 'PENDING'
+         WHERE status = 'PENDING' AND answer_for_job_id IS NULL
          ORDER BY created_at ASC
          LIMIT ?`,
-      ) as unknown as {
-        all: (limitArg: number) => Array<{
-          id: string;
-          target: LaunchpadTarget;
-          prompt: string;
-          owner_user_id: string;
-          status: LaunchpadRequestStatus;
-          job_id?: string | null;
-          slack_channel_id?: string | null;
-          anchor_ts?: string | null;
-          requested_for_user_id?: string | null;
-          origin_channel_id?: string | null;
-          origin_thread_ts?: string | null;
-          origin_event_ts?: string | null;
-          result_json?: string | null;
-          error_message?: string | null;
-          created_at: string;
-          updated_at: string;
-        }>;
-      }
-    ).all(safeLimit);
+      )
+      .all(safeLimit) as LaunchpadRow[];
 
     const claimed: LaunchpadRequestRecord[] = [];
-    const claimStmt = this.db.prepare(
+    for (const row of rows) {
+      if (!this.claimPendingRequestStmt().run(now, row.id).changes) {
+        continue;
+      }
+      claimed.push(launchpadRecord({ ...row, status: 'CLAIMED', error_message: null, updated_at: now }));
+    }
+
+    return claimed;
+  }
+
+  private claimPendingRequestStmt() {
+    return this.db.prepare(
       `UPDATE launchpad_requests
        SET status = 'CLAIMED',
            error_message = NULL,
            updated_at = ?
        WHERE id = ? AND status = 'PENDING'`,
     );
+  }
 
-    for (const row of rows) {
-      const result = claimStmt.run(now, row.id);
-      if (result.changes < 1) {
-        continue;
-      }
-      claimed.push({
-        id: row.id,
-        target: row.target,
-        prompt: row.prompt,
-        ownerUserId: row.owner_user_id,
-        status: 'CLAIMED',
-        jobId: row.job_id ?? undefined,
-        slackChannelId: row.slack_channel_id ?? undefined,
-        anchorTs: row.anchor_ts ?? undefined,
-        requestedForUserId: row.requested_for_user_id ?? undefined,
-        originChannelId: row.origin_channel_id ?? undefined,
-        originThreadTs: row.origin_thread_ts ?? undefined,
-        originEventTs: row.origin_event_ts ?? undefined,
-        resultJson: row.result_json ?? undefined,
-        errorMessage: row.error_message ?? undefined,
-        createdAt: row.created_at,
-        updatedAt: now,
-      });
+  /** Answers from the app to a run waiting on a person, oldest first. */
+  pendingLaunchpadAnswers(): LaunchpadRequestRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT ${LAUNCHPAD_COLUMNS}
+         FROM launchpad_requests
+         WHERE status = 'PENDING' AND answer_for_job_id IS NOT NULL
+         ORDER BY created_at ASC
+         LIMIT 20`,
+      )
+      .all() as LaunchpadRow[];
+    return rows.map(launchpadRecord);
+  }
+
+  /** Takes one waiting request for this sidecar. False when it was cancelled or taken first. */
+  claimLaunchpadRequest(id: string): boolean {
+    return this.claimPendingRequestStmt().run(new Date().toISOString(), id).changes > 0;
+  }
+
+  /**
+   * An answer handed to the gate its job waits at: the job carries on with
+   * it, so the request is done. False when it was cancelled first.
+   */
+  markLaunchpadAnswerDelivered(id: string, jobId: string): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE launchpad_requests
+         SET status = 'SUCCESS', job_id = ?, error_message = NULL, updated_at = ?
+         WHERE id = ? AND status = 'PENDING'`,
+      )
+      .run(jobId, new Date().toISOString(), id);
+    return result.changes > 0;
+  }
+
+  /** Marks the job as waiting on a person at this gate, replacing any wait it had. */
+  beginHumanWait(wait: Omit<HumanWait, 'startedAt'>): void {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO human_waits
+           (job_id, kind, channel_id, thread_ts, prompt_ts, allowed_user_ids, expects, started_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        wait.jobId,
+        wait.kind,
+        wait.channelId,
+        wait.threadTs,
+        wait.promptTs,
+        JSON.stringify(wait.allowedUserIds),
+        wait.expects ?? null,
+        new Date().toISOString(),
+      );
+  }
+
+  /** The gate stopped waiting. A newer wait of the same job is left alone. */
+  endHumanWait(jobId: string, promptTs: string): void {
+    this.db.prepare('DELETE FROM human_waits WHERE job_id = ? AND prompt_ts = ?').run(jobId, promptTs);
+  }
+
+  humanWaitFor(jobId: string): HumanWait | undefined {
+    const row = this.db.prepare('SELECT * FROM human_waits WHERE job_id = ?').get(jobId) as
+      | {
+          job_id: string;
+          kind: HumanWaitKind;
+          channel_id: string;
+          thread_ts: string;
+          prompt_ts: string;
+          allowed_user_ids: string;
+          expects: string | null;
+          started_at: string;
+        }
+      | undefined;
+    if (!row) return undefined;
+    let allowedUserIds: string[] = [];
+    try {
+      const parsed: unknown = JSON.parse(row.allowed_user_ids);
+      if (Array.isArray(parsed)) allowedUserIds = parsed.filter((id): id is string => typeof id === 'string');
+    } catch {
+      // nobody listed: the gate decides
     }
+    return {
+      jobId: row.job_id,
+      kind: row.kind,
+      channelId: row.channel_id,
+      threadTs: row.thread_ts,
+      promptTs: row.prompt_ts,
+      allowedUserIds,
+      ...(row.expects ? { expects: row.expects } : {}),
+      startedAt: row.started_at,
+    };
+  }
 
-    return claimed;
+  /** At startup no gate is waiting: the jobs that were died with the last sidecar. */
+  clearHumanWaits(): void {
+    this.db.prepare('DELETE FROM human_waits').run();
   }
 
   /**
@@ -1411,58 +1556,10 @@ export class JobStore {
   }
 
   getLaunchpadRequest(id: string): LaunchpadRequestRecord | undefined {
-    const row = this.db
-      .prepare(
-        `SELECT id, target, prompt, owner_user_id, status, job_id, slack_channel_id, anchor_ts,
-                requested_for_user_id, origin_channel_id, origin_thread_ts, origin_event_ts,
-                result_json, error_message, created_at, updated_at
-         FROM launchpad_requests
-         WHERE id = ?
-         LIMIT 1`,
-      )
-      .get(id) as
-      | {
-          id: string;
-          target: LaunchpadTarget;
-          prompt: string;
-          owner_user_id: string;
-          status: LaunchpadRequestStatus;
-          job_id?: string | null;
-          slack_channel_id?: string | null;
-          anchor_ts?: string | null;
-          requested_for_user_id?: string | null;
-          origin_channel_id?: string | null;
-          origin_thread_ts?: string | null;
-          origin_event_ts?: string | null;
-          result_json?: string | null;
-          error_message?: string | null;
-          created_at: string;
-          updated_at: string;
-        }
+    const row = this.db.prepare(`SELECT ${LAUNCHPAD_COLUMNS} FROM launchpad_requests WHERE id = ? LIMIT 1`).get(id) as
+      | LaunchpadRow
       | undefined;
-
-    if (!row) {
-      return undefined;
-    }
-
-    return {
-      id: row.id,
-      target: row.target,
-      prompt: row.prompt,
-      ownerUserId: row.owner_user_id,
-      status: row.status,
-      jobId: row.job_id ?? undefined,
-      slackChannelId: row.slack_channel_id ?? undefined,
-      anchorTs: row.anchor_ts ?? undefined,
-      requestedForUserId: row.requested_for_user_id ?? undefined,
-      originChannelId: row.origin_channel_id ?? undefined,
-      originThreadTs: row.origin_thread_ts ?? undefined,
-      originEventTs: row.origin_event_ts ?? undefined,
-      resultJson: row.result_json ?? undefined,
-      errorMessage: row.error_message ?? undefined,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-    };
+    return row ? launchpadRecord(row) : undefined;
   }
 
   /**
@@ -3533,16 +3630,18 @@ export class JobStore {
         workflow: WorkflowIntent;
         status: JobRecord['status'];
         errorMessage?: string;
+        updatedAt?: string;
       }
     | undefined {
     const row = this.db
-      .prepare(`SELECT id, workflow, status, error_message FROM jobs WHERE id = ? LIMIT 1`)
+      .prepare(`SELECT id, workflow, status, error_message, updated_at FROM jobs WHERE id = ? LIMIT 1`)
       .get(jobId) as
       | {
           id?: string;
           workflow?: WorkflowIntent;
           status?: JobRecord['status'];
           error_message?: string | null;
+          updated_at?: string | null;
         }
       | undefined;
 
@@ -3555,6 +3654,7 @@ export class JobStore {
       workflow: row.workflow,
       status: row.status,
       errorMessage: row.error_message ?? undefined,
+      updatedAt: row.updated_at ?? undefined,
     };
   }
 
