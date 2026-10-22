@@ -50,6 +50,13 @@ describe('SlackText edge cases', () => {
     expect(out).toContain('>b|c</a>');
   });
 
+  it('formats a token right after another token or an entity', () => {
+    expect(html('*a*~b~')).toContain('<strong>a</strong><s>b</s>');
+    expect(html(':tada:*Done*')).toContain('🎉</span><strong>Done</strong>');
+    expect(html('`x`*y*')).toContain('</code><strong>y</strong>');
+    expect(html('&lt;*b*')).toContain('&lt;<strong>b</strong>');
+  });
+
   it('keeps the characters around bold and italic', () => {
     expect(html('(*yes*) and x _no_.')).toContain('(<strong>yes</strong>) and x <em>no</em>.');
   });
@@ -75,6 +82,7 @@ describe('emoji', () => {
   it('finds emoji by name, prefix matches first', () => {
     const names = searchEmoji('pra').map(emoji => emoji.names[0]);
     expect(names[0]).toBe('pray');
+    expect(searchEmoji('fire')[0].char).toBe('🔥');
     expect(searchEmoji('   ')).toEqual([]);
   });
 });

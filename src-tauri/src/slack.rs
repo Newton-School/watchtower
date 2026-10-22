@@ -541,8 +541,9 @@ async fn get_run_thread_inner(db_path: &Path, job_id: &str) -> Result<RunThread,
     Ok(thread)
 }
 
-/// Slack pages a long thread newest first and repeats the parent on every
-/// page, so put the pages back together: one copy of each message, oldest first.
+/// Slack pages a long thread newest first (checked 2026-10-22) and repeats the
+/// parent on every page, so put the pages back together: one copy of each
+/// message, oldest first. A thread past the page limit keeps its newest part.
 fn in_thread_order(messages: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
     fn ts_key(message: &serde_json::Value) -> (u64, u64) {
         let ts = message.get("ts").and_then(|t| t.as_str()).unwrap_or("");
@@ -643,16 +644,18 @@ async fn post_in_thread(
         .pointer("/message/thread_ts")
         .and_then(|t| t.as_str());
     if landed_in != Some(target.thread_ts.as_str()) {
-        let _ = slack_call(
+        let removed = slack_call(
             token,
             "chat.delete",
             &[("channel", &target.channel), ("ts", &ts)],
         )
         .await;
-        return Err(
-            "The thread is gone, so the reply would have landed in the channel. It was taken back."
-                .to_string(),
-        );
+        return Err(match removed {
+            Ok(_) => "The thread is gone, so the reply would have landed in the channel. It was taken back.".to_string(),
+            Err(err) => format!(
+                "The thread is gone, so the reply landed in the channel (message {ts}), and taking it back failed ({err}). Delete it in Slack."
+            ),
+        });
     }
     Ok(PostedMessage { ts })
 }

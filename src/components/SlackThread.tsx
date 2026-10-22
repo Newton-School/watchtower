@@ -144,6 +144,22 @@ export function SlackThread({ jobId }: SlackThreadProps) {
     if (list && pinnedToBottom.current) list.scrollTop = list.scrollHeight;
   }, [messageCount]);
 
+  // Escape backs out of an edit or a delete prompt without closing the run
+  // page, wherever focus is (WebKit leaves it on the page after a click).
+  const canBackOut = editing !== null || confirmDelete !== null;
+  useEffect(() => {
+    if (!canBackOut) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      e.stopPropagation();
+      setEditing(null);
+      setConfirmDelete(null);
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [canBackOut]);
+
   if (thread && !thread.hasThread) return null;
 
   const send = async () => {
@@ -170,19 +186,6 @@ export function SlackThread({ jobId }: SlackThreadProps) {
     setPickerFor(current => (current?.anchor === anchor ? null : { ts, anchor }));
   };
 
-  // Escape backs out of an edit, a delete prompt or the picker, without
-  // closing the run page.
-  const onKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
-    if (e.key !== 'Escape') return;
-    if (editing || confirmDelete || pickerFor) {
-      e.preventDefault();
-      e.stopPropagation();
-      setEditing(null);
-      setConfirmDelete(null);
-      setPickerFor(null);
-    }
-  };
-
   const title =
     thread?.channelKind === 'im'
       ? 'Direct message'
@@ -190,7 +193,7 @@ export function SlackThread({ jobId }: SlackThreadProps) {
         ? 'Group message'
         : `#${thread?.channelName ?? thread?.channelId ?? 'slack'}`;
   const replies = thread?.replyCount ?? 0;
-  const shown = thread?.truncated ? ` · showing ${Math.max(messageCount - 1, 0)}` : '';
+  const shown = thread?.truncated ? ` · showing the latest ${Math.max(messageCount - 1, 0)}` : '';
   const actions = thread?.permalink ? (
     <a className="ghost-button" href={thread.permalink} target="_blank" rel="noopener noreferrer">
       Open in Slack ↗
@@ -236,7 +239,7 @@ export function SlackThread({ jobId }: SlackThreadProps) {
           }}
         />
       ) : (
-        <div onKeyDown={onKeyDown}>
+        <div>
           {loadError ? <p className="slack-thread-warning">{loadError}</p> : null}
           <div
             className="slack-thread-messages"

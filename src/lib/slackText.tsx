@@ -5,10 +5,10 @@ import type { SlackUser } from '../types';
 // One inline token at a time: <...> links and mentions, `code`, *bold*,
 // _italic_, ~strike~ and :emoji:. Bold, italic and strike need a word
 // boundary on both sides, like Slack, so snake_case and 2*3*4 stay as text.
-// The boundary before is a captured character rather than a lookbehind, which
+// The boundary before is checked in code rather than with a lookbehind, which
 // older macOS WebKit can't parse.
 const INLINE =
-  /<([^<>\n]+)>|`([^`\n]+)`|(^|[^\w*])\*([^\s*](?:[^*\n]*?[^\s*])?)\*(?![\w*])|(^|[^\w_])_([^\s_](?:[^_\n]*?[^\s_])?)_(?![\w_])|(^|[^\w~])~([^\s~](?:[^~\n]*?[^\s~])?)~(?![\w~])|:([a-z0-9_+'-]+(?:::skin-tone-[2-6])?):/g;
+  /<([^<>\n]+)>|`([^`\n]+)`|\*([^\s*](?:[^*\n]*?[^\s*])?)\*(?![\w*])|_([^\s_](?:[^_\n]*?[^\s_])?)_(?![\w_])|~([^\s~](?:[^~\n]*?[^\s~])?)~(?![\w~])|:([a-z0-9_+'-]+(?:::skin-tone-[2-6])?):/g;
 
 // Mention, channel and link tokens, which Slack text keeps as markup.
 const SLACK_TOKEN = /<(?:[@#!][^<>\s|]+|(?:https?|mailto):[^<>\s|]+)(?:\|[^<>]*)?>/g;
@@ -79,13 +79,21 @@ function renderInline(text: string, users: Record<string, SlackUser>, keyPrefix:
   const nodes: ReactNode[] = [];
   let last = 0;
   let index = 0;
-  for (const match of text.matchAll(INLINE)) {
-    const start = match.index ?? 0;
+  // Its own copy: the global regex keeps its position, and this recurses.
+  const pattern = new RegExp(INLINE.source, 'g');
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text)) !== null) {
+    const start = match.index;
+    const [whole, angle, code, bold, italic, strike, emoji] = match;
+    const marker = bold !== undefined ? '*' : italic !== undefined ? '_' : strike !== undefined ? '~' : null;
+    const prev = text[start - 1];
+    if (marker && prev !== undefined && (/\w/.test(prev) || prev === marker)) {
+      // Mid-word, like snake_case: not formatting. Try again one character on.
+      pattern.lastIndex = start + 1;
+      continue;
+    }
     if (start > last) nodes.push(decode(text.slice(last, start)));
     const key = `${keyPrefix}-${index++}`;
-    const [whole, angle, code, boldBefore, bold, italicBefore, italic, strikeBefore, strike, emoji] = match;
-    const before = boldBefore ?? italicBefore ?? strikeBefore;
-    if (before) nodes.push(decode(before));
     if (angle !== undefined) nodes.push(renderAngle(angle, users, key));
     else if (code !== undefined) {
       nodes.push(

@@ -21,6 +21,7 @@ export function EmojiPicker({ anchor, onPick, onClose }: EmojiPickerProps) {
   const [query, setQuery] = useState('');
   const [position, setPosition] = useState<{ top: number; left: number } | null>(null);
   const ref = useRef<HTMLDivElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
 
   useLayoutEffect(() => {
     const rect = anchor.getBoundingClientRect();
@@ -30,6 +31,11 @@ export function EmojiPicker({ anchor, onPick, onClose }: EmojiPickerProps) {
     const left = Math.min(Math.max(GAP, rect.right - WIDTH), window.innerWidth - WIDTH - GAP);
     setPosition({ top, left });
   }, [anchor]);
+
+  // Focus once placed: a hidden input can't take focus, so autoFocus would miss.
+  useEffect(() => {
+    if (position) searchRef.current?.focus();
+  }, [position]);
 
   useEffect(() => {
     const inside = (target: EventTarget | null) =>
@@ -43,18 +49,20 @@ export function EmojiPicker({ anchor, onPick, onClose }: EmojiPickerProps) {
     const onPointerDown = (e: PointerEvent) => {
       if (!inside(e.target)) onClose();
     };
-    // It is placed once, so close it when what's under it moves.
-    const onScroll = (e: Event) => {
+    // It is placed once, so close it when the reader scrolls what's under it.
+    // (A wheel, not a scroll event: the thread scrolling itself to a new
+    // message shouldn't close it.)
+    const onWheel = (e: WheelEvent) => {
       if (!inside(e.target)) onClose();
     };
     window.addEventListener('keydown', onKeyDown, true);
     window.addEventListener('pointerdown', onPointerDown);
-    window.addEventListener('scroll', onScroll, true);
+    window.addEventListener('wheel', onWheel, true);
     window.addEventListener('resize', onClose);
     return () => {
       window.removeEventListener('keydown', onKeyDown, true);
       window.removeEventListener('pointerdown', onPointerDown);
-      window.removeEventListener('scroll', onScroll, true);
+      window.removeEventListener('wheel', onWheel, true);
       window.removeEventListener('resize', onClose);
     };
   }, [anchor, onClose]);
@@ -72,7 +80,7 @@ export function EmojiPicker({ anchor, onPick, onClose }: EmojiPickerProps) {
     >
       <input
         className="emoji-picker-search"
-        autoFocus
+        ref={searchRef}
         placeholder="Search emoji"
         value={query}
         onChange={e => setQuery(e.target.value)}

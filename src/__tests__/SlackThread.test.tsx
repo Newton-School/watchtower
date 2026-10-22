@@ -239,6 +239,44 @@ describe('SlackThread', () => {
     });
   });
 
+  it('focuses the picker search so typing finds an emoji', async () => {
+    respondWith(makeThread());
+    render(<SlackThread jobId="job-1" />);
+    await screen.findByText('#miniog-testing');
+
+    fireEvent.click(within(messageRow('1000.000002')).getByRole('button', { name: 'React as miniOG' }));
+    const search = screen.getByPlaceholderText('Search emoji');
+    await waitFor(() => expect(document.activeElement).toBe(search));
+    fireEvent.change(search, { target: { value: 'fire' } });
+    fireEvent.keyDown(search, { key: 'Enter' });
+
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith('set_miniog_reaction', {
+        jobId: 'job-1',
+        ts: '1000.000002',
+        name: 'fire',
+        add: true,
+      });
+    });
+  });
+
+  it('Escape closes a delete prompt even with focus back on the page', async () => {
+    respondWith(makeThread());
+    render(<SlackThread jobId="job-1" />);
+    await screen.findByText('#miniog-testing');
+
+    const reply = messageRow('1000.000002');
+    fireEvent.click(within(reply).getByRole('button', { name: 'Delete message' }));
+    expect(within(reply).getByText('Delete this message for everyone?')).toBeTruthy();
+    const pageSawIt = vi.fn();
+    window.addEventListener('keydown', pageSawIt);
+    fireEvent.keyDown(document.body, { key: 'Escape' });
+    window.removeEventListener('keydown', pageSawIt);
+
+    expect(within(reply).queryByText('Delete this message for everyone?')).toBeNull();
+    expect(pageSawIt).not.toHaveBeenCalled();
+  });
+
   it('closes the picker when its button is clicked again', async () => {
     respondWith(makeThread());
     render(<SlackThread jobId="job-1" />);

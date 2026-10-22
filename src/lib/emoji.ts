@@ -43,16 +43,18 @@ export function emojiChar(name: string): string | null {
   return tone && SKIN_TONES[tone] ? char + SKIN_TONES[tone] : char;
 }
 
-/** Emoji whose names contain `query`, best matches (name starts with it) first. */
+/** Emoji whose names contain `query`: the exact name first, then names starting with it. */
 export function searchEmoji(query: string, limit = 48): Emoji[] {
   const q = query.trim().toLowerCase().replace(/^:|:$/g, '');
   if (!q) return [];
+  const exact: Emoji[] = [];
   const starts: Emoji[] = [];
   const contains: Emoji[] = [];
   for (const emoji of EMOJI) {
     if (emoji.category === 'Component') continue;
-    if (emoji.names.some(name => name.startsWith(q))) starts.push(emoji);
+    if (emoji.names.includes(q)) exact.push(emoji);
+    else if (emoji.names.some(name => name.startsWith(q))) starts.push(emoji);
     else if (emoji.names.some(name => name.includes(q))) contains.push(emoji);
   }
-  return [...starts, ...contains].slice(0, limit);
+  return [...exact, ...starts, ...contains].slice(0, limit);
 }
