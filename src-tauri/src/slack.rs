@@ -59,14 +59,14 @@ fn classify_read_error(code: String) -> SlackReadError {
 
 /// Where a job lives in Slack.
 #[derive(Debug, PartialEq)]
-struct JobSlackTarget {
-    channel: String,
-    thread_ts: String,
+pub(crate) struct JobSlackTarget {
+    pub(crate) channel: String,
+    pub(crate) thread_ts: String,
     /// The message that started the run, when the run came from one.
-    trigger_ts: Option<String>,
+    pub(crate) trigger_ts: Option<String>,
 }
 
-fn job_slack_target(
+pub(crate) fn job_slack_target(
     connection: &Connection,
     job_id: &str,
 ) -> Result<Option<JobSlackTarget>, String> {
@@ -111,7 +111,7 @@ fn load_job(db_path: &Path, job_id: &str) -> Result<(Option<JobSlackTarget>, App
 
 /// Records something done from the app in the run's trace. Best effort: the
 /// Slack action already happened, so a failed write must not undo it.
-fn log_app_action(
+pub(crate) fn log_app_action(
     db_path: &Path,
     job_id: &str,
     level: &str,
@@ -221,7 +221,7 @@ fn slack_error_code(response: &serde_json::Value) -> Option<String> {
 }
 
 /// Call Slack and turn `ok: false` into an error naming Slack's code.
-async fn slack_call(
+pub(crate) async fn slack_call(
     token: &str,
     method: &str,
     fields: &[(&str, &str)],
@@ -233,10 +233,10 @@ async fn slack_call(
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SlackUser {
-    name: String,
+    pub(crate) name: String,
     avatar_url: Option<String>,
     is_bot: bool,
 }
@@ -334,7 +334,7 @@ fn user_ids_in(messages: &[serde_json::Value]) -> HashSet<String> {
 }
 
 /// Names and avatars for `ids`, from the cache or users.info (a few at a time).
-async fn resolve_users(token: &str, ids: HashSet<String>) -> HashMap<String, SlackUser> {
+pub(crate) async fn resolve_users(token: &str, ids: HashSet<String>) -> HashMap<String, SlackUser> {
     let mut found = HashMap::new();
     let mut missing = Vec::new();
     {
@@ -584,7 +584,7 @@ fn in_thread_order(messages: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
     unique
 }
 
-fn require_target(target: Option<JobSlackTarget>) -> Result<JobSlackTarget, String> {
+pub(crate) fn require_target(target: Option<JobSlackTarget>) -> Result<JobSlackTarget, String> {
     target.ok_or_else(|| "This run has no Slack thread.".to_string())
 }
 
@@ -599,7 +599,7 @@ fn is_slack_ts(ts: &str) -> bool {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PostedMessage {
-    ts: String,
+    pub(crate) ts: String,
 }
 
 #[tauri::command]
@@ -639,7 +639,7 @@ async fn post_as_miniog_inner(
     )
 }
 
-async fn post_in_thread(
+pub(crate) async fn post_in_thread(
     token: &str,
     target: &JobSlackTarget,
     text: &str,
@@ -682,7 +682,7 @@ async fn post_in_thread(
 }
 
 /// Logs an action's outcome in the run's trace and hands the result back.
-fn traced<T>(
+pub(crate) fn traced<T>(
     db_path: &Path,
     job_id: &str,
     stage: &str,

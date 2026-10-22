@@ -198,6 +198,26 @@ export type SlackDirectory = {
   groups: DirectoryGroup[];
 };
 
+/** What the run's thread view can do with the run itself. */
+export type RunControls = {
+  canStop: boolean;
+  /** What a re-run would ask, without the mention of miniOG. */
+  rerunAsk: string | null;
+  /** Who a re-run is for, when that isn't the owner. */
+  rerunFor: string | null;
+  /** The run working in this thread now, if any. */
+  busyJobId: string | null;
+  /** That run is waiting for an answer, which a new ask would be taken as. */
+  busyWaiting: boolean;
+  /** A run started from the app that miniOG hasn't picked up yet. */
+  starting: boolean;
+};
+
+export type StartedRun = { requestId: string; askTs: string | null };
+
+/** A run started from the thread view, as its launchpad request tracks it. */
+export type StartedRunStatus = { status: string; jobId: string | null; error: string | null };
+
 /** A Slack message object as conversations.replies returns it (the fields the app reads). */
 export type SlackMessage = {
   ts: string;

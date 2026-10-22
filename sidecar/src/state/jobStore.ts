@@ -821,6 +821,11 @@ export class JobStore {
     } catch {
       /* column already exists */
     }
+    try {
+      this.db.exec(`ALTER TABLE launchpad_requests ADD COLUMN origin_event_ts TEXT`);
+    } catch {
+      /* column already exists */
+    }
 
     try {
       // Slack ts of the "Want me to fix this?" prompt — needed so the reaction
@@ -1192,14 +1197,15 @@ export class JobStore {
     requestedForUserId?: string;
     originChannelId?: string;
     originThreadTs?: string;
+    originEventTs?: string;
   }): void {
     const now = new Date().toISOString();
     this.db
       .prepare(
         `INSERT INTO launchpad_requests(
            id, target, prompt, owner_user_id, status, slack_channel_id, anchor_ts,
-           requested_for_user_id, origin_channel_id, origin_thread_ts, created_at, updated_at
-         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           requested_for_user_id, origin_channel_id, origin_thread_ts, origin_event_ts, created_at, updated_at
+         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.id,
@@ -1212,6 +1218,7 @@ export class JobStore {
         input.requestedForUserId ?? null,
         input.originChannelId ?? null,
         input.originThreadTs ?? null,
+        input.originEventTs ?? null,
         now,
         now,
       );
@@ -1223,7 +1230,7 @@ export class JobStore {
     const rows = (
       this.db.prepare(
         `SELECT id, target, prompt, owner_user_id, status, job_id, slack_channel_id, anchor_ts,
-                requested_for_user_id, origin_channel_id, origin_thread_ts,
+                requested_for_user_id, origin_channel_id, origin_thread_ts, origin_event_ts,
                 result_json, error_message, created_at, updated_at
          FROM launchpad_requests
          WHERE status = 'PENDING'
@@ -1242,6 +1249,7 @@ export class JobStore {
           requested_for_user_id?: string | null;
           origin_channel_id?: string | null;
           origin_thread_ts?: string | null;
+          origin_event_ts?: string | null;
           result_json?: string | null;
           error_message?: string | null;
           created_at: string;
@@ -1276,6 +1284,7 @@ export class JobStore {
         requestedForUserId: row.requested_for_user_id ?? undefined,
         originChannelId: row.origin_channel_id ?? undefined,
         originThreadTs: row.origin_thread_ts ?? undefined,
+        originEventTs: row.origin_event_ts ?? undefined,
         resultJson: row.result_json ?? undefined,
         errorMessage: row.error_message ?? undefined,
         createdAt: row.created_at,
@@ -1284,6 +1293,70 @@ export class JobStore {
     }
 
     return claimed;
+  }
+
+  /**
+   * Puts a request back in line for the poller when miniOG couldn't start it
+   * yet: its thread was still held by a run that is stopping or finishing.
+   */
+  requeueLaunchpadRequest(id: string): void {
+    this.db
+      .prepare(
+        `UPDATE launchpad_requests
+         SET status = 'PENDING',
+             slack_channel_id = NULL,
+             anchor_ts = NULL,
+             updated_at = ?
+         WHERE id = ? AND job_id IS NULL AND status IN ('CLAIMED', 'QUEUED')`,
+      )
+      .run(new Date().toISOString(), id);
+  }
+
+  /**
+   * On startup, closes requests for a run in a Slack thread (an ask or re-run
+   * from the app's thread view, or a retrigger) that waited longer than
+   * `maxAgeMinutes` without starting. Run now, maybe days later, they would
+   * surprise the thread. Requests from the Launchpad page still retry.
+   * Returns the requests closed, so a posted ask can be taken back.
+   */
+  expireStaleOriginLaunchpadRequests(
+    maxAgeMinutes: number,
+  ): Array<{ id: string; originChannelId: string; originEventTs?: string }> {
+    const now = new Date();
+    const cutoff = new Date(now.getTime() - maxAgeMinutes * 60_000).toISOString();
+    const stale = `status IN ('PENDING', 'CLAIMED', 'QUEUED')
+           AND job_id IS NULL
+           AND origin_channel_id IS NOT NULL
+           AND created_at < ?`;
+    const rows = this.db
+      .prepare(`SELECT id, origin_channel_id, origin_event_ts FROM launchpad_requests WHERE ${stale}`)
+      .all(cutoff) as Array<{ id: string; origin_channel_id: string; origin_event_ts?: string | null }>;
+    this.db
+      .prepare(`UPDATE launchpad_requests SET status = 'FAILED', error_message = ?, updated_at = ? WHERE ${stale}`)
+      .run(`Not started within ${maxAgeMinutes} minutes, so it was dropped.`, now.toISOString(), cutoff);
+    return rows.map(row => ({
+      id: row.id,
+      originChannelId: row.origin_channel_id,
+      originEventTs: row.origin_event_ts ?? undefined,
+    }));
+  }
+
+  /** The thread a job ran in, and the launchpad request behind it, if any. */
+  jobOrigin(jobId: string): { channelId: string; threadTs: string; launchpadRequestId?: string } | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT channel_id, thread_ts, json_extract(payload_json, '$.launchpadRequestId') AS request_id
+         FROM jobs
+         WHERE id = ?
+         LIMIT 1`,
+      )
+      .get(jobId) as { channel_id?: string; thread_ts?: string; request_id?: string | null } | undefined;
+    if (!row?.channel_id || !row.thread_ts) return undefined;
+    return {
+      channelId: row.channel_id,
+      threadTs: row.thread_ts,
+      launchpadRequestId: row.request_id ?? undefined,
+    };
   }
 
   markLaunchpadRequestQueued(input: { id: string; slackChannelId: string; anchorTs: string }): void {
@@ -1341,6 +1414,7 @@ export class JobStore {
     const row = this.db
       .prepare(
         `SELECT id, target, prompt, owner_user_id, status, job_id, slack_channel_id, anchor_ts,
+                requested_for_user_id, origin_channel_id, origin_thread_ts, origin_event_ts,
                 result_json, error_message, created_at, updated_at
          FROM launchpad_requests
          WHERE id = ?
@@ -1356,6 +1430,10 @@ export class JobStore {
           job_id?: string | null;
           slack_channel_id?: string | null;
           anchor_ts?: string | null;
+          requested_for_user_id?: string | null;
+          origin_channel_id?: string | null;
+          origin_thread_ts?: string | null;
+          origin_event_ts?: string | null;
           result_json?: string | null;
           error_message?: string | null;
           created_at: string;
@@ -1376,6 +1454,10 @@ export class JobStore {
       jobId: row.job_id ?? undefined,
       slackChannelId: row.slack_channel_id ?? undefined,
       anchorTs: row.anchor_ts ?? undefined,
+      requestedForUserId: row.requested_for_user_id ?? undefined,
+      originChannelId: row.origin_channel_id ?? undefined,
+      originThreadTs: row.origin_thread_ts ?? undefined,
+      originEventTs: row.origin_event_ts ?? undefined,
       resultJson: row.result_json ?? undefined,
       errorMessage: row.error_message ?? undefined,
       createdAt: row.created_at,

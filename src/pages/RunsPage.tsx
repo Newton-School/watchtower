@@ -21,7 +21,7 @@ type RunsPageProps = {
   data: DashboardData | null;
   onReviewChanges?: (runId: string) => void;
   onSelectRun: (runId: string) => void;
-  onRefresh?: () => void;
+  onRefresh?: () => void | Promise<void>;
   selectedRunId: string | null;
   selectedRunLogs: JobLogEntry[];
   selectedRunPipeline?: PipelineRunData | null;
@@ -43,6 +43,10 @@ export function RunsPage({
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
   const [activeStage, setActiveStage] = useState<string | null>(null);
   const [costSummary, setCostSummary] = useState<JobCostSummary | null>(null);
+  // A run opened from its thread before the list has it, and whether a
+  // refresh since has failed to list it.
+  const [openingRunId, setOpeningRunId] = useState<string | null>(null);
+  const [openingMissed, setOpeningMissed] = useState(false);
 
   useEffect(() => {
     if (!detailRunId) {
@@ -115,8 +119,28 @@ export function RunsPage({
 
   const handleSelectRun = (runId: string) => {
     setDetailRunId(runId);
+    setActiveStage(null);
     onSelectRun(runId);
   };
+
+  // A run started from a thread may not be in the list yet: refresh it first.
+  const openRun = async (runId: string) => {
+    setOpeningRunId(runId);
+    setOpeningMissed(false);
+    handleSelectRun(runId);
+    try {
+      await onRefresh?.();
+    } catch {
+      // It opens once the next refresh lists it.
+    }
+    setOpeningMissed(true);
+  };
+
+  // While a run opened from its thread isn't listed, App shows another run's
+  // trace; once it's listed, point the trace back at it.
+  useEffect(() => {
+    if (selectedRun && selectedRunId !== selectedRun.id) onSelectRun(selectedRun.id);
+  }, [selectedRun, selectedRunId, onSelectRun]);
 
   const handleCancelRun = async (runId: string) => {
     try {
@@ -147,6 +171,18 @@ export function RunsPage({
     }
   }, []); // only on mount
 
+  // A run just started from a thread shows up on the next refresh.
+  if (detailRunId && !selectedRun && openingRunId === detailRunId) {
+    return (
+      <div className="page-stack">
+        <button className="ghost-button run-detail-back" type="button" onClick={() => setDetailRunId(null)}>
+          &larr; Back to Runs
+        </button>
+        <p className="muted">{openingMissed ? "That run isn't in the recent runs list yet." : 'Opening the run…'}</p>
+      </div>
+    );
+  }
+
   // Detail View
   if (detailRunId && selectedRun) {
     return (
@@ -155,7 +191,7 @@ export function RunsPage({
           &larr; Back to Runs
         </button>
 
-        <SlackThread jobId={selectedRun.id} />
+        <SlackThread key={selectedRun.id} jobId={selectedRun.id} onOpenRun={runId => void openRun(runId)} />
 
         <GlowCard>
           <article className="surface-card detail-card">

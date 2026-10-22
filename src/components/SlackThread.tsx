@@ -1,16 +1,30 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import type { RemoveReactionsResult, RunThread, SlackFile, SlackMessage, SlackUser } from '../types';
+import type {
+  RemoveReactionsResult,
+  RunControls,
+  RunThread,
+  SlackFile,
+  SlackMessage,
+  SlackUser,
+  StartedRun,
+  StartedRunStatus,
+} from '../types';
 import { emojiChar } from '../lib/emoji';
 import { SlackText, fromSlackText, toSlackText } from '../lib/slackText';
 import { loadSlackImage } from '../lib/slackCache';
+import { useEscapeLayer } from '../lib/escapeLayers';
 import { EmojiPicker } from './EmojiPicker';
 import { SlackComposer } from './SlackComposer';
-import type { ComposedMessage } from './SlackComposer';
+import type { ComposedAsk, ComposedMessage } from './SlackComposer';
+import { RunControlsBar, blockedReason, isWaiting } from './RunControlsBar';
+import type { StartedRunView } from './RunControlsBar';
 import { SectionCard } from './primitives';
 
 const REFRESH_MS = 5000;
+// How often to check on a run started from here until miniOG takes it.
+const STARTED_POLL_MS = 2000;
 // Slack folds a message into the previous one when the same person posts again this soon.
 const GROUP_WINDOW_SECONDS = 5 * 60;
 
@@ -107,17 +121,23 @@ function SlackImage({ file }: { file: SlackFile }) {
 
 type SlackThreadProps = {
   jobId: string;
+  /** Opens another run's page: a run started from here, or one busy in the thread. */
+  onOpenRun?: (jobId: string) => void;
 };
 
 /**
  * The run's Slack thread, read live, where the owner acts as miniOG: reply,
- * react, and edit or delete miniOG's own messages. Everything done here is
- * logged in the run's trace.
+ * react, edit or delete miniOG's own messages, stop the run, re-run it, or ask
+ * miniOG something new here. Everything done here is logged in the run's
+ * trace.
  */
-export function SlackThread({ jobId }: SlackThreadProps) {
+export function SlackThread({ jobId, onOpenRun }: SlackThreadProps) {
   const [thread, setThread] = useState<RunThread | null>(null);
+  const [controls, setControls] = useState<RunControls | null>(null);
+  const [started, setStarted] = useState<StartedRunView | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [controlError, setControlError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState<{ ts: string; text: string } | null>(null);
@@ -130,8 +150,22 @@ export function SlackThread({ jobId }: SlackThreadProps) {
   // A Slack hiccup on a refresh keeps the last good read on screen.
   const hasGoodRead = useRef(false);
 
+  // The run's own state comes from the app's database: quick, and read on
+  // every refresh even while a slow Slack read holds up the thread.
+  const controlsSeq = useRef(0);
+  const loadControls = useCallback(async () => {
+    const seq = ++controlsSeq.current;
+    try {
+      const next = await invoke<RunControls>('get_run_controls', { jobId });
+      if (seq === controlsSeq.current) setControls(next);
+    } catch {
+      // The last read stays; tried again on the next refresh.
+    }
+  }, [jobId]);
+
   const load = useCallback(
     async (fromPoll = false) => {
+      void loadControls();
       if (fromPoll && polling.current) return;
       const seq = ++readSeq.current;
       if (fromPoll) polling.current = true;
@@ -151,14 +185,17 @@ export function SlackThread({ jobId }: SlackThreadProps) {
         if (fromPoll) polling.current = false;
       }
     },
-    [jobId],
+    [jobId, loadControls],
   );
 
   useEffect(() => {
     hasGoodRead.current = false;
     setThread(null);
+    setControls(null);
+    setStarted(null);
     setLoadError(null);
     setActionError(null);
+    setControlError(null);
     setNotice(null);
     setEditing(null);
     setConfirmDelete(null);
@@ -170,15 +207,74 @@ export function SlackThread({ jobId }: SlackThreadProps) {
     return () => window.clearInterval(timer);
   }, [load]);
 
-  const act = async (command: string, args: Record<string, unknown>): Promise<boolean> => {
+  /** Runs an action, then re-reads. Its error shows next to where it was asked for. */
+  const act = async (
+    command: string,
+    args: Record<string, unknown>,
+    setError: (error: string | null) => void = setActionError,
+  ): Promise<boolean> => {
     setBusy(true);
-    setActionError(null);
+    setError(null);
     try {
       await invoke(command, { jobId, ...args });
       await load();
       return true;
     } catch (err) {
-      setActionError(String(err));
+      setError(String(err));
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Follow a run started from here until miniOG takes it or turns it down.
+  const startedId = started?.requestId ?? null;
+  const startedWaiting = started !== null && isWaiting(started.status);
+  useEffect(() => {
+    if (!startedId || !startedWaiting) return;
+    const check = async () => {
+      if (document.visibilityState !== 'visible') return;
+      try {
+        const status = await invoke<StartedRunStatus>('get_started_run', { requestId: startedId });
+        setStarted(current => (current?.requestId === startedId ? { ...current, status } : current));
+        // The thread and the controls catch up at once, not on the next refresh.
+        if (!isWaiting(status)) void load();
+      } catch {
+        // Checked again on the next tick.
+      }
+    };
+    const timer = window.setInterval(() => void check(), STARTED_POLL_MS);
+    return () => window.clearInterval(timer);
+  }, [startedId, startedWaiting, load]);
+
+  // Drops a run miniOG hasn't taken yet; the sidecar never sees it.
+  const cancelStarted = async () => {
+    if (!started) return;
+    const { requestId } = started;
+    if (await act('cancel_started_run', { requestId }, setControlError)) {
+      setStarted(current =>
+        current?.requestId === requestId
+          ? { ...current, cancelled: true, status: { status: 'FAILED', jobId: null, error: null } }
+          : current,
+      );
+    }
+  };
+
+  const startRun = async (
+    kind: StartedRunView['kind'],
+    command: string,
+    args: Record<string, unknown>,
+    setError: (error: string | null) => void,
+  ): Promise<boolean> => {
+    setBusy(true);
+    setError(null);
+    try {
+      const run = await invoke<StartedRun>(command, { jobId, ...args });
+      setStarted({ kind, requestId: run.requestId, startedAt: Date.now(), askTs: run.askTs, status: null });
+      await load();
+      return true;
+    } catch (err) {
+      setError(String(err));
       return false;
     } finally {
       setBusy(false);
@@ -194,21 +290,11 @@ export function SlackThread({ jobId }: SlackThreadProps) {
     if (list && pinnedToBottom.current) list.scrollTop = list.scrollHeight;
   }, [messageCount]);
 
-  // Escape backs out of an edit or a delete prompt without closing the run
-  // page, wherever focus is (WebKit leaves it on the page after a click).
-  const canBackOut = editing !== null || confirmDelete !== null;
-  useEffect(() => {
-    if (!canBackOut) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return;
-      e.preventDefault();
-      e.stopPropagation();
-      setEditing(null);
-      setConfirmDelete(null);
-    };
-    window.addEventListener('keydown', onKeyDown, true);
-    return () => window.removeEventListener('keydown', onKeyDown, true);
-  }, [canBackOut]);
+  // Escape backs out of an edit or a delete prompt without closing the run page.
+  useEscapeLayer(editing !== null || confirmDelete !== null, () => {
+    setEditing(null);
+    setConfirmDelete(null);
+  });
 
   if (thread && !thread.hasThread) return null;
 
@@ -221,6 +307,9 @@ export function SlackThread({ jobId }: SlackThreadProps) {
       return false;
     }
   };
+
+  const askMiniog = ({ text, postAsk }: ComposedAsk) =>
+    startRun('ask', 'ask_miniog_in_thread', { text, postAsk }, setActionError);
 
   const saveEdit = async () => {
     if (!editing || busy) return;
@@ -263,6 +352,22 @@ export function SlackThread({ jobId }: SlackThreadProps) {
       }
       actions={actions}
     >
+      {controls ? (
+        <RunControlsBar
+          jobId={jobId}
+          controls={controls}
+          users={thread?.users ?? {}}
+          threadClosed={!thread || Boolean(thread.readError)}
+          busy={busy}
+          started={started}
+          error={controlError}
+          onStop={() => act('stop_run', {}, setControlError)}
+          onRerun={postAsk => startRun('rerun', 'rerun_in_thread', { postAsk }, setControlError)}
+          onDismissStarted={() => setStarted(null)}
+          onCancelStarted={() => void cancelStarted()}
+          onOpenRun={onOpenRun}
+        />
+      ) : null}
       {loadError && !thread ? (
         <div className="slack-thread-state">
           <span className="slack-thread-error">{loadError}</span>
@@ -316,6 +421,7 @@ export function SlackThread({ jobId }: SlackThreadProps) {
                   busy={busy}
                   editing={editing?.ts === message.ts ? editing.text : null}
                   confirmingDelete={confirmDelete === message.ts}
+                  stopsRun={message.ts === thread.triggerTs && Boolean(controls?.canStop)}
                   picker={pickerFor?.ts === message.ts ? pickerFor.anchor : null}
                   onReact={name => toggleReaction(message, name)}
                   onTogglePicker={anchor => togglePicker(message.ts, anchor)}
@@ -344,6 +450,8 @@ export function SlackThread({ jobId }: SlackThreadProps) {
             busy={busy}
             participants={[...new Set(thread.messages.map(message => message.user ?? ''))].filter(Boolean)}
             onSend={sendMessage}
+            onAsk={controls ? askMiniog : undefined}
+            askBlocked={blockedReason(controls)}
           />
         </div>
       )}
@@ -358,6 +466,8 @@ type MessageRowProps = {
   busy: boolean;
   editing: string | null;
   confirmingDelete: boolean;
+  /** Deleting this message stops the run going in the thread. */
+  stopsRun: boolean;
   /** The button the picker is open from, when it's open on this message. */
   picker: HTMLElement | null;
   onReact: (name: string) => void;
@@ -379,6 +489,7 @@ function MessageRow({
   busy,
   editing,
   confirmingDelete,
+  stopsRun,
   picker,
   onReact,
   onTogglePicker,
@@ -509,7 +620,11 @@ function MessageRow({
 
         {confirmingDelete ? (
           <div className="slack-confirm">
-            <span>Delete this message for everyone?</span>
+            <span>
+              {stopsRun
+                ? 'Delete this message for everyone? It started this run, so the run stops too.'
+                : 'Delete this message for everyone?'}
+            </span>
             <button className="ghost-button" type="button" onClick={onCancelDelete}>
               Cancel
             </button>

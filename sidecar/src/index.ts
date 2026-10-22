@@ -17,7 +17,7 @@ import {
   finalizeLaunchpadWorkflowResult,
   markLaunchpadJobCreated,
 } from './launchpad/launchpadLifecycle.js';
-import { startLaunchpadRequestPoller } from './launchpad/launchpadIntake.js';
+import { startLaunchpadRequestPoller, takeBackPostedAsk } from './launchpad/launchpadIntake.js';
 import { logger } from './logging/logger.js';
 import { configureButtons } from './slack/buttonReplies.js';
 import { runPrFollowUp } from './workflows/prFollowUp.js';
@@ -893,7 +893,10 @@ async function processEvent(event: SlackEventEnvelope, client: WebClient): Promi
   // (channelId, eventTs), and the durable dedup gates below all run after
   // async work, so without an in-process claim both copies can race past
   // them and create two jobs for one user action.
-  const claimKey = `${event.channelId}:${event.eventTs}`;
+  // A launchpad run is its request: two requests may start from one message.
+  const claimKey = event.launchpadRequestId
+    ? `launchpad:${event.launchpadRequestId}`
+    : `${event.channelId}:${event.eventTs}`;
   if (inFlightProcessClaims.has(claimKey)) {
     logger.info(
       { eventId: event.eventId, channelId: event.channelId, eventTs: event.eventTs },
@@ -909,8 +912,37 @@ async function processEvent(event: SlackEventEnvelope, client: WebClient): Promi
   }
 }
 
+/** How long a launchpad run waits for its thread to free up before it is dropped. */
+const LAUNCHPAD_BUSY_WAIT_MS = 2 * 60 * 1000;
+
+/** A run asked for in a Slack thread that hasn't started in this long is dropped at startup. */
+const ORIGIN_REQUEST_MAX_AGE_MIN = 30;
+
+/**
+ * Closes the launchpad request behind an event that will not start a run.
+ * Left QUEUED, it would never finish, and the next sidecar start would run it.
+ */
+async function closeLaunchpadRequest(
+  event: SlackEventEnvelope,
+  client: WebClient,
+  status: 'SKIPPED' | 'FAILED',
+  reason: string,
+): Promise<void> {
+  if (!event.launchpadRequestId) return;
+  const request = store.getLaunchpadRequest(event.launchpadRequestId);
+  const takenBack = request ? await takeBackPostedAsk(client, request) : false;
+  store.markLaunchpadRequestFinished({
+    id: event.launchpadRequestId,
+    status,
+    errorMessage: takenBack ? `${reason} The posted ask was taken back.` : reason,
+  });
+}
+
 async function processEventClaimed(event: SlackEventEnvelope, client: WebClient): Promise<void> {
-  if (store.hasJobForEventTs(event.channelId, event.eventTs)) {
+  // A launchpad run may start from a message an earlier run started from: a
+  // re-run from the app does exactly that. Its request id already makes it
+  // unique.
+  if (event.ingestSource !== 'launchpad' && store.hasJobForEventTs(event.channelId, event.eventTs)) {
     store.recordEvent(event.eventId, event.channelId, event.threadTs);
     logger.info(
       { eventId: event.eventId, channelId: event.channelId, eventTs: event.eventTs },
@@ -924,6 +956,18 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
   // lock lapse under a long job (issue #261).
   const activeThreadJobId = activeJobIdForThread(event.channelId, event.threadTs);
   if (activeThreadJobId) {
+    // A run started from the app just after a stop, or as a run finishes,
+    // finds the thread still held while that run cleans up: it waits its
+    // turn for a little while before giving up.
+    const request = event.launchpadRequestId ? store.getLaunchpadRequest(event.launchpadRequestId) : undefined;
+    if (request && Date.now() - Date.parse(request.createdAt) < LAUNCHPAD_BUSY_WAIT_MS) {
+      store.requeueLaunchpadRequest(request.id);
+      logger.info(
+        { eventId: event.eventId, requestId: request.id, activeJobId: activeThreadJobId },
+        'launchpad request waits for its thread',
+      );
+      return;
+    }
     store.recordEvent(event.eventId, event.channelId, event.threadTs);
     logger.info(
       {
@@ -934,6 +978,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
       },
       'skipped: thread already has an active job',
     );
+    await closeLaunchpadRequest(event, client, 'SKIPPED', 'miniOG is already working in this thread.');
     return;
   }
 
@@ -947,6 +992,17 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
   // that column as OWNER_AUTOPILOT even when the classifier later routed
   // them to PR_REVIEW. Read the actual pause cause from job_logs instead.
   const pausedJob = store.pausedJobForThread(event.channelId, event.threadTs);
+  // A run started from the app is never the answer to a question miniOG
+  // asked: answering is for a reply in the thread.
+  if (pausedJob && event.launchpadRequestId) {
+    store.recordEvent(event.eventId, event.channelId, event.threadTs);
+    logger.info(
+      { eventId: event.eventId, pausedJobId: pausedJob.id },
+      'launchpad request skipped: thread awaits an answer',
+    );
+    await closeLaunchpadRequest(event, client, 'SKIPPED', 'miniOG is waiting for an answer in this thread.');
+    return;
+  }
   const routeQuestion = pausedJob ? store.pausedRouteQuestion(pausedJob.id) : undefined;
   const pauseSignal = pausedJob
     ? store.isPausedAwaitingPrUrl(pausedJob.id)
@@ -1053,6 +1109,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
   if (!task.mentionDetected) {
     logger.info({ eventId: event.eventId }, 'skip non-mention message');
     await removeReaction(client, event.channelId, event.eventTs, 'eyes');
+    await closeLaunchpadRequest(event, client, 'SKIPPED', 'miniOG did not see a request in it.');
     return;
   }
 
@@ -1094,6 +1151,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
       .catch(() => {});
     await removeReaction(client, event.channelId, event.eventTs, 'eyes');
     await addReaction(client, event.channelId, event.eventTs, 'no_entry_sign');
+    await closeLaunchpadRequest(event, client, 'FAILED', policyDecision.reason);
     return;
   }
 
@@ -1829,6 +1887,11 @@ async function main(): Promise<void> {
   // the intake poller picks them up again. Without this, a sidecar crash
   // between claim and job-link leaves the desktop-originated request
   // silently never executing and never recovering.
+  // Their posted asks are taken back once the Slack client is up.
+  const expiredLaunchpad = store.expireStaleOriginLaunchpadRequests(ORIGIN_REQUEST_MAX_AGE_MIN);
+  if (expiredLaunchpad.length > 0) {
+    logger.warn({ expiredLaunchpad: expiredLaunchpad.length }, 'dropped thread launchpad requests that never started');
+  }
   const strandedLaunchpad = store.recoverStrandedLaunchpadRequests();
   if (strandedLaunchpad > 0) {
     logger.warn(
@@ -1860,6 +1923,7 @@ async function main(): Promise<void> {
       await processReactionFeedback(event, webClient as WebClient);
     },
   );
+  for (const request of expiredLaunchpad) void takeBackPostedAsk(client.webClient, request);
 
   process.on('SIGINT', () => {
     logger.info('received SIGINT');
@@ -2073,6 +2137,31 @@ async function main(): Promise<void> {
       if (cancelled) {
         store.markJob(jobId, 'CANCELLED', { errorMessage: 'Cancelled from Watchtower UI.' });
         logger.info({ jobId }, 'job cancelled from UI');
+      } else if (store.getJobSummary(jobId)?.status === 'PAUSED') {
+        // A run waiting on a person has no process to abort: closing it is
+        // the stop. Its :zzz: goes, and the thread is told, so nobody answers
+        // a question that no longer resumes anything.
+        store.markJob(jobId, 'CANCELLED', { errorMessage: 'Cancelled from Watchtower UI.' });
+        const anchor = store.eventAnchorFor(jobId);
+        if (anchor) void removeReaction(client.webClient, anchor.channelId, anchor.eventTs, 'zzz');
+        const origin = store.jobOrigin(jobId);
+        if (origin?.launchpadRequestId) {
+          store.markLaunchpadRequestFinished({
+            id: origin.launchpadRequestId,
+            status: 'FAILED',
+            errorMessage: 'Cancelled.',
+          });
+        }
+        if (origin) {
+          void client.webClient.chat
+            .postMessage({
+              channel: origin.channelId,
+              thread_ts: origin.threadTs,
+              text: 'Stopped — this run was cancelled from the Watchtower app.',
+            })
+            .catch(() => {});
+        }
+        logger.info({ jobId }, 'paused job cancelled from UI');
       }
     }
   }, 2000);

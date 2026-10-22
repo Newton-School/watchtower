@@ -28,6 +28,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
+mod run_controls;
 mod slack;
 
 const TRAY_ID: &str = "watchtower-tray";
@@ -585,6 +586,12 @@ pub fn run() {
             slack::get_slack_image,
             slack::get_slack_directory,
             slack::upload_as_miniog,
+            run_controls::get_run_controls,
+            run_controls::stop_run,
+            run_controls::rerun_in_thread,
+            run_controls::ask_miniog_in_thread,
+            run_controls::get_started_run,
+            run_controls::cancel_started_run,
             get_job_cost_summary,
             get_performance_overview,
             list_dossiers,
@@ -3203,6 +3210,16 @@ fn initialize_db(path: &PathBuf) -> Result<(), String> {
     // dashboard surfaces show the right label without disturbing jobs.workflow
     // (which pauseResume uses for resume detection).
     let _ = connection.execute("ALTER TABLE jobs ADD COLUMN executed_workflow TEXT", []);
+    // Launchpad on-behalf-of and origin-thread columns, which the sidecar also
+    // adds: the run page writes them before the sidecar may have started.
+    for column in [
+        "requested_for_user_id",
+        "origin_channel_id",
+        "origin_thread_ts",
+        "origin_event_ts",
+    ] {
+        let _ = connection.execute(&format!("ALTER TABLE launchpad_requests ADD COLUMN {column} TEXT"), []);
+    }
     // dossier_cache_signals is a SQLite-only bridge from desktop Tauri commands
     // to the sidecar's in-memory dossier cache. Whenever the desktop mutates a
     // user's dossier or pinned facts, it INSERT OR REPLACEs the user_id with

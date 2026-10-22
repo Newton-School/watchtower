@@ -1892,6 +1892,133 @@ h3 {
   font-size: 0.8125rem;
 }
 
+.run-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.run-controls-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.run-controls-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.8125rem;
+  color: var(--text-soft);
+}
+
+.run-controls-buttons {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.run-controls-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(var(--accent-rgb), 0.04);
+  font-size: 0.875rem;
+}
+
+.run-controls-ask blockquote {
+  max-height: 160px;
+  overflow-y: auto;
+  margin: 6px 0 0;
+  padding-left: 10px;
+  border-left: 3px solid var(--line);
+  color: var(--text-strong);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.run-controls-hint {
+  font-size: 0.8125rem;
+}
+
+.run-controls-panel .slack-broadcast {
+  margin-left: 0;
+}
+
+.run-controls-panel .slack-thread-warning {
+  margin-bottom: 0;
+}
+
+.run-controls-panel-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.run-controls-error {
+  margin: 0;
+  font-size: 0.8125rem;
+}
+
+.run-controls-started {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.8125rem;
+  color: var(--text-soft);
+}
+
+.run-controls-link {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--accent);
+  font-size: 0.8125rem;
+  cursor: pointer;
+}
+
+.run-controls-link:hover {
+  text-decoration: underline;
+}
+
+.slack-composer-modes {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.slack-composer-mode {
+  padding: 4px 12px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-soft);
+  font-size: 0.8125rem;
+  cursor: pointer;
+}
+
+.slack-composer-mode:hover {
+  color: var(--text-strong);
+}
+
+.slack-composer-mode-active {
+  border-color: var(--line);
+  background: rgba(var(--accent-rgb), 0.08);
+  color: var(--text-strong);
+}
+
+.slack-composer-note {
+  margin: 8px 0 0;
+}
+
 .detail-error {
   margin: 0;
   line-height: 1.7;

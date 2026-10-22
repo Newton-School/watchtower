@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { v4 as uuidv4 } from 'uuid';
-import { runLaunchpadRequestPoller } from '../src/launchpad/launchpadIntake.js';
+import { runLaunchpadRequestPoller, takeBackPostedAsk } from '../src/launchpad/launchpadIntake.js';
 import { JobStore } from '../src/state/jobStore.js';
 import type { AppConfig, SlackEventEnvelope } from '../src/types/contracts.js';
 
@@ -250,6 +250,7 @@ describe('launchpadIntake', () => {
       requestedForUserId: 'U_REQ',
       originChannelId: 'C_ORIG',
       originThreadTs: '1.2',
+      originEventTs: '1.5',
     });
 
     const claimed = store.claimPendingLaunchpadRequests();
@@ -259,9 +260,88 @@ describe('launchpadIntake', () => {
       requestedForUserId: 'U_REQ',
       originChannelId: 'C_ORIG',
       originThreadTs: '1.2',
+      originEventTs: '1.5',
     });
 
     store.close();
     fs.rmSync(dbPath, { force: true });
+  });
+
+  it('starts a run from the thread view at its posted ask, inside the origin thread', async () => {
+    const { dbPath, store } = createStore();
+    store.createLaunchpadRequest({
+      id: 'req-ask',
+      target: 'miniog',
+      prompt: 'check the deploy logs',
+      ownerUserId: 'UOWNER1',
+      originChannelId: 'C0B5ZVDM7GU',
+      originThreadTs: '1792655209.535679',
+      originEventTs: '1792659999.000100',
+    });
+    const webClient = {
+      conversations: { open: vi.fn() },
+      chat: { postMessage: vi.fn() },
+    };
+    const enqueue = vi
+      .fn<(event: SlackEventEnvelope, client: typeof webClient, source: 'launchpad') => Promise<void>>()
+      .mockResolvedValue(undefined);
+
+    await runLaunchpadRequestPoller({ webClient: webClient as any, config, store, enqueue });
+
+    expect(webClient.chat.postMessage).not.toHaveBeenCalled();
+    expect(enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventId: 'launchpad:req-ask:1792659999.000100',
+        threadTs: '1792655209.535679',
+        eventTs: '1792659999.000100',
+        userId: 'UOWNER1',
+      }),
+      webClient,
+      'launchpad',
+    );
+    expect(store.getLaunchpadRequest('req-ask')?.anchorTs).toBe('1792655209.535679');
+
+    store.close();
+    fs.rmSync(dbPath, { force: true });
+  });
+  it('puts a request back in line, and drops thread requests that never started', () => {
+    const { dbPath, store } = createStore();
+    const thread = { originChannelId: 'C0B5ZVDM7GU', originThreadTs: '1.0' };
+    store.createLaunchpadRequest({ id: 'req-wait', target: 'miniog', prompt: 'p', ownerUserId: 'UOWNER1', ...thread });
+    store.createLaunchpadRequest({ id: 'req-old', target: 'miniog', prompt: 'p', ownerUserId: 'UOWNER1', ...thread });
+    store.createLaunchpadRequest({ id: 'req-desk', target: 'miniog', prompt: 'p', ownerUserId: 'UOWNER1' });
+    const claimed = store.claimPendingLaunchpadRequests();
+    expect(claimed.map(request => request.id).sort()).toEqual(['req-desk', 'req-old', 'req-wait']);
+    store.markLaunchpadRequestQueued({ id: 'req-wait', slackChannelId: 'C0B5ZVDM7GU', anchorTs: '1.0' });
+
+    store.requeueLaunchpadRequest('req-wait');
+    expect(store.getLaunchpadRequest('req-wait')?.status).toBe('PENDING');
+
+    const db = (store as any).db;
+    db.prepare(`UPDATE launchpad_requests SET created_at = '2026-01-01T00:00:00.000Z'`).run();
+    expect(
+      store
+        .expireStaleOriginLaunchpadRequests(30)
+        .map(request => request.id)
+        .sort(),
+    ).toEqual(['req-old', 'req-wait']);
+    expect(store.getLaunchpadRequest('req-old')).toMatchObject({
+      status: 'FAILED',
+      errorMessage: 'Not started within 30 minutes, so it was dropped.',
+    });
+    // The Launchpad page's own request still retries.
+    expect(store.getLaunchpadRequest('req-desk')?.status).toBe('CLAIMED');
+
+    store.close();
+    fs.rmSync(dbPath, { force: true });
+  });
+  it('takes back only a posted ask, and never throws', async () => {
+    const remove = vi.fn().mockResolvedValue({ ok: true });
+    const webClient = { chat: { delete: remove } } as any;
+    expect(await takeBackPostedAsk(webClient, { originChannelId: 'C1' })).toBe(false);
+    expect(await takeBackPostedAsk(webClient, { originChannelId: 'C1', originEventTs: '1.5' })).toBe(true);
+    expect(remove).toHaveBeenCalledWith({ channel: 'C1', ts: '1.5' });
+    remove.mockRejectedValueOnce(new Error('message_not_found'));
+    expect(await takeBackPostedAsk(webClient, { originChannelId: 'C1', originEventTs: '1.6' })).toBe(false);
   });
 });

@@ -286,6 +286,12 @@ export interface LaunchpadRequestRecord {
    */
   originChannelId?: string;
   originThreadTs?: string;
+  /**
+   * The message in the origin thread the run starts from, which gets its
+   * emojis: a posted ask, or the message a re-run repeats. The thread's first
+   * message when unset.
+   */
+  originEventTs?: string;
   resultJson?: string;
   errorMessage?: string;
   createdAt: string;

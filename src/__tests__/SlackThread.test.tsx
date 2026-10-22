@@ -209,8 +209,10 @@ describe('SlackThread', () => {
 
   it('keeps the last read on screen when a refresh hits a Slack hiccup', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
-    invoke.mockResolvedValueOnce(makeThread());
-    invoke.mockResolvedValueOnce(makeThread({ messages: [], readError: { kind: 'other', code: 'ratelimited' } }));
+    const reads = [makeThread(), makeThread({ messages: [], readError: { kind: 'other', code: 'ratelimited' } })];
+    invoke.mockImplementation((command: string) =>
+      Promise.resolve(command === 'get_run_thread' ? (reads.length > 1 ? reads.shift() : reads[0]) : undefined),
+    );
     render(<SlackThread jobId="job-1" />);
     await screen.findByText('#miniog-testing');
 

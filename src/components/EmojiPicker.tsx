@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { EMOJI, EMOJI_CATEGORIES, emojiChar, searchEmoji } from '../lib/emoji';
+import { useEscapeLayer } from '../lib/escapeLayers';
 import type { Emoji } from '../lib/emoji';
 
 const WIDTH = 340;
@@ -73,15 +74,11 @@ export function EmojiPicker({ anchor, onPick, onClose }: EmojiPickerProps) {
     if (position) searchRef.current?.focus();
   }, [position]);
 
+  useEscapeLayer(true, onClose);
+
   useEffect(() => {
     const inside = (target: EventTarget | null) =>
       target instanceof Node && (ref.current?.contains(target) || anchor.contains(target));
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.stopPropagation();
-        onClose();
-      }
-    };
     const onPointerDown = (e: PointerEvent) => {
       if (!inside(e.target)) onClose();
     };
@@ -91,12 +88,10 @@ export function EmojiPicker({ anchor, onPick, onClose }: EmojiPickerProps) {
     const onWheel = (e: WheelEvent) => {
       if (!inside(e.target)) onClose();
     };
-    window.addEventListener('keydown', onKeyDown, true);
     window.addEventListener('pointerdown', onPointerDown);
     window.addEventListener('wheel', onWheel, true);
     window.addEventListener('resize', onClose);
     return () => {
-      window.removeEventListener('keydown', onKeyDown, true);
       window.removeEventListener('pointerdown', onPointerDown);
       window.removeEventListener('wheel', onWheel, true);
       window.removeEventListener('resize', onClose);
