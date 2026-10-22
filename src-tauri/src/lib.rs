@@ -3234,6 +3234,7 @@ fn initialize_db(path: &PathBuf) -> Result<(), String> {
                 thread_ts TEXT NOT NULL,
                 prompt_ts TEXT NOT NULL,
                 allowed_user_ids TEXT NOT NULL DEFAULT '[]',
+                expects TEXT,
                 started_at TEXT NOT NULL
             )",
         )

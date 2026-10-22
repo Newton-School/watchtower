@@ -17,8 +17,11 @@ export type StartedRunView = {
   startedAt: number;
   /** The posted ask or answer, when it was posted. */
   askTs: string | null;
-  /** For an answer: the run it answers. */
+  /** For an answer: the run it answers and the question it was written for. */
   answersJobId?: string | null;
+  answersPromptTs?: string | null;
+  /** When miniOG took it. */
+  tookAt?: number;
   status: StartedRunStatus | null;
   /** Cancelled from here before miniOG took it. */
   cancelled?: boolean;
@@ -35,7 +38,9 @@ export const STARTING_NOTE = "miniOG hasn't picked up the last thing sent from h
 /** Why a new run can't start in this thread right now. */
 export function blockedReason(controls: RunControls | null): string | null {
   if (controls?.busyJobId && controls.busyWaiting) {
-    return 'miniOG is waiting for an answer in this thread. Answer it below, or stop that run to start another.';
+    return controls.answer && controls.answer.answerBy.length === 0
+      ? 'miniOG is waiting for an answer in this thread. Answer it below, or stop that run to start another.'
+      : 'miniOG is waiting for an answer in this thread. Stop that run to start another.';
   }
   if (controls?.busyJobId) return 'miniOG is already working in this thread.';
   if (controls?.starting) return STARTING_NOTE;
@@ -50,6 +55,8 @@ type RunControlsBarProps = {
   threadClosed: boolean;
   busy: boolean;
   started: StartedRunView | null;
+  /** miniOG took the answer sent from here a while ago and still waits on the same question. */
+  answerUnread?: boolean;
   /** What went wrong with the last Stop or Re-run. */
   error: string | null;
   onStop: () => Promise<boolean>;
@@ -67,6 +74,7 @@ export function RunControlsBar({
   threadClosed,
   busy,
   started,
+  answerUnread = false,
   error,
   onStop,
   onRerun,
@@ -240,6 +248,7 @@ export function RunControlsBar({
         <StartedRunLine
           started={started}
           jobId={jobId}
+          answerUnread={answerUnread}
           busy={busy}
           onDismiss={onDismissStarted}
           onCancel={onCancelStarted}
@@ -253,6 +262,7 @@ export function RunControlsBar({
 function StartedRunLine({
   started,
   jobId,
+  answerUnread,
   busy,
   onDismiss,
   onCancel,
@@ -260,6 +270,7 @@ function StartedRunLine({
 }: {
   started: StartedRunView;
   jobId: string;
+  answerUnread: boolean;
   busy: boolean;
   onDismiss: () => void;
   onCancel: () => void;
@@ -286,6 +297,11 @@ function StartedRunLine({
       now - started.startedAt < SLOW_PICKUP_MS
         ? `Waiting for miniOG to pick up your ${what}…`
         : `miniOG hasn't picked up your ${what} yet. Check that it's running.`;
+  } else if (tookIt && started.kind === 'answer') {
+    // Handed to the run that waited, or a paused run picked up again in a new one.
+    if (status?.jobId !== started.answersJobId) text = 'miniOG picked the run up again with your answer.';
+    else if (answerUnread) text = 'miniOG is still waiting on this question. See the thread for what it needs.';
+    else text = otherRun ? 'miniOG has your answer, in the other run.' : 'miniOG has your answer.';
   } else if (tookIt) {
     text = `miniOG took your ${what}.`;
   } else if (started.cancelled) {
@@ -301,7 +317,7 @@ function StartedRunLine({
       <span role="status">{text}</span>
       {otherRun && onOpenRun ? (
         <button className="run-controls-link" type="button" onClick={() => onOpenRun(otherRun)}>
-          {otherRun === started.answersJobId ? 'Open that run →' : 'Open the new run →'}
+          {otherRun === started.answersJobId ? 'Open it →' : 'Open the new run →'}
         </button>
       ) : null}
       {waiting ? (

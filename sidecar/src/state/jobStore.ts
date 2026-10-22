@@ -481,6 +481,7 @@ export class JobStore {
         thread_ts TEXT NOT NULL,
         prompt_ts TEXT NOT NULL,
         allowed_user_ids TEXT NOT NULL DEFAULT '[]',
+        expects TEXT,
         started_at TEXT NOT NULL
       );
 
@@ -1375,8 +1376,9 @@ export class JobStore {
   beginHumanWait(wait: Omit<HumanWait, 'startedAt'>): void {
     this.db
       .prepare(
-        `INSERT OR REPLACE INTO human_waits (job_id, kind, channel_id, thread_ts, prompt_ts, allowed_user_ids, started_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT OR REPLACE INTO human_waits
+           (job_id, kind, channel_id, thread_ts, prompt_ts, allowed_user_ids, expects, started_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         wait.jobId,
@@ -1385,6 +1387,7 @@ export class JobStore {
         wait.threadTs,
         wait.promptTs,
         JSON.stringify(wait.allowedUserIds),
+        wait.expects ?? null,
         new Date().toISOString(),
       );
   }
@@ -1403,6 +1406,7 @@ export class JobStore {
           thread_ts: string;
           prompt_ts: string;
           allowed_user_ids: string;
+          expects: string | null;
           started_at: string;
         }
       | undefined;
@@ -1421,6 +1425,7 @@ export class JobStore {
       threadTs: row.thread_ts,
       promptTs: row.prompt_ts,
       allowedUserIds,
+      ...(row.expects ? { expects: row.expects } : {}),
       startedAt: row.started_at,
     };
   }
@@ -3620,16 +3625,18 @@ export class JobStore {
         workflow: WorkflowIntent;
         status: JobRecord['status'];
         errorMessage?: string;
+        updatedAt?: string;
       }
     | undefined {
     const row = this.db
-      .prepare(`SELECT id, workflow, status, error_message FROM jobs WHERE id = ? LIMIT 1`)
+      .prepare(`SELECT id, workflow, status, error_message, updated_at FROM jobs WHERE id = ? LIMIT 1`)
       .get(jobId) as
       | {
           id?: string;
           workflow?: WorkflowIntent;
           status?: JobRecord['status'];
           error_message?: string | null;
+          updated_at?: string | null;
         }
       | undefined;
 
@@ -3642,6 +3649,7 @@ export class JobStore {
       workflow: row.workflow,
       status: row.status,
       errorMessage: row.error_message ?? undefined,
+      updatedAt: row.updated_at ?? undefined,
     };
   }
 

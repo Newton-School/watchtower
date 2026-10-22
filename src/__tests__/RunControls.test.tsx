@@ -45,7 +45,7 @@ const waitingOnPlan: RunControls = {
   canStop: true,
   busyJobId: 'job-1',
   busyWaiting: true,
-  answer: { jobId: 'job-1', kind: 'approval', promptTs: '100.000002', answerBy: [] },
+  answer: { jobId: 'job-1', kind: 'approval', promptTs: '100.000002', answerBy: [], expects: null },
 };
 
 // One directory for the whole file: the app shares its first read.
@@ -200,7 +200,7 @@ describe('run controls in the thread view', () => {
   });
 
   it('treats a run waiting for an answer as holding the thread', async () => {
-    respondWith({ ...idle, canStop: true, busyJobId: 'job-1', busyWaiting: true });
+    respondWith(waitingOnPlan);
     render(<SlackThread jobId="job-1" />);
 
     expect(await screen.findByText('miniOG is waiting for an answer on this run.')).toBeTruthy();
@@ -230,14 +230,85 @@ describe('run controls in the thread view', () => {
     fireEvent.keyDown(box, { key: 'Enter' });
 
     await waitFor(() =>
-      expect(invoke).toHaveBeenCalledWith('answer_miniog', { jobId: 'job-1', text: 'yes', postAnswer: true }),
+      expect(invoke).toHaveBeenCalledWith('answer_miniog', {
+        jobId: 'job-1',
+        text: 'yes',
+        postAnswer: true,
+        answersJobId: 'job-1',
+        promptTs: '100.000002',
+      }),
     );
     expect(await screen.findByRole('textbox', { name: 'Reply as miniOG' })).toBeTruthy();
     expect(await screen.findByText('Waiting for miniOG to pick up your answer…')).toBeTruthy();
     vi.advanceTimersByTime(2000);
-    expect(await screen.findByText('miniOG took your answer.')).toBeTruthy();
+    expect(await screen.findByText('miniOG has your answer.')).toBeTruthy();
     // The answer went into this run: nothing new to open.
     expect(screen.queryByRole('button', { name: /^Open/ })).toBeNull();
+
+    // A second answer waits while the gate reads the first.
+    fireEvent.click(screen.getByRole('button', { name: 'Answer miniOG' }));
+    expect(await screen.findByText('miniOG is reading your answer…')).toBeTruthy();
+    // Still the same question a while later: it didn't take that as the answer.
+    vi.advanceTimersByTime(20_000);
+    expect(
+      await screen.findByText('miniOG is still waiting on this question. See the thread for what it needs.'),
+    ).toBeTruthy();
+    expect(screen.queryByText('miniOG is reading your answer…')).toBeNull();
+  });
+
+  it('holds an answer draft when miniOG asks something new under it', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let controls: RunControls = waitingOnPlan;
+    respondWith(() => controls);
+    render(<SlackThread jobId="job-1" />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Answer miniOG' }));
+    const box = screen.getByRole('textbox', { name: 'Answer miniOG' });
+    fireEvent.change(box, { target: { value: 'yes' } });
+
+    controls = {
+      ...waitingOnPlan,
+      answer: { jobId: 'job-1', kind: 'confirm', promptTs: '100.000005', answerBy: [], expects: 'confirm merge' },
+    };
+    vi.advanceTimersByTime(5000);
+    const note = await screen.findByText('miniOG asked something new. Read it, then pick Answer miniOG again.');
+    expect(note.getAttribute('role')).toBe('status');
+    expect(box.getAttribute('aria-describedby')).toBe(note.id);
+    fireEvent.keyDown(box, { key: 'Enter' });
+    expect(invoke).not.toHaveBeenCalledWith('answer_miniog', expect.anything());
+
+    // Picked again, it answers the new question, whose phrase it shows.
+    fireEvent.click(screen.getByRole('button', { name: 'Answer miniOG' }));
+    expect((box as HTMLTextAreaElement).placeholder).toBe('Type "confirm merge" to confirm…');
+    fireEvent.keyDown(box, { key: 'Enter' });
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith('answer_miniog', expect.objectContaining({ promptTs: '100.000005' })),
+    );
+  });
+
+  it('keeps words typed while an answer goes out, in Answer mode', async () => {
+    let finish: (value: unknown) => void = () => {};
+    respondWith(waitingOnPlan);
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) =>
+      command === 'answer_miniog' ? new Promise(resolve => (finish = resolve)) : base(command, args),
+    );
+    render(<SlackThread jobId="job-1" />);
+
+    expect(
+      await screen.findByText("Posts as miniOG, which miniOG won't read as the answer: use Answer miniOG for that."),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Answer miniOG' }));
+    const box = screen.getByRole('textbox', { name: 'Answer miniOG' });
+    fireEvent.change(box, { target: { value: 'yes' } });
+    fireEvent.keyDown(box, { key: 'Enter' });
+    fireEvent.change(box, { target: { value: 'yes, and use staging' } });
+    finish({ requestId: 'req-1', askTs: null, answersJobId: 'job-1' });
+
+    await waitFor(() => expect(screen.getByText('Waiting for miniOG to pick up your answer…')).toBeTruthy());
+    expect((screen.getByRole('textbox', { name: 'Answer miniOG' }) as HTMLTextAreaElement).value).toBe(
+      'yes, and use staging',
+    );
   });
 
   it('picks a paused run up again silently, remembers that, and follows the new run', async () => {
@@ -247,7 +318,7 @@ describe('run controls in the thread view', () => {
         ...idle,
         busyJobId: 'job-7',
         busyWaiting: true,
-        answer: { jobId: 'job-7', kind: 'paused', promptTs: null, answerBy: [] },
+        answer: { jobId: 'job-7', kind: 'paused', promptTs: null, answerBy: [], expects: null },
       },
       { started: [{ status: 'RUNNING', jobId: 'job-8', error: null }] },
     );
@@ -268,9 +339,12 @@ describe('run controls in the thread view', () => {
         jobId: 'job-1',
         text: 'use the staging data',
         postAnswer: false,
+        answersJobId: 'job-7',
+        promptTs: null,
       }),
     );
     vi.advanceTimersByTime(2000);
+    expect(await screen.findByText('miniOG picked the run up again with your answer.')).toBeTruthy();
     fireEvent.click(await screen.findByRole('button', { name: 'Open the new run →' }));
     expect(onOpenRun).toHaveBeenCalledWith('job-8');
   });
@@ -278,7 +352,13 @@ describe('run controls in the thread view', () => {
   it("can't answer a question meant for someone else", async () => {
     respondWith({
       ...waitingOnPlan,
-      answer: { jobId: 'job-1', kind: 'confirm', promptTs: '100.000002', answerBy: ['UASKER'] },
+      answer: {
+        jobId: 'job-1',
+        kind: 'confirm',
+        promptTs: '100.000002',
+        answerBy: ['UASKER'],
+        expects: 'confirm deploy',
+      },
     });
     render(<SlackThread jobId="job-1" />);
 
@@ -286,6 +366,10 @@ describe('run controls in the thread view', () => {
     fireEvent.change(screen.getByRole('textbox', { name: 'Answer miniOG' }), { target: { value: 'confirm deploy' } });
     expect((screen.getByRole('button', { name: 'Answer' }) as HTMLButtonElement).disabled).toBe(true);
     expect(screen.getByText('Only @rahul can answer this, in Slack.')).toBeTruthy();
+    // Nor is the Re-run hint to answer it below.
+    expect((screen.getByRole('button', { name: 'Re-run' }) as HTMLButtonElement).title).toBe(
+      'miniOG is waiting for an answer in this thread. Stop that run to start another.',
+    );
   });
 
   it('never sends an ask as an answer when miniOG starts waiting under it', async () => {

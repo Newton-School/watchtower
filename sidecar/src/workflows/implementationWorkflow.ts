@@ -39,6 +39,7 @@ import { inferRepoFromAffectedFiles, readRepoAffinity, repoPathFor, resolveRepoO
 import { enabledRepoKeys, getRepo, repoKeyForWorkspacePath } from '../repos/registry.js';
 import type { RepoAffinity } from '../router/repoClassifier.js';
 import { waitForClarificationWithIdle, detectClarificationLoop } from './shared/clarificationGuards.js';
+import { requesterOf } from './shared/requester.js';
 import type { ClarificationRound } from './shared/clarificationGuards.js';
 import { profileForAgentRole } from '../codex/modelProfiles.js';
 import { buildPlannerPrompt, buildPlannerPlanModePrompt } from '../agents/prompts.js';
@@ -446,7 +447,7 @@ export async function runApprovalLoop(input: {
 
   for (let iteration = iterationStart; iteration < MAX_FEEDBACK_ITERATIONS; iteration++) {
     // Worked out for each version of the plan: a revision can add or remove a behaviour change.
-    const requesterToConfirm = requesterToConfirmFor(planMarkdown, config, task.event.userId);
+    const requesterToConfirm = requesterToConfirmFor(planMarkdown, config, requesterOf(task));
     let approvalPromptTs: string | undefined;
     if (iteration === iterationStart && resumeApprovalPromptTs) {
       // Resuming: the prompt is already posted; the resume mention is the next reply we want to classify.
@@ -487,14 +488,14 @@ export async function runApprovalLoop(input: {
       channelId: task.event.channelId,
       threadTs: task.event.threadTs,
       approverUserIds: adminUserIds,
-      triggerUserId: task.event.userId,
+      triggerUserId: requesterOf(task),
       approvalPromptTs,
       logStep: logStep ?? (() => {}),
       botUserId: config.botUserId,
       signal,
       reminders: {
         afterMs: PLAN_APPROVAL_REMINDERS_MS,
-        text: `${approverMention} <@${task.event.userId}>'s plan above still needs a yes or no.`,
+        text: `${approverMention} <@${requesterOf(task)}>'s plan above still needs a yes or no.`,
       },
       approverMention,
       requesterToConfirm,
@@ -563,7 +564,7 @@ export async function runApprovalLoop(input: {
         channelId: task.event.channelId,
         threadTs: task.event.threadTs,
         approverUserIds: adminUserIds,
-        triggerUserId: task.event.userId,
+        triggerUserId: requesterOf(task),
         approvalPromptTs: askReviseTs,
         logStep: logStep ?? (() => {}),
         botUserId: config.botUserId,
@@ -791,7 +792,7 @@ Return the JSON now.`;
           affectedFiles: planAffectedFiles,
           scope: planScope,
           repoPath: pipelineCwd,
-          requesterToConfirm: requesterToConfirmFor(planMarkdown, config, task.event.userId),
+          requesterToConfirm: requesterToConfirmFor(planMarkdown, config, requesterOf(task)),
           logStep,
         });
         planMessageTs = revisedTs ?? planMessageTs;
@@ -1198,7 +1199,7 @@ async function runImplementationWorkflowBody(params: {
       }
       if (!clarificationTs) break;
 
-      const allowedAnswerers = [...new Set([task.event.userId, ...getAdminUserIds(config)])];
+      const allowedAnswerers = [...new Set([requesterOf(task), ...getAdminUserIds(config)])];
       const outcome = await waitForClarificationWithIdle({
         slack,
         channelId: task.event.channelId,
@@ -1333,7 +1334,7 @@ async function runImplementationWorkflowBody(params: {
               channelId: task.event.channelId,
               threadTs: task.event.threadTs,
               approverUserIds: adminUserIds,
-              triggerUserId: task.event.userId,
+              triggerUserId: requesterOf(task),
               approvalPromptTs: confirmResult.ts,
               logStep: logStep ?? (() => {}),
               botUserId: config.botUserId,
@@ -1689,7 +1690,7 @@ Write your response as a ready-to-post Slack message describing what you did.
           affectedFiles: planAffectedFiles,
           scope: planScope,
           repoPath: pipelineCwd,
-          requesterToConfirm: requesterToConfirmFor(planMarkdown, config, task.event.userId),
+          requesterToConfirm: requesterToConfirmFor(planMarkdown, config, requesterOf(task)),
           logStep,
         });
       } catch (error) {
@@ -1924,7 +1925,7 @@ Write your response as a ready-to-post Slack message describing what you did.
       const promptTs = askResp.ts;
 
       const adminUserIds = getAdminUserIds(config);
-      const allowedIds = Array.from(new Set([task.event.userId, ...adminUserIds, ...config.coreDevSlackUserIds]));
+      const allowedIds = Array.from(new Set([requesterOf(task), ...adminUserIds, ...config.coreDevSlackUserIds]));
 
       if (!promptTs) {
         logStep?.({

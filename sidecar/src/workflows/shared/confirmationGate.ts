@@ -80,6 +80,7 @@ function confirmationWait(params: Parameters<typeof pollForExactConfirmation>[0]
     threadTs: params.threadTs,
     promptTs: params.promptTs,
     allowedUserIds: [...params.allowedUserIds],
+    expects: params.phrase,
   };
 }
 

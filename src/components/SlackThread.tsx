@@ -17,7 +17,7 @@ import { loadSlackImage } from '../lib/slackCache';
 import { useEscapeLayer } from '../lib/escapeLayers';
 import { EmojiPicker } from './EmojiPicker';
 import { SlackComposer } from './SlackComposer';
-import type { ComposedAsk, ComposedMessage, ComposerAnswering } from './SlackComposer';
+import type { ComposedAnswer, ComposedAsk, ComposedMessage, ComposerAnswering } from './SlackComposer';
 import { RunControlsBar, STARTING_NOTE, blockedReason, isWaiting } from './RunControlsBar';
 import type { StartedRunView } from './RunControlsBar';
 import { SectionCard } from './primitives';
@@ -25,6 +25,9 @@ import { SectionCard } from './primitives';
 const REFRESH_MS = 5000;
 // How often to check on a run started from here until miniOG takes it.
 const STARTED_POLL_MS = 2000;
+// A gate reads the thread every 5 seconds, and may think about a reply after;
+// an answer it took is given this long before the question counts as unanswered.
+const ANSWER_READ_MS = 20_000;
 // Slack folds a message into the previous one when the same person posts again this soon.
 const GROUP_WINDOW_SECONDS = 5 * 60;
 
@@ -236,7 +239,11 @@ export function SlackThread({ jobId, onOpenRun }: SlackThreadProps) {
       if (document.visibilityState !== 'visible') return;
       try {
         const status = await invoke<StartedRunStatus>('get_started_run', { requestId: startedId });
-        setStarted(current => (current?.requestId === startedId ? { ...current, status } : current));
+        setStarted(current =>
+          current?.requestId === startedId
+            ? { ...current, status, tookAt: current.tookAt ?? (isWaiting(status) ? undefined : Date.now()) }
+            : current,
+        );
         // The thread and the controls catch up at once, not on the next refresh.
         if (!isWaiting(status)) void load();
       } catch {
@@ -246,6 +253,27 @@ export function SlackThread({ jobId, onOpenRun }: SlackThreadProps) {
     const timer = window.setInterval(() => void check(), STARTED_POLL_MS);
     return () => window.clearInterval(timer);
   }, [startedId, startedWaiting, load]);
+
+  // An answer miniOG took to the question it still waits on: give the gate a
+  // moment to read it before another answer can go, then say it's unanswered.
+  const answeredAt =
+    started?.kind === 'answer' && started.status?.status === 'SUCCESS' ? (started.tookAt ?? null) : null;
+  const [readWindowOver, setReadWindowOver] = useState<number | null>(null);
+  useEffect(() => {
+    if (answeredAt === null) return;
+    const timer = window.setTimeout(
+      () => setReadWindowOver(answeredAt),
+      Math.max(0, answeredAt + ANSWER_READ_MS - Date.now()),
+    );
+    return () => window.clearTimeout(timer);
+  }, [answeredAt]);
+  const sameQuestion =
+    answeredAt !== null &&
+    started?.status?.jobId === started?.answersJobId &&
+    controls?.answer?.jobId === started?.answersJobId &&
+    controls?.answer?.promptTs === (started?.answersPromptTs ?? null);
+  const readingAnswer = sameQuestion && readWindowOver !== answeredAt;
+  const answerUnread = sameQuestion && readWindowOver === answeredAt;
 
   // Drops a run miniOG hasn't taken yet; the sidecar never sees it.
   const cancelStarted = async () => {
@@ -265,6 +293,7 @@ export function SlackThread({ jobId, onOpenRun }: SlackThreadProps) {
     command: string,
     args: Record<string, unknown>,
     setError: (error: string | null) => void,
+    answersPromptTs: string | null = null,
   ): Promise<boolean> => {
     setBusy(true);
     setError(null);
@@ -276,6 +305,7 @@ export function SlackThread({ jobId, onOpenRun }: SlackThreadProps) {
         startedAt: Date.now(),
         askTs: run.askTs,
         answersJobId: run.answersJobId,
+        answersPromptTs,
         status: null,
       });
       await load();
@@ -318,20 +348,31 @@ export function SlackThread({ jobId, onOpenRun }: SlackThreadProps) {
   const askMiniog = ({ text, postAsk }: ComposedAsk) =>
     startRun('ask', 'ask_miniog_in_thread', { text, postAsk }, setActionError);
 
-  const answerMiniog = ({ text, postAsk }: ComposedAsk) =>
-    startRun('answer', 'answer_miniog', { text, postAnswer: postAsk }, setActionError);
+  const answerMiniog = ({ text, postAsk, jobId: answersJobId, promptTs }: ComposedAnswer) =>
+    startRun(
+      'answer',
+      'answer_miniog',
+      { text, postAnswer: postAsk, answersJobId, promptTs },
+      setActionError,
+      promptTs,
+    );
 
   // The run waiting for an answer, and whether the owner can give it from here.
   const waitingFor = controls?.answer ?? null;
   const answering: ComposerAnswering | null = waitingFor
     ? {
         kind: waitingFor.kind,
+        jobId: waitingFor.jobId,
+        promptTs: waitingFor.promptTs,
+        expects: waitingFor.expects,
         blocked:
           waitingFor.answerBy.length > 0
-            ? `Only ${waitingFor.answerBy.map(id => `@${thread?.users[id]?.name ?? id}`).join(', ')} can answer this, in Slack.`
+            ? `Only ${waitingFor.answerBy.map(id => `@${thread?.users[id]?.name ?? id}`).join(' or ')} can answer this, in Slack.`
             : controls?.starting
               ? STARTING_NOTE
-              : null,
+              : readingAnswer
+                ? 'miniOG is reading your answer…'
+                : null,
       }
     : null;
 
@@ -384,6 +425,7 @@ export function SlackThread({ jobId, onOpenRun }: SlackThreadProps) {
           threadClosed={!thread || Boolean(thread.readError)}
           busy={busy}
           started={started}
+          answerUnread={answerUnread}
           error={controlError}
           onStop={() => act('stop_run', {}, setControlError)}
           onRerun={postAsk => startRun('rerun', 'rerun_in_thread', { postAsk }, setControlError)}

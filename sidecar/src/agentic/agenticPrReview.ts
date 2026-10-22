@@ -24,6 +24,7 @@ import {
 import { isRepoEnabled } from '../repos/registry.js';
 import { extractUserFocus } from './reviewFocus.js';
 import { reviewSinglePr, type PrReviewDeps, type PrReviewOutcome } from './prReviewAgent.js';
+import { requesterOf } from '../workflows/shared/requester.js';
 
 export type AgenticPrReviewStore = Pick<JobStore, 'findLatestReviewedPrHeadSha' | 'getChannelPolicyPack'> &
   Partial<Pick<JobStore, 'recordPrReviewFindings' | 'getPrReviewFindings'>> &
@@ -173,7 +174,7 @@ export async function runAgenticPrReview(params: {
     await slack.chat.postMessage({
       channel: task.event.channelId,
       thread_ts: task.event.threadTs,
-      text: `<@${task.event.userId}> drop the GitHub PR URL in this thread and i will pick it up. Format: \`https://github.com/Newton-School/<repo>/pull/<number>\``,
+      text: `<@${requesterOf(task)}> drop the GitHub PR URL in this thread and i will pick it up. Format: \`https://github.com/Newton-School/<repo>/pull/<number>\``,
     });
 
     return {
@@ -230,7 +231,7 @@ export async function runAgenticPrReview(params: {
         data: { prUrl: target.url, allowedOrg: config.allowedPrOrg },
       });
       if (!outOfScopeNotified) {
-        await postToThread(buildOutOfScopePrReply(task.event.userId, config.allowedPrOrg));
+        await postToThread(buildOutOfScopePrReply(requesterOf(task), config.allowedPrOrg));
         outOfScopeNotified = true;
       }
       continue;

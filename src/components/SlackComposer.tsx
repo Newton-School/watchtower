@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import type { ClipboardEvent as ReactClipboardEvent, DragEvent as ReactDragEvent } from 'react';
 import type { AnswerKind, SlackDirectory } from '../types';
 import { loadSlackDirectory } from '../lib/slackCache';
@@ -17,10 +17,16 @@ const ANSWER_POSTS_KEY = 'watchtower.answerPostsInThread';
 const ANSWER_PLACEHOLDERS: Record<AnswerKind, string> = {
   approval: 'Answer miniOG: yes to go ahead, no, or what to change…',
   question: "Answer miniOG's question…",
-  repo_choice: 'Tell miniOG which repo, e.g. web or api…',
+  repo_choice: 'Tell miniOG which repo…',
   confirm: 'Type the phrase miniOG asked for…',
   paused: 'Answer miniOG to pick this up again…',
 };
+
+function answerPlaceholder(answering: ComposerAnswering | null): string {
+  if (!answering) return 'Answer miniOG…';
+  if (answering.kind === 'confirm' && answering.expects) return `Type "${answering.expects}" to confirm…`;
+  return ANSWER_PLACEHOLDERS[answering.kind];
+}
 
 /** What the box shows for a mention, and the Slack markup it posts as. */
 type Mention = { label: string; token: string };
@@ -34,8 +40,17 @@ export type ComposedMessage = { text: string; broadcast: boolean; files: File[] 
 /** An ask that starts a new run here, or an answer to a run waiting here, on the owner's authority. */
 export type ComposedAsk = { text: string; postAsk: boolean };
 
-/** miniOG waits for an answer in the thread. */
-export type ComposerAnswering = { kind: AnswerKind; blocked: string | null };
+/** miniOG waits for an answer in the thread: which run, on which question. */
+export type ComposerAnswering = {
+  kind: AnswerKind;
+  jobId: string;
+  promptTs: string | null;
+  expects: string | null;
+  blocked: string | null;
+};
+
+/** An answer, with the question it was written for. */
+export type ComposedAnswer = ComposedAsk & { jobId: string; promptTs: string | null };
 
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -77,7 +92,7 @@ type SlackComposerProps = {
   askBlocked?: string | null;
   /** miniOG waits for an answer here: "Answer miniOG" takes the place of "Ask miniOG". */
   answering?: ComposerAnswering | null;
-  onAnswer?: (answer: ComposedAsk) => Promise<boolean>;
+  onAnswer?: (answer: ComposedAnswer) => Promise<boolean>;
 };
 
 /**
@@ -98,6 +113,8 @@ export function SlackComposer({
   const [mode, setMode] = useState<'reply' | 'ask' | 'answer'>('reply');
   const [postAsk, setPostAsk] = useState(() => readFlag(ASK_POSTS_KEY, true));
   const [postAnswer, setPostAnswer] = useState(() => readFlag(ANSWER_POSTS_KEY, true));
+  // The question an answer is being written to, from when Answer was picked.
+  const [answerFor, setAnswerFor] = useState<{ jobId: string; promptTs: string | null } | null>(null);
   const [draft, setDraft] = useState('');
   const [mentions, setMentions] = useState<Mention[]>([]);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
@@ -123,22 +140,39 @@ export function SlackComposer({
   draftRef.current = draft;
   // The second mode answers miniOG while it waits, and asks it for a new run otherwise.
   const second = answering && onAnswer ? 'answer' : onAsk ? 'ask' : null;
+  // miniOG moved on to another question since Answer was picked.
+  const askedAnew =
+    mode === 'answer' &&
+    second === 'answer' &&
+    (answerFor?.jobId !== answering?.jobId || answerFor?.promptTs !== answering?.promptTs);
   // The thread changed under a draft meant for miniOG: an ask must not go as
-  // an answer, nor an answer as a new ask, so nothing goes until a mode is picked.
-  const stale = mode !== 'reply' && mode !== second;
+  // an answer, an answer as a new ask, nor an answer to a question not read,
+  // so nothing goes until a mode is picked again.
+  const stale = (mode !== 'reply' && mode !== second) || askedAnew;
   const toMiniog = mode !== 'reply';
   const asking = mode === 'ask' && !stale;
   const answeringNow = mode === 'answer' && !stale;
   const posting = mode === 'answer' ? postAnswer : postAsk;
-  const blockedNote = stale
-    ? mode === 'answer'
-      ? "miniOG isn't waiting for an answer anymore, so this can't go as one."
-      : 'miniOG is waiting for an answer now. Pick Answer miniOG to send this as the answer.'
-    : asking
-      ? askBlocked
-      : answeringNow
-        ? (answering?.blocked ?? null)
-        : null;
+  const blockedNote = askedAnew
+    ? 'miniOG asked something new. Read it, then pick Answer miniOG again.'
+    : stale
+      ? mode === 'answer'
+        ? "miniOG isn't waiting for an answer anymore, so this can't go as one."
+        : second === 'answer'
+          ? 'miniOG is waiting for an answer now. Pick Answer miniOG to send this as the answer.'
+          : "miniOG can't take an ask here right now."
+      : asking
+        ? askBlocked
+        : answeringNow
+          ? (answering?.blocked ?? null)
+          : null;
+  const noteId = useId();
+
+  const pickMode = (next: 'reply' | 'ask' | 'answer') => {
+    setMode(next);
+    setAnswerFor(next === 'answer' && answering ? { jobId: answering.jobId, promptTs: answering.promptTs } : null);
+    setFileError(null);
+  };
 
   // Read the directory early; the first read takes a few seconds. If it
   // failed, typing @ tries again.
@@ -260,18 +294,24 @@ export function SlackComposer({
 
   const sendToMiniog = async () => {
     const typed = draft;
-    const handler = answeringNow ? onAnswer : asking ? onAsk : undefined;
-    if (!handler || busy || sending.current || blockedNote || !typed.trim()) return;
+    if (busy || sending.current || blockedNote || !typed.trim()) return;
+    const text = applyMentions(toSlackText(typed.trim()), mentions);
+    let send: (() => Promise<boolean>) | null = null;
+    if (answeringNow && onAnswer && answerFor) {
+      send = () => onAnswer({ text, postAsk: posting, ...answerFor });
+    } else if (asking && onAsk) {
+      send = () => onAsk({ text, postAsk: posting });
+    }
+    if (!send) return;
     sending.current = true;
     try {
-      const sent = await handler({ text: applyMentions(toSlackText(typed.trim()), mentions), postAsk: posting });
-      if (!sent) return;
-      if (draftRef.current === typed) {
-        setDraft('');
-        setMentions([]);
-      }
+      if (!(await send())) return;
+      // Anything typed while it went stays, in this mode, so it can't go out as a reply.
+      if (draftRef.current !== typed) return;
+      setDraft('');
+      setMentions([]);
       // Back to replying, so the next Enter sends miniOG nothing more.
-      setMode('reply');
+      pickMode('reply');
     } finally {
       sending.current = false;
     }
@@ -342,7 +382,7 @@ export function SlackComposer({
         setDragging(false);
       }}
     >
-      {second ? (
+      {second || mode !== 'reply' ? (
         <div
           className="slack-composer-modes"
           role="group"
@@ -352,24 +392,22 @@ export function SlackComposer({
             type="button"
             aria-pressed={mode === 'reply'}
             className={mode === 'reply' ? 'slack-composer-mode slack-composer-mode-active' : 'slack-composer-mode'}
-            onClick={() => {
-              setMode('reply');
-              setFileError(null);
-            }}
+            onClick={() => pickMode('reply')}
           >
             Reply as miniOG
           </button>
-          <button
-            type="button"
-            aria-pressed={mode === second}
-            className={mode === second ? 'slack-composer-mode slack-composer-mode-active' : 'slack-composer-mode'}
-            onClick={() => {
-              setMode(second);
-              setFileError(null);
-            }}
-          >
-            {second === 'answer' ? 'Answer miniOG' : 'Ask miniOG'}
-          </button>
+          {second ? (
+            <button
+              type="button"
+              aria-pressed={mode === second && !stale}
+              className={
+                mode === second && !stale ? 'slack-composer-mode slack-composer-mode-active' : 'slack-composer-mode'
+              }
+              onClick={() => pickMode(second)}
+            >
+              {second === 'answer' ? 'Answer miniOG' : 'Ask miniOG'}
+            </button>
+          ) : null}
         </div>
       ) : null}
 
@@ -420,11 +458,10 @@ export function SlackComposer({
       <textarea
         ref={boxRef}
         aria-label={mode === 'answer' ? 'Answer miniOG' : mode === 'ask' ? 'Ask miniOG' : 'Reply as miniOG'}
+        aria-describedby={blockedNote ? noteId : undefined}
         placeholder={
           mode === 'answer'
-            ? answering
-              ? ANSWER_PLACEHOLDERS[answering.kind]
-              : 'Answer miniOG…'
+            ? answerPlaceholder(answering)
             : mode === 'ask'
               ? 'Ask miniOG to do something in this thread…'
               : 'Reply as miniOG…'
@@ -535,7 +572,9 @@ export function SlackComposer({
         </div>
         <span className="muted slack-composer-hint">
           {!toMiniog
-            ? 'Posts as miniOG. Shift+Enter for a new line.'
+            ? second === 'answer'
+              ? "Posts as miniOG, which miniOG won't read as the answer: use Answer miniOG for that."
+              : 'Posts as miniOG. Shift+Enter for a new line.'
             : mode === 'answer'
               ? postAnswer
                 ? 'miniOG posts your answer here, then carries on with it.'
@@ -563,7 +602,11 @@ export function SlackComposer({
           </button>
         )}
       </div>
-      {blockedNote ? <p className="slack-thread-warning slack-composer-note">{blockedNote}</p> : null}
+      {blockedNote ? (
+        <p className="slack-thread-warning slack-composer-note" id={noteId} role="status">
+          {blockedNote}
+        </p>
+      ) : null}
       {fileError ? <p className="slack-thread-error">{fileError}</p> : null}
       {emojiAnchor ? (
         <EmojiPicker

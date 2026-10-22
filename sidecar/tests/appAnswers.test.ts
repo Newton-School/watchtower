@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { v4 as uuidv4 } from 'uuid';
-import { routeAppAnswer, runAppAnswerPoller } from '../src/launchpad/appAnswers.js';
+import { replyTsAfter, routeAppAnswer, runAppAnswerPoller } from '../src/launchpad/appAnswers.js';
 import { whileWaitingForAnswer } from '../src/runtime/humanWaits.js';
 import { __resetButtonRepliesForTests, buttonRepliesSince, recordButtonReply } from '../src/slack/buttonReplies.js';
 import { JobStore } from '../src/state/jobStore.js';
@@ -34,6 +34,12 @@ function createJob(store: JobStore, id: string): void {
     threadTs: THREAD,
     payload: { text: '<@UBOT1> fix the banner', requestUserId: 'UREQ1' },
   });
+}
+
+/** Paused a while ago, so its :zzz: is up. */
+function pauseLongAgo(store: JobStore, jobId: string): void {
+  store.markJob(jobId, 'PAUSED');
+  (store as any).db.prepare('UPDATE jobs SET updated_at = ? WHERE id = ?').run('2026-10-22T00:00:00.000Z', jobId);
 }
 
 function waitAt(store: JobStore, jobId: string, promptTs = PROMPT): void {
@@ -117,6 +123,20 @@ describe('whileWaitingForAnswer', () => {
     });
   });
 
+  it('keeps the phrase a confirm gate takes', () => {
+    const store = createStore();
+    store.beginHumanWait({
+      jobId: 'job-4',
+      kind: 'confirm',
+      channelId: CHANNEL,
+      threadTs: THREAD,
+      promptTs: PROMPT,
+      allowedUserIds: ['UOWNER1'],
+      expects: 'confirm merge',
+    });
+    expect(store.humanWaitFor('job-4')?.expects).toBe('confirm merge');
+  });
+
   it('leaves a newer wait alone when an older gate ends, and startup clears every wait', () => {
     const store = createStore();
     waitAt(store, 'job-3', '1761200100.000200');
@@ -141,8 +161,26 @@ describe('routeAppAnswer', () => {
     });
 
     createJob(store, 'job-paused');
-    store.markJob('job-paused', 'PAUSED');
+    pauseLongAgo(store, 'job-paused');
     expect(routeAppAnswer(store, { answerForJobId: 'job-paused' })).toEqual({ kind: 'resume' });
+  });
+
+  it('waits for a run that has only just paused, and never resumes one paused under a mid-run answer', () => {
+    const store = createStore();
+    createJob(store, 'job-paused');
+    store.markJob('job-paused', 'PAUSED');
+    expect(routeAppAnswer(store, { answerForJobId: 'job-paused' })).toEqual({ kind: 'later' });
+    expect(routeAppAnswer(store, { answerForJobId: 'job-paused' }, Date.now() + 6_000)).toEqual({ kind: 'resume' });
+    expect(routeAppAnswer(store, { answerForJobId: 'job-paused', answerPromptTs: PROMPT })).toEqual({
+      kind: 'drop',
+      reason: 'miniOG paused before your answer reached it. Answer again to pick it back up.',
+    });
+  });
+
+  it('dates the answer after its question even when the clock runs behind Slack', () => {
+    expect(replyTsAfter('1761200100.000200', 1_761_200_000_000)).toBe('1761200100.000201');
+    expect(replyTsAfter('1761200100.999999', 1_761_200_000_000)).toBe('1761200101.000000');
+    expect(replyTsAfter('1761200100.000200', 1_761_200_200_500)).toBe('1761200200.500000');
   });
 
   it('drops an answer that would reach the wrong question or nothing', () => {
@@ -198,7 +236,7 @@ describe('runAppAnswerPoller', () => {
   it('picks a paused run up again from the answer, in its thread', async () => {
     const store = createStore();
     createJob(store, 'job-paused');
-    store.markJob('job-paused', 'PAUSED');
+    pauseLongAgo(store, 'job-paused');
     answer(store, 'ans-2', 'job-paused', { originEventTs: '1761200200.000300' });
     const { params, enqueue } = intake(store);
 

@@ -240,6 +240,8 @@ export interface HumanWait {
   promptTs: string;
   /** Who the gate takes an answer from. */
   allowedUserIds: string[];
+  /** The exact phrase a confirm gate takes, when it takes nothing else. */
+  expects?: string;
   startedAt: string;
 }
 

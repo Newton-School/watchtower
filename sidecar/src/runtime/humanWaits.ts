@@ -16,6 +16,7 @@ export async function whileWaitingForAnswer<T>(
     threadTs: string;
     promptTs: string;
     allowedUserIds: string[];
+    expects?: string;
   },
   run: () => Promise<T>,
 ): Promise<T> {

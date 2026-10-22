@@ -226,6 +226,8 @@ export type AnswerTarget = {
   promptTs: string | null;
   /** Who it takes an answer from, when the owner isn't one of them. */
   answerBy: string[];
+  /** The exact phrase a confirm takes, when it takes nothing else. */
+  expects: string | null;
 };
 
 export type StartedRun = {

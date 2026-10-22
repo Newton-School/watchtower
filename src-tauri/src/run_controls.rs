@@ -62,7 +62,12 @@ pub(crate) struct AnswerTarget {
     /// Who it takes an answer from when the owner isn't one of them, so the
     /// app can't answer it.
     answer_by: Vec<String>,
+    /// The exact phrase a confirm takes, when it takes nothing else.
+    expects: Option<String>,
 }
+
+/// The run an answer is for and the question it was written to.
+type Answering = (String, Option<String>);
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -253,24 +258,46 @@ fn answer_target(
     job_id: &str,
     owner: Option<&str>,
 ) -> Result<Option<AnswerTarget>, String> {
-    type Wait = (String, Option<String>, Option<String>, Option<String>);
+    type Wait = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
     let found: Option<Wait> = connection
         .query_row(
-            "SELECT j.status, w.kind, w.prompt_ts, w.allowed_user_ids FROM jobs j
+            "SELECT j.status, w.kind, w.prompt_ts, w.allowed_user_ids, w.expects FROM jobs j
              LEFT JOIN human_waits w ON w.job_id = j.id
              WHERE j.id = ?",
             params![job_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()
         .map_err(|err| format!("db query waiting run failed: {err}"))?;
-    let Some((status, kind, prompt_ts, allowed)) = found else {
+    let Some((status, kind, prompt_ts, allowed, expects)) = found else {
         return Ok(None);
     };
-    let kind = match (status.as_str(), kind) {
-        ("RUNNING", Some(kind)) => kind,
-        ("PAUSED", _) => "paused".to_string(),
-        _ => return Ok(None),
+    // A paused run waits for any reply; a wait left from before it paused is not its question.
+    if status == "PAUSED" {
+        return Ok(Some(AnswerTarget {
+            job_id: job_id.to_string(),
+            kind: "paused".to_string(),
+            prompt_ts: None,
+            answer_by: Vec::new(),
+            expects: None,
+        }));
+    }
+    let (Some(kind), true) = (kind, status == "RUNNING") else {
+        return Ok(None);
     };
     let allowed: Vec<String> = allowed
         .and_then(|json| serde_json::from_str(&json).ok())
@@ -279,9 +306,10 @@ fn answer_target(
         allowed.is_empty() || owner.is_some_and(|owner| allowed.iter().any(|id| id == owner));
     Ok(Some(AnswerTarget {
         job_id: job_id.to_string(),
-        prompt_ts: prompt_ts.filter(|_| kind != "paused"),
         kind,
+        prompt_ts,
         answer_by: if owner_may { Vec::new() } else { allowed },
+        expects,
     }))
 }
 
@@ -434,7 +462,7 @@ pub(crate) async fn rerun_in_thread(
     post_ask: bool,
     state: State<'_, AppState>,
 ) -> Result<StartedRun, String> {
-    start_run(&state.db_path, &job_id, Start::Rerun, None, post_ask).await
+    start_run(&state.db_path, &job_id, Start::Rerun, None, post_ask, None).await
 }
 
 #[tauri::command]
@@ -444,7 +472,15 @@ pub(crate) async fn ask_miniog_in_thread(
     post_ask: bool,
     state: State<'_, AppState>,
 ) -> Result<StartedRun, String> {
-    start_run(&state.db_path, &job_id, Start::Ask, Some(text), post_ask).await
+    start_run(
+        &state.db_path,
+        &job_id,
+        Start::Ask,
+        Some(text),
+        post_ask,
+        None,
+    )
+    .await
 }
 
 /// Answers the run waiting in this thread. Mid-run, the gate takes it as the
@@ -454,14 +490,18 @@ pub(crate) async fn answer_miniog(
     job_id: String,
     text: String,
     post_answer: bool,
+    answers_job_id: String,
+    prompt_ts: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<StartedRun, String> {
+    let written_for = (answers_job_id, prompt_ts);
     start_run(
         &state.db_path,
         &job_id,
         Start::Answer,
         Some(text),
         post_answer,
+        Some(&written_for),
     )
     .await
 }
@@ -473,7 +513,7 @@ struct Prepared {
     ask: String,
     requested_for: Option<String>,
     /// For an answer: the run it answers and the question it waits on.
-    answering: Option<(String, Option<String>)>,
+    answering: Option<Answering>,
 }
 
 async fn start_run(
@@ -482,8 +522,9 @@ async fn start_run(
     start: Start,
     text: Option<String>,
     post_ask: bool,
+    written_for: Option<&Answering>,
 ) -> Result<StartedRun, String> {
-    let prepared = prepare_start(db_path, job_id, start, text.as_deref());
+    let prepared = prepare_start(db_path, job_id, start, text.as_deref(), written_for);
     let mut data = serde_json::json!({ "postAsk": post_ask });
     if let Ok(prepared) = &prepared {
         data["ask"] = serde_json::json!(prepared.ask);
@@ -523,6 +564,7 @@ fn prepare_start(
     job_id: &str,
     start: Start,
     text: Option<&str>,
+    written_for: Option<&Answering>,
 ) -> Result<Prepared, String> {
     let connection = Connection::open(db_path).map_err(|err| format!("db open failed: {err}"))?;
     let settings = read_app_settings(&connection)?;
@@ -536,7 +578,16 @@ fn prepare_start(
         .ok_or_else(|| "No owner Slack user IDs are configured.".to_string())?;
     let target = slack::require_target(slack::job_slack_target(&connection, job_id)?)?;
     if let Start::Answer = start {
-        return prepare_answer(&connection, settings.slack_bot_token, owner, target, text);
+        let written_for =
+            written_for.ok_or_else(|| "Say which question this answers.".to_string())?;
+        return prepare_answer(
+            &connection,
+            settings.slack_bot_token,
+            owner,
+            target,
+            text,
+            written_for,
+        );
     }
     if let Some((busy, waiting)) = busy_job(&connection, &target)? {
         return Err(match (busy == job_id, waiting) {
@@ -578,6 +629,35 @@ fn prepare_start(
     })
 }
 
+/// A reply as a confirm reads it: no mentions, formatting marks or trailing
+/// punctuation, any case. Mirrors normalizeConfirmationReply in the sidecar.
+fn confirmation_text(text: &str) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("<@") {
+        plain.push_str(&rest[..start]);
+        match rest[start..].find('>') {
+            Some(end) => {
+                plain.push(' ');
+                rest = &rest[start + end + 1..];
+            }
+            None => {
+                rest = &rest[start..];
+                break;
+            }
+        }
+    }
+    plain.push_str(rest);
+    plain
+        .chars()
+        .filter(|c| !"`*_~\"'“”‘’.!,".contains(*c))
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 /// Why nothing new can go to miniOG from here yet.
 const STARTING: &str = "miniOG hasn't picked up the last thing sent from here yet.";
 
@@ -587,12 +667,17 @@ fn prepare_answer(
     owner: String,
     target: JobSlackTarget,
     text: Option<&str>,
+    written_for: &Answering,
 ) -> Result<Prepared, String> {
     let waiting = match busy_job(connection, &target)? {
         Some((busy, true)) => answer_target(connection, &busy, Some(&owner))?,
         _ => None,
     }
     .ok_or_else(|| "miniOG isn't waiting for an answer in this thread.".to_string())?;
+    // Only the question that was read: miniOG may have moved on since.
+    if (&waiting.job_id, &waiting.prompt_ts) != (&written_for.0, &written_for.1) {
+        return Err("miniOG asked something new. Read it, then answer again.".to_string());
+    }
     if !waiting.answer_by.is_empty() {
         return Err("Only the person miniOG asked can answer this, in Slack.".to_string());
     }
@@ -602,6 +687,11 @@ fn prepare_answer(
     let answer = text.unwrap_or("").trim();
     if answer.is_empty() {
         return Err("Write the answer first.".to_string());
+    }
+    if let Some(phrase) = &waiting.expects {
+        if confirmation_text(answer) != *phrase {
+            return Err(format!("miniOG takes exactly \"{phrase}\" here."));
+        }
     }
     // A paused run picked up again stays the requester's.
     let requested_for = requester(connection, &job_row(connection, &waiting.job_id)?.payload)
@@ -739,12 +829,12 @@ async fn cancel_request(db_path: &Path, job_id: &str, request_id: &str) -> Resul
         let connection =
             Connection::open(db_path).map_err(|err| format!("db open failed: {err}"))?;
         let target = slack::require_target(slack::job_slack_target(&connection, job_id)?)?;
-        let ask_ts: Option<String> = connection
+        let (ask_ts, is_answer): (Option<String>, bool) = connection
             .query_row(
-                "SELECT origin_event_ts FROM launchpad_requests
+                "SELECT origin_event_ts, answer_for_job_id IS NOT NULL FROM launchpad_requests
                  WHERE id = ? AND origin_channel_id = ? AND origin_thread_ts = ?",
                 params![request_id, target.channel, target.thread_ts],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|err| format!("db query launchpad request failed: {err}"))?
@@ -758,9 +848,12 @@ async fn cancel_request(db_path: &Path, job_id: &str, request_id: &str) -> Resul
             )
             .map_err(|err| format!("db cancel launchpad request failed: {err}"))?;
         if cancelled == 0 {
-            return Err(
-                "miniOG is picking it up right now. Stop the run once it starts.".to_string(),
-            );
+            return Err(if is_answer {
+                "Too late: miniOG already has your answer."
+            } else {
+                "miniOG is picking it up right now. Stop the run once it starts."
+            }
+            .to_string());
         }
         let token = read_app_settings(&connection)?.slack_bot_token;
         (token, target.channel, ask_ts)
@@ -1108,14 +1201,41 @@ mod tests {
         let _ = fs::remove_file(db_path);
     }
 
-    fn wait_at(connection: &Connection, job_id: &str, kind: &str, allowed: &[&str]) {
+    fn wait_at(
+        connection: &Connection,
+        job_id: &str,
+        kind: &str,
+        allowed: &[&str],
+        expects: Option<&str>,
+    ) {
         connection
             .execute(
-                "INSERT OR REPLACE INTO human_waits (job_id, kind, channel_id, thread_ts, prompt_ts, allowed_user_ids, started_at)
-                 VALUES (?, ?, 'C0B5ZVDM7GU', '1.0', '1.5', ?, '2026-10-23T00:00:00Z')",
-                params![job_id, kind, serde_json::json!(allowed).to_string()],
+                "INSERT OR REPLACE INTO human_waits (job_id, kind, channel_id, thread_ts, prompt_ts, allowed_user_ids, expects, started_at)
+                 VALUES (?, ?, 'C0B5ZVDM7GU', '1.0', '1.5', ?, ?, '2026-10-23T00:00:00Z')",
+                params![job_id, kind, serde_json::json!(allowed).to_string(), expects],
             )
             .expect("insert wait");
+    }
+
+    /// The owner answers the run waiting in `job_id`'s thread, written for `written_for`.
+    fn answer(
+        connection: &Connection,
+        job_id: &str,
+        text: &str,
+        written_for: (&str, Option<&str>),
+    ) -> Result<Prepared, String> {
+        let target = slack::job_slack_target(connection, job_id)
+            .unwrap()
+            .unwrap();
+        let written_for = (written_for.0.to_string(), written_for.1.map(str::to_string));
+        prepare_answer(
+            connection,
+            "xoxb".into(),
+            OWNER.into(),
+            target,
+            Some(text),
+            &written_for,
+        )
     }
 
     #[test]
@@ -1135,24 +1255,26 @@ mod tests {
         assert!(!working.busy_waiting);
         assert!(working.answer.is_none());
 
-        wait_at(&connection, "planning", "approval", &[OWNER, "UADMIN"]);
+        wait_at(
+            &connection,
+            "planning",
+            "approval",
+            &[OWNER, "UADMIN"],
+            None,
+        );
         let waiting = controls(&connection, "planning");
         assert!(waiting.busy_waiting);
-        let answer = waiting.answer.expect("answerable");
-        assert_eq!(answer.job_id, "planning");
-        assert_eq!(answer.kind, "approval");
-        assert_eq!(answer.prompt_ts.as_deref(), Some("1.5"));
-        assert!(answer.answer_by.is_empty());
+        let target = waiting.answer.expect("answerable");
+        assert_eq!(target.job_id, "planning");
+        assert_eq!(target.kind, "approval");
+        assert_eq!(target.prompt_ts.as_deref(), Some("1.5"));
+        assert!(target.answer_by.is_empty());
 
-        let target = slack::job_slack_target(&connection, "planning")
-            .unwrap()
-            .unwrap();
-        let prepared = prepare_answer(
+        let prepared = answer(
             &connection,
-            "xoxb".into(),
-            OWNER.into(),
-            target,
-            Some("  yes  "),
+            "planning",
+            "  yes  ",
+            ("planning", Some("1.5")),
         )
         .unwrap();
         assert_eq!(prepared.ask, "yes");
@@ -1182,12 +1304,66 @@ mod tests {
         assert_eq!(answer_prompt.as_deref(), Some("1.5"));
 
         // One thing at a time: the answer not yet taken holds the thread.
-        let target = slack::job_slack_target(&connection, "planning")
-            .unwrap()
-            .unwrap();
-        assert!(
-            prepare_answer(&connection, "xoxb".into(), OWNER.into(), target, Some("no")).is_err()
+        assert!(answer(&connection, "planning", "no", ("planning", Some("1.5"))).is_err());
+
+        drop(connection);
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn an_answer_only_goes_to_the_question_it_was_written_for() {
+        let (db_path, connection) = test_db();
+        insert_job(
+            &connection,
+            "planning",
+            "Ev1",
+            "RUNNING",
+            "1.0",
+            serde_json::json!({}),
         );
+        wait_at(&connection, "planning", "approval", &[OWNER], None);
+
+        let moved_on = answer(&connection, "planning", "yes", ("planning", Some("1.4")));
+        assert_eq!(
+            moved_on.err().as_deref(),
+            Some("miniOG asked something new. Read it, then answer again.")
+        );
+        assert!(answer(&connection, "planning", "yes", ("other-run", Some("1.5"))).is_err());
+
+        drop(connection);
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn a_confirm_takes_only_its_phrase() {
+        let (db_path, connection) = test_db();
+        insert_job(
+            &connection,
+            "merging",
+            "Ev1",
+            "RUNNING",
+            "1.0",
+            serde_json::json!({}),
+        );
+        wait_at(
+            &connection,
+            "merging",
+            "confirm",
+            &[OWNER],
+            Some("confirm merge"),
+        );
+        let target = controls(&connection, "merging").answer.expect("waiting");
+        assert_eq!(target.expects.as_deref(), Some("confirm merge"));
+
+        let written_for = ("merging", Some("1.5"));
+        assert_eq!(
+            answer(&connection, "merging", "yes", written_for)
+                .err()
+                .as_deref(),
+            Some("miniOG takes exactly \"confirm merge\" here.")
+        );
+        assert!(answer(&connection, "merging", "*Confirm  merge!*", written_for).is_ok());
+        assert_eq!(confirmation_text("<@U1> `Confirm` merge."), "confirm merge");
 
         drop(connection);
         let _ = fs::remove_file(db_path);
@@ -1204,38 +1380,25 @@ mod tests {
             "1.0",
             serde_json::json!({ "requestUserId": OWNER }),
         );
-        // A wait left behind by a run that has since paused names no question.
-        wait_at(&connection, "parked", "question", &[OWNER]);
-        let answer = controls(&connection, "parked").answer.expect("answerable");
-        assert_eq!(answer.kind, "paused");
-        assert_eq!(answer.prompt_ts, None);
-
-        let target = slack::job_slack_target(&connection, "parked")
-            .unwrap()
-            .unwrap();
-        let prepared = prepare_answer(
+        // A wait left from before it paused is not its question, nor who may answer.
+        wait_at(
             &connection,
-            "xoxb".into(),
-            OWNER.into(),
-            target,
-            Some("go on"),
-        )
-        .unwrap();
+            "parked",
+            "confirm",
+            &["UASKER"],
+            Some("confirm deploy"),
+        );
+        let target = controls(&connection, "parked").answer.expect("answerable");
+        assert_eq!(target.kind, "paused");
+        assert_eq!(target.prompt_ts, None);
+        assert!(target.answer_by.is_empty());
+        assert_eq!(target.expects, None);
+
+        let prepared = answer(&connection, "parked", "go on", ("parked", None)).unwrap();
         // The owner's own run stays theirs: no one else to run it for.
         assert_eq!(prepared.requested_for, None);
         assert_eq!(prepared.answering, Some(("parked".to_string(), None)));
-
-        let target = slack::job_slack_target(&connection, "parked")
-            .unwrap()
-            .unwrap();
-        assert!(prepare_answer(
-            &connection,
-            "xoxb".into(),
-            OWNER.into(),
-            target,
-            Some("   ")
-        )
-        .is_err());
+        assert!(answer(&connection, "parked", "   ", ("parked", None)).is_err());
 
         drop(connection);
         let _ = fs::remove_file(db_path);
@@ -1252,21 +1415,17 @@ mod tests {
             "1.0",
             serde_json::json!({}),
         );
-        wait_at(&connection, "deploying", "confirm", &["UASKER"]);
-        let answer = controls(&connection, "deploying").answer.expect("waiting");
-        assert_eq!(answer.answer_by, vec!["UASKER".to_string()]);
-
-        let target = slack::job_slack_target(&connection, "deploying")
-            .unwrap()
-            .unwrap();
-        assert!(prepare_answer(
+        wait_at(
             &connection,
-            "xoxb".into(),
-            OWNER.into(),
-            target,
-            Some("confirm deploy")
-        )
-        .is_err());
+            "deploying",
+            "confirm",
+            &["UASKER"],
+            Some("confirm deploy"),
+        );
+        let target = controls(&connection, "deploying").answer.expect("waiting");
+        assert_eq!(target.answer_by, vec!["UASKER".to_string()]);
+        let written_for = ("deploying", Some("1.5"));
+        assert!(answer(&connection, "deploying", "confirm deploy", written_for).is_err());
 
         // Nothing waits in a finished run's thread.
         connection
@@ -1276,17 +1435,7 @@ mod tests {
             )
             .unwrap();
         assert!(controls(&connection, "deploying").answer.is_none());
-        let target = slack::job_slack_target(&connection, "deploying")
-            .unwrap()
-            .unwrap();
-        assert!(prepare_answer(
-            &connection,
-            "xoxb".into(),
-            OWNER.into(),
-            target,
-            Some("yes")
-        )
-        .is_err());
+        assert!(answer(&connection, "deploying", "yes", written_for).is_err());
 
         drop(connection);
         let _ = fs::remove_file(db_path);
