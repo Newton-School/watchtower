@@ -15,6 +15,7 @@ import { formatCostUsd, formatDurationMs, formatPercent, formatTokens, getStatus
 import { Timestamp } from '../components/Timestamp';
 import { AgentPipelineView } from '../components/AgentPipelineView';
 import { GlowCard } from '../components/GlowCard';
+import { RunReactions } from '../components/RunReactions';
 
 type RunsPageProps = {
   data: DashboardData | null;
@@ -229,6 +230,8 @@ export function RunsPage({
             ) : null}
           </article>
         </GlowCard>
+
+        <RunReactions jobId={selectedRun.id} running={['RUNNING', 'QUEUED', 'CLAIMED'].includes(selectedRun.status)} />
 
         {selectedRunLogs.length > 0 ? (
           <GlowCard>

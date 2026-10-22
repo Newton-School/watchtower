@@ -153,6 +153,24 @@ export type AgentCallRow = {
   createdAt: string;
 };
 
+export type JobReactions = {
+  hasMessage: boolean;
+  /** null when the app could not read the message; readError says why. */
+  reactions: string[] | null;
+  readError: SlackReadError | null;
+};
+
+export type SlackReadError = {
+  /** noAccess: a private channel the bot can't read, though it can still remove. */
+  kind: 'deleted' | 'auth' | 'noAccess' | 'other';
+  code: string;
+};
+
+export type RemoveReactionsResult = {
+  removed: string[];
+  failed: string[];
+};
+
 export type JobCostSummary = {
   jobId: string;
   totalCostUsd: number;
