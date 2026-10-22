@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ClipboardEvent as ReactClipboardEvent, DragEvent as ReactDragEvent } from 'react';
-import type { SlackDirectory } from '../types';
+import type { AnswerKind, SlackDirectory } from '../types';
 import { loadSlackDirectory } from '../lib/slackCache';
 import { toSlackText } from '../lib/slackText';
 import { readFlag, writeFlag } from '../lib/prefs';
@@ -12,6 +12,15 @@ const MAX_FILES = 10;
 const MAX_TOTAL_BYTES = 50 * 1024 * 1024;
 const MAX_SUGGESTIONS = 8;
 const ASK_POSTS_KEY = 'watchtower.askPostsInThread';
+const ANSWER_POSTS_KEY = 'watchtower.answerPostsInThread';
+
+const ANSWER_PLACEHOLDERS: Record<AnswerKind, string> = {
+  approval: 'Answer miniOG: yes to go ahead, no, or what to change…',
+  question: "Answer miniOG's question…",
+  repo_choice: 'Tell miniOG which repo, e.g. web or api…',
+  confirm: 'Type the phrase miniOG asked for…',
+  paused: 'Answer miniOG to pick this up again…',
+};
 
 /** What the box shows for a mention, and the Slack markup it posts as. */
 type Mention = { label: string; token: string };
@@ -22,8 +31,11 @@ type Attachment = { id: number; file: File; previewUrl: string | null };
 
 export type ComposedMessage = { text: string; broadcast: boolean; files: File[] };
 
-/** An ask that starts a new run here, on the owner's authority. */
+/** An ask that starts a new run here, or an answer to a run waiting here, on the owner's authority. */
 export type ComposedAsk = { text: string; postAsk: boolean };
+
+/** miniOG waits for an answer in the thread. */
+export type ComposerAnswering = { kind: AnswerKind; blocked: string | null };
 
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -63,16 +75,29 @@ type SlackComposerProps = {
   onAsk?: (ask: ComposedAsk) => Promise<boolean>;
   /** Why an ask can't start right now. */
   askBlocked?: string | null;
+  /** miniOG waits for an answer here: "Answer miniOG" takes the place of "Ask miniOG". */
+  answering?: ComposerAnswering | null;
+  onAnswer?: (answer: ComposedAsk) => Promise<boolean>;
 };
 
 /**
  * The reply box: posts as miniOG, with @mentions, attachments, emoji and
  * "also send to channel". In "Ask miniOG" mode it starts a new run in the
- * thread instead, with the ask posted first or not at all.
+ * thread instead, with the ask posted first or not at all. While miniOG waits
+ * for an answer in the thread, that mode is "Answer miniOG", which answers it.
  */
-export function SlackComposer({ busy, participants, onSend, onAsk, askBlocked = null }: SlackComposerProps) {
-  const [mode, setMode] = useState<'reply' | 'ask'>('reply');
+export function SlackComposer({
+  busy,
+  participants,
+  onSend,
+  onAsk,
+  askBlocked = null,
+  answering = null,
+  onAnswer,
+}: SlackComposerProps) {
+  const [mode, setMode] = useState<'reply' | 'ask' | 'answer'>('reply');
   const [postAsk, setPostAsk] = useState(() => readFlag(ASK_POSTS_KEY, true));
+  const [postAnswer, setPostAnswer] = useState(() => readFlag(ANSWER_POSTS_KEY, true));
   const [draft, setDraft] = useState('');
   const [mentions, setMentions] = useState<Mention[]>([]);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
@@ -96,7 +121,24 @@ export function SlackComposer({ busy, participants, onSend, onAsk, askBlocked = 
   attachmentsRef.current = attachments;
   const draftRef = useRef(draft);
   draftRef.current = draft;
-  const asking = mode === 'ask' && onAsk !== undefined;
+  // The second mode answers miniOG while it waits, and asks it for a new run otherwise.
+  const second = answering && onAnswer ? 'answer' : onAsk ? 'ask' : null;
+  // The thread changed under a draft meant for miniOG: an ask must not go as
+  // an answer, nor an answer as a new ask, so nothing goes until a mode is picked.
+  const stale = mode !== 'reply' && mode !== second;
+  const toMiniog = mode !== 'reply';
+  const asking = mode === 'ask' && !stale;
+  const answeringNow = mode === 'answer' && !stale;
+  const posting = mode === 'answer' ? postAnswer : postAsk;
+  const blockedNote = stale
+    ? mode === 'answer'
+      ? "miniOG isn't waiting for an answer anymore, so this can't go as one."
+      : 'miniOG is waiting for an answer now. Pick Answer miniOG to send this as the answer.'
+    : asking
+      ? askBlocked
+      : answeringNow
+        ? (answering?.blocked ?? null)
+        : null;
 
   // Read the directory early; the first read takes a few seconds. If it
   // failed, typing @ tries again.
@@ -175,7 +217,7 @@ export function SlackComposer({ busy, participants, onSend, onAsk, askBlocked = 
   };
 
   const addFiles = (files: FileList | File[]) => {
-    if (asking) {
+    if (toMiniog) {
       setFileError('Files go with a reply. Switch to Reply to attach them.');
       return;
     }
@@ -216,18 +258,19 @@ export function SlackComposer({ busy, participants, onSend, onAsk, askBlocked = 
     });
   };
 
-  const ask = async () => {
+  const sendToMiniog = async () => {
     const typed = draft;
-    if (!onAsk || busy || sending.current || askBlocked || !typed.trim()) return;
+    const handler = answeringNow ? onAnswer : asking ? onAsk : undefined;
+    if (!handler || busy || sending.current || blockedNote || !typed.trim()) return;
     sending.current = true;
     try {
-      const started = await onAsk({ text: applyMentions(toSlackText(typed.trim()), mentions), postAsk });
-      if (!started) return;
+      const sent = await handler({ text: applyMentions(toSlackText(typed.trim()), mentions), postAsk: posting });
+      if (!sent) return;
       if (draftRef.current === typed) {
         setDraft('');
         setMentions([]);
       }
-      // Back to replying, so the next Enter doesn't start another run.
+      // Back to replying, so the next Enter sends miniOG nothing more.
       setMode('reply');
     } finally {
       sending.current = false;
@@ -235,8 +278,8 @@ export function SlackComposer({ busy, participants, onSend, onAsk, askBlocked = 
   };
 
   const send = async () => {
-    if (asking) {
-      await ask();
+    if (toMiniog) {
+      await sendToMiniog();
       return;
     }
     const typed = draft;
@@ -278,7 +321,7 @@ export function SlackComposer({ busy, participants, onSend, onAsk, askBlocked = 
         void send();
       }}
       onDragEnter={(e: ReactDragEvent) => {
-        if (!asking && e.dataTransfer.types.includes('Files')) {
+        if (!toMiniog && e.dataTransfer.types.includes('Files')) {
           dragDepth.current += 1;
           setDragging(true);
         }
@@ -299,12 +342,16 @@ export function SlackComposer({ busy, participants, onSend, onAsk, askBlocked = 
         setDragging(false);
       }}
     >
-      {onAsk ? (
-        <div className="slack-composer-modes" role="group" aria-label="Reply or ask">
+      {second ? (
+        <div
+          className="slack-composer-modes"
+          role="group"
+          aria-label={second === 'answer' ? 'Reply or answer' : 'Reply or ask'}
+        >
           <button
             type="button"
-            aria-pressed={!asking}
-            className={asking ? 'slack-composer-mode' : 'slack-composer-mode slack-composer-mode-active'}
+            aria-pressed={mode === 'reply'}
+            className={mode === 'reply' ? 'slack-composer-mode slack-composer-mode-active' : 'slack-composer-mode'}
             onClick={() => {
               setMode('reply');
               setFileError(null);
@@ -314,14 +361,14 @@ export function SlackComposer({ busy, participants, onSend, onAsk, askBlocked = 
           </button>
           <button
             type="button"
-            aria-pressed={asking}
-            className={asking ? 'slack-composer-mode slack-composer-mode-active' : 'slack-composer-mode'}
+            aria-pressed={mode === second}
+            className={mode === second ? 'slack-composer-mode slack-composer-mode-active' : 'slack-composer-mode'}
             onClick={() => {
-              setMode('ask');
+              setMode(second);
               setFileError(null);
             }}
           >
-            Ask miniOG
+            {second === 'answer' ? 'Answer miniOG' : 'Ask miniOG'}
           </button>
         </div>
       ) : null}
@@ -350,7 +397,7 @@ export function SlackComposer({ busy, participants, onSend, onAsk, askBlocked = 
         </ul>
       ) : null}
 
-      {attachments.length > 0 && !asking ? (
+      {attachments.length > 0 && !toMiniog ? (
         <div className="slack-attachments">
           {attachments.map(attachment => (
             <div className="slack-attachment" key={attachment.id}>
@@ -372,8 +419,16 @@ export function SlackComposer({ busy, participants, onSend, onAsk, askBlocked = 
 
       <textarea
         ref={boxRef}
-        aria-label={asking ? 'Ask miniOG' : 'Reply as miniOG'}
-        placeholder={asking ? 'Ask miniOG to do something in this thread…' : 'Reply as miniOG…'}
+        aria-label={mode === 'answer' ? 'Answer miniOG' : mode === 'ask' ? 'Ask miniOG' : 'Reply as miniOG'}
+        placeholder={
+          mode === 'answer'
+            ? answering
+              ? ANSWER_PLACEHOLDERS[answering.kind]
+              : 'Answer miniOG…'
+            : mode === 'ask'
+              ? 'Ask miniOG to do something in this thread…'
+              : 'Reply as miniOG…'
+        }
         rows={2}
         value={draft}
         onChange={e => {
@@ -384,7 +439,7 @@ export function SlackComposer({ busy, participants, onSend, onAsk, askBlocked = 
         onPaste={(e: ReactClipboardEvent<HTMLTextAreaElement>) => {
           // An ask takes no files, so a paste is just its text (copied cells
           // carry an image of themselves too).
-          if (!asking && e.clipboardData.files.length > 0) {
+          if (!toMiniog && e.clipboardData.files.length > 0) {
             e.preventDefault();
             addFiles(e.clipboardData.files);
           }
@@ -416,9 +471,9 @@ export function SlackComposer({ busy, participants, onSend, onAsk, askBlocked = 
           <button
             type="button"
             className="slack-action"
-            title={asking ? 'Files go with a reply' : 'Attach files'}
+            title={toMiniog ? 'Files go with a reply' : 'Attach files'}
             aria-label="Attach files"
-            disabled={asking}
+            disabled={toMiniog}
             onClick={() => fileRef.current?.click()}
           >
             📎
@@ -446,17 +501,22 @@ export function SlackComposer({ busy, participants, onSend, onAsk, askBlocked = 
           >
             ☺︎
           </button>
-          {asking ? (
+          {toMiniog ? (
             <label className="slack-broadcast">
               <input
                 type="checkbox"
-                checked={postAsk}
+                checked={posting}
                 onChange={e => {
-                  setPostAsk(e.target.checked);
-                  writeFlag(ASK_POSTS_KEY, e.target.checked);
+                  if (mode === 'answer') {
+                    setPostAnswer(e.target.checked);
+                    writeFlag(ANSWER_POSTS_KEY, e.target.checked);
+                  } else {
+                    setPostAsk(e.target.checked);
+                    writeFlag(ASK_POSTS_KEY, e.target.checked);
+                  }
                 }}
               />
-              Post the ask in the thread
+              {mode === 'answer' ? 'Post the answer in the thread' : 'Post the ask in the thread'}
             </label>
           ) : (
             <label
@@ -474,20 +534,24 @@ export function SlackComposer({ busy, participants, onSend, onAsk, askBlocked = 
           )}
         </div>
         <span className="muted slack-composer-hint">
-          {!asking
+          {!toMiniog
             ? 'Posts as miniOG. Shift+Enter for a new line.'
-            : postAsk
-              ? 'miniOG posts the ask here first, then works on it.'
-              : 'Nothing is posted, not even an emoji; miniOG just starts answering here.'}
+            : mode === 'answer'
+              ? postAnswer
+                ? 'miniOG posts your answer here, then carries on with it.'
+                : 'Nothing is posted; miniOG just carries on with your answer.'
+              : postAsk
+                ? 'miniOG posts the ask here first, then works on it.'
+                : 'Nothing is posted, not even an emoji; miniOG just starts answering here.'}
         </span>
-        {asking ? (
+        {toMiniog ? (
           <button
             className="primary-button"
             type="submit"
-            disabled={busy || Boolean(askBlocked) || !draft.trim()}
-            title={askBlocked ?? undefined}
+            disabled={busy || Boolean(blockedNote) || !draft.trim()}
+            title={blockedNote ?? undefined}
           >
-            Ask
+            {mode === 'answer' ? 'Answer' : 'Ask'}
           </button>
         ) : (
           <button
@@ -499,7 +563,7 @@ export function SlackComposer({ busy, participants, onSend, onAsk, askBlocked = 
           </button>
         )}
       </div>
-      {asking && askBlocked ? <p className="slack-thread-warning slack-composer-note">{askBlocked}</p> : null}
+      {blockedNote ? <p className="slack-thread-warning slack-composer-note">{blockedNote}</p> : null}
       {fileError ? <p className="slack-thread-error">{fileError}</p> : null}
       {emojiAnchor ? (
         <EmojiPicker

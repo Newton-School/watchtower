@@ -1,5 +1,7 @@
 import type { WebClient } from '@slack/web-api';
 import { fetchThreadContext } from '../../slack/threadContext.js';
+import { withButtonReplies } from '../../slack/buttonReplies.js';
+import { whileWaitingForAnswer } from '../../runtime/humanWaits.js';
 import type { WorkflowStepLogger } from '../../types/contracts.js';
 
 export type ClarificationOutcome =
@@ -41,7 +43,21 @@ export function isCancelReply(text: string): boolean {
   return CANCEL_WORDS.has(firstToken) || CANCEL_WORDS.has(cleaned);
 }
 
-export async function waitForClarificationWithIdle(params: {
+type ClarificationWait = Parameters<typeof pollForClarificationWithIdle>[0];
+
+/** Waits for the answer to a question miniOG asked; the app can answer it too. */
+export function waitForClarificationWithIdle(params: ClarificationWait): Promise<ClarificationOutcome> {
+  const wait = {
+    kind: 'question' as const,
+    channelId: params.channelId,
+    threadTs: params.threadTs,
+    promptTs: params.promptTs,
+    allowedUserIds: [...params.allowedUserIds],
+  };
+  return whileWaitingForAnswer(wait, () => pollForClarificationWithIdle(params));
+}
+
+async function pollForClarificationWithIdle(params: {
   slack: WebClient;
   channelId: string;
   threadTs: string;
@@ -112,7 +128,10 @@ export async function waitForClarificationWithIdle(params: {
       continue;
     }
 
-    const candidates = messages.filter(m => m.ts > promptTs && m.user !== botUserId);
+    // An answer from the app arrives beside the thread's replies.
+    const candidates = withButtonReplies(messages, channelId, promptTs).filter(
+      m => m.ts > promptTs && m.user !== botUserId,
+    );
     for (const reply of candidates) {
       const answer = reply.text.trim();
       if (!answer) continue;

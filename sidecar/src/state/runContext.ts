@@ -10,8 +10,9 @@ export interface AgentCallContext {
 
 /**
  * AsyncLocalStorage that propagates the current job/pipeline context so that
- * runCodex can record agent_calls without every workflow having to plumb
- * `store` and `jobId` through its signature.
+ * runCodex can record agent_calls, and a gate can record that it waits on a
+ * person, without every workflow having to plumb `store` and `jobId` through
+ * its signature.
  *
  * Set once at the top of a workflow dispatch with `agentCallContext.run({
  * jobId, store }, () => ...)`. Pipeline stages may extend with their own role

@@ -10,13 +10,15 @@ const SLOW_PICKUP_MS = 2 * 60 * 1000;
 // A stop lands within a few seconds; after this the button comes back.
 const STOPPING_MS = 20 * 1000;
 
-/** A run started from this thread view, and what the sidecar has made of it so far. */
+/** A run started, or an answer sent, from this thread view, and what the sidecar has made of it so far. */
 export type StartedRunView = {
-  kind: 'rerun' | 'ask';
+  kind: 'rerun' | 'ask' | 'answer';
   requestId: string;
   startedAt: number;
-  /** The posted ask, when the ask was posted. */
+  /** The posted ask or answer, when it was posted. */
   askTs: string | null;
+  /** For an answer: the run it answers. */
+  answersJobId?: string | null;
   status: StartedRunStatus | null;
   /** Cancelled from here before miniOG took it. */
   cancelled?: boolean;
@@ -27,13 +29,16 @@ export function isWaiting(status: StartedRunStatus | null): boolean {
   return !status || (!status.jobId && ['PENDING', 'CLAIMED', 'QUEUED'].includes(status.status));
 }
 
+/** Why nothing new can go to miniOG from here yet. */
+export const STARTING_NOTE = "miniOG hasn't picked up the last thing sent from here yet.";
+
 /** Why a new run can't start in this thread right now. */
 export function blockedReason(controls: RunControls | null): string | null {
   if (controls?.busyJobId && controls.busyWaiting) {
-    return 'miniOG is waiting for an answer in this thread. Stop that run to start another.';
+    return 'miniOG is waiting for an answer in this thread. Answer it below, or stop that run to start another.';
   }
   if (controls?.busyJobId) return 'miniOG is already working in this thread.';
-  if (controls?.starting) return 'A run in this thread is waiting to be picked up.';
+  if (controls?.starting) return STARTING_NOTE;
   return null;
 }
 
@@ -269,31 +274,34 @@ function StartedRunLine({
     return () => window.clearInterval(timer);
   }, [waiting]);
 
-  const what = started.kind === 'rerun' ? 're-run' : 'ask';
+  const what = started.kind === 'rerun' ? 're-run' : started.kind;
   const { status } = started;
-  const newRun = status?.jobId && status.jobId !== jobId ? status.jobId : null;
+  // An answer taken mid-run carries on in the run that waited; a paused run
+  // picked up again, like a re-run or an ask, goes on in a new one.
+  const tookIt = !waiting && Boolean(status?.jobId);
+  const otherRun = tookIt && status?.jobId !== jobId ? (status?.jobId ?? null) : null;
   let text: string;
   if (waiting) {
     text =
       now - started.startedAt < SLOW_PICKUP_MS
         ? `Waiting for miniOG to pick up your ${what}…`
         : `miniOG hasn't picked up your ${what} yet. Check that it's running.`;
-  } else if (newRun) {
+  } else if (tookIt) {
     text = `miniOG took your ${what}.`;
   } else if (started.cancelled) {
     text = `Cancelled your ${what} before miniOG took it.`;
   } else {
     const why = status?.error ?? (status?.status === 'SKIPPED' ? 'it was skipped' : 'it failed');
-    text = `miniOG didn't start your ${what}: ${why}`;
+    text = `miniOG didn't ${started.kind === 'answer' ? 'take' : 'start'} your ${what}: ${why}`;
   }
-  const trouble = !waiting && !newRun && !started.cancelled;
+  const trouble = !waiting && !tookIt && !started.cancelled;
 
   return (
     <div className={trouble ? 'run-controls-started slack-thread-error' : 'run-controls-started'}>
       <span role="status">{text}</span>
-      {newRun && onOpenRun ? (
-        <button className="run-controls-link" type="button" onClick={() => onOpenRun(newRun)}>
-          Open the new run →
+      {otherRun && onOpenRun ? (
+        <button className="run-controls-link" type="button" onClick={() => onOpenRun(otherRun)}>
+          {otherRun === started.answersJobId ? 'Open that run →' : 'Open the new run →'}
         </button>
       ) : null}
       {waiting ? (

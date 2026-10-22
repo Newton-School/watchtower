@@ -17,8 +17,8 @@ import { loadSlackImage } from '../lib/slackCache';
 import { useEscapeLayer } from '../lib/escapeLayers';
 import { EmojiPicker } from './EmojiPicker';
 import { SlackComposer } from './SlackComposer';
-import type { ComposedAsk, ComposedMessage } from './SlackComposer';
-import { RunControlsBar, blockedReason, isWaiting } from './RunControlsBar';
+import type { ComposedAsk, ComposedMessage, ComposerAnswering } from './SlackComposer';
+import { RunControlsBar, STARTING_NOTE, blockedReason, isWaiting } from './RunControlsBar';
 import type { StartedRunView } from './RunControlsBar';
 import { SectionCard } from './primitives';
 
@@ -270,7 +270,14 @@ export function SlackThread({ jobId, onOpenRun }: SlackThreadProps) {
     setError(null);
     try {
       const run = await invoke<StartedRun>(command, { jobId, ...args });
-      setStarted({ kind, requestId: run.requestId, startedAt: Date.now(), askTs: run.askTs, status: null });
+      setStarted({
+        kind,
+        requestId: run.requestId,
+        startedAt: Date.now(),
+        askTs: run.askTs,
+        answersJobId: run.answersJobId,
+        status: null,
+      });
       await load();
       return true;
     } catch (err) {
@@ -310,6 +317,23 @@ export function SlackThread({ jobId, onOpenRun }: SlackThreadProps) {
 
   const askMiniog = ({ text, postAsk }: ComposedAsk) =>
     startRun('ask', 'ask_miniog_in_thread', { text, postAsk }, setActionError);
+
+  const answerMiniog = ({ text, postAsk }: ComposedAsk) =>
+    startRun('answer', 'answer_miniog', { text, postAnswer: postAsk }, setActionError);
+
+  // The run waiting for an answer, and whether the owner can give it from here.
+  const waitingFor = controls?.answer ?? null;
+  const answering: ComposerAnswering | null = waitingFor
+    ? {
+        kind: waitingFor.kind,
+        blocked:
+          waitingFor.answerBy.length > 0
+            ? `Only ${waitingFor.answerBy.map(id => `@${thread?.users[id]?.name ?? id}`).join(', ')} can answer this, in Slack.`
+            : controls?.starting
+              ? STARTING_NOTE
+              : null,
+      }
+    : null;
 
   const saveEdit = async () => {
     if (!editing || busy) return;
@@ -422,6 +446,7 @@ export function SlackThread({ jobId, onOpenRun }: SlackThreadProps) {
                   editing={editing?.ts === message.ts ? editing.text : null}
                   confirmingDelete={confirmDelete === message.ts}
                   stopsRun={message.ts === thread.triggerTs && Boolean(controls?.canStop)}
+                  awaitsAnswer={waitingFor?.promptTs === message.ts}
                   picker={pickerFor?.ts === message.ts ? pickerFor.anchor : null}
                   onReact={name => toggleReaction(message, name)}
                   onTogglePicker={anchor => togglePicker(message.ts, anchor)}
@@ -452,6 +477,8 @@ export function SlackThread({ jobId, onOpenRun }: SlackThreadProps) {
             onSend={sendMessage}
             onAsk={controls ? askMiniog : undefined}
             askBlocked={blockedReason(controls)}
+            answering={answering}
+            onAnswer={answerMiniog}
           />
         </div>
       )}
@@ -468,6 +495,8 @@ type MessageRowProps = {
   confirmingDelete: boolean;
   /** Deleting this message stops the run going in the thread. */
   stopsRun: boolean;
+  /** The question miniOG waits for an answer to. */
+  awaitsAnswer: boolean;
   /** The button the picker is open from, when it's open on this message. */
   picker: HTMLElement | null;
   onReact: (name: string) => void;
@@ -490,6 +519,7 @@ function MessageRow({
   editing,
   confirmingDelete,
   stopsRun,
+  awaitsAnswer,
   picker,
   onReact,
   onTogglePicker,
@@ -508,7 +538,7 @@ function MessageRow({
   // A gate prompt's buttons live in its blocks, and an edit would strip them.
   const hasButtons = message.blocks?.some(block => block.type === 'actions') ?? false;
   const isTrigger = message.ts === thread.triggerTs;
-  const showHeader = !grouped || isTrigger;
+  const showHeader = !grouped || isTrigger || awaitsAnswer;
 
   return (
     <div
@@ -537,6 +567,7 @@ function MessageRow({
             {author.isBot ? <span className="slack-app-badge">APP</span> : null}
             <time title={time.full}>{time.short}</time>
             {isTrigger ? <span className="slack-run-tag">started this run</span> : null}
+            {awaitsAnswer ? <span className="slack-run-tag">waiting for an answer</span> : null}
           </div>
         ) : null}
 

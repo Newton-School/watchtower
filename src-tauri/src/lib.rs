@@ -590,6 +590,7 @@ pub fn run() {
             run_controls::stop_run,
             run_controls::rerun_in_thread,
             run_controls::ask_miniog_in_thread,
+            run_controls::answer_miniog,
             run_controls::get_started_run,
             run_controls::cancel_started_run,
             get_job_cost_summary,
@@ -3217,9 +3218,26 @@ fn initialize_db(path: &PathBuf) -> Result<(), String> {
         "origin_channel_id",
         "origin_thread_ts",
         "origin_event_ts",
+        "answer_for_job_id",
+        "answer_prompt_ts",
     ] {
         let _ = connection.execute(&format!("ALTER TABLE launchpad_requests ADD COLUMN {column} TEXT"), []);
     }
+    // A gate waiting on a person while its job runs, written by the sidecar
+    // for the run page to answer; created here too for when it hasn't started.
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS human_waits (
+                job_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                thread_ts TEXT NOT NULL,
+                prompt_ts TEXT NOT NULL,
+                allowed_user_ids TEXT NOT NULL DEFAULT '[]',
+                started_at TEXT NOT NULL
+            )",
+        )
+        .map_err(|err| format!("db migration failed: {err}"))?;
     // dossier_cache_signals is a SQLite-only bridge from desktop Tauri commands
     // to the sidecar's in-memory dossier cache. Whenever the desktop mutates a
     // user's dossier or pinned facts, it INSERT OR REPLACEs the user_id with
