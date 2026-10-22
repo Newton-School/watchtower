@@ -1,17 +1,21 @@
 //! Slack calls the app makes as miniOG: reading a run's thread, and posting,
-//! editing, deleting and reacting in it. Every command takes a job id and acts
-//! only in that job's channel, so the page can't reach any other conversation.
+//! editing, deleting and reacting in it. Every command that reads or writes a
+//! conversation takes a job id and acts only in that job's channel. Fetching a
+//! Slack-hosted image and reading the workspace directory are read-only and
+//! not tied to a run.
 
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
     process::Stdio,
     sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
+use base64::Engine as _;
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 use tokio::{process::Command, task::JoinSet};
 
@@ -141,29 +145,15 @@ fn curl_config_quote(value: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-/// Call a Slack Web API method with curl. The config goes in on stdin so the
-/// token never shows up in the process list.
-async fn slack_api(
-    token: &str,
-    method: &str,
-    fields: &[(&str, &str)],
-) -> Result<serde_json::Value, String> {
+/// Run curl with `config` on stdin, so the token never shows up in the
+/// process list, and return what it wrote to stdout.
+async fn run_curl(config: &str, args: &[&str]) -> Result<Vec<u8>, String> {
     use tokio::io::AsyncWriteExt;
 
-    let mut config = format!(
-        "header = {}\nurl = {}\n",
-        curl_config_quote(&format!("Authorization: Bearer {token}")),
-        curl_config_quote(&format!("https://slack.com/api/{method}")),
-    );
-    for (key, value) in fields {
-        config.push_str(&format!(
-            "data-urlencode = {}\n",
-            curl_config_quote(&format!("{key}={value}"))
-        ));
-    }
-
     let mut child = Command::new("/usr/bin/curl")
-        .args(["-sS", "--max-time", "15", "-K", "-"])
+        // -g: Slack file URLs can hold [ and ], which curl would read as a glob.
+        .args(["-sS", "-g", "-K", "-"])
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -185,7 +175,35 @@ async fn slack_api(
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    serde_json::from_slice(&output.stdout)
+    Ok(output.stdout)
+}
+
+fn auth_header(token: &str) -> String {
+    format!(
+        "header = {}\n",
+        curl_config_quote(&format!("Authorization: Bearer {token}"))
+    )
+}
+
+/// Call a Slack Web API method.
+async fn slack_api(
+    token: &str,
+    method: &str,
+    fields: &[(&str, &str)],
+) -> Result<serde_json::Value, String> {
+    let mut config = auth_header(token);
+    config.push_str(&format!(
+        "url = {}\n",
+        curl_config_quote(&format!("https://slack.com/api/{method}"))
+    ));
+    for (key, value) in fields {
+        config.push_str(&format!(
+            "data-urlencode = {}\n",
+            curl_config_quote(&format!("{key}={value}"))
+        ));
+    }
+    let stdout = run_curl(&config, &["--max-time", "15"]).await?;
+    serde_json::from_slice(&stdout)
         .map_err(|err| format!("Slack sent an unreadable response: {err}"))
 }
 
@@ -588,22 +606,24 @@ pub(crate) struct PostedMessage {
 pub(crate) async fn post_as_miniog(
     job_id: String,
     text: String,
+    broadcast: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<PostedMessage, String> {
-    post_as_miniog_inner(&state.db_path, &job_id, &text).await
+    post_as_miniog_inner(&state.db_path, &job_id, &text, broadcast.unwrap_or(false)).await
 }
 
 async fn post_as_miniog_inner(
     db_path: &Path,
     job_id: &str,
     text: &str,
+    broadcast: bool,
 ) -> Result<PostedMessage, String> {
     if text.trim().is_empty() {
         return Err("Write something first.".to_string());
     }
     let (target, settings) = load_job(db_path, job_id)?;
     let target = require_target(target)?;
-    let result = post_in_thread(&settings.slack_bot_token, &target, text).await;
+    let result = post_in_thread(&settings.slack_bot_token, &target, text, broadcast).await;
     let ts = result
         .as_ref()
         .map(|posted| posted.ts.clone())
@@ -614,7 +634,7 @@ async fn post_as_miniog_inner(
         "watchtower.slack.post",
         "Posted in the thread as miniOG from Watchtower.",
         "Posting as miniOG from Watchtower failed.",
-        serde_json::json!({ "ts": ts, "text": text }),
+        serde_json::json!({ "ts": ts, "text": text, "broadcast": broadcast }),
         result,
     )
 }
@@ -623,17 +643,18 @@ async fn post_in_thread(
     token: &str,
     target: &JobSlackTarget,
     text: &str,
+    broadcast: bool,
 ) -> Result<PostedMessage, String> {
-    let response = slack_call(
-        token,
-        "chat.postMessage",
-        &[
-            ("channel", &target.channel),
-            ("thread_ts", &target.thread_ts),
-            ("text", text),
-        ],
-    )
-    .await?;
+    let mut fields = vec![
+        ("channel", target.channel.as_str()),
+        ("thread_ts", target.thread_ts.as_str()),
+        ("text", text),
+    ];
+    // "Also send to channel": the reply shows in the channel too.
+    if broadcast {
+        fields.push(("reply_broadcast", "true"));
+    }
+    let response = slack_call(token, "chat.postMessage", &fields).await?;
     let ts = response
         .get("ts")
         .and_then(|t| t.as_str())
@@ -837,6 +858,391 @@ async fn set_miniog_reaction_inner(
         serde_json::json!({ "ts": ts, "name": name }),
         result,
     )
+}
+
+/// Images in a thread are private Slack files; the token goes only to Slack's file host.
+const SLACK_FILE_HOST: &str = "https://files.slack.com/";
+const MAX_IMAGE_BYTES: usize = 15 * 1024 * 1024;
+const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
+const MAX_UPLOAD_FILES: usize = 10;
+
+fn is_image_mimetype(mimetype: &str) -> bool {
+    mimetype.strip_prefix("image/").is_some_and(|sub| {
+        !sub.is_empty()
+            && sub
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c))
+    })
+}
+
+/// A Slack-hosted image as a data URL the page can show.
+#[tauri::command]
+pub(crate) async fn get_slack_image(
+    url: String,
+    mimetype: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    get_slack_image_inner(&state.db_path, &url, &mimetype).await
+}
+
+async fn get_slack_image_inner(
+    db_path: &Path,
+    url: &str,
+    mimetype: &str,
+) -> Result<String, String> {
+    if !url.starts_with(SLACK_FILE_HOST) {
+        return Err("Only Slack-hosted images can be shown.".to_string());
+    }
+    if !is_image_mimetype(mimetype) {
+        return Err(format!("{mimetype} is not an image."));
+    }
+    let settings = {
+        let connection =
+            Connection::open(db_path).map_err(|err| format!("db open failed: {err}"))?;
+        read_app_settings(&connection)?
+    };
+    let mut config = auth_header(&settings.slack_bot_token);
+    config.push_str(&format!("url = {}\n", curl_config_quote(url)));
+    let max = MAX_IMAGE_BYTES.to_string();
+    let bytes = run_curl(
+        &config,
+        &["--fail", "--max-time", "30", "--max-filesize", &max],
+    )
+    .await?;
+    // Without access Slack answers with its sign-in page (or a redirect) instead of the file.
+    if bytes.is_empty() || looks_like_html(&bytes) {
+        return Err("Slack sent a web page instead of the image.".to_string());
+    }
+    Ok(format!(
+        "data:{mimetype};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    ))
+}
+
+fn looks_like_html(bytes: &[u8]) -> bool {
+    let start: String = String::from_utf8_lossy(&bytes[..bytes.len().min(64)])
+        .trim_start()
+        .to_ascii_lowercase();
+    start.starts_with("<!doctype html") || start.starts_with("<html")
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DirectoryPerson {
+    id: String,
+    name: String,
+    real_name: Option<String>,
+    avatar_url: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DirectoryGroup {
+    id: String,
+    handle: String,
+    name: String,
+}
+
+#[derive(Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SlackDirectory {
+    people: Vec<DirectoryPerson>,
+    groups: Vec<DirectoryGroup>,
+}
+
+/// How long the workspace directory is reused before it is read again.
+const DIRECTORY_TTL: Duration = Duration::from_secs(60 * 60);
+/// users.list pages of 200 to read at most.
+const MAX_DIRECTORY_PAGES: usize = 50;
+
+/// A directory read without its user groups is kept only this long.
+const PARTIAL_DIRECTORY_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// The directory, when it was read, and how long to keep it.
+type CachedDirectory = (Instant, Duration, SlackDirectory);
+
+fn directory_cache() -> &'static Mutex<Option<CachedDirectory>> {
+    static CACHE: OnceLock<Mutex<Option<CachedDirectory>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Call Slack, waiting once and retrying when it says to slow down (users.list
+/// allows about 20 calls a minute).
+async fn slack_call_patiently(
+    token: &str,
+    method: &str,
+    fields: &[(&str, &str)],
+) -> Result<serde_json::Value, String> {
+    match slack_call(token, method, fields).await {
+        Err(err) if err.ends_with("ratelimited") => {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            slack_call(token, method, fields).await
+        }
+        result => result,
+    }
+}
+
+fn directory_person(member: &serde_json::Value) -> Option<DirectoryPerson> {
+    let flag = |key: &str| member.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+    if flag("deleted")
+        || flag("is_bot")
+        || flag("is_app_user")
+        || member.get("id")?.as_str()? == "USLACKBOT"
+    {
+        return None;
+    }
+    let profile = member.get("profile");
+    let text = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let real_name =
+        text(profile.and_then(|p| p.get("real_name"))).or_else(|| text(member.get("real_name")));
+    let name = text(profile.and_then(|p| p.get("display_name")))
+        .or_else(|| real_name.clone())
+        .or_else(|| text(member.get("name")))?;
+    Some(DirectoryPerson {
+        id: member.get("id")?.as_str()?.to_string(),
+        name,
+        real_name,
+        avatar_url: text(profile.and_then(|p| p.get("image_48"))),
+    })
+}
+
+fn directory_group(group: &serde_json::Value) -> Option<DirectoryGroup> {
+    if group
+        .get("date_delete")
+        .and_then(|d| d.as_i64())
+        .unwrap_or(0)
+        != 0
+    {
+        return None;
+    }
+    Some(DirectoryGroup {
+        id: group.get("id")?.as_str()?.to_string(),
+        handle: group.get("handle")?.as_str()?.to_string(),
+        name: group
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+/// The workspace's people and user groups, for @mention suggestions.
+#[tauri::command]
+pub(crate) async fn get_slack_directory(
+    state: State<'_, AppState>,
+) -> Result<SlackDirectory, String> {
+    get_slack_directory_inner(&state.db_path).await
+}
+
+async fn get_slack_directory_inner(db_path: &Path) -> Result<SlackDirectory, String> {
+    if let Some((read_at, ttl, directory)) = directory_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
+        if read_at.elapsed() < *ttl {
+            return Ok(directory.clone());
+        }
+    }
+    let settings = {
+        let connection =
+            Connection::open(db_path).map_err(|err| format!("db open failed: {err}"))?;
+        read_app_settings(&connection)?
+    };
+    let token = settings.slack_bot_token.as_str();
+    let mut directory = SlackDirectory::default();
+    let mut cursor = String::new();
+    for _ in 0..MAX_DIRECTORY_PAGES {
+        let mut fields = vec![("limit", "200")];
+        if !cursor.is_empty() {
+            fields.push(("cursor", cursor.as_str()));
+        }
+        let response = slack_call_patiently(token, "users.list", &fields).await?;
+        for member in response
+            .get("members")
+            .and_then(|m| m.as_array())
+            .into_iter()
+            .flatten()
+        {
+            directory.people.extend(directory_person(member));
+        }
+        cursor = response
+            .pointer("/response_metadata/next_cursor")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        if cursor.is_empty() {
+            break;
+        }
+    }
+    // Groups are a nice-to-have; people still work without them, and the
+    // directory is read again sooner.
+    let mut ttl = DIRECTORY_TTL;
+    match slack_call_patiently(token, "usergroups.list", &[]).await {
+        Err(_) => ttl = PARTIAL_DIRECTORY_TTL,
+        Ok(response) => {
+            for group in response
+                .get("usergroups")
+                .and_then(|g| g.as_array())
+                .into_iter()
+                .flatten()
+            {
+                directory.groups.extend(directory_group(group));
+            }
+        }
+    }
+    *directory_cache().lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((Instant::now(), ttl, directory.clone()));
+    Ok(directory)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UploadFile {
+    name: String,
+    data_base64: String,
+}
+
+/// Post files in the thread as miniOG, with `text` as the message beside them.
+#[tauri::command]
+pub(crate) async fn upload_as_miniog(
+    job_id: String,
+    text: String,
+    files: Vec<UploadFile>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    upload_as_miniog_inner(&state.db_path, &job_id, &text, files).await
+}
+
+async fn upload_as_miniog_inner(
+    db_path: &Path,
+    job_id: &str,
+    text: &str,
+    files: Vec<UploadFile>,
+) -> Result<(), String> {
+    if files.is_empty() {
+        return Err("Pick a file first.".to_string());
+    }
+    if files.len() > MAX_UPLOAD_FILES {
+        return Err(format!(
+            "Attach at most {MAX_UPLOAD_FILES} files at a time."
+        ));
+    }
+    let mut decoded = Vec::new();
+    for file in files {
+        // Check the size before decoding, so an oversized file never lands in memory twice.
+        if file.data_base64.len() > MAX_UPLOAD_BYTES / 3 * 4 + 4 {
+            return Err(format!("{} is over 20 MB.", file.name));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(file.data_base64.as_bytes())
+            .map_err(|err| format!("{} could not be read: {err}", file.name))?;
+        if bytes.is_empty() || bytes.len() > MAX_UPLOAD_BYTES {
+            return Err(format!("{} must be between 1 byte and 20 MB.", file.name));
+        }
+        let name = file.name.trim();
+        decoded.push((
+            if name.is_empty() {
+                "file".to_string()
+            } else {
+                name.to_string()
+            },
+            bytes,
+        ));
+    }
+    let (target, settings) = load_job(db_path, job_id)?;
+    let target = require_target(target)?;
+    let names: Vec<_> = decoded
+        .iter()
+        .map(|(name, bytes)| serde_json::json!({ "name": name, "bytes": bytes.len() }))
+        .collect();
+    let result = upload_in_thread(&settings.slack_bot_token, &target, text, &decoded).await;
+    traced(
+        db_path,
+        job_id,
+        "watchtower.slack.upload",
+        "Posted files in the thread as miniOG from Watchtower.",
+        "Posting files as miniOG from Watchtower failed.",
+        serde_json::json!({ "files": names, "text": text }),
+        result,
+    )
+}
+
+/// Slack's upload flow: ask for an upload URL per file, send the bytes there,
+/// then share them all in the thread in one message.
+async fn upload_in_thread(
+    token: &str,
+    target: &JobSlackTarget,
+    text: &str,
+    files: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    // Unlike a reply, a file share can't be checked afterwards, so make sure
+    // the thread is still there; with its first message gone the files would
+    // land in the channel.
+    let parent = slack_api(
+        token,
+        "conversations.replies",
+        &[
+            ("channel", &target.channel),
+            ("ts", &target.thread_ts),
+            ("limit", "1"),
+        ],
+    )
+    .await?;
+    if let Some(code) = slack_error_code(&parent) {
+        return Err(format!(
+            "The thread can't be read (Slack said {code}), so the files weren't sent."
+        ));
+    }
+    let mut uploaded = Vec::new();
+    for (name, bytes) in files {
+        let length = bytes.len().to_string();
+        let response = slack_call(
+            token,
+            "files.getUploadURLExternal",
+            &[("filename", name), ("length", &length)],
+        )
+        .await?;
+        let upload_url = response
+            .get("upload_url")
+            .and_then(|u| u.as_str())
+            .unwrap_or("");
+        let file_id = response
+            .get("file_id")
+            .and_then(|f| f.as_str())
+            .unwrap_or("");
+        if !upload_url.starts_with(SLACK_FILE_HOST) || file_id.is_empty() {
+            return Err("Slack did not give a usable upload address.".to_string());
+        }
+        let path = std::env::temp_dir().join(format!("watchtower-upload-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, bytes).map_err(|err| format!("could not stage {name}: {err}"))?;
+        let config = format!(
+            "url = {}\ndata-binary = {}\n",
+            curl_config_quote(upload_url),
+            curl_config_quote(&format!("@{}", path.display()))
+        );
+        let sent = run_curl(&config, &["--fail", "--max-time", "120"]).await;
+        let _ = std::fs::remove_file(&path);
+        sent.map_err(|err| format!("{name} did not upload: {err}"))?;
+        uploaded.push(serde_json::json!({ "id": file_id, "title": name }));
+    }
+    let files_json = serde_json::Value::Array(uploaded).to_string();
+    let mut fields = vec![
+        ("files", files_json.as_str()),
+        ("channel_id", target.channel.as_str()),
+        ("thread_ts", target.thread_ts.as_str()),
+    ];
+    if !text.trim().is_empty() {
+        fields.push(("initial_comment", text));
+    }
+    slack_call(token, "files.completeUploadExternal", &fields).await?;
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -1093,6 +1499,45 @@ mod tests {
 
         drop(connection);
         let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn image_checks_accept_only_images_and_spot_sign_in_pages() {
+        assert!(is_image_mimetype("image/png"));
+        assert!(is_image_mimetype("image/svg+xml"));
+        assert!(!is_image_mimetype("image/"));
+        assert!(!is_image_mimetype("text/html"));
+        assert!(!is_image_mimetype("image/png\"\nurl = x"));
+        assert!(looks_like_html(b"  <!DOCTYPE html><html>"));
+        assert!(looks_like_html(b"<HTML><head>"));
+        assert!(!looks_like_html(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    #[test]
+    fn directory_keeps_active_people_and_groups() {
+        let person = serde_json::json!({
+            "id": "U1", "name": "aditya", "real_name": "Aditya S",
+            "profile": { "display_name": "", "real_name": "Aditya Sisodia", "image_48": "https://a/48.png" }
+        });
+        let found = directory_person(&person).expect("person");
+        assert_eq!(
+            (found.name.as_str(), found.real_name.as_deref()),
+            ("Aditya Sisodia", Some("Aditya Sisodia"))
+        );
+        for skipped in [
+            serde_json::json!({ "id": "U2", "name": "gone", "deleted": true }),
+            serde_json::json!({ "id": "U3", "name": "bot", "is_bot": true }),
+            serde_json::json!({ "id": "USLACKBOT", "name": "slackbot" }),
+        ] {
+            assert!(directory_person(&skipped).is_none());
+        }
+        let group = serde_json::json!({ "id": "S1", "handle": "core-dev", "name": "Core dev", "date_delete": 0 });
+        assert_eq!(
+            directory_group(&group).map(|g| g.handle),
+            Some("core-dev".to_string())
+        );
+        let deleted = serde_json::json!({ "id": "S2", "handle": "old", "name": "Old", "date_delete": 1700000000 });
+        assert!(directory_group(&deleted).is_none());
     }
 
     #[test]

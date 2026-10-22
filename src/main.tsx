@@ -2,7 +2,10 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { Toaster } from 'sonner';
 import App from './App';
+import { installDropGuard } from './lib/dropGuard';
 import './styles.css';
+
+installDropGuard();
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>

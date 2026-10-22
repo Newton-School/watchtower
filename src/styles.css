@@ -1595,7 +1595,7 @@ h3 {
 .emoji-picker {
   position: fixed;
   z-index: 50;
-  width: 300px;
+  width: 340px;
   padding: 8px;
   border: 1px solid var(--line-strong);
   border-radius: 10px;
@@ -1605,7 +1605,7 @@ h3 {
 
 .emoji-picker-search {
   width: 100%;
-  margin-bottom: 8px;
+  margin-bottom: 6px;
   padding: 6px 10px;
   border: 1px solid var(--line-strong);
   border-radius: 6px;
@@ -1613,14 +1613,52 @@ h3 {
   color: var(--text-strong);
 }
 
+.emoji-picker-tabs {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--line);
+}
+
+.emoji-picker-tab {
+  appearance: none;
+  flex: 1;
+  height: 28px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  font-size: 1rem;
+  cursor: pointer;
+}
+
+.emoji-picker-tab:hover {
+  background: var(--line-strong);
+}
+
+/* Fixed height, so a picker opened upward doesn't grow over its button. */
+.emoji-picker-scroll {
+  position: relative;
+  height: 260px;
+  overflow-y: auto;
+}
+
+.emoji-picker-scroll section {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 200px;
+}
+
+.emoji-picker-heading {
+  margin: 6px 2px 2px;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
 .emoji-picker-grid {
   display: grid;
-  grid-template-columns: repeat(8, 1fr);
+  grid-template-columns: repeat(9, 1fr);
   align-content: start;
   gap: 2px;
-  /* A fixed height, so a picker opened upward doesn't grow over its button. */
-  height: 220px;
-  overflow-y: auto;
 }
 
 .emoji-picker-option {
@@ -1640,6 +1678,152 @@ h3 {
 .emoji-picker-empty {
   grid-column: 1 / -1;
   padding: 6px;
+}
+
+.emoji-picker-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  margin-top: 4px;
+  padding: 0 4px;
+  border-top: 1px solid var(--line);
+  font-size: 0.75rem;
+  color: var(--text-soft);
+}
+
+.emoji-picker-footer-char {
+  font-size: 1.25rem;
+}
+
+.slack-image {
+  display: block;
+  max-width: 360px;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.slack-image img {
+  display: block;
+  max-width: 360px;
+  max-height: 360px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.slack-image-loading {
+  display: block;
+  max-width: 360px;
+  border-radius: 8px;
+  background: var(--line-strong);
+}
+
+.slack-composer {
+  position: relative;
+}
+
+.slack-composer-dragging textarea {
+  border-color: var(--accent);
+  border-style: dashed;
+}
+
+.slack-composer-tools {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.slack-broadcast {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 6px;
+  font-size: 0.8125rem;
+  color: var(--text-soft);
+  cursor: pointer;
+}
+
+.slack-composer-hint {
+  margin-left: auto;
+}
+
+.slack-attachments {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.slack-attachment {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 280px;
+  padding: 4px 4px 4px 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  font-size: 0.8125rem;
+}
+
+.slack-attachment img {
+  width: 32px;
+  height: 32px;
+  border-radius: 4px;
+  object-fit: cover;
+}
+
+.slack-attachment-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-strong);
+}
+
+.slack-mention-list {
+  position: absolute;
+  bottom: calc(100% - 8px);
+  left: 0;
+  z-index: 20;
+  width: min(360px, 100%);
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: var(--bg-panel-strong);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+.slack-mention-option {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-soft);
+  font-size: 0.8125rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.slack-mention-active {
+  background: var(--accent-soft);
+}
+
+.slack-mention-avatar {
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  font-size: 0.6875rem;
+}
+
+.slack-mention-name {
+  font-weight: 600;
+  color: var(--text-strong);
 }
 
 .slack-edit textarea,
