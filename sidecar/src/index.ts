@@ -909,8 +909,20 @@ async function processEvent(event: SlackEventEnvelope, client: WebClient): Promi
   }
 }
 
+/**
+ * Closes the launchpad request behind an event that will not start a run.
+ * Left QUEUED, it would never finish, and the next sidecar start would run it.
+ */
+function closeLaunchpadRequest(event: SlackEventEnvelope, status: 'SKIPPED' | 'FAILED', reason: string): void {
+  if (!event.launchpadRequestId) return;
+  store.markLaunchpadRequestFinished({ id: event.launchpadRequestId, status, errorMessage: reason });
+}
+
 async function processEventClaimed(event: SlackEventEnvelope, client: WebClient): Promise<void> {
-  if (store.hasJobForEventTs(event.channelId, event.eventTs)) {
+  // A launchpad run may start from a message an earlier run started from: a
+  // re-run from the app does exactly that. Its request id already makes it
+  // unique.
+  if (event.ingestSource !== 'launchpad' && store.hasJobForEventTs(event.channelId, event.eventTs)) {
     store.recordEvent(event.eventId, event.channelId, event.threadTs);
     logger.info(
       { eventId: event.eventId, channelId: event.channelId, eventTs: event.eventTs },
@@ -934,6 +946,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
       },
       'skipped: thread already has an active job',
     );
+    closeLaunchpadRequest(event, 'SKIPPED', 'miniOG is already working in this thread.');
     return;
   }
 
@@ -1053,6 +1066,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
   if (!task.mentionDetected) {
     logger.info({ eventId: event.eventId }, 'skip non-mention message');
     await removeReaction(client, event.channelId, event.eventTs, 'eyes');
+    closeLaunchpadRequest(event, 'SKIPPED', 'miniOG did not see a request in it.');
     return;
   }
 
@@ -1094,6 +1108,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
       .catch(() => {});
     await removeReaction(client, event.channelId, event.eventTs, 'eyes');
     await addReaction(client, event.channelId, event.eventTs, 'no_entry_sign');
+    closeLaunchpadRequest(event, 'FAILED', policyDecision.reason);
     return;
   }
 
@@ -2073,6 +2088,13 @@ async function main(): Promise<void> {
       if (cancelled) {
         store.markJob(jobId, 'CANCELLED', { errorMessage: 'Cancelled from Watchtower UI.' });
         logger.info({ jobId }, 'job cancelled from UI');
+      } else if (store.getJobSummary(jobId)?.status === 'PAUSED') {
+        // A run waiting on a person has no process to abort: closing it is
+        // the stop, and its :zzz: goes with it.
+        store.markJob(jobId, 'CANCELLED', { errorMessage: 'Cancelled from Watchtower UI.' });
+        const anchor = store.eventAnchorFor(jobId);
+        if (anchor) void removeReaction(client.webClient, anchor.channelId, anchor.eventTs, 'zzz');
+        logger.info({ jobId }, 'paused job cancelled from UI');
       }
     }
   }, 2000);

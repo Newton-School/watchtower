@@ -1,16 +1,29 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import type { RemoveReactionsResult, RunThread, SlackFile, SlackMessage, SlackUser } from '../types';
+import type {
+  RemoveReactionsResult,
+  RunControls,
+  RunThread,
+  SlackFile,
+  SlackMessage,
+  SlackUser,
+  StartedRun,
+  StartedRunStatus,
+} from '../types';
 import { emojiChar } from '../lib/emoji';
 import { SlackText, fromSlackText, toSlackText } from '../lib/slackText';
 import { loadSlackImage } from '../lib/slackCache';
 import { EmojiPicker } from './EmojiPicker';
 import { SlackComposer } from './SlackComposer';
-import type { ComposedMessage } from './SlackComposer';
+import type { ComposedAsk, ComposedMessage } from './SlackComposer';
+import { RunControlsBar, isWaiting } from './RunControlsBar';
+import type { StartedRunView } from './RunControlsBar';
 import { SectionCard } from './primitives';
 
 const REFRESH_MS = 5000;
+// How often to check on a run started from here until miniOG takes it.
+const STARTED_POLL_MS = 2000;
 // Slack folds a message into the previous one when the same person posts again this soon.
 const GROUP_WINDOW_SECONDS = 5 * 60;
 
@@ -107,15 +120,20 @@ function SlackImage({ file }: { file: SlackFile }) {
 
 type SlackThreadProps = {
   jobId: string;
+  /** Opens another run's page: a run started from here, or one busy in the thread. */
+  onOpenRun?: (jobId: string) => void;
 };
 
 /**
  * The run's Slack thread, read live, where the owner acts as miniOG: reply,
- * react, and edit or delete miniOG's own messages. Everything done here is
- * logged in the run's trace.
+ * react, edit or delete miniOG's own messages, stop the run, re-run it, or ask
+ * miniOG something new here. Everything done here is logged in the run's
+ * trace.
  */
-export function SlackThread({ jobId }: SlackThreadProps) {
+export function SlackThread({ jobId, onOpenRun }: SlackThreadProps) {
   const [thread, setThread] = useState<RunThread | null>(null);
+  const [controls, setControls] = useState<RunControls | null>(null);
+  const [started, setStarted] = useState<StartedRunView | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -135,6 +153,11 @@ export function SlackThread({ jobId }: SlackThreadProps) {
       if (fromPoll && polling.current) return;
       const seq = ++readSeq.current;
       if (fromPoll) polling.current = true;
+      // The run's own state comes from the app's database: quick, and it
+      // lands even when Slack doesn't.
+      invoke<RunControls>('get_run_controls', { jobId })
+        .then(next => seq === readSeq.current && setControls(next))
+        .catch(() => {});
       try {
         const next = await invoke<RunThread>('get_run_thread', { jobId });
         if (seq !== readSeq.current) return;
@@ -157,6 +180,8 @@ export function SlackThread({ jobId }: SlackThreadProps) {
   useEffect(() => {
     hasGoodRead.current = false;
     setThread(null);
+    setControls(null);
+    setStarted(null);
     setLoadError(null);
     setActionError(null);
     setNotice(null);
@@ -175,6 +200,43 @@ export function SlackThread({ jobId }: SlackThreadProps) {
     setActionError(null);
     try {
       await invoke(command, { jobId, ...args });
+      await load();
+      return true;
+    } catch (err) {
+      setActionError(String(err));
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Follow a run started from here until miniOG takes it or turns it down.
+  const startedId = started?.requestId ?? null;
+  const startedWaiting = started !== null && isWaiting(started.status);
+  useEffect(() => {
+    if (!startedId || !startedWaiting) return;
+    const check = async () => {
+      try {
+        const status = await invoke<StartedRunStatus>('get_started_run', { requestId: startedId });
+        setStarted(current => (current?.requestId === startedId ? { ...current, status } : current));
+      } catch {
+        // Checked again on the next tick.
+      }
+    };
+    const timer = window.setInterval(() => void check(), STARTED_POLL_MS);
+    return () => window.clearInterval(timer);
+  }, [startedId, startedWaiting]);
+
+  const startRun = async (
+    kind: StartedRunView['kind'],
+    command: string,
+    args: Record<string, unknown>,
+  ): Promise<boolean> => {
+    setBusy(true);
+    setActionError(null);
+    try {
+      const run = await invoke<StartedRun>(command, { jobId, ...args });
+      setStarted({ kind, requestId: run.requestId, status: null });
       await load();
       return true;
     } catch (err) {
@@ -222,6 +284,8 @@ export function SlackThread({ jobId }: SlackThreadProps) {
     }
   };
 
+  const askMiniog = ({ text, postAsk }: ComposedAsk) => startRun('ask', 'ask_miniog_in_thread', { text, postAsk });
+
   const saveEdit = async () => {
     if (!editing || busy) return;
     if (await act('edit_miniog_message', { ts: editing.ts, text: toSlackText(editing.text) })) setEditing(null);
@@ -263,6 +327,21 @@ export function SlackThread({ jobId }: SlackThreadProps) {
       }
       actions={actions}
     >
+      {thread && controls ? (
+        <RunControlsBar
+          jobId={jobId}
+          controls={controls}
+          users={thread.users}
+          threadClosed={Boolean(thread.readError)}
+          busy={busy}
+          started={started}
+          onStop={() => act('stop_run', {})}
+          onRerun={postAsk => startRun('rerun', 'rerun_in_thread', { postAsk })}
+          onDismissStarted={() => setStarted(null)}
+          onOpenRun={onOpenRun}
+        />
+      ) : null}
+      {thread?.readError && actionError ? <p className="slack-thread-error">{actionError}</p> : null}
       {loadError && !thread ? (
         <div className="slack-thread-state">
           <span className="slack-thread-error">{loadError}</span>
@@ -344,6 +423,14 @@ export function SlackThread({ jobId }: SlackThreadProps) {
             busy={busy}
             participants={[...new Set(thread.messages.map(message => message.user ?? ''))].filter(Boolean)}
             onSend={sendMessage}
+            onAsk={controls ? askMiniog : undefined}
+            askBlocked={
+              controls?.busyJobId
+                ? 'miniOG is already working in this thread.'
+                : controls?.starting
+                  ? 'A run started from here is waiting to be picked up.'
+                  : null
+            }
           />
         </div>
       )}

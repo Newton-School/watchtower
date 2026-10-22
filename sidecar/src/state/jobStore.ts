@@ -821,6 +821,11 @@ export class JobStore {
     } catch {
       /* column already exists */
     }
+    try {
+      this.db.exec(`ALTER TABLE launchpad_requests ADD COLUMN origin_event_ts TEXT`);
+    } catch {
+      /* column already exists */
+    }
 
     try {
       // Slack ts of the "Want me to fix this?" prompt — needed so the reaction
@@ -1192,14 +1197,15 @@ export class JobStore {
     requestedForUserId?: string;
     originChannelId?: string;
     originThreadTs?: string;
+    originEventTs?: string;
   }): void {
     const now = new Date().toISOString();
     this.db
       .prepare(
         `INSERT INTO launchpad_requests(
            id, target, prompt, owner_user_id, status, slack_channel_id, anchor_ts,
-           requested_for_user_id, origin_channel_id, origin_thread_ts, created_at, updated_at
-         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           requested_for_user_id, origin_channel_id, origin_thread_ts, origin_event_ts, created_at, updated_at
+         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.id,
@@ -1212,6 +1218,7 @@ export class JobStore {
         input.requestedForUserId ?? null,
         input.originChannelId ?? null,
         input.originThreadTs ?? null,
+        input.originEventTs ?? null,
         now,
         now,
       );
@@ -1223,7 +1230,7 @@ export class JobStore {
     const rows = (
       this.db.prepare(
         `SELECT id, target, prompt, owner_user_id, status, job_id, slack_channel_id, anchor_ts,
-                requested_for_user_id, origin_channel_id, origin_thread_ts,
+                requested_for_user_id, origin_channel_id, origin_thread_ts, origin_event_ts,
                 result_json, error_message, created_at, updated_at
          FROM launchpad_requests
          WHERE status = 'PENDING'
@@ -1242,6 +1249,7 @@ export class JobStore {
           requested_for_user_id?: string | null;
           origin_channel_id?: string | null;
           origin_thread_ts?: string | null;
+          origin_event_ts?: string | null;
           result_json?: string | null;
           error_message?: string | null;
           created_at: string;
@@ -1276,6 +1284,7 @@ export class JobStore {
         requestedForUserId: row.requested_for_user_id ?? undefined,
         originChannelId: row.origin_channel_id ?? undefined,
         originThreadTs: row.origin_thread_ts ?? undefined,
+        originEventTs: row.origin_event_ts ?? undefined,
         resultJson: row.result_json ?? undefined,
         errorMessage: row.error_message ?? undefined,
         createdAt: row.created_at,

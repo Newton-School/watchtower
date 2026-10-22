@@ -250,6 +250,7 @@ describe('launchpadIntake', () => {
       requestedForUserId: 'U_REQ',
       originChannelId: 'C_ORIG',
       originThreadTs: '1.2',
+      originEventTs: '1.5',
     });
 
     const claimed = store.claimPendingLaunchpadRequests();
@@ -259,7 +260,46 @@ describe('launchpadIntake', () => {
       requestedForUserId: 'U_REQ',
       originChannelId: 'C_ORIG',
       originThreadTs: '1.2',
+      originEventTs: '1.5',
     });
+
+    store.close();
+    fs.rmSync(dbPath, { force: true });
+  });
+
+  it('starts a run from the thread view at its posted ask, inside the origin thread', async () => {
+    const { dbPath, store } = createStore();
+    store.createLaunchpadRequest({
+      id: 'req-ask',
+      target: 'miniog',
+      prompt: 'check the deploy logs',
+      ownerUserId: 'UOWNER1',
+      originChannelId: 'C0B5ZVDM7GU',
+      originThreadTs: '1792655209.535679',
+      originEventTs: '1792659999.000100',
+    });
+    const webClient = {
+      conversations: { open: vi.fn() },
+      chat: { postMessage: vi.fn() },
+    };
+    const enqueue = vi
+      .fn<(event: SlackEventEnvelope, client: typeof webClient, source: 'launchpad') => Promise<void>>()
+      .mockResolvedValue(undefined);
+
+    await runLaunchpadRequestPoller({ webClient: webClient as any, config, store, enqueue });
+
+    expect(webClient.chat.postMessage).not.toHaveBeenCalled();
+    expect(enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventId: 'launchpad:req-ask:1792659999.000100',
+        threadTs: '1792655209.535679',
+        eventTs: '1792659999.000100',
+        userId: 'UOWNER1',
+      }),
+      webClient,
+      'launchpad',
+    );
+    expect(store.getLaunchpadRequest('req-ask')?.anchorTs).toBe('1792655209.535679');
 
     store.close();
     fs.rmSync(dbPath, { force: true });

@@ -16,17 +16,20 @@ export function buildLaunchpadEnvelope(params: {
   };
   channelId: string;
   anchorTs: string;
+  /** The message the run starts from, when not the thread's first message. */
+  eventTs?: string;
 }): SlackEventEnvelope {
   const { config, request, channelId, anchorTs } = params;
+  const eventTs = params.eventTs ?? anchorTs;
 
   return {
-    eventId: `launchpad:${request.id}:${anchorTs}`,
+    eventId: `launchpad:${request.id}:${eventTs}`,
     channelId,
     // Origin-thread anchors (issue #343) land in real channels; the legacy
     // anchor is always the owner DM.
     channelType: channelId.startsWith('D') ? 'im' : 'channel',
     threadTs: anchorTs,
-    eventTs: anchorTs,
+    eventTs,
     // Permissions evaluate the owner who queued the retrigger; the real
     // requester travels separately for attribution + dossier recall.
     userId: request.ownerUserId,
@@ -41,6 +44,7 @@ export function buildLaunchpadEnvelope(params: {
       requestedForUserId: request.requestedForUserId,
       prompt: request.prompt,
       anchorTs,
+      eventTs,
     },
   };
 }
@@ -176,6 +180,9 @@ export async function runLaunchpadRequestPoller(params: {
         request,
         channelId,
         anchorTs,
+        // A run started from the app's thread view starts from the posted ask
+        // or the message it repeats, and its emojis go there.
+        eventTs: request.originChannelId && request.originThreadTs ? request.originEventTs : undefined,
       });
 
       await enqueue(event, webClient, 'launchpad');

@@ -21,7 +21,7 @@ type RunsPageProps = {
   data: DashboardData | null;
   onReviewChanges?: (runId: string) => void;
   onSelectRun: (runId: string) => void;
-  onRefresh?: () => void;
+  onRefresh?: () => void | Promise<void>;
   selectedRunId: string | null;
   selectedRunLogs: JobLogEntry[];
   selectedRunPipeline?: PipelineRunData | null;
@@ -118,6 +118,16 @@ export function RunsPage({
     onSelectRun(runId);
   };
 
+  // A run started from a thread may not be in the list yet: refresh it first.
+  const openRun = async (runId: string) => {
+    try {
+      await onRefresh?.();
+    } catch {
+      // The run opens once the next refresh lists it.
+    }
+    handleSelectRun(runId);
+  };
+
   const handleCancelRun = async (runId: string) => {
     try {
       await invoke('cancel_job', { jobId: runId });
@@ -155,7 +165,7 @@ export function RunsPage({
           &larr; Back to Runs
         </button>
 
-        <SlackThread jobId={selectedRun.id} />
+        <SlackThread key={selectedRun.id} jobId={selectedRun.id} onOpenRun={runId => void openRun(runId)} />
 
         <GlowCard>
           <article className="surface-card detail-card">
