@@ -1335,6 +1335,66 @@ h3 {
   word-break: break-word;
 }
 
+.run-reactions-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.run-reactions-error {
+  color: #ffe9c5;
+}
+
+.run-reactions-list {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.run-reaction-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px 4px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.run-reaction-emoji {
+  font-size: 1.05rem;
+  line-height: 1;
+}
+
+.run-reaction-remove {
+  appearance: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  border: none;
+  background: transparent;
+  color: var(--text-soft);
+  cursor: pointer;
+  font-size: 0.95rem;
+  line-height: 1;
+}
+
+.run-reaction-remove:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-strong);
+}
+
+.run-reaction-remove:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.run-reactions-notice {
+  margin-top: 10px;
+}
+
 .detail-error {
   margin: 0;
   line-height: 1.7;

@@ -153,6 +153,18 @@ export type AgentCallRow = {
   createdAt: string;
 };
 
+export type JobReactions = {
+  hasMessage: boolean;
+  /** null when Slack would not let the app read the message. */
+  reactions: string[] | null;
+  readError: string | null;
+};
+
+export type RemoveReactionsResult = {
+  removed: string[];
+  failed: string[];
+};
+
 export type JobCostSummary = {
   jobId: string;
   totalCostUsd: number;
