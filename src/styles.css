@@ -1642,6 +1642,11 @@ h3 {
   overflow-y: auto;
 }
 
+.emoji-picker-scroll section {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 200px;
+}
+
 .emoji-picker-heading {
   margin: 6px 2px 2px;
   font-size: 0.6875rem;

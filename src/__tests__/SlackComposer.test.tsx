@@ -27,6 +27,9 @@ function type(box: HTMLTextAreaElement, value: string) {
 
 describe('SlackComposer', () => {
   beforeEach(() => {
+    // jsdom has no object URLs; image attachments use them for previews.
+    URL.createObjectURL = vi.fn(() => 'blob:preview');
+    URL.revokeObjectURL = vi.fn();
     invoke.mockReset();
     invoke.mockImplementation((command: string) =>
       command === 'get_slack_directory' ? Promise.resolve(directory) : Promise.resolve(undefined),
@@ -81,6 +84,39 @@ describe('SlackComposer', () => {
     await waitFor(() => expect(onSend).toHaveBeenLastCalledWith({ text: '', broadcast: false, files: [file] }));
   });
 
+  it('sends once when Enter is pressed again while files are being read', async () => {
+    let finish: (sent: boolean) => void = () => {};
+    const onSend = vi.fn(() => new Promise<boolean>(resolve => (finish = resolve)));
+    render(<SlackComposer busy={false} participants={[]} onSend={onSend} />);
+    const box = screen.getByRole('textbox', { name: 'Reply as miniOG' });
+    fireEvent.change(screen.getByLabelText('Files to attach'), {
+      target: { files: [new File(['a'], 'a.txt', { type: 'text/plain' })] },
+    });
+
+    fireEvent.keyDown(box, { key: 'Enter' });
+    fireEvent.keyDown(box, { key: 'Enter' });
+    finish(true);
+
+    await waitFor(() => expect(screen.queryByText('a.txt')).toBeNull());
+    expect(onSend).toHaveBeenCalledTimes(1);
+  });
+
+  it('takes files dropped on it', () => {
+    setup();
+    const file = new File(['img'], 'drop.png', { type: 'image/png' });
+    const form = screen.getByRole('textbox', { name: 'Reply as miniOG' }).closest('form') as HTMLFormElement;
+    fireEvent.drop(form, { dataTransfer: { files: [file], types: ['Files'] } });
+
+    expect(screen.getByText('drop.png')).toBeTruthy();
+  });
+
+  it('says why an empty file is refused', () => {
+    setup();
+    fireEvent.change(screen.getByLabelText('Files to attach'), { target: { files: [new File([], 'blank.txt')] } });
+
+    expect(screen.getByText("blank.txt is empty, so it can't be attached.")).toBeTruthy();
+  });
+
   it('refuses files over 20 MB', () => {
     setup();
     const big = new File(['x'], 'huge.mov');
@@ -107,5 +143,15 @@ describe('applyMentions', () => {
       { label: '@Sam K', token: '<@U2>' },
     ]);
     expect(text).toBe('ask <@U2> and <@U1> &amp; co');
+  });
+
+  it("doesn't match inside a longer name or inside another mention's markup", () => {
+    expect(applyMentions('@Samantha and @Sam', [{ label: '@Sam', token: '<@U1>' }])).toBe('@Samantha and <@U1>');
+    expect(
+      applyMentions('@core-dev and @core', [
+        { label: '@core-dev', token: '<!subteam^S1|@core-dev>' },
+        { label: '@core', token: '<@U9>' },
+      ]),
+    ).toBe('<!subteam^S1|@core-dev> and <@U9>');
   });
 });

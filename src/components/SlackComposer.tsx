@@ -6,6 +6,8 @@ import { toSlackText } from '../lib/slackText';
 import { EmojiPicker } from './EmojiPicker';
 
 const MAX_FILE_BYTES = 20 * 1024 * 1024;
+const MAX_FILES = 10;
+const MAX_TOTAL_BYTES = 50 * 1024 * 1024;
 const MAX_SUGGESTIONS = 8;
 
 /** What the box shows for a mention, and the Slack markup it posts as. */
@@ -17,11 +19,20 @@ type Attachment = { id: number; file: File; previewUrl: string | null };
 
 export type ComposedMessage = { text: string; broadcast: boolean; files: File[] };
 
-/** Swap each mention's label for its Slack markup, longest first so "@Sam K" wins over "@Sam". */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Swap each mention's label for its Slack markup in one pass, longest label
+ * first, so "@Sam K" wins over "@Sam", "@Sam" never matches inside a
+ * hand-typed "@Samantha", and one swap can't land inside another's markup.
+ */
 export function applyMentions(slackText: string, mentions: Mention[]): string {
-  return [...mentions]
-    .sort((a, b) => b.label.length - a.label.length)
-    .reduce((text, mention) => text.split(toSlackText(mention.label)).join(mention.token), slackText);
+  if (mentions.length === 0) return slackText;
+  const tokens = new Map(mentions.map(mention => [toSlackText(mention.label), mention.token]));
+  const labels = [...tokens.keys()].sort((a, b) => b.length - a.length).map(escapeRegExp);
+  return slackText.replace(new RegExp(`(?:${labels.join('|')})(?![\\w])`, 'g'), label => tokens.get(label) ?? label);
 }
 
 function formatBytes(bytes: number): string {
@@ -56,18 +67,27 @@ export function SlackComposer({ busy, participants, onSend }: SlackComposerProps
   const [emojiAnchor, setEmojiAnchor] = useState<HTMLElement | null>(null);
   const [fileError, setFileError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
+  // dragenter/dragleave also fire over child elements, so count them.
+  const dragDepth = useRef(0);
+  // Reading files takes a moment before the parent marks itself busy; this
+  // stops a second Enter from sending the same files twice.
+  const sending = useRef(false);
   const boxRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const nextAttachmentId = useRef(0);
   const attachmentsRef = useRef<Attachment[]>([]);
   attachmentsRef.current = attachments;
+  const draftRef = useRef(draft);
+  draftRef.current = draft;
 
-  // Read the directory early; the first read takes a few seconds.
+  // Read the directory early; the first read takes a few seconds. If it
+  // failed, typing @ tries again.
+  const wantsDirectory = mentionQuery !== null && directory === null;
   useEffect(() => {
     loadSlackDirectory()
       .then(setDirectory)
       .catch(() => setDirectory(null));
-  }, []);
+  }, [wantsDirectory]);
 
   useEffect(
     () => () => {
@@ -135,11 +155,23 @@ export function SlackComposer({ busy, participants, onSend }: SlackComposerProps
 
   const addFiles = (files: FileList | File[]) => {
     const added: Attachment[] = [];
+    let count = attachments.length;
+    let total = attachments.reduce((sum, attachment) => sum + attachment.file.size, 0);
     for (const file of Array.from(files)) {
-      if (file.size === 0 || file.size > MAX_FILE_BYTES) {
+      if (file.size === 0) {
+        setFileError(`${file.name} is empty, so it can't be attached.`);
+        continue;
+      }
+      if (file.size > MAX_FILE_BYTES) {
         setFileError(`${file.name} is over 20 MB, so it can't be attached.`);
         continue;
       }
+      if (count + 1 > MAX_FILES || total + file.size > MAX_TOTAL_BYTES) {
+        setFileError(`Up to ${MAX_FILES} files and 50 MB go in one reply.`);
+        break;
+      }
+      count += 1;
+      total += file.size;
       added.push({
         id: nextAttachmentId.current++,
         file,
@@ -162,21 +194,30 @@ export function SlackComposer({ busy, participants, onSend }: SlackComposerProps
 
   const send = async () => {
     const typed = draft;
-    if (busy || (!typed.trim() && attachments.length === 0)) return;
-    const sent = await onSend({
-      text: applyMentions(toSlackText(typed.trim()), mentions),
-      broadcast: broadcast && attachments.length === 0,
-      files: attachments.map(attachment => attachment.file),
-    });
-    if (!sent) return;
-    // Keep anything typed while the send was in flight.
-    setDraft(current => (current === typed ? '' : current));
-    setMentions([]);
-    for (const attachment of attachments) {
-      if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
+    const sentAttachments = attachments;
+    if (busy || sending.current || (!typed.trim() && sentAttachments.length === 0)) return;
+    sending.current = true;
+    try {
+      const sent = await onSend({
+        text: applyMentions(toSlackText(typed.trim()), mentions),
+        broadcast: broadcast && sentAttachments.length === 0,
+        files: sentAttachments.map(attachment => attachment.file),
+      });
+      if (!sent) return;
+      // Keep anything typed or attached while the send was in flight.
+      if (draftRef.current === typed) {
+        setDraft('');
+        setMentions([]);
+      }
+      const sentIds = new Set(sentAttachments.map(attachment => attachment.id));
+      for (const attachment of sentAttachments) {
+        if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
+      }
+      setAttachments(current => current.filter(attachment => !sentIds.has(attachment.id)));
+      setBroadcast(false);
+    } finally {
+      sending.current = false;
     }
-    setAttachments([]);
-    setBroadcast(false);
   };
 
   const suggesting = suggestions.length > 0;
@@ -188,18 +229,25 @@ export function SlackComposer({ busy, participants, onSend }: SlackComposerProps
         e.preventDefault();
         void send();
       }}
-      onDragOver={(e: ReactDragEvent) => {
+      onDragEnter={(e: ReactDragEvent) => {
         if (e.dataTransfer.types.includes('Files')) {
-          e.preventDefault();
+          dragDepth.current += 1;
           setDragging(true);
         }
       }}
-      onDragLeave={() => setDragging(false)}
+      onDragOver={(e: ReactDragEvent) => {
+        if (e.dataTransfer.types.includes('Files')) e.preventDefault();
+      }}
+      onDragLeave={() => {
+        dragDepth.current = Math.max(0, dragDepth.current - 1);
+        if (dragDepth.current === 0) setDragging(false);
+      }}
       onDrop={(e: ReactDragEvent) => {
         if (e.dataTransfer.files.length > 0) {
           e.preventDefault();
           addFiles(e.dataTransfer.files);
         }
+        dragDepth.current = 0;
         setDragging(false);
       }}
     >

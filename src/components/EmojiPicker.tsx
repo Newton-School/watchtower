@@ -108,21 +108,39 @@ export function EmojiPicker({ anchor, onPick, onClose }: EmojiPickerProps) {
     onPick(name);
   };
 
-  const results = query.trim() ? searchEmoji(query, 120) : null;
+  const results = useMemo(() => (query.trim() ? searchEmoji(query, 120) : null), [query]);
 
-  const renderOption = (emoji: Emoji) => (
-    <button
-      key={emoji.names[0]}
-      type="button"
-      className="emoji-picker-option"
-      title={`:${emoji.names[0]}:`}
-      aria-label={`:${emoji.names[0]}:`}
-      onClick={() => pick(emoji.names[0])}
-      onMouseEnter={() => setHovered(emoji.names[0])}
-    >
-      {emoji.char}
-    </button>
-  );
+  // The grid holds ~1,900 buttons; build it once per search, not on every hover.
+  const pickRef = useRef(pick);
+  pickRef.current = pick;
+  const grid = useMemo(() => {
+    const renderOption = (emoji: Emoji) => (
+      <button
+        key={emoji.names[0]}
+        type="button"
+        className="emoji-picker-option"
+        title={`:${emoji.names[0]}:`}
+        aria-label={`:${emoji.names[0]}:`}
+        onClick={() => pickRef.current(emoji.names[0])}
+        onMouseEnter={() => setHovered(emoji.names[0])}
+      >
+        {emoji.char}
+      </button>
+    );
+    return results ? (
+      <div className="emoji-picker-grid">
+        {results.map(renderOption)}
+        {results.length === 0 ? <span className="muted emoji-picker-empty">No emoji named that.</span> : null}
+      </div>
+    ) : (
+      sections.map(section => (
+        <section key={section.category} data-category={section.category}>
+          <h4 className="emoji-picker-heading">{section.category}</h4>
+          <div className="emoji-picker-grid">{section.emoji.map(renderOption)}</div>
+        </section>
+      ))
+    );
+  }, [results, sections]);
 
   return createPortal(
     <div
@@ -163,19 +181,7 @@ export function EmojiPicker({ anchor, onPick, onClose }: EmojiPickerProps) {
         </div>
       )}
       <div className="emoji-picker-scroll" ref={gridRef}>
-        {results ? (
-          <div className="emoji-picker-grid">
-            {results.map(renderOption)}
-            {results.length === 0 ? <span className="muted emoji-picker-empty">No emoji named that.</span> : null}
-          </div>
-        ) : (
-          sections.map(section => (
-            <section key={section.category} data-category={section.category}>
-              <h4 className="emoji-picker-heading">{section.category}</h4>
-              <div className="emoji-picker-grid">{section.emoji.map(renderOption)}</div>
-            </section>
-          ))
-        )}
+        {grid}
       </div>
       <div className="emoji-picker-footer">
         {hovered ? (

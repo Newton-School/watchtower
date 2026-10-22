@@ -323,6 +323,10 @@ describe('SlackThread', () => {
       mimetype: 'image/png',
     });
     expect(screen.getByRole('link', { name: '📎 notes.pdf' })).toBeTruthy();
+
+    // An image that won't decode falls back to a link to the file.
+    fireEvent.error(image);
+    expect(await screen.findByRole('link', { name: '🖼 shot.png' })).toBeTruthy();
   });
 
   it('renders nothing for a run without a Slack thread', async () => {

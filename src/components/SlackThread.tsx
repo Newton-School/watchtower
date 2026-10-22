@@ -96,7 +96,11 @@ function SlackImage({ file }: { file: SlackFile }) {
   const height = file.thumb_360_w && file.thumb_360_h ? Math.round((width / file.thumb_360_w) * file.thumb_360_h) : 200;
   return (
     <a className="slack-image" href={file.permalink} target="_blank" rel="noopener noreferrer" title={name}>
-      {src ? <img src={src} alt={name} /> : <span className="slack-image-loading" style={{ width, height }} />}
+      {src ? (
+        <img src={src} alt={name} onError={() => setFailed(true)} />
+      ) : (
+        <span className="slack-image-loading" style={{ width, height }} />
+      )}
     </a>
   );
 }

@@ -1,6 +1,8 @@
 //! Slack calls the app makes as miniOG: reading a run's thread, and posting,
-//! editing, deleting and reacting in it. Every command takes a job id and acts
-//! only in that job's channel, so the page can't reach any other conversation.
+//! editing, deleting and reacting in it. Every command that reads or writes a
+//! conversation takes a job id and acts only in that job's channel. Fetching a
+//! Slack-hosted image and reading the workspace directory are read-only and
+//! not tied to a run.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -149,7 +151,8 @@ async fn run_curl(config: &str, args: &[&str]) -> Result<Vec<u8>, String> {
     use tokio::io::AsyncWriteExt;
 
     let mut child = Command::new("/usr/bin/curl")
-        .args(["-sS", "-K", "-"])
+        // -g: Slack file URLs can hold [ and ], which curl would read as a glob.
+        .args(["-sS", "-g", "-K", "-"])
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -861,6 +864,7 @@ async fn set_miniog_reaction_inner(
 const SLACK_FILE_HOST: &str = "https://files.slack.com/";
 const MAX_IMAGE_BYTES: usize = 15 * 1024 * 1024;
 const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
+const MAX_UPLOAD_FILES: usize = 10;
 
 fn is_image_mimetype(mimetype: &str) -> bool {
     mimetype.strip_prefix("image/").is_some_and(|sub| {
@@ -905,8 +909,8 @@ async fn get_slack_image_inner(
         &["--fail", "--max-time", "30", "--max-filesize", &max],
     )
     .await?;
-    // Without access Slack answers with its sign-in page instead of the file.
-    if looks_like_html(&bytes) {
+    // Without access Slack answers with its sign-in page (or a redirect) instead of the file.
+    if bytes.is_empty() || looks_like_html(&bytes) {
         return Err("Slack sent a web page instead of the image.".to_string());
     }
     Ok(format!(
@@ -951,9 +955,31 @@ const DIRECTORY_TTL: Duration = Duration::from_secs(60 * 60);
 /// users.list pages of 200 to read at most.
 const MAX_DIRECTORY_PAGES: usize = 50;
 
-fn directory_cache() -> &'static Mutex<Option<(Instant, SlackDirectory)>> {
-    static CACHE: OnceLock<Mutex<Option<(Instant, SlackDirectory)>>> = OnceLock::new();
+/// A directory read without its user groups is kept only this long.
+const PARTIAL_DIRECTORY_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// The directory, when it was read, and how long to keep it.
+type CachedDirectory = (Instant, Duration, SlackDirectory);
+
+fn directory_cache() -> &'static Mutex<Option<CachedDirectory>> {
+    static CACHE: OnceLock<Mutex<Option<CachedDirectory>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Call Slack, waiting once and retrying when it says to slow down (users.list
+/// allows about 20 calls a minute).
+async fn slack_call_patiently(
+    token: &str,
+    method: &str,
+    fields: &[(&str, &str)],
+) -> Result<serde_json::Value, String> {
+    match slack_call(token, method, fields).await {
+        Err(err) if err.ends_with("ratelimited") => {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            slack_call(token, method, fields).await
+        }
+        result => result,
+    }
 }
 
 fn directory_person(member: &serde_json::Value) -> Option<DirectoryPerson> {
@@ -1015,12 +1041,12 @@ pub(crate) async fn get_slack_directory(
 }
 
 async fn get_slack_directory_inner(db_path: &Path) -> Result<SlackDirectory, String> {
-    if let Some((read_at, directory)) = directory_cache()
+    if let Some((read_at, ttl, directory)) = directory_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
     {
-        if read_at.elapsed() < DIRECTORY_TTL {
+        if read_at.elapsed() < *ttl {
             return Ok(directory.clone());
         }
     }
@@ -1037,7 +1063,7 @@ async fn get_slack_directory_inner(db_path: &Path) -> Result<SlackDirectory, Str
         if !cursor.is_empty() {
             fields.push(("cursor", cursor.as_str()));
         }
-        let response = slack_call(token, "users.list", &fields).await?;
+        let response = slack_call_patiently(token, "users.list", &fields).await?;
         for member in response
             .get("members")
             .and_then(|m| m.as_array())
@@ -1055,19 +1081,24 @@ async fn get_slack_directory_inner(db_path: &Path) -> Result<SlackDirectory, Str
             break;
         }
     }
-    // Groups are a nice-to-have; people still work without them.
-    if let Ok(response) = slack_call(token, "usergroups.list", &[]).await {
-        for group in response
-            .get("usergroups")
-            .and_then(|g| g.as_array())
-            .into_iter()
-            .flatten()
-        {
-            directory.groups.extend(directory_group(group));
+    // Groups are a nice-to-have; people still work without them, and the
+    // directory is read again sooner.
+    let mut ttl = DIRECTORY_TTL;
+    match slack_call_patiently(token, "usergroups.list", &[]).await {
+        Err(_) => ttl = PARTIAL_DIRECTORY_TTL,
+        Ok(response) => {
+            for group in response
+                .get("usergroups")
+                .and_then(|g| g.as_array())
+                .into_iter()
+                .flatten()
+            {
+                directory.groups.extend(directory_group(group));
+            }
         }
     }
     *directory_cache().lock().unwrap_or_else(|e| e.into_inner()) =
-        Some((Instant::now(), directory.clone()));
+        Some((Instant::now(), ttl, directory.clone()));
     Ok(directory)
 }
 
@@ -1098,8 +1129,17 @@ async fn upload_as_miniog_inner(
     if files.is_empty() {
         return Err("Pick a file first.".to_string());
     }
+    if files.len() > MAX_UPLOAD_FILES {
+        return Err(format!(
+            "Attach at most {MAX_UPLOAD_FILES} files at a time."
+        ));
+    }
     let mut decoded = Vec::new();
     for file in files {
+        // Check the size before decoding, so an oversized file never lands in memory twice.
+        if file.data_base64.len() > MAX_UPLOAD_BYTES / 3 * 4 + 4 {
+            return Err(format!("{} is over 20 MB.", file.name));
+        }
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(file.data_base64.as_bytes())
             .map_err(|err| format!("{} could not be read: {err}", file.name))?;
@@ -1142,6 +1182,24 @@ async fn upload_in_thread(
     text: &str,
     files: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
+    // Unlike a reply, a file share can't be checked afterwards, so make sure
+    // the thread is still there; with its first message gone the files would
+    // land in the channel.
+    let parent = slack_api(
+        token,
+        "conversations.replies",
+        &[
+            ("channel", &target.channel),
+            ("ts", &target.thread_ts),
+            ("limit", "1"),
+        ],
+    )
+    .await?;
+    if let Some(code) = slack_error_code(&parent) {
+        return Err(format!(
+            "The thread can't be read (Slack said {code}), so the files weren't sent."
+        ));
+    }
     let mut uploaded = Vec::new();
     for (name, bytes) in files {
         let length = bytes.len().to_string();
