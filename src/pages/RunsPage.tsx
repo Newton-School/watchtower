@@ -15,7 +15,7 @@ import { formatCostUsd, formatDurationMs, formatPercent, formatTokens, getStatus
 import { Timestamp } from '../components/Timestamp';
 import { AgentPipelineView } from '../components/AgentPipelineView';
 import { GlowCard } from '../components/GlowCard';
-import { RunReactions } from '../components/RunReactions';
+import { SlackThread } from '../components/SlackThread';
 
 type RunsPageProps = {
   data: DashboardData | null;
@@ -130,7 +130,11 @@ export function RunsPage({
   useEffect(() => {
     if (!detailRunId) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setDetailRunId(null);
+      if (e.key !== 'Escape' || e.defaultPrevented) return;
+      // Escape in a text box backs out of that box, not the page.
+      if (e.target instanceof HTMLElement && e.target.closest('input, textarea, select, [contenteditable="true"]'))
+        return;
+      setDetailRunId(null);
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
@@ -150,6 +154,8 @@ export function RunsPage({
         <button className="ghost-button run-detail-back" type="button" onClick={() => setDetailRunId(null)}>
           &larr; Back to Runs
         </button>
+
+        <SlackThread jobId={selectedRun.id} />
 
         <GlowCard>
           <article className="surface-card detail-card">
@@ -230,8 +236,6 @@ export function RunsPage({
             ) : null}
           </article>
         </GlowCard>
-
-        <RunReactions jobId={selectedRun.id} running={['RUNNING', 'QUEUED', 'CLAIMED'].includes(selectedRun.status)} />
 
         {selectedRunLogs.length > 0 ? (
           <GlowCard>
