@@ -32,7 +32,8 @@ export function applyMentions(slackText: string, mentions: Mention[]): string {
   if (mentions.length === 0) return slackText;
   const tokens = new Map(mentions.map(mention => [toSlackText(mention.label), mention.token]));
   const labels = [...tokens.keys()].sort((a, b) => b.length - a.length).map(escapeRegExp);
-  return slackText.replace(new RegExp(`(?:${labels.join('|')})(?![\\w])`, 'g'), label => tokens.get(label) ?? label);
+  // Not followed by more of a name: "@core" stays out of "@core-dev" and "@dipesh.rajoria".
+  return slackText.replace(new RegExp(`(?:${labels.join('|')})(?![.-]*\\w)`, 'g'), label => tokens.get(label) ?? label);
 }
 
 function formatBytes(bytes: number): string {
@@ -83,7 +84,10 @@ export function SlackComposer({ busy, participants, onSend }: SlackComposerProps
   // Read the directory early; the first read takes a few seconds. If it
   // failed, typing @ tries again.
   const wantsDirectory = mentionQuery !== null && directory === null;
+  const directoryRequested = useRef(false);
   useEffect(() => {
+    if (directoryRequested.current && !wantsDirectory) return;
+    directoryRequested.current = true;
     loadSlackDirectory()
       .then(setDirectory)
       .catch(() => setDirectory(null));
@@ -155,19 +159,20 @@ export function SlackComposer({ busy, participants, onSend }: SlackComposerProps
 
   const addFiles = (files: FileList | File[]) => {
     const added: Attachment[] = [];
+    let refusal: string | null = null;
     let count = attachments.length;
     let total = attachments.reduce((sum, attachment) => sum + attachment.file.size, 0);
     for (const file of Array.from(files)) {
       if (file.size === 0) {
-        setFileError(`${file.name} is empty, so it can't be attached.`);
+        refusal = `${file.name} is empty, so it can't be attached.`;
         continue;
       }
       if (file.size > MAX_FILE_BYTES) {
-        setFileError(`${file.name} is over 20 MB, so it can't be attached.`);
+        refusal = `${file.name} is over 20 MB, so it can't be attached.`;
         continue;
       }
       if (count + 1 > MAX_FILES || total + file.size > MAX_TOTAL_BYTES) {
-        setFileError(`Up to ${MAX_FILES} files and 50 MB go in one reply.`);
+        refusal = `Up to ${MAX_FILES} files and 50 MB go in one reply.`;
         break;
       }
       count += 1;
@@ -178,10 +183,8 @@ export function SlackComposer({ busy, participants, onSend }: SlackComposerProps
         previewUrl: file.type.startsWith('image/') ? URL.createObjectURL(file) : null,
       });
     }
-    if (added.length > 0) {
-      setFileError(null);
-      setAttachments(current => [...current, ...added]);
-    }
+    setFileError(refusal);
+    if (added.length > 0) setAttachments(current => [...current, ...added]);
   };
 
   const removeAttachment = (id: number) => {

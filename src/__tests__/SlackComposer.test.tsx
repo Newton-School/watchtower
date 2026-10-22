@@ -110,11 +110,24 @@ describe('SlackComposer', () => {
     expect(screen.getByText('drop.png')).toBeTruthy();
   });
 
-  it('says why an empty file is refused', () => {
+  it('says why a file is refused even when others in the same pick attach', () => {
     setup();
-    fireEvent.change(screen.getByLabelText('Files to attach'), { target: { files: [new File([], 'blank.txt')] } });
+    fireEvent.change(screen.getByLabelText('Files to attach'), {
+      target: { files: [new File([], 'blank.txt'), new File(['a'], 'a.txt')] },
+    });
 
     expect(screen.getByText("blank.txt is empty, so it can't be attached.")).toBeTruthy();
+    expect(screen.getByText('a.txt')).toBeTruthy();
+  });
+
+  it('attaches at most 10 files and says so', () => {
+    setup();
+    const files = Array.from({ length: 12 }, (_, i) => new File(['x'], `f${i}.txt`));
+    fireEvent.change(screen.getByLabelText('Files to attach'), { target: { files } });
+
+    expect(screen.getByText('Up to 10 files and 50 MB go in one reply.')).toBeTruthy();
+    expect(screen.queryByText('f10.txt')).toBeNull();
+    expect(screen.getByText('f9.txt')).toBeTruthy();
   });
 
   it('refuses files over 20 MB', () => {
@@ -153,5 +166,18 @@ describe('applyMentions', () => {
         { label: '@core', token: '<@U9>' },
       ]),
     ).toBe('<!subteam^S1|@core-dev> and <@U9>');
+  });
+});
+
+describe('applyMentions word boundary', () => {
+  it('leaves longer hand-typed names and email addresses alone', () => {
+    const mentions = [
+      { label: '@core', token: '<@U9>' },
+      { label: '@dipesh', token: '<@U1>' },
+    ];
+    expect(applyMentions('@core-dev @dipesh.rajoria x@dipesh.com', mentions)).toBe(
+      '@core-dev @dipesh.rajoria x@dipesh.com',
+    );
+    expect(applyMentions('ping @core. and @dipesh, thanks', mentions)).toBe('ping <@U9>. and <@U1>, thanks');
   });
 });
