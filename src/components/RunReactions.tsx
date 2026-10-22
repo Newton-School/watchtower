@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import type { JobReactions, RemoveReactionsResult } from '../types';
+import type { JobReactions, RemoveReactionsResult, SlackReadError } from '../types';
 import { SectionCard } from './primitives';
 
 // The emojis miniOG uses; anything else shows as its :name:.
@@ -9,8 +9,6 @@ const EMOJI: Record<string, string> = {
   white_check_mark: '✅',
   x: '❌',
   zzz: '💤',
-  no_entry_sign: '🚫',
-  memo: '📝',
 };
 
 function emojiFor(name: string): string {
@@ -57,6 +55,17 @@ export function RunReactions({ jobId, running }: RunReactionsProps) {
     void load();
   }, [load]);
 
+  // miniOG swaps 👀 for its last emoji when the run ends, so read again then.
+  // The status flips a moment before the swap, so give it a beat.
+  const wasRunning = useRef(running);
+  useEffect(() => {
+    const ended = wasRunning.current && !running;
+    wasRunning.current = running;
+    if (!ended) return;
+    const timer = setTimeout(() => void load(), 2000);
+    return () => clearTimeout(timer);
+  }, [running, load]);
+
   const remove = async (names: string[] | null) => {
     setBusy(true);
     setNotice(null);
@@ -97,14 +106,12 @@ export function RunReactions({ jobId, running }: RunReactionsProps) {
       ) : !reactions ? (
         <p className="muted">Checking Slack…</p>
       ) : names === null ? (
-        <div className="run-reactions-row">
-          <span className="muted">
-            Slack won't let the app read that message ({reactions.readError}), so it can't list them.
-          </span>
-          <button className="ghost-button" type="button" disabled={busy} onClick={() => void remove(null)}>
-            Remove any miniOG emojis
-          </button>
-        </div>
+        <ReadErrorRow
+          readError={reactions.readError}
+          busy={busy}
+          onRetry={() => void load()}
+          onSweep={() => void remove(null)}
+        />
       ) : names.length === 0 ? (
         <p className="muted">None left on the message.</p>
       ) : (
@@ -130,5 +137,41 @@ export function RunReactions({ jobId, running }: RunReactionsProps) {
         <p className="muted run-reactions-notice">The run is still going; miniOG adds its last emoji when it ends.</p>
       ) : null}
     </SectionCard>
+  );
+}
+
+type ReadErrorRowProps = {
+  readError: SlackReadError | null;
+  busy: boolean;
+  onRetry: () => void;
+  onSweep: () => void;
+};
+
+function ReadErrorRow({ readError, busy, onRetry, onSweep }: ReadErrorRowProps) {
+  const code = readError?.code ?? 'unknown_error';
+  if (readError?.kind === 'deleted') {
+    return <p className="muted">That message was deleted, so there's nothing to clean.</p>;
+  }
+  if (readError?.kind === 'noAccess') {
+    return (
+      <div className="run-reactions-row">
+        <span className="muted">Slack won't let the app read that message ({code}), so it can't list them.</span>
+        <button className="ghost-button" type="button" disabled={busy} onClick={onSweep}>
+          Remove any miniOG emojis
+        </button>
+      </div>
+    );
+  }
+  const message =
+    readError?.kind === 'auth'
+      ? `Slack rejected the bot token (${code}). Check it in Settings.`
+      : `Slack couldn't read that message (${code}).`;
+  return (
+    <div className="run-reactions-row">
+      <span className="run-reactions-error">{message}</span>
+      <button className="ghost-button" type="button" disabled={busy} onClick={onRetry}>
+        Retry
+      </button>
+    </div>
   );
 }

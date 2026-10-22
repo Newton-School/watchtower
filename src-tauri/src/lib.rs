@@ -1248,16 +1248,18 @@ async fn cancel_job(job_id: String, state: State<'_, AppState>) -> Result<(), St
     Ok(())
 }
 
-/// Every emoji miniOG puts on a message: :eyes: while working, an outcome
-/// emoji when done, :no_entry_sign: on a denial, and the unknown-task picks.
-/// Slack lets only the bot remove its own reactions, so the app does it.
-const MINIOG_REACTION_NAMES: &[&str] = &[
-    "eyes",
-    "white_check_mark",
-    "x",
-    "zzz",
-    "no_entry_sign",
-    "memo",
+/// The emojis miniOG leaves on the message that started a run: :eyes: while
+/// working, then an outcome emoji. Slack lets only the bot remove its own
+/// reactions, so the app does it.
+const MINIOG_REACTION_NAMES: &[&str] = &["eyes", "white_check_mark", "x", "zzz"];
+
+/// Slack errors that mean the bot token itself is bad.
+const SLACK_AUTH_ERRORS: &[&str] = &[
+    "not_authed",
+    "invalid_auth",
+    "token_revoked",
+    "token_expired",
+    "account_inactive",
 ];
 
 #[derive(Serialize)]
@@ -1265,10 +1267,29 @@ const MINIOG_REACTION_NAMES: &[&str] = &[
 struct JobReactions {
     /// False when the run did not start from a Slack message (nothing to clean).
     has_message: bool,
-    /// The emojis miniOG has on the message right now; `None` when Slack would
-    /// not let the app read it (a private channel the bot has no history scope for).
+    /// The emojis miniOG has on the message right now; `None` when the app
+    /// could not read it, and `read_error` says why.
     reactions: Option<Vec<String>>,
-    read_error: Option<String>,
+    read_error: Option<SlackReadError>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SlackReadError {
+    /// "deleted", "auth", "noAccess" (a private channel the bot has no history
+    /// scope for; removing still works) or "other".
+    kind: &'static str,
+    code: String,
+}
+
+fn classify_read_error(code: String) -> SlackReadError {
+    let kind = match code.as_str() {
+        "thread_not_found" | "message_not_found" => "deleted",
+        "missing_scope" | "not_in_channel" => "noAccess",
+        code if SLACK_AUTH_ERRORS.contains(&code) => "auth",
+        _ => "other",
+    };
+    SlackReadError { kind, code }
 }
 
 #[derive(Serialize)]
@@ -1461,7 +1482,7 @@ async fn get_job_reactions_inner(db_path: &Path, job_id: &str) -> Result<JobReac
         return Ok(JobReactions {
             has_message: true,
             reactions: None,
-            read_error: Some(code),
+            read_error: Some(classify_read_error(code)),
         });
     }
     Ok(JobReactions {
@@ -1522,10 +1543,20 @@ async fn remove_job_reactions_inner(
         .await;
         match response.map(|r| slack_error_code(&r)) {
             Ok(None) => result.removed.push(name),
-            // miniOG never left this one (or it is already gone).
-            Ok(Some(code)) if code == "no_reaction" => {}
-            Ok(Some(code)) => result.failed.push(format!("{name}: {code}")),
-            Err(err) => result.failed.push(format!("{name}: {err}")),
+            // miniOG never left this one, or it or the message is already gone.
+            Ok(Some(code)) if code == "no_reaction" || code == "message_not_found" => {}
+            Ok(Some(code)) => {
+                let bad_token = SLACK_AUTH_ERRORS.contains(&code.as_str());
+                result.failed.push(format!("{name}: {code}"));
+                if bad_token {
+                    break;
+                }
+            }
+            // curl itself failed; the next call would too.
+            Err(err) => {
+                result.failed.push(format!("{name}: {err}"));
+                break;
+            }
         }
     }
     Ok(result)
@@ -5255,6 +5286,17 @@ mod tests {
             "UBOT1"
         )
         .is_empty());
+    }
+
+    #[test]
+    fn classify_read_error_sorts_slack_errors() {
+        assert_eq!(
+            classify_read_error("thread_not_found".into()).kind,
+            "deleted"
+        );
+        assert_eq!(classify_read_error("missing_scope".into()).kind, "noAccess");
+        assert_eq!(classify_read_error("invalid_auth".into()).kind, "auth");
+        assert_eq!(classify_read_error("ratelimited".into()).kind, "other");
     }
 
     #[test]
