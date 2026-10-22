@@ -15,7 +15,7 @@ import { formatCostUsd, formatDurationMs, formatPercent, formatTokens, getStatus
 import { Timestamp } from '../components/Timestamp';
 import { AgentPipelineView } from '../components/AgentPipelineView';
 import { GlowCard } from '../components/GlowCard';
-import { RunReactions } from '../components/RunReactions';
+import { SlackThread } from '../components/SlackThread';
 
 type RunsPageProps = {
   data: DashboardData | null;
@@ -151,6 +151,8 @@ export function RunsPage({
           &larr; Back to Runs
         </button>
 
+        <SlackThread jobId={selectedRun.id} />
+
         <GlowCard>
           <article className="surface-card detail-card">
             <div className="run-detail-header">
@@ -230,8 +232,6 @@ export function RunsPage({
             ) : null}
           </article>
         </GlowCard>
-
-        <RunReactions jobId={selectedRun.id} running={['RUNNING', 'QUEUED', 'CLAIMED'].includes(selectedRun.status)} />
 
         {selectedRunLogs.length > 0 ? (
           <GlowCard>

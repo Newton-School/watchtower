@@ -153,15 +153,59 @@ export type AgentCallRow = {
   createdAt: string;
 };
 
-export type JobReactions = {
-  hasMessage: boolean;
-  /** null when the app could not read the message; readError says why. */
-  reactions: string[] | null;
+export type SlackUser = {
+  name: string;
+  avatarUrl: string | null;
+  isBot: boolean;
+};
+
+export type SlackReaction = {
+  name: string;
+  count: number;
+  users: string[];
+};
+
+export type SlackFile = {
+  id: string;
+  name?: string;
+  title?: string;
+  mimetype?: string;
+  permalink?: string;
+};
+
+/** A Slack message object as conversations.replies returns it (the fields the app reads). */
+export type SlackMessage = {
+  ts: string;
+  thread_ts?: string;
+  user?: string;
+  bot_id?: string;
+  bot_profile?: { name?: string; icons?: { image_48?: string; image_72?: string } };
+  username?: string;
+  text?: string;
+  subtype?: string;
+  edited?: { ts: string };
+  reactions?: SlackReaction[];
+  files?: SlackFile[];
+};
+
+export type RunThread = {
+  hasThread: boolean;
+  channelId: string;
+  channelName: string | null;
+  channelKind: 'channel' | 'private' | 'im' | 'mpim' | '';
+  threadTs: string;
+  /** The message that started this run, when it came from one. */
+  triggerTs: string | null;
+  botUserId: string;
+  permalink: string | null;
+  messages: SlackMessage[];
+  users: Record<string, SlackUser>;
+  /** Set when the app could not read the thread. */
   readError: SlackReadError | null;
 };
 
 export type SlackReadError = {
-  /** noAccess: a private channel the bot can't read, though it can still remove. */
+  /** noAccess: a private channel the bot can't read, though it can still remove its emojis. */
   kind: 'deleted' | 'auth' | 'noAccess' | 'other';
   code: string;
 };
