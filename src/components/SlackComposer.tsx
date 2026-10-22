@@ -4,6 +4,7 @@ import type { SlackDirectory } from '../types';
 import { loadSlackDirectory } from '../lib/slackCache';
 import { toSlackText } from '../lib/slackText';
 import { readFlag, writeFlag } from '../lib/prefs';
+import { useEscapeLayer } from '../lib/escapeLayers';
 import { EmojiPicker } from './EmojiPicker';
 
 const MAX_FILE_BYTES = 20 * 1024 * 1024;
@@ -221,10 +222,13 @@ export function SlackComposer({ busy, participants, onSend, onAsk, askBlocked = 
     sending.current = true;
     try {
       const started = await onAsk({ text: applyMentions(toSlackText(typed.trim()), mentions), postAsk });
-      if (started && draftRef.current === typed) {
+      if (!started) return;
+      if (draftRef.current === typed) {
         setDraft('');
         setMentions([]);
       }
+      // Back to replying, so the next Enter doesn't start another run.
+      setMode('reply');
     } finally {
       sending.current = false;
     }
@@ -263,6 +267,8 @@ export function SlackComposer({ busy, participants, onSend, onAsk, askBlocked = 
   };
 
   const suggesting = suggestions.length > 0;
+  // Escape closes the suggestions before anything opened earlier.
+  useEscapeLayer(suggesting, () => setMentionQuery(null));
 
   return (
     <form
@@ -272,7 +278,7 @@ export function SlackComposer({ busy, participants, onSend, onAsk, askBlocked = 
         void send();
       }}
       onDragEnter={(e: ReactDragEvent) => {
-        if (e.dataTransfer.types.includes('Files')) {
+        if (!asking && e.dataTransfer.types.includes('Files')) {
           dragDepth.current += 1;
           setDragging(true);
         }
@@ -294,20 +300,21 @@ export function SlackComposer({ busy, participants, onSend, onAsk, askBlocked = 
       }}
     >
       {onAsk ? (
-        <div className="slack-composer-modes" role="tablist" aria-label="What the box does">
+        <div className="slack-composer-modes" role="group" aria-label="Reply or ask">
           <button
             type="button"
-            role="tab"
-            aria-selected={!asking}
+            aria-pressed={!asking}
             className={asking ? 'slack-composer-mode' : 'slack-composer-mode slack-composer-mode-active'}
-            onClick={() => setMode('reply')}
+            onClick={() => {
+              setMode('reply');
+              setFileError(null);
+            }}
           >
             Reply as miniOG
           </button>
           <button
             type="button"
-            role="tab"
-            aria-selected={asking}
+            aria-pressed={asking}
             className={asking ? 'slack-composer-mode slack-composer-mode-active' : 'slack-composer-mode'}
             onClick={() => {
               setMode('ask');
@@ -375,7 +382,9 @@ export function SlackComposer({ busy, participants, onSend, onAsk, askBlocked = 
         }}
         onSelect={e => findMentionQuery(e.currentTarget.value, e.currentTarget.selectionStart)}
         onPaste={(e: ReactClipboardEvent<HTMLTextAreaElement>) => {
-          if (e.clipboardData.files.length > 0) {
+          // An ask takes no files, so a paste is just its text (copied cells
+          // carry an image of themselves too).
+          if (!asking && e.clipboardData.files.length > 0) {
             e.preventDefault();
             addFiles(e.clipboardData.files);
           }
@@ -391,11 +400,6 @@ export function SlackComposer({ busy, participants, onSend, onAsk, askBlocked = 
             if (e.key === 'Enter' || e.key === 'Tab') {
               e.preventDefault();
               pickSuggestion(suggestions[highlight]);
-              return;
-            }
-            if (e.key === 'Escape') {
-              e.preventDefault();
-              setMentionQuery(null);
               return;
             }
           }
@@ -473,8 +477,8 @@ export function SlackComposer({ busy, participants, onSend, onAsk, askBlocked = 
           {!asking
             ? 'Posts as miniOG. Shift+Enter for a new line.'
             : postAsk
-              ? 'miniOG posts that you asked, then works on it here.'
-              : 'Nothing is posted; miniOG just starts answering here.'}
+              ? 'miniOG posts the ask here first, then works on it.'
+              : 'Nothing is posted, not even an emoji; miniOG just starts answering here.'}
         </span>
         {asking ? (
           <button

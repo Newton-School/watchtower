@@ -2,25 +2,51 @@ import { useEffect, useState } from 'react';
 import type { RunControls, SlackUser, StartedRunStatus } from '../types';
 import { SlackText } from '../lib/slackText';
 import { readFlag, writeFlag } from '../lib/prefs';
+import { useEscapeLayer } from '../lib/escapeLayers';
 
 const RERUN_POSTS_KEY = 'watchtower.rerunPostsAsk';
+// The sidecar takes a request within seconds; this long means it isn't taking any.
+const SLOW_PICKUP_MS = 2 * 60 * 1000;
+// A stop lands within a few seconds; after this the button comes back.
+const STOPPING_MS = 20 * 1000;
 
 /** A run started from this thread view, and what the sidecar has made of it so far. */
-export type StartedRunView = { kind: 'rerun' | 'ask'; requestId: string; status: StartedRunStatus | null };
+export type StartedRunView = {
+  kind: 'rerun' | 'ask';
+  requestId: string;
+  startedAt: number;
+  /** The posted ask, when the ask was posted. */
+  askTs: string | null;
+  status: StartedRunStatus | null;
+  /** What happened to the posted ask after miniOG turned the run down. */
+  askCleanup?: 'removed' | 'failed';
+};
 
 /** Waiting for the sidecar to take the request. */
 export function isWaiting(status: StartedRunStatus | null): boolean {
   return !status || (!status.jobId && ['PENDING', 'CLAIMED', 'QUEUED'].includes(status.status));
 }
 
+/** Why a new run can't start in this thread right now. */
+export function blockedReason(controls: RunControls | null): string | null {
+  if (controls?.busyJobId && controls.busyWaiting) {
+    return 'miniOG is waiting for an answer in this thread. Stop that run to start another.';
+  }
+  if (controls?.busyJobId) return 'miniOG is already working in this thread.';
+  if (controls?.starting) return 'A run in this thread is waiting to be picked up.';
+  return null;
+}
+
 type RunControlsBarProps = {
   jobId: string;
   controls: RunControls;
   users: Record<string, SlackUser>;
-  /** The thread can't take a new run (deleted, or unreadable). */
+  /** The thread can't take a new run (deleted, unreadable, or not read yet). */
   threadClosed: boolean;
   busy: boolean;
   started: StartedRunView | null;
+  /** What went wrong with the last Stop or Re-run. */
+  error: string | null;
   onStop: () => Promise<boolean>;
   onRerun: (postAsk: boolean) => Promise<boolean>;
   onDismissStarted: () => void;
@@ -35,54 +61,52 @@ export function RunControlsBar({
   threadClosed,
   busy,
   started,
+  error,
   onStop,
   onRerun,
   onDismissStarted,
   onOpenRun,
 }: RunControlsBarProps) {
   const [confirmingStop, setConfirmingStop] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [rerunOpen, setRerunOpen] = useState(false);
   const [postAsk, setPostAsk] = useState(() => readFlag(RERUN_POSTS_KEY, true));
 
   const otherRun = controls.busyJobId && controls.busyJobId !== jobId ? controls.busyJobId : null;
-  const blocked = controls.busyJobId
-    ? 'miniOG is already working in this thread.'
-    : controls.starting
-      ? 'A run started from here is waiting to be picked up.'
-      : null;
+  const blocked = blockedReason(controls);
   const canRerun = Boolean(controls.rerunAsk) && !threadClosed;
 
   // Close what no longer applies once the run moves on.
   useEffect(() => {
-    if (!controls.canStop) setConfirmingStop(false);
-  }, [controls.canStop]);
-
-  // Escape backs out of a prompt here without leaving the run page.
-  const open = confirmingStop || rerunOpen;
-  useEffect(() => {
-    if (!open) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return;
-      e.preventDefault();
-      e.stopPropagation();
+    if (!controls.canStop) {
       setConfirmingStop(false);
-      setRerunOpen(false);
-    };
-    window.addEventListener('keydown', onKeyDown, true);
-    return () => window.removeEventListener('keydown', onKeyDown, true);
-  }, [open]);
+      setStopping(false);
+    }
+  }, [controls.canStop]);
+  useEffect(() => {
+    if (!canRerun) setRerunOpen(false);
+  }, [canRerun]);
+  useEffect(() => {
+    if (!stopping) return;
+    const timer = window.setTimeout(() => setStopping(false), STOPPING_MS);
+    return () => window.clearTimeout(timer);
+  }, [stopping]);
 
-  if (!controls.canStop && !canRerun && !otherRun && !started) return null;
+  useEscapeLayer(confirmingStop || rerunOpen, () => {
+    setConfirmingStop(false);
+    setRerunOpen(false);
+  });
+
+  if (!controls.canStop && !canRerun && !otherRun && !blocked && !started && !error) return null;
+
+  const waitingNote = controls.busyWaiting ? 'waiting for an answer on' : 'working on';
+  const note = controls.busyJobId === jobId ? (stopping ? 'Stopping…' : `miniOG is ${waitingNote} this run.`) : blocked;
 
   return (
     <div className="run-controls">
       <div className="run-controls-row">
         <span className="run-controls-note">
-          {controls.busyJobId === jobId
-            ? 'miniOG is working on this run.'
-            : otherRun
-              ? 'miniOG is working on another run in this thread.'
-              : null}
+          {otherRun ? `miniOG is ${waitingNote} another run in this thread.` : note}
           {otherRun && onOpenRun ? (
             <button className="run-controls-link" type="button" onClick={() => onOpenRun(otherRun)}>
               Open it
@@ -94,14 +118,15 @@ export function RunControlsBar({
             <button
               className="ghost-button"
               type="button"
-              disabled={busy}
+              disabled={busy || stopping}
               aria-expanded={confirmingStop}
               onClick={() => {
                 setRerunOpen(false);
                 setConfirmingStop(current => !current);
               }}
             >
-              ■ Stop run
+              <span aria-hidden="true">■ </span>
+              {stopping ? 'Stopping…' : 'Stop run'}
             </button>
           ) : null}
           {canRerun ? (
@@ -116,7 +141,8 @@ export function RunControlsBar({
                 setRerunOpen(current => !current);
               }}
             >
-              ↻ Re-run
+              <span aria-hidden="true">↻ </span>
+              Re-run
             </button>
           ) : null}
         </div>
@@ -134,10 +160,13 @@ export function RunControlsBar({
               type="button"
               disabled={busy}
               onClick={async () => {
-                if (await onStop()) setConfirmingStop(false);
+                if (await onStop()) {
+                  setConfirmingStop(false);
+                  setStopping(true);
+                }
               }}
             >
-              Stop run
+              Yes, stop
             </button>
           </div>
         </div>
@@ -172,8 +201,8 @@ export function RunControlsBar({
           </label>
           <span className="muted run-controls-hint">
             {postAsk
-              ? 'miniOG posts that you re-ran it, with the ask, and its emojis go on that post.'
-              : 'Nothing is posted; miniOG just starts answering here.'}
+              ? 'miniOG posts the ask here first; its emojis go on that post.'
+              : 'Nothing is posted, not even an emoji; miniOG just starts answering here.'}
           </span>
           {blocked ? <span className="slack-thread-warning">{blocked}</span> : null}
           <div className="run-controls-panel-actions">
@@ -188,10 +217,16 @@ export function RunControlsBar({
                 if (await onRerun(postAsk)) setRerunOpen(false);
               }}
             >
-              Re-run
+              Re-run now
             </button>
           </div>
         </div>
+      ) : null}
+
+      {error ? (
+        <p className="slack-thread-error run-controls-error" role="alert">
+          {error}
+        </p>
       ) : null}
 
       {started ? (
@@ -212,16 +247,40 @@ function StartedRunLine({
   onDismiss: () => void;
   onOpenRun?: (jobId: string) => void;
 }) {
+  // Re-render now and then so a slow pickup gets noticed.
+  const [now, setNow] = useState(() => Date.now());
+  const waiting = isWaiting(started.status);
+  useEffect(() => {
+    if (!waiting) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 15_000);
+    return () => window.clearInterval(timer);
+  }, [waiting]);
+
   const what = started.kind === 'rerun' ? 're-run' : 'ask';
   const { status } = started;
   const newRun = status?.jobId && status.jobId !== jobId ? status.jobId : null;
   let text: string;
-  if (isWaiting(status)) text = `Waiting for miniOG to pick up your ${what}…`;
-  else if (newRun) text = `miniOG took your ${what}.`;
-  else text = `miniOG didn't start your ${what}: ${status?.error ?? `it ended as ${status?.status.toLowerCase()}`}`;
+  if (waiting) {
+    text =
+      now - started.startedAt < SLOW_PICKUP_MS
+        ? `Waiting for miniOG to pick up your ${what}…`
+        : `miniOG hasn't picked up your ${what} yet. Check that it's running.`;
+  } else if (newRun) {
+    text = `miniOG took your ${what}.`;
+  } else {
+    const why = status?.error ?? (status?.status === 'SKIPPED' ? 'it was skipped' : 'it failed');
+    const cleanup =
+      started.askCleanup === 'removed'
+        ? ' The posted ask was taken back.'
+        : started.askCleanup === 'failed'
+          ? ' Delete the posted ask in Slack.'
+          : '';
+    text = `miniOG didn't start your ${what}: ${why}${cleanup}`;
+  }
+  const trouble = !waiting && !newRun;
 
   return (
-    <div className={newRun || isWaiting(status) ? 'run-controls-started' : 'run-controls-started slack-thread-error'}>
+    <div className={trouble ? 'run-controls-started slack-thread-error' : 'run-controls-started'}>
       <span role="status">{text}</span>
       {newRun && onOpenRun ? (
         <button className="run-controls-link" type="button" onClick={() => onOpenRun(newRun)}>

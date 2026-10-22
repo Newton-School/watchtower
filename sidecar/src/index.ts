@@ -893,7 +893,10 @@ async function processEvent(event: SlackEventEnvelope, client: WebClient): Promi
   // (channelId, eventTs), and the durable dedup gates below all run after
   // async work, so without an in-process claim both copies can race past
   // them and create two jobs for one user action.
-  const claimKey = `${event.channelId}:${event.eventTs}`;
+  // A launchpad run is its request: two requests may start from one message.
+  const claimKey = event.launchpadRequestId
+    ? `launchpad:${event.launchpadRequestId}`
+    : `${event.channelId}:${event.eventTs}`;
   if (inFlightProcessClaims.has(claimKey)) {
     logger.info(
       { eventId: event.eventId, channelId: event.channelId, eventTs: event.eventTs },
@@ -908,6 +911,12 @@ async function processEvent(event: SlackEventEnvelope, client: WebClient): Promi
     inFlightProcessClaims.delete(claimKey);
   }
 }
+
+/** How long a launchpad run waits for its thread to free up before it is dropped. */
+const LAUNCHPAD_BUSY_WAIT_MS = 2 * 60 * 1000;
+
+/** A run asked for in a Slack thread that hasn't started in this long is dropped at startup. */
+const ORIGIN_REQUEST_MAX_AGE_MIN = 30;
 
 /**
  * Closes the launchpad request behind an event that will not start a run.
@@ -936,6 +945,18 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
   // lock lapse under a long job (issue #261).
   const activeThreadJobId = activeJobIdForThread(event.channelId, event.threadTs);
   if (activeThreadJobId) {
+    // A run started from the app just after a stop, or as a run finishes,
+    // finds the thread still held while that run cleans up: it waits its
+    // turn for a little while before giving up.
+    const request = event.launchpadRequestId ? store.getLaunchpadRequest(event.launchpadRequestId) : undefined;
+    if (request && Date.now() - Date.parse(request.createdAt) < LAUNCHPAD_BUSY_WAIT_MS) {
+      store.requeueLaunchpadRequest(request.id);
+      logger.info(
+        { eventId: event.eventId, requestId: request.id, activeJobId: activeThreadJobId },
+        'launchpad request waits for its thread',
+      );
+      return;
+    }
     store.recordEvent(event.eventId, event.channelId, event.threadTs);
     logger.info(
       {
@@ -1844,6 +1865,10 @@ async function main(): Promise<void> {
   // the intake poller picks them up again. Without this, a sidecar crash
   // between claim and job-link leaves the desktop-originated request
   // silently never executing and never recovering.
+  const expiredLaunchpad = store.expireStaleOriginLaunchpadRequests(ORIGIN_REQUEST_MAX_AGE_MIN);
+  if (expiredLaunchpad > 0) {
+    logger.warn({ expiredLaunchpad }, 'dropped thread launchpad requests that never started');
+  }
   const strandedLaunchpad = store.recoverStrandedLaunchpadRequests();
   if (strandedLaunchpad > 0) {
     logger.warn(
@@ -2090,10 +2115,28 @@ async function main(): Promise<void> {
         logger.info({ jobId }, 'job cancelled from UI');
       } else if (store.getJobSummary(jobId)?.status === 'PAUSED') {
         // A run waiting on a person has no process to abort: closing it is
-        // the stop, and its :zzz: goes with it.
+        // the stop. Its :zzz: goes, and the thread is told, so nobody answers
+        // a question that no longer resumes anything.
         store.markJob(jobId, 'CANCELLED', { errorMessage: 'Cancelled from Watchtower UI.' });
         const anchor = store.eventAnchorFor(jobId);
         if (anchor) void removeReaction(client.webClient, anchor.channelId, anchor.eventTs, 'zzz');
+        const origin = store.jobOrigin(jobId);
+        if (origin?.launchpadRequestId) {
+          store.markLaunchpadRequestFinished({
+            id: origin.launchpadRequestId,
+            status: 'FAILED',
+            errorMessage: 'Cancelled.',
+          });
+        }
+        if (origin) {
+          void client.webClient.chat
+            .postMessage({
+              channel: origin.channelId,
+              thread_ts: origin.threadTs,
+              text: 'Stopped — this run was cancelled from the Watchtower app.',
+            })
+            .catch(() => {});
+        }
         logger.info({ jobId }, 'paused job cancelled from UI');
       }
     }

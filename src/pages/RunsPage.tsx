@@ -43,6 +43,8 @@ export function RunsPage({
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
   const [activeStage, setActiveStage] = useState<string | null>(null);
   const [costSummary, setCostSummary] = useState<JobCostSummary | null>(null);
+  // A run opened from its thread before the list has it.
+  const [openingRunId, setOpeningRunId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!detailRunId) {
@@ -115,17 +117,19 @@ export function RunsPage({
 
   const handleSelectRun = (runId: string) => {
     setDetailRunId(runId);
+    setActiveStage(null);
     onSelectRun(runId);
   };
 
   // A run started from a thread may not be in the list yet: refresh it first.
   const openRun = async (runId: string) => {
+    setOpeningRunId(runId);
+    handleSelectRun(runId);
     try {
       await onRefresh?.();
     } catch {
-      // The run opens once the next refresh lists it.
+      // It opens once the next refresh lists it.
     }
-    handleSelectRun(runId);
   };
 
   const handleCancelRun = async (runId: string) => {
@@ -156,6 +160,18 @@ export function RunsPage({
       setDetailRunId(selectedRunId);
     }
   }, []); // only on mount
+
+  // A run just started from a thread shows up on the next refresh.
+  if (detailRunId && !selectedRun && openingRunId === detailRunId) {
+    return (
+      <div className="page-stack">
+        <button className="ghost-button run-detail-back" type="button" onClick={() => setDetailRunId(null)}>
+          &larr; Back to Runs
+        </button>
+        <p className="muted">Opening the run…</p>
+      </div>
+    );
+  }
 
   // Detail View
   if (detailRunId && selectedRun) {

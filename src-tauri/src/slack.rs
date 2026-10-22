@@ -233,7 +233,7 @@ pub(crate) async fn slack_call(
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SlackUser {
     pub(crate) name: String,

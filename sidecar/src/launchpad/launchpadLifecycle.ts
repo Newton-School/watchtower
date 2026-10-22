@@ -62,7 +62,10 @@ export async function finalizeLaunchpadWorkflowResult(params: {
   }
 
   let fallbackPosted = false;
-  if (!result.slackPosted) {
+  // A stopped or skipped run has nothing to report: a stop was already
+  // announced, and a skip ("staying silent") must stay silent.
+  const reportable = result.status !== 'CANCELLED' && result.status !== 'SKIPPED';
+  if (!result.slackPosted && reportable) {
     const text = fallbackCompletionText(result.message);
     try {
       await slack.chat.postMessage({

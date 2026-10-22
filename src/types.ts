@@ -207,6 +207,8 @@ export type RunControls = {
   rerunFor: string | null;
   /** The run working in this thread now, if any. */
   busyJobId: string | null;
+  /** That run is waiting for an answer, which a new ask would be taken as. */
+  busyWaiting: boolean;
   /** A run started from the app that miniOG hasn't picked up yet. */
   starting: boolean;
 };

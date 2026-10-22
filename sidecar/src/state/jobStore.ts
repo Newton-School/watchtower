@@ -1295,6 +1295,66 @@ export class JobStore {
     return claimed;
   }
 
+  /**
+   * Puts a request back in line for the poller when miniOG couldn't start it
+   * yet: its thread was still held by a run that is stopping or finishing.
+   */
+  requeueLaunchpadRequest(id: string): void {
+    this.db
+      .prepare(
+        `UPDATE launchpad_requests
+         SET status = 'PENDING',
+             slack_channel_id = NULL,
+             anchor_ts = NULL,
+             updated_at = ?
+         WHERE id = ? AND job_id IS NULL AND status IN ('CLAIMED', 'QUEUED')`,
+      )
+      .run(new Date().toISOString(), id);
+  }
+
+  /**
+   * On startup, closes requests for a run in a Slack thread (an ask or re-run
+   * from the app's thread view, or a retrigger) that waited longer than
+   * `maxAgeMinutes` without starting. Run now, maybe days later, they would
+   * surprise the thread. Requests from the Launchpad page still retry.
+   * Returns the number of rows closed.
+   */
+  expireStaleOriginLaunchpadRequests(maxAgeMinutes: number): number {
+    const now = new Date();
+    const cutoff = new Date(now.getTime() - maxAgeMinutes * 60_000).toISOString();
+    const result = this.db
+      .prepare(
+        `UPDATE launchpad_requests
+         SET status = 'FAILED',
+             error_message = ?,
+             updated_at = ?
+         WHERE status IN ('PENDING', 'CLAIMED', 'QUEUED')
+           AND job_id IS NULL
+           AND origin_channel_id IS NOT NULL
+           AND created_at < ?`,
+      )
+      .run(`Not started within ${maxAgeMinutes} minutes, so it was dropped.`, now.toISOString(), cutoff);
+    return result.changes;
+  }
+
+  /** The thread a job ran in, and the launchpad request behind it, if any. */
+  jobOrigin(jobId: string): { channelId: string; threadTs: string; launchpadRequestId?: string } | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT channel_id, thread_ts, json_extract(payload_json, '$.launchpadRequestId') AS request_id
+         FROM jobs
+         WHERE id = ?
+         LIMIT 1`,
+      )
+      .get(jobId) as { channel_id?: string; thread_ts?: string; request_id?: string | null } | undefined;
+    if (!row?.channel_id || !row.thread_ts) return undefined;
+    return {
+      channelId: row.channel_id,
+      threadTs: row.thread_ts,
+      launchpadRequestId: row.request_id ?? undefined,
+    };
+  }
+
   markLaunchpadRequestQueued(input: { id: string; slackChannelId: string; anchorTs: string }): void {
     this.db
       .prepare(

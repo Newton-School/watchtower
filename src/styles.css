@@ -1935,6 +1935,8 @@ h3 {
 }
 
 .run-controls-ask blockquote {
+  max-height: 160px;
+  overflow-y: auto;
   margin: 6px 0 0;
   padding-left: 10px;
   border-left: 3px solid var(--line);
@@ -1959,6 +1961,11 @@ h3 {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+}
+
+.run-controls-error {
+  margin: 0;
+  font-size: 0.8125rem;
 }
 
 .run-controls-started {
@@ -1993,7 +2000,7 @@ h3 {
   border: 1px solid transparent;
   border-radius: 999px;
   background: transparent;
-  color: var(--text-muted);
+  color: var(--text-soft);
   font-size: 0.8125rem;
   cursor: pointer;
 }

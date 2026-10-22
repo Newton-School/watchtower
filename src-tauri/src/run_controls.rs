@@ -3,10 +3,13 @@
 //! which the sidecar turns into a mention of miniOG on the owner's authority.
 //! Either the ask is posted in the thread first, as miniOG, so people can see
 //! what was asked (the run's emojis then go on that post), or the run starts
-//! without a word. Every control is logged in the trace of the run it was
-//! used from.
+//! without a word or an emoji. Every control is logged in the trace of the run
+//! it was used from.
 
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use chrono::{Duration, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -16,17 +19,13 @@ use uuid::Uuid;
 
 use crate::{
     is_settings_complete, parse_owner_ids, read_app_settings,
-    slack::{self, JobSlackTarget},
+    slack::{self, JobSlackTarget, SlackUser},
     AppState,
 };
 
-/// A request the sidecar has not picked up in this long is stuck, not
-/// starting, and no longer holds the thread.
-const STARTING_MINUTES: i64 = 10;
-
-/// Events that are not a message in the thread, so a re-run can't start from
-/// them: slash commands, shortcuts and emoji replies.
-const NON_MESSAGE_EVENTS: &[&str] = &["command:", "shortcut:", "reaction-resume:"];
+/// A request the sidecar has not picked up in this long no longer holds the
+/// thread. The sidecar drops such requests when it next starts.
+const STARTING_MINUTES: i64 = 30;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,6 +39,8 @@ pub(crate) struct RunControls {
     rerun_for: Option<String>,
     /// The run working in this thread now, if any: miniOG takes one at a time.
     busy_job_id: Option<String>,
+    /// That run is waiting for an answer, which a new ask would be taken as.
+    busy_waiting: bool,
     /// A run started from the app that miniOG has not picked up yet.
     starting: bool,
 }
@@ -64,27 +65,22 @@ pub(crate) struct StartedRunStatus {
 
 struct JobRow {
     status: String,
-    event_id: String,
     payload: serde_json::Value,
 }
 
 fn job_row(connection: &Connection, job_id: &str) -> Result<JobRow, String> {
-    let (status, event_id, payload_json): (String, String, Option<String>) = connection
+    let (status, payload_json): (String, Option<String>) = connection
         .query_row(
-            "SELECT status, event_id, payload_json FROM jobs WHERE id = ?",
+            "SELECT status, payload_json FROM jobs WHERE id = ?",
             params![job_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(|err| format!("db query job failed: {err}"))?
         .ok_or_else(|| format!("job {job_id} not found"))?;
     let payload = serde_json::from_str(payload_json.as_deref().unwrap_or(""))
         .unwrap_or(serde_json::Value::Null);
-    Ok(JobRow {
-        status,
-        event_id,
-        payload,
-    })
+    Ok(JobRow { status, payload })
 }
 
 fn can_stop(status: &str) -> bool {
@@ -147,29 +143,82 @@ fn requester(connection: &Connection, payload: &serde_json::Value) -> Option<Str
     })
 }
 
-/// The message a silent re-run starts from: the one the run started from,
-/// when that was a message.
-fn rerun_event_ts(event_id: &str, target: &JobSlackTarget) -> Option<String> {
-    if NON_MESSAGE_EVENTS
-        .iter()
-        .any(|prefix| event_id.starts_with(prefix))
-    {
-        return None;
+/// A Slack-style timestamp for now that names no message. A silent run starts
+/// from it, so its emojis land nowhere, the whole thread stays its context,
+/// and it shares nothing with a message an earlier run started from.
+fn quiet_event_ts() -> String {
+    let now = Utc::now();
+    format!("{}.{:06}", now.timestamp(), now.timestamp_subsec_micros())
+}
+
+/// The ask as miniOG posts it: mentions become plain names, so showing the
+/// ask pings no one again. The run itself gets the ask unchanged.
+fn without_pings(text: &str, users: &HashMap<String, SlackUser>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('<') {
+        let Some(len) = rest[start..].find('>') else {
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let token = &rest[start + 1..start + len];
+        let (target, label) = token.split_once('|').unwrap_or((token, ""));
+        let label = label.trim_start_matches('@');
+        let plain = if let Some(id) = target.strip_prefix('@') {
+            let name = users
+                .get(id)
+                .map(|user| user.name.as_str())
+                .filter(|name| !name.is_empty())
+                .or(Some(label).filter(|label| !label.is_empty()))
+                .unwrap_or(id);
+            Some(format!("@{name}"))
+        } else if matches!(target, "!here" | "!channel" | "!everyone") {
+            Some(format!("@{}", &target[1..]))
+        } else if target.starts_with("!subteam^") {
+            Some(format!(
+                "@{}",
+                if label.is_empty() { "group" } else { label }
+            ))
+        } else {
+            None
+        };
+        match plain {
+            Some(plain) => out.push_str(&plain),
+            None => out.push_str(&rest[start..=start + len]),
+        }
+        rest = &rest[start + len + 1..];
     }
-    target.trigger_ts.clone()
+    out.push_str(rest);
+    out
+}
+
+/// The people an ask mentions.
+fn mentioned_users(text: &str) -> HashSet<String> {
+    text.split("<@")
+        .skip(1)
+        .filter_map(|after| after.split(['>', '|']).next())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn now_iso() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-fn busy_job(connection: &Connection, target: &JobSlackTarget) -> Result<Option<String>, String> {
+/// The run holding the thread, and whether it is waiting for an answer. A
+/// paused run counts: a new ask would be taken as its answer.
+fn busy_job(
+    connection: &Connection,
+    target: &JobSlackTarget,
+) -> Result<Option<(String, bool)>, String> {
     connection
         .query_row(
-            "SELECT id FROM jobs WHERE channel_id = ? AND thread_ts = ? AND status = 'RUNNING'
-             ORDER BY created_at DESC LIMIT 1",
+            "SELECT id, status = 'PAUSED' FROM jobs
+             WHERE channel_id = ? AND thread_ts = ? AND status IN ('RUNNING', 'PAUSED')
+             ORDER BY status = 'PAUSED', created_at DESC LIMIT 1",
             params![target.channel, target.thread_ts],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(|err| format!("db query busy job failed: {err}"))
@@ -201,13 +250,14 @@ fn run_controls(
 ) -> Result<RunControls, String> {
     let job = job_row(connection, job_id)?;
     let target = slack::job_slack_target(connection, job_id)?;
-    let (busy_job_id, starting) = match &target {
+    let (busy, starting) = match &target {
         Some(target) => (
             busy_job(connection, target)?,
             starting_in(connection, target)?,
         ),
         None => (None, false),
     };
+    let busy_waiting = busy.as_ref().is_some_and(|(_, waiting)| *waiting);
     let rerun_ask = target.as_ref().and_then(|_| {
         job.payload
             .get("text")
@@ -222,7 +272,8 @@ fn run_controls(
         can_stop: can_stop(&job.status),
         rerun_ask,
         rerun_for,
-        busy_job_id,
+        busy_job_id: busy.map(|(id, _)| id),
+        busy_waiting,
         starting,
     })
 }
@@ -330,8 +381,6 @@ struct Prepared {
     owner: String,
     ask: String,
     requested_for: Option<String>,
-    /// Where a silent run starts; the thread's first message when None.
-    silent_event_ts: Option<String>,
 }
 
 async fn start_run(
@@ -385,31 +434,34 @@ fn prepare_start(
         .cloned()
         .ok_or_else(|| "No owner Slack user IDs are configured.".to_string())?;
     let target = slack::require_target(slack::job_slack_target(&connection, job_id)?)?;
-    if let Some(busy) = busy_job(&connection, &target)? {
-        return Err(if busy == job_id {
-            "This run is still going. Stop it first.".to_string()
-        } else {
-            "miniOG is already working in this thread. Wait for that run or stop it.".to_string()
-        });
+    if let Some((busy, waiting)) = busy_job(&connection, &target)? {
+        return Err(match (busy == job_id, waiting) {
+            (true, false) => "This run is still going. Stop it first.",
+            (true, true) => "This run is waiting for an answer. Stop it first.",
+            (false, false) => {
+                "miniOG is already working in this thread. Wait for that run or stop it."
+            }
+            (false, true) => "miniOG is waiting for an answer in this thread. Stop that run first.",
+        }
+        .to_string());
     }
     if starting_in(&connection, &target)? {
-        return Err("A run started from here hasn't been picked up yet.".to_string());
+        return Err("A run in this thread is waiting to be picked up.".to_string());
     }
-    let (ask, requested_for, silent_event_ts) = match start {
+    let (ask, requested_for) = match start {
         Start::Ask => {
             let ask = text.unwrap_or("").trim();
             if ask.is_empty() {
                 return Err("Write what to ask first.".to_string());
             }
-            (ask.to_string(), None, None)
+            (ask.to_string(), None)
         }
         Start::Rerun => {
             let controls = run_controls(&connection, job_id, &settings.bot_user_id, &owners)?;
             let ask = controls
                 .rerun_ask
                 .ok_or_else(|| "This run has no ask to repeat.".to_string())?;
-            let event_id = job_row(&connection, job_id)?.event_id;
-            (ask, controls.rerun_for, rerun_event_ts(&event_id, &target))
+            (ask, controls.rerun_for)
         }
     };
     Ok(Prepared {
@@ -418,7 +470,6 @@ fn prepare_start(
         owner,
         ask,
         requested_for,
-        silent_event_ts,
     })
 }
 
@@ -429,13 +480,14 @@ async fn queue_run(
     post_ask: bool,
 ) -> Result<StartedRun, String> {
     let ask_ts = if post_ask {
-        let owner_name =
-            slack::resolve_users(&prepared.token, HashSet::from([prepared.owner.clone()]))
-                .await
-                .remove(&prepared.owner)
-                .map(|user| user.name)
-                .filter(|name| !name.trim().is_empty());
-        let text = start.announcement(owner_name.as_deref(), &prepared.ask);
+        let mut ids = mentioned_users(&prepared.ask);
+        ids.insert(prepared.owner.clone());
+        let users = slack::resolve_users(&prepared.token, ids).await;
+        let owner_name = users
+            .get(&prepared.owner)
+            .map(|user| user.name.as_str())
+            .filter(|name| !name.trim().is_empty());
+        let text = start.announcement(owner_name, &without_pings(&prepared.ask, &users));
         Some(
             slack::post_in_thread(&prepared.token, &prepared.target, &text, false)
                 .await?
@@ -444,7 +496,7 @@ async fn queue_run(
     } else {
         None
     };
-    let event_ts = ask_ts.clone().or(prepared.silent_event_ts.clone());
+    let event_ts = ask_ts.clone().unwrap_or_else(quiet_event_ts);
     let queued = Connection::open(db_path)
         .map_err(|err| format!("db open failed: {err}"))
         .and_then(|connection| {
@@ -454,7 +506,7 @@ async fn queue_run(
                 &prepared.ask,
                 prepared.requested_for.as_deref(),
                 &prepared.target,
-                event_ts.as_deref(),
+                Some(&event_ts),
             )
         });
     match queued {
@@ -598,19 +650,34 @@ mod tests {
     }
 
     #[test]
-    fn a_silent_rerun_starts_from_the_message_the_run_did() {
-        let target = JobSlackTarget {
-            channel: "C0B5ZVDM7GU".into(),
-            thread_ts: "1.0".into(),
-            trigger_ts: Some("1.5".into()),
-        };
-        assert_eq!(rerun_event_ts("Ev123", &target).as_deref(), Some("1.5"));
+    fn a_silent_run_starts_from_no_message() {
+        let ts = quiet_event_ts();
+        let (secs, micros) = ts.split_once('.').unwrap();
+        assert!(secs.parse::<i64>().unwrap() > 1_700_000_000);
+        assert_eq!(micros.len(), 6);
+    }
+
+    #[test]
+    fn the_posted_ask_pings_no_one_again() {
+        let users = HashMap::from([(
+            "UASKER".to_string(),
+            serde_json::from_value::<SlackUser>(
+                serde_json::json!({ "name": "rahul", "avatarUrl": null, "isBot": false }),
+            )
+            .unwrap(),
+        )]);
         assert_eq!(
-            rerun_event_ts("replay:C:1.5", &target).as_deref(),
-            Some("1.5")
+            without_pings(
+                "<!here> <@UASKER> and <@UOTHER|sam> see <!subteam^S1|@core-dev> in <#C1|general> <https://x.y|link>",
+                &users
+            ),
+            "@here @rahul and @sam see @core-dev in <#C1|general> <https://x.y|link>"
         );
-        assert_eq!(rerun_event_ts("command:abc", &target), None);
-        assert_eq!(rerun_event_ts("reaction-resume:x", &target), None);
+        assert_eq!(without_pings("<@UNKNOWN> a < b", &users), "@UNKNOWN a < b");
+        assert_eq!(
+            mentioned_users("<@UASKER> and <@UOTHER|sam> <!here>"),
+            HashSet::from(["UASKER".to_string(), "UOTHER".to_string()])
+        );
     }
 
     #[test]
@@ -651,6 +718,12 @@ mod tests {
         let mine = controls(&connection, "mine");
         assert!(mine.can_stop);
         assert_eq!(
+            mine.busy_job_id.as_deref(),
+            Some("mine"),
+            "a paused run holds its thread"
+        );
+        assert!(mine.busy_waiting);
+        assert_eq!(
             mine.rerun_for, None,
             "the owner's own run is not on anyone's behalf"
         );
@@ -665,10 +738,9 @@ mod tests {
             "1.0",
             serde_json::json!({ "eventTs": "1.7" }),
         );
-        assert_eq!(
-            controls(&connection, "done").busy_job_id.as_deref(),
-            Some("going")
-        );
+        let done = controls(&connection, "done");
+        assert_eq!(done.busy_job_id.as_deref(), Some("going"));
+        assert!(!done.busy_waiting);
 
         // So does a request from the app the sidecar has not taken yet, but
         // not one stuck for longer than the window.

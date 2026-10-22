@@ -304,4 +304,30 @@ describe('launchpadIntake', () => {
     store.close();
     fs.rmSync(dbPath, { force: true });
   });
+  it('puts a request back in line, and drops thread requests that never started', () => {
+    const { dbPath, store } = createStore();
+    const thread = { originChannelId: 'C0B5ZVDM7GU', originThreadTs: '1.0' };
+    store.createLaunchpadRequest({ id: 'req-wait', target: 'miniog', prompt: 'p', ownerUserId: 'UOWNER1', ...thread });
+    store.createLaunchpadRequest({ id: 'req-old', target: 'miniog', prompt: 'p', ownerUserId: 'UOWNER1', ...thread });
+    store.createLaunchpadRequest({ id: 'req-desk', target: 'miniog', prompt: 'p', ownerUserId: 'UOWNER1' });
+    const claimed = store.claimPendingLaunchpadRequests();
+    expect(claimed.map(request => request.id).sort()).toEqual(['req-desk', 'req-old', 'req-wait']);
+    store.markLaunchpadRequestQueued({ id: 'req-wait', slackChannelId: 'C0B5ZVDM7GU', anchorTs: '1.0' });
+
+    store.requeueLaunchpadRequest('req-wait');
+    expect(store.getLaunchpadRequest('req-wait')?.status).toBe('PENDING');
+
+    const db = (store as any).db;
+    db.prepare(`UPDATE launchpad_requests SET created_at = '2026-01-01T00:00:00.000Z'`).run();
+    expect(store.expireStaleOriginLaunchpadRequests(30)).toBe(2);
+    expect(store.getLaunchpadRequest('req-old')).toMatchObject({
+      status: 'FAILED',
+      errorMessage: 'Not started within 30 minutes, so it was dropped.',
+    });
+    // The Launchpad page's own request still retries.
+    expect(store.getLaunchpadRequest('req-desk')?.status).toBe('CLAIMED');
+
+    store.close();
+    fs.rmSync(dbPath, { force: true });
+  });
 });
