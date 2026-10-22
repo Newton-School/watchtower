@@ -27,7 +27,7 @@ const REFRESH_MS = 5000;
 const STARTED_POLL_MS = 2000;
 // A gate reads the thread every 5 seconds, and may think about a reply after;
 // an answer it took is given this long before the question counts as unanswered.
-const ANSWER_READ_MS = 20_000;
+const ANSWER_READ_MS = 30_000;
 // Slack folds a message into the previous one when the same person posts again this soon.
 const GROUP_WINDOW_SECONDS = 5 * 60;
 
@@ -230,20 +230,25 @@ export function SlackThread({ jobId, onOpenRun }: SlackThreadProps) {
     }
   };
 
+  // The last answer a gate mid-run took from here. Kept apart from `started`,
+  // so dismissing its line doesn't let a second answer go before it's read.
+  const [lastAnswer, setLastAnswer] = useState<{ jobId: string; promptTs: string | null; at: number } | null>(null);
+
   // Follow a run started from here until miniOG takes it or turns it down.
   const startedId = started?.requestId ?? null;
   const startedWaiting = started !== null && isWaiting(started.status);
+  const answersJobId = started?.kind === 'answer' ? (started.answersJobId ?? null) : null;
+  const answersPromptTs = started?.answersPromptTs ?? null;
   useEffect(() => {
     if (!startedId || !startedWaiting) return;
     const check = async () => {
       if (document.visibilityState !== 'visible') return;
       try {
         const status = await invoke<StartedRunStatus>('get_started_run', { requestId: startedId });
-        setStarted(current =>
-          current?.requestId === startedId
-            ? { ...current, status, tookAt: current.tookAt ?? (isWaiting(status) ? undefined : Date.now()) }
-            : current,
-        );
+        setStarted(current => (current?.requestId === startedId ? { ...current, status } : current));
+        if (answersJobId && status.status === 'SUCCESS' && status.jobId === answersJobId) {
+          setLastAnswer({ jobId: answersJobId, promptTs: answersPromptTs, at: Date.now() });
+        }
         // The thread and the controls catch up at once, not on the next refresh.
         if (!isWaiting(status)) void load();
       } catch {
@@ -252,12 +257,11 @@ export function SlackThread({ jobId, onOpenRun }: SlackThreadProps) {
     };
     const timer = window.setInterval(() => void check(), STARTED_POLL_MS);
     return () => window.clearInterval(timer);
-  }, [startedId, startedWaiting, load]);
+  }, [startedId, startedWaiting, answersJobId, answersPromptTs, load]);
 
   // An answer miniOG took to the question it still waits on: give the gate a
   // moment to read it before another answer can go, then say it's unanswered.
-  const answeredAt =
-    started?.kind === 'answer' && started.status?.status === 'SUCCESS' ? (started.tookAt ?? null) : null;
+  const answeredAt = lastAnswer?.at ?? null;
   const [readWindowOver, setReadWindowOver] = useState<number | null>(null);
   useEffect(() => {
     if (answeredAt === null) return;
@@ -268,10 +272,9 @@ export function SlackThread({ jobId, onOpenRun }: SlackThreadProps) {
     return () => window.clearTimeout(timer);
   }, [answeredAt]);
   const sameQuestion =
-    answeredAt !== null &&
-    started?.status?.jobId === started?.answersJobId &&
-    controls?.answer?.jobId === started?.answersJobId &&
-    controls?.answer?.promptTs === (started?.answersPromptTs ?? null);
+    lastAnswer !== null &&
+    controls?.answer?.jobId === lastAnswer.jobId &&
+    controls.answer.promptTs === lastAnswer.promptTs;
   const readingAnswer = sameQuestion && readWindowOver !== answeredAt;
   const answerUnread = sameQuestion && readWindowOver === answeredAt;
 

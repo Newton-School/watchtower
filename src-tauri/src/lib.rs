@@ -3239,6 +3239,7 @@ fn initialize_db(path: &PathBuf) -> Result<(), String> {
             )",
         )
         .map_err(|err| format!("db migration failed: {err}"))?;
+    let _ = connection.execute("ALTER TABLE human_waits ADD COLUMN expects TEXT", []);
     // dossier_cache_signals is a SQLite-only bridge from desktop Tauri commands
     // to the sidecar's in-memory dossier cache. Whenever the desktop mutates a
     // user's dossier or pinned facts, it INSERT OR REPLACEs the user_id with

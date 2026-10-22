@@ -572,8 +572,8 @@ export function SlackComposer({
         </div>
         <span className="muted slack-composer-hint">
           {!toMiniog
-            ? second === 'answer'
-              ? "Posts as miniOG, which miniOG won't read as the answer: use Answer miniOG for that."
+            ? second === 'answer' && !answering?.blocked
+              ? 'Posts as miniOG. To answer its question, use Answer miniOG.'
               : 'Posts as miniOG. Shift+Enter for a new line.'
             : mode === 'answer'
               ? postAnswer
@@ -602,11 +602,10 @@ export function SlackComposer({
           </button>
         )}
       </div>
-      {blockedNote ? (
-        <p className="slack-thread-warning slack-composer-note" id={noteId} role="status">
-          {blockedNote}
-        </p>
-      ) : null}
+      {/* Always there, so a screen reader announces the note when it appears. */}
+      <div className={blockedNote ? 'slack-thread-warning slack-composer-note' : undefined} id={noteId} role="status">
+        {blockedNote}
+      </div>
       {fileError ? <p className="slack-thread-error">{fileError}</p> : null}
       {emojiAnchor ? (
         <EmojiPicker

@@ -689,7 +689,13 @@ fn prepare_answer(
         return Err("Write the answer first.".to_string());
     }
     if let Some(phrase) = &waiting.expects {
-        if confirmation_text(answer) != *phrase {
+        let said = confirmation_text(answer);
+        // The phrase, or a no: the confirm takes both.
+        let declines = matches!(
+            said.as_str(),
+            "no" | "nope" | "cancel" | "stop" | "abort" | "dont"
+        );
+        if said != *phrase && !declines {
             return Err(format!("miniOG takes exactly \"{phrase}\" here."));
         }
     }
@@ -1363,6 +1369,7 @@ mod tests {
             Some("miniOG takes exactly \"confirm merge\" here.")
         );
         assert!(answer(&connection, "merging", "*Confirm  merge!*", written_for).is_ok());
+        assert!(answer(&connection, "merging", "No.", written_for).is_ok());
         assert_eq!(confirmation_text("<@U1> `Confirm` merge."), "confirm merge");
 
         drop(connection);

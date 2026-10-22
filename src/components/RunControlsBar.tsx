@@ -20,8 +20,6 @@ export type StartedRunView = {
   /** For an answer: the run it answers and the question it was written for. */
   answersJobId?: string | null;
   answersPromptTs?: string | null;
-  /** When miniOG took it. */
-  tookAt?: number;
   status: StartedRunStatus | null;
   /** Cancelled from here before miniOG took it. */
   cancelled?: boolean;

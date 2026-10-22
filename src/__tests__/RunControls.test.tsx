@@ -248,12 +248,68 @@ describe('run controls in the thread view', () => {
     // A second answer waits while the gate reads the first.
     fireEvent.click(screen.getByRole('button', { name: 'Answer miniOG' }));
     expect(await screen.findByText('miniOG is reading your answer…')).toBeTruthy();
+    // Dismissing the line doesn't let a second answer go before the first is read.
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+    expect(screen.getByText('miniOG is reading your answer…')).toBeTruthy();
     // Still the same question a while later: it didn't take that as the answer.
-    vi.advanceTimersByTime(20_000);
+    vi.advanceTimersByTime(30_000);
+    await waitFor(() => expect(screen.queryByText('miniOG is reading your answer…')).toBeNull());
+  });
+
+  it('says when miniOG still waits on the question it took an answer to', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    respondWith(waitingOnPlan, { started: [{ status: 'SUCCESS', jobId: 'job-1', error: null }] });
+    render(<SlackThread jobId="job-1" />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Answer miniOG' }));
+    const box = screen.getByRole('textbox', { name: 'Answer miniOG' });
+    fireEvent.change(box, { target: { value: 'hmm' } });
+    fireEvent.keyDown(box, { key: 'Enter' });
+    await screen.findByText('Waiting for miniOG to pick up your answer…');
+    vi.advanceTimersByTime(2000);
+    expect(await screen.findByText('miniOG has your answer.')).toBeTruthy();
+    vi.advanceTimersByTime(30_000);
     expect(
       await screen.findByText('miniOG is still waiting on this question. See the thread for what it needs.'),
     ).toBeTruthy();
-    expect(screen.queryByText('miniOG is reading your answer…')).toBeNull();
+  });
+
+  it('answers a run waiting in the thread from another run, and opens it', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    respondWith(
+      {
+        ...idle,
+        busyJobId: 'job-9',
+        busyWaiting: true,
+        answer: { jobId: 'job-9', kind: 'question', promptTs: '100.000002', answerBy: [], expects: null },
+      },
+      { started: [{ status: 'SUCCESS', jobId: 'job-9', error: null }] },
+    );
+    const onOpenRun = vi.fn();
+    render(<SlackThread jobId="job-1" onOpenRun={onOpenRun} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Answer miniOG' }));
+    const box = screen.getByRole('textbox', { name: 'Answer miniOG' });
+    fireEvent.change(box, { target: { value: 'the web repo' } });
+    fireEvent.keyDown(box, { key: 'Enter' });
+    await screen.findByText('Waiting for miniOG to pick up your answer…');
+    vi.advanceTimersByTime(2000);
+    expect(await screen.findByText('miniOG has your answer, in the other run.')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Open it →' }));
+    expect(onOpenRun).toHaveBeenCalledWith('job-9');
+  });
+
+  it('shows why the app turned an answer down, and keeps the words', async () => {
+    respondWith(waitingOnPlan, { fail: { answer_miniog: 'miniOG asked something new. Read it, then answer again.' } });
+    render(<SlackThread jobId="job-1" />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Answer miniOG' }));
+    const box = screen.getByRole('textbox', { name: 'Answer miniOG' }) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: 'yes' } });
+    fireEvent.keyDown(box, { key: 'Enter' });
+
+    expect(await screen.findByText('miniOG asked something new. Read it, then answer again.')).toBeTruthy();
+    expect(box.value).toBe('yes');
   });
 
   it('holds an answer draft when miniOG asks something new under it', async () => {
@@ -295,9 +351,7 @@ describe('run controls in the thread view', () => {
     );
     render(<SlackThread jobId="job-1" />);
 
-    expect(
-      await screen.findByText("Posts as miniOG, which miniOG won't read as the answer: use Answer miniOG for that."),
-    ).toBeTruthy();
+    expect(await screen.findByText('Posts as miniOG. To answer its question, use Answer miniOG.')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Answer miniOG' }));
     const box = screen.getByRole('textbox', { name: 'Answer miniOG' });
     fireEvent.change(box, { target: { value: 'yes' } });

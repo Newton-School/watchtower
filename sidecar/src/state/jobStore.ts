@@ -889,6 +889,11 @@ export class JobStore {
     } catch {
       /* column already exists */
     }
+    try {
+      this.db.exec(`ALTER TABLE human_waits ADD COLUMN expects TEXT`);
+    } catch {
+      /* column already exists */
+    }
     // Answers from the app's thread view to a run waiting on a person.
     try {
       this.db.exec(`ALTER TABLE launchpad_requests ADD COLUMN answer_for_job_id TEXT`);
