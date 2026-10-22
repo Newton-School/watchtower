@@ -3,7 +3,7 @@ import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import type { RemoveReactionsResult, RunThread, SlackMessage, SlackUser } from '../types';
 import { emojiChar } from '../lib/emoji';
-import { SlackText } from '../lib/slackText';
+import { SlackText, fromSlackText, toSlackText } from '../lib/slackText';
 import { EmojiPicker } from './EmojiPicker';
 import { SectionCard } from './primitives';
 
@@ -47,7 +47,8 @@ function describeRemoval(result: RemoveReactionsResult): string {
 }
 
 function submitOnEnter(e: ReactKeyboardEvent<HTMLTextAreaElement>, submit: () => void) {
-  if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+  // WebKit ends an IME composition before the Enter keydown; keyCode 229 still marks it.
+  if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && e.keyCode !== 229) {
     e.preventDefault();
     submit();
   }
@@ -71,11 +72,13 @@ export function SlackThread({ jobId }: SlackThreadProps) {
   const [draft, setDraft] = useState('');
   const [editing, setEditing] = useState<{ ts: string; text: string } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
-  const [pickerFor, setPickerFor] = useState<string | null>(null);
+  const [pickerFor, setPickerFor] = useState<{ ts: string; anchor: HTMLElement } | null>(null);
 
   // Only the newest read may land, so a slow poll can't overwrite a fresher one.
   const readSeq = useRef(0);
   const polling = useRef(false);
+  // A Slack hiccup on a refresh keeps the last good read on screen.
+  const hasGoodRead = useRef(false);
 
   const load = useCallback(
     async (fromPoll = false) => {
@@ -84,10 +87,14 @@ export function SlackThread({ jobId }: SlackThreadProps) {
       if (fromPoll) polling.current = true;
       try {
         const next = await invoke<RunThread>('get_run_thread', { jobId });
-        if (seq === readSeq.current) {
-          setThread(next);
-          setLoadError(null);
+        if (seq !== readSeq.current) return;
+        if (next.readError?.kind === 'other' && hasGoodRead.current) {
+          setLoadError(`Couldn't refresh (Slack said ${next.readError.code}); showing the last read.`);
+          return;
         }
+        hasGoodRead.current = next.hasThread && !next.readError;
+        setThread(next);
+        setLoadError(null);
       } catch (err) {
         if (seq === readSeq.current) setLoadError(String(err));
       } finally {
@@ -98,6 +105,7 @@ export function SlackThread({ jobId }: SlackThreadProps) {
   );
 
   useEffect(() => {
+    hasGoodRead.current = false;
     setThread(null);
     setLoadError(null);
     setActionError(null);
@@ -139,20 +147,40 @@ export function SlackThread({ jobId }: SlackThreadProps) {
   if (thread && !thread.hasThread) return null;
 
   const send = async () => {
-    const text = draft;
-    if (!text.trim() || busy) return;
-    if (await act('post_as_miniog', { text })) setDraft('');
+    const typed = draft;
+    if (!typed.trim() || busy) return;
+    // Keep anything typed while the send was in flight.
+    if (await act('post_as_miniog', { text: toSlackText(typed) }))
+      setDraft(current => (current === typed ? '' : current));
   };
 
   const saveEdit = async () => {
     if (!editing || busy) return;
-    if (await act('edit_miniog_message', { ts: editing.ts, text: editing.text })) setEditing(null);
+    if (await act('edit_miniog_message', { ts: editing.ts, text: toSlackText(editing.text) })) setEditing(null);
   };
 
   const toggleReaction = (message: SlackMessage, name: string) => {
+    if (busy) return;
     const mine = message.reactions?.some(r => r.name === name && r.users.includes(thread?.botUserId ?? ''));
     setPickerFor(null);
     void act('set_miniog_reaction', { ts: message.ts, name, add: !mine });
+  };
+
+  const togglePicker = (ts: string, anchor: HTMLElement) => {
+    setPickerFor(current => (current?.anchor === anchor ? null : { ts, anchor }));
+  };
+
+  // Escape backs out of an edit, a delete prompt or the picker, without
+  // closing the run page.
+  const onKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== 'Escape') return;
+    if (editing || confirmDelete || pickerFor) {
+      e.preventDefault();
+      e.stopPropagation();
+      setEditing(null);
+      setConfirmDelete(null);
+      setPickerFor(null);
+    }
   };
 
   const title =
@@ -161,7 +189,8 @@ export function SlackThread({ jobId }: SlackThreadProps) {
       : thread?.channelKind === 'mpim'
         ? 'Group message'
         : `#${thread?.channelName ?? thread?.channelId ?? 'slack'}`;
-  const replies = Math.max(messageCount - 1, 0);
+  const replies = thread?.replyCount ?? 0;
+  const shown = thread?.truncated ? ` · showing ${Math.max(messageCount - 1, 0)}` : '';
   const actions = thread?.permalink ? (
     <a className="ghost-button" href={thread.permalink} target="_blank" rel="noopener noreferrer">
       Open in Slack ↗
@@ -173,7 +202,9 @@ export function SlackThread({ jobId }: SlackThreadProps) {
       className="slack-thread-card"
       title={title}
       subtitle={
-        thread ? `Thread · ${replies} ${replies === 1 ? 'reply' : 'replies'} · you act as miniOG here` : 'Thread'
+        thread
+          ? `Thread · ${replies} ${replies === 1 ? 'reply' : 'replies'}${shown} · you act as miniOG here`
+          : 'Thread'
       }
       actions={actions}
     >
@@ -205,7 +236,8 @@ export function SlackThread({ jobId }: SlackThreadProps) {
           }}
         />
       ) : (
-        <>
+        <div onKeyDown={onKeyDown}>
+          {loadError ? <p className="slack-thread-warning">{loadError}</p> : null}
           <div
             className="slack-thread-messages"
             ref={listRef}
@@ -229,13 +261,13 @@ export function SlackThread({ jobId }: SlackThreadProps) {
                   busy={busy}
                   editing={editing?.ts === message.ts ? editing.text : null}
                   confirmingDelete={confirmDelete === message.ts}
-                  pickerOpen={pickerFor === message.ts}
+                  picker={pickerFor?.ts === message.ts ? pickerFor.anchor : null}
                   onReact={name => toggleReaction(message, name)}
-                  onOpenPicker={() => setPickerFor(message.ts)}
+                  onTogglePicker={anchor => togglePicker(message.ts, anchor)}
                   onClosePicker={() => setPickerFor(null)}
                   onStartEdit={() => {
                     setConfirmDelete(null);
-                    setEditing({ ts: message.ts, text: message.text ?? '' });
+                    setEditing({ ts: message.ts, text: fromSlackText(message.text ?? '') });
                   }}
                   onEditChange={text => setEditing({ ts: message.ts, text })}
                   onSaveEdit={() => void saveEdit()}
@@ -275,7 +307,7 @@ export function SlackThread({ jobId }: SlackThreadProps) {
               </button>
             </div>
           </form>
-        </>
+        </div>
       )}
     </SectionCard>
   );
@@ -288,9 +320,10 @@ type MessageRowProps = {
   busy: boolean;
   editing: string | null;
   confirmingDelete: boolean;
-  pickerOpen: boolean;
+  /** The button the picker is open from, when it's open on this message. */
+  picker: HTMLElement | null;
   onReact: (name: string) => void;
-  onOpenPicker: () => void;
+  onTogglePicker: (anchor: HTMLElement) => void;
   onClosePicker: () => void;
   onStartEdit: () => void;
   onEditChange: (text: string) => void;
@@ -308,9 +341,9 @@ function MessageRow({
   busy,
   editing,
   confirmingDelete,
-  pickerOpen,
+  picker,
   onReact,
-  onOpenPicker,
+  onTogglePicker,
   onClosePicker,
   onStartEdit,
   onEditChange,
@@ -323,6 +356,8 @@ function MessageRow({
   const author = authorOf(message, thread.users);
   const time = messageTime(message.ts);
   const isMiniog = Boolean(thread.botUserId) && message.user === thread.botUserId;
+  // A gate prompt's buttons live in its blocks, and an edit would strip them.
+  const hasButtons = message.blocks?.some(block => block.type === 'actions') ?? false;
   const isTrigger = message.ts === thread.triggerTs;
   const showHeader = !grouped || isTrigger;
 
@@ -363,10 +398,7 @@ function MessageRow({
               autoFocus
               value={editing}
               onChange={e => onEditChange(e.target.value)}
-              onKeyDown={e => {
-                if (e.key === 'Escape') onCancelEdit();
-                else submitOnEnter(e, onSaveEdit);
-              }}
+              onKeyDown={e => submitOnEnter(e, onSaveEdit)}
             />
             <div className="slack-edit-actions">
               <button className="ghost-button" type="button" onClick={onCancelEdit}>
@@ -426,7 +458,7 @@ function MessageRow({
               className="slack-reaction slack-reaction-add"
               aria-label="Add a reaction as miniOG"
               disabled={busy}
-              onClick={onOpenPicker}
+              onClick={e => onTogglePicker(e.currentTarget)}
             >
               ☺︎+
             </button>
@@ -453,21 +485,23 @@ function MessageRow({
             className="slack-action"
             title="React as miniOG"
             aria-label="React as miniOG"
-            onClick={onOpenPicker}
+            onClick={e => onTogglePicker(e.currentTarget)}
           >
             ☺︎
           </button>
           {isMiniog ? (
             <>
-              <button
-                type="button"
-                className="slack-action"
-                title="Edit"
-                aria-label="Edit message"
-                onClick={onStartEdit}
-              >
-                ✎
-              </button>
+              {hasButtons ? null : (
+                <button
+                  type="button"
+                  className="slack-action"
+                  title="Edit"
+                  aria-label="Edit message"
+                  onClick={onStartEdit}
+                >
+                  ✎
+                </button>
+              )}
               <button
                 type="button"
                 className="slack-action"
@@ -482,11 +516,7 @@ function MessageRow({
         </div>
       ) : null}
 
-      {pickerOpen ? (
-        <div className="slack-picker-anchor">
-          <EmojiPicker onPick={onReact} onClose={onClosePicker} />
-        </div>
-      ) : null}
+      {picker ? <EmojiPicker anchor={picker} onPick={onReact} onClose={onClosePicker} /> : null}
     </div>
   );
 }

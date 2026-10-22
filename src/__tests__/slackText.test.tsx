@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { render } from '@testing-library/react';
-import { SlackText } from '../lib/slackText';
+import { SlackText, fromSlackText, toSlackText } from '../lib/slackText';
 import { emojiChar, searchEmoji } from '../lib/emoji';
 
 const users = { U1: { name: 'theOG', avatarUrl: null, isBot: false } };
@@ -38,6 +38,29 @@ describe('SlackText', () => {
       '<blockquote class="slack-quote">quoted <span class="slack-mention">@theOG</span></blockquote>',
     );
     expect(out).toContain('after &lt;3');
+  });
+});
+
+describe('SlackText edge cases', () => {
+  it('treats an unclosed fence as text and an empty label as no label', () => {
+    const out = html('use ```npm ci and <#C9|> or <https://x.co/a|b|c>');
+    expect(out).toContain('use ```npm ci');
+    expect(out).not.toContain('<pre');
+    expect(out).toContain('#C9');
+    expect(out).toContain('>b|c</a>');
+  });
+
+  it('keeps the characters around bold and italic', () => {
+    expect(html('(*yes*) and x _no_.')).toContain('(<strong>yes</strong>) and x <em>no</em>.');
+  });
+});
+
+describe('escaping for Slack', () => {
+  it('escapes &, < and > outside mention and link tokens, and round-trips', () => {
+    const typed = 'if a < b && c > d, ping <@U1> or <https://x.co|docs>';
+    const slack = toSlackText(typed);
+    expect(slack).toBe('if a &lt; b &amp;&amp; c &gt; d, ping <@U1> or <https://x.co|docs>');
+    expect(fromSlackText(slack)).toBe(typed);
   });
 });
 

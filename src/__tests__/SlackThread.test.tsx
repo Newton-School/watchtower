@@ -30,6 +30,8 @@ function makeThread(overrides: Partial<RunThread> = {}): RunThread {
       },
       { ts: '1000.000002', user: 'UBOT', bot_id: 'B1', text: 'I can work on *newton-web*.' },
     ],
+    replyCount: 1,
+    truncated: false,
     readError: null,
     ...overrides,
   };
@@ -184,6 +186,70 @@ describe('SlackThread', () => {
 
     expect(await screen.findByText('Removed 👀.')).toBeTruthy();
     expect(invoke).toHaveBeenCalledWith('remove_job_reactions', { jobId: 'job-1', names: null });
+  });
+
+  it('Escape cancels an edit and is kept from the page', async () => {
+    respondWith(makeThread());
+    render(<SlackThread jobId="job-1" />);
+    await screen.findByText('#miniog-testing');
+
+    const reply = messageRow('1000.000002');
+    fireEvent.click(within(reply).getByRole('button', { name: 'Edit message' }));
+    const editor = within(reply).getByRole('textbox', { name: 'Edit message' });
+    const pageSawIt = vi.fn();
+    window.addEventListener('keydown', pageSawIt);
+    fireEvent.keyDown(editor, { key: 'Escape' });
+    window.removeEventListener('keydown', pageSawIt);
+
+    expect(within(reply).queryByRole('textbox', { name: 'Edit message' })).toBeNull();
+    expect(pageSawIt).not.toHaveBeenCalled();
+  });
+
+  it('keeps the last read on screen when a refresh hits a Slack hiccup', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    invoke.mockResolvedValueOnce(makeThread());
+    invoke.mockResolvedValueOnce(makeThread({ messages: [], readError: { kind: 'other', code: 'ratelimited' } }));
+    render(<SlackThread jobId="job-1" />);
+    await screen.findByText('#miniog-testing');
+
+    await act(async () => {
+      vi.advanceTimersByTime(5000);
+    });
+
+    expect(await screen.findByText("Couldn't refresh (Slack said ratelimited); showing the last read.")).toBeTruthy();
+    expect(messageRow('1000.000002')).toBeTruthy();
+  });
+
+  it("doesn't offer Edit on a prompt with buttons, and escapes what you type", async () => {
+    const thread = makeThread();
+    thread.messages[1] = { ...thread.messages[1], blocks: [{ type: 'section' }, { type: 'actions' }] };
+    respondWith(thread);
+    render(<SlackThread jobId="job-1" />);
+    await screen.findByText('#miniog-testing');
+
+    const reply = messageRow('1000.000002');
+    expect(within(reply).queryByRole('button', { name: 'Edit message' })).toBeNull();
+    expect(within(reply).getByRole('button', { name: 'Delete message' })).toBeTruthy();
+
+    const box = screen.getByRole('textbox', { name: 'Reply as miniOG' });
+    fireEvent.change(box, { target: { value: 'a < b & c, ask <@UOG>' } });
+    fireEvent.keyDown(box, { key: 'Enter' });
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith('post_as_miniog', { jobId: 'job-1', text: 'a &lt; b &amp; c, ask <@UOG>' });
+    });
+  });
+
+  it('closes the picker when its button is clicked again', async () => {
+    respondWith(makeThread());
+    render(<SlackThread jobId="job-1" />);
+    await screen.findByText('#miniog-testing');
+
+    const button = within(messageRow('1000.000002')).getByRole('button', { name: 'React as miniOG' });
+    fireEvent.click(button);
+    expect(screen.getByRole('dialog', { name: 'Pick a reaction' })).toBeTruthy();
+    fireEvent.pointerDown(button);
+    fireEvent.click(button);
+    expect(screen.queryByRole('dialog', { name: 'Pick a reaction' })).toBeNull();
   });
 
   it('renders nothing for a run without a Slack thread', async () => {

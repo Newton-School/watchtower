@@ -5,15 +5,44 @@ import type { SlackUser } from '../types';
 // One inline token at a time: <...> links and mentions, `code`, *bold*,
 // _italic_, ~strike~ and :emoji:. Bold, italic and strike need a word
 // boundary on both sides, like Slack, so snake_case and 2*3*4 stay as text.
+// The boundary before is a captured character rather than a lookbehind, which
+// older macOS WebKit can't parse.
 const INLINE =
-  /<([^<>\n]+)>|`([^`\n]+)`|(?<![\w*])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\w*])|(?<![\w_])_(?!\s)([^_\n]+?)(?<!\s)_(?![\w_])|(?<![\w~])~(?!\s)([^~\n]+?)(?<!\s)~(?![\w~])|:([a-z0-9_+'-]+(?:::skin-tone-[2-6])?):/g;
+  /<([^<>\n]+)>|`([^`\n]+)`|(^|[^\w*])\*([^\s*](?:[^*\n]*?[^\s*])?)\*(?![\w*])|(^|[^\w_])_([^\s_](?:[^_\n]*?[^\s_])?)_(?![\w_])|(^|[^\w~])~([^\s~](?:[^~\n]*?[^\s~])?)~(?![\w~])|:([a-z0-9_+'-]+(?:::skin-tone-[2-6])?):/g;
+
+// Mention, channel and link tokens, which Slack text keeps as markup.
+const SLACK_TOKEN = /<(?:[@#!][^<>\s|]+|(?:https?|mailto):[^<>\s|]+)(?:\|[^<>]*)?>/g;
 
 function decode(text: string): string {
   return text.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
 }
 
+function escapeMarkup(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/** Text typed in the app, ready for Slack: &, < and > escaped, except inside mention and link tokens. */
+export function toSlackText(input: string): string {
+  let out = '';
+  let last = 0;
+  for (const match of input.matchAll(SLACK_TOKEN)) {
+    const start = match.index ?? 0;
+    out += escapeMarkup(input.slice(last, start)) + match[0];
+    last = start + match[0].length;
+  }
+  return out + escapeMarkup(input.slice(last));
+}
+
+/** Slack text as someone would type it, for editing. */
+export function fromSlackText(text: string): string {
+  return decode(text);
+}
+
 function renderAngle(body: string, users: Record<string, SlackUser>, key: string): ReactNode {
-  const [target, label] = body.split('|', 2);
+  const bar = body.indexOf('|');
+  const target = bar === -1 ? body : body.slice(0, bar);
+  // An empty label (`<#C123|>`) means "no label", as in Slack.
+  const label = bar === -1 ? undefined : body.slice(bar + 1) || undefined;
   if (target.startsWith('@')) {
     const id = target.slice(1);
     return (
@@ -54,7 +83,9 @@ function renderInline(text: string, users: Record<string, SlackUser>, keyPrefix:
     const start = match.index ?? 0;
     if (start > last) nodes.push(decode(text.slice(last, start)));
     const key = `${keyPrefix}-${index++}`;
-    const [whole, angle, code, bold, italic, strike, emoji] = match;
+    const [whole, angle, code, boldBefore, bold, italicBefore, italic, strikeBefore, strike, emoji] = match;
+    const before = boldBefore ?? italicBefore ?? strikeBefore;
+    if (before) nodes.push(decode(before));
     if (angle !== undefined) nodes.push(renderAngle(angle, users, key));
     else if (code !== undefined) {
       nodes.push(
@@ -123,6 +154,8 @@ function renderLines(text: string, users: Record<string, SlackUser>, keyPrefix: 
 export function renderSlackText(text: string, users: Record<string, SlackUser>): ReactNode[] {
   const nodes: ReactNode[] = [];
   const parts = text.split('```');
+  // An unclosed ``` is just text, as in Slack.
+  if (parts.length % 2 === 0) parts.splice(-2, 2, `${parts[parts.length - 2]}\`\`\`${parts[parts.length - 1]}`);
   parts.forEach((part, i) => {
     if (i % 2 === 1) {
       nodes.push(

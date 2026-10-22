@@ -229,10 +229,15 @@ struct ChannelInfo {
     kind: &'static str,
 }
 
-fn user_cache() -> &'static Mutex<HashMap<String, SlackUser>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, SlackUser>>> = OnceLock::new();
+/// Users looked up so far; `None` marks an id Slack had no user for, so it
+/// isn't asked about again on every refresh.
+fn user_cache() -> &'static Mutex<HashMap<String, Option<SlackUser>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<SlackUser>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
+
+/// users.info lookups to run at once.
+const USER_LOOKUP_BATCH: usize = 8;
 
 fn channel_cache() -> &'static Mutex<HashMap<String, ChannelInfo>> {
     static CACHE: OnceLock<Mutex<HashMap<String, ChannelInfo>>> = OnceLock::new();
@@ -310,7 +315,7 @@ fn user_ids_in(messages: &[serde_json::Value]) -> HashSet<String> {
     ids
 }
 
-/// Names and avatars for `ids`, from the cache or users.info (looked up in parallel).
+/// Names and avatars for `ids`, from the cache or users.info (a few at a time).
 async fn resolve_users(token: &str, ids: HashSet<String>) -> HashMap<String, SlackUser> {
     let mut found = HashMap::new();
     let mut missing = Vec::new();
@@ -318,31 +323,42 @@ async fn resolve_users(token: &str, ids: HashSet<String>) -> HashMap<String, Sla
         let cache = user_cache().lock().unwrap_or_else(|e| e.into_inner());
         for id in ids {
             match cache.get(&id) {
-                Some(user) => {
+                Some(Some(user)) => {
                     found.insert(id, user.clone());
                 }
+                Some(None) => {}
                 None => missing.push(id),
             }
         }
     }
-    let mut lookups = JoinSet::new();
-    for id in missing {
-        let token = token.to_string();
-        lookups.spawn(async move {
-            let user = slack_call(&token, "users.info", &[("user", &id)])
-                .await
-                .ok()
-                .and_then(|response| slack_user_from(&response));
-            (id, user)
-        });
-    }
-    while let Some(Ok((id, user))) = lookups.join_next().await {
-        if let Some(user) = user {
+    for batch in missing.chunks(USER_LOOKUP_BATCH) {
+        let mut lookups = JoinSet::new();
+        for id in batch {
+            let token = token.to_string();
+            let id = id.clone();
+            lookups.spawn(async move {
+                let response = slack_call(&token, "users.info", &[("user", &id)]).await;
+                (id, response)
+            });
+        }
+        while let Some(joined) = lookups.join_next().await {
+            let Ok((id, response)) = joined else {
+                continue;
+            };
+            let user = match &response {
+                Ok(response) => slack_user_from(response),
+                // Only a definite "no such user" is remembered; a network
+                // blip is retried on the next refresh.
+                Err(err) if err.ends_with("user_not_found") => None,
+                Err(_) => continue,
+            };
+            if let Some(user) = &user {
+                found.insert(id.clone(), user.clone());
+            }
             user_cache()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(id.clone(), user.clone());
-            found.insert(id, user);
+                .insert(id, user);
         }
     }
     found
@@ -436,8 +452,12 @@ pub(crate) struct RunThread {
     trigger_ts: Option<String>,
     bot_user_id: String,
     permalink: Option<String>,
-    /// Slack message objects as conversations.replies returns them.
+    /// Slack message objects as conversations.replies returns them, oldest first.
     messages: Vec<serde_json::Value>,
+    /// Replies in the thread per Slack, which can exceed what `messages` holds.
+    reply_count: usize,
+    /// True when the thread is longer than the app reads.
+    truncated: bool,
     users: HashMap<String, SlackUser>,
     /// Set when the app could not read the thread; `messages` is then empty.
     read_error: Option<SlackReadError>,
@@ -457,6 +477,9 @@ async fn get_run_thread_inner(db_path: &Path, job_id: &str) -> Result<RunThread,
         return Ok(RunThread::default());
     };
     let token = settings.slack_bot_token.as_str();
+    if settings.bot_user_id.trim().is_empty() {
+        return Err("Set the bot user ID in Settings first.".to_string());
+    }
     let mut thread = RunThread {
         has_thread: true,
         channel_id: target.channel.clone(),
@@ -494,6 +517,16 @@ async fn get_run_thread_inner(db_path: &Path, job_id: &str) -> Result<RunThread,
             break;
         }
     }
+    thread.truncated = thread.read_error.is_none() && !cursor.is_empty();
+    thread.messages = in_thread_order(std::mem::take(&mut thread.messages));
+    thread.reply_count = thread
+        .messages
+        .iter()
+        .find(|m| m.get("ts").and_then(|t| t.as_str()) == Some(target.thread_ts.as_str()))
+        .and_then(|parent| parent.get("reply_count"))
+        .and_then(|count| count.as_u64())
+        .map(|count| count as usize)
+        .unwrap_or_else(|| thread.messages.len().saturating_sub(1));
 
     let info = channel_info(token, &target.channel).await;
     thread.channel_name = info.name;
@@ -506,6 +539,30 @@ async fn get_run_thread_inner(db_path: &Path, job_id: &str) -> Result<RunThread,
         thread.permalink = thread_permalink(token, &target.channel, &target.thread_ts).await;
     }
     Ok(thread)
+}
+
+/// Slack pages a long thread newest first and repeats the parent on every
+/// page, so put the pages back together: one copy of each message, oldest first.
+fn in_thread_order(messages: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    fn ts_key(message: &serde_json::Value) -> (u64, u64) {
+        let ts = message.get("ts").and_then(|t| t.as_str()).unwrap_or("");
+        let (secs, micros) = ts.split_once('.').unwrap_or((ts, "0"));
+        (secs.parse().unwrap_or(0), micros.parse().unwrap_or(0))
+    }
+    let mut seen = HashSet::new();
+    let mut unique: Vec<serde_json::Value> = messages
+        .into_iter()
+        .filter(|m| {
+            seen.insert(
+                m.get("ts")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        })
+        .collect();
+    unique.sort_by_key(ts_key);
+    unique
 }
 
 fn require_target(target: Option<JobSlackTarget>) -> Result<JobSlackTarget, String> {
@@ -545,8 +602,29 @@ async fn post_as_miniog_inner(
     }
     let (target, settings) = load_job(db_path, job_id)?;
     let target = require_target(target)?;
-    let result = slack_call(
-        &settings.slack_bot_token,
+    let result = post_in_thread(&settings.slack_bot_token, &target, text).await;
+    let ts = result
+        .as_ref()
+        .map(|posted| posted.ts.clone())
+        .unwrap_or_default();
+    traced(
+        db_path,
+        job_id,
+        "watchtower.slack.post",
+        "Posted in the thread as miniOG from Watchtower.",
+        "Posting as miniOG from Watchtower failed.",
+        serde_json::json!({ "ts": ts, "text": text }),
+        result,
+    )
+}
+
+async fn post_in_thread(
+    token: &str,
+    target: &JobSlackTarget,
+    text: &str,
+) -> Result<PostedMessage, String> {
+    let response = slack_call(
+        token,
         "chat.postMessage",
         &[
             ("channel", &target.channel),
@@ -554,36 +632,49 @@ async fn post_as_miniog_inner(
             ("text", text),
         ],
     )
-    .await;
-    match result {
-        Ok(response) => {
-            let ts = response
-                .get("ts")
-                .and_then(|t| t.as_str())
-                .unwrap_or("")
-                .to_string();
-            log_app_action(
-                db_path,
-                job_id,
-                "INFO",
-                "watchtower.slack.post",
-                "Posted in the thread as miniOG from Watchtower.",
-                serde_json::json!({ "ts": ts, "text": text }),
-            );
-            Ok(PostedMessage { ts })
-        }
+    .await?;
+    let ts = response
+        .get("ts")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    // Slack posts to the channel itself when the thread's first message is gone.
+    let landed_in = response
+        .pointer("/message/thread_ts")
+        .and_then(|t| t.as_str());
+    if landed_in != Some(target.thread_ts.as_str()) {
+        let _ = slack_call(
+            token,
+            "chat.delete",
+            &[("channel", &target.channel), ("ts", &ts)],
+        )
+        .await;
+        return Err(
+            "The thread is gone, so the reply would have landed in the channel. It was taken back."
+                .to_string(),
+        );
+    }
+    Ok(PostedMessage { ts })
+}
+
+/// Logs an action's outcome in the run's trace and hands the result back.
+fn traced<T>(
+    db_path: &Path,
+    job_id: &str,
+    stage: &str,
+    done: &str,
+    failed: &str,
+    mut data: serde_json::Value,
+    result: Result<T, String>,
+) -> Result<T, String> {
+    match &result {
+        Ok(_) => log_app_action(db_path, job_id, "INFO", stage, done, data),
         Err(err) => {
-            log_app_action(
-                db_path,
-                job_id,
-                "WARN",
-                "watchtower.slack.post",
-                "Posting as miniOG from Watchtower failed.",
-                serde_json::json!({ "error": err }),
-            );
-            Err(err)
+            data["error"] = serde_json::json!(err);
+            log_app_action(db_path, job_id, "WARN", stage, failed, data);
         }
     }
+    result
 }
 
 #[tauri::command]
@@ -610,21 +701,28 @@ async fn edit_miniog_message_inner(
     }
     let (target, settings) = load_job(db_path, job_id)?;
     let target = require_target(target)?;
-    slack_call(
+    // Without `blocks`, Slack keeps showing a message's old blocks over the new text.
+    let result = slack_call(
         &settings.slack_bot_token,
         "chat.update",
-        &[("channel", &target.channel), ("ts", ts), ("text", text)],
+        &[
+            ("channel", &target.channel),
+            ("ts", ts),
+            ("text", text),
+            ("blocks", "[]"),
+        ],
     )
-    .await?;
-    log_app_action(
+    .await
+    .map(|_| ());
+    traced(
         db_path,
         job_id,
-        "INFO",
         "watchtower.slack.edit",
         "Edited a miniOG message from Watchtower.",
+        "Editing a miniOG message from Watchtower failed.",
         serde_json::json!({ "ts": ts, "text": text }),
-    );
-    Ok(())
+        result,
+    )
 }
 
 #[tauri::command]
@@ -642,21 +740,22 @@ async fn delete_miniog_message_inner(db_path: &Path, job_id: &str, ts: &str) -> 
     }
     let (target, settings) = load_job(db_path, job_id)?;
     let target = require_target(target)?;
-    slack_call(
+    let result = slack_call(
         &settings.slack_bot_token,
         "chat.delete",
         &[("channel", &target.channel), ("ts", ts)],
     )
-    .await?;
-    log_app_action(
+    .await
+    .map(|_| ());
+    traced(
         db_path,
         job_id,
-        "INFO",
         "watchtower.slack.delete",
         "Deleted a miniOG message from Watchtower.",
+        "Deleting a miniOG message from Watchtower failed.",
         serde_json::json!({ "ts": ts }),
-    );
-    Ok(())
+        result,
+    )
 }
 
 fn is_reaction_name(name: &str) -> bool {
@@ -698,7 +797,7 @@ async fn set_miniog_reaction_inner(
     } else {
         "reactions.remove"
     };
-    let response = slack_api(
+    let result = slack_api(
         &settings.slack_bot_token,
         method,
         &[
@@ -707,32 +806,34 @@ async fn set_miniog_reaction_inner(
             ("name", name),
         ],
     )
-    .await?;
-    match slack_error_code(&response).as_deref() {
+    .await
+    .and_then(|response| match slack_error_code(&response).as_deref() {
         // Already in the state asked for.
-        None | Some("already_reacted") | Some("no_reaction") => {}
-        Some(code) => return Err(format!("Slack said {code}")),
-    }
-    let (stage, message) = if add {
+        None | Some("already_reacted") | Some("no_reaction") => Ok(()),
+        Some(code) => Err(format!("Slack said {code}")),
+    });
+    let (stage, done, failed) = if add {
         (
             "watchtower.slack.react",
             "Added a miniOG reaction from Watchtower.",
+            "Adding a miniOG reaction from Watchtower failed.",
         )
     } else {
         (
             "watchtower.slack.unreact",
             "Removed a miniOG reaction from Watchtower.",
+            "Removing a miniOG reaction from Watchtower failed.",
         )
     };
-    log_app_action(
+    traced(
         db_path,
         job_id,
-        "INFO",
         stage,
-        message,
+        done,
+        failed,
         serde_json::json!({ "ts": ts, "name": name }),
-    );
-    Ok(())
+        result,
+    )
 }
 
 #[derive(Serialize)]
@@ -932,6 +1033,63 @@ mod tests {
         assert_eq!(user.name, "miniOG");
         assert!(user.is_bot);
         assert_eq!(user.avatar_url.as_deref(), Some("https://a/48.png"));
+    }
+
+    #[test]
+    fn in_thread_order_dedupes_pages_and_sorts_oldest_first() {
+        // Slack pages newest first and repeats the parent on every page.
+        let pages = vec![
+            serde_json::json!({ "ts": "100.000001", "reply_count": 4 }),
+            serde_json::json!({ "ts": "100.000400" }),
+            serde_json::json!({ "ts": "100.000500" }),
+            serde_json::json!({ "ts": "100.000001", "reply_count": 4 }),
+            serde_json::json!({ "ts": "100.000020" }),
+            serde_json::json!({ "ts": "99.900000" }),
+        ];
+        let order: Vec<_> = in_thread_order(pages)
+            .iter()
+            .map(|m| m["ts"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "99.900000",
+                "100.000001",
+                "100.000020",
+                "100.000400",
+                "100.000500"
+            ]
+        );
+    }
+
+    #[test]
+    fn traced_logs_failures_as_warnings_with_the_error() {
+        let (db_path, connection) = test_db();
+        let result: Result<(), String> = traced(
+            &db_path,
+            "job-2",
+            "watchtower.slack.edit",
+            "done",
+            "failed",
+            serde_json::json!({ "ts": "1.0" }),
+            Err("Slack said cant_update_message".to_string()),
+        );
+        assert!(result.is_err());
+        let (level, message, data): (String, String, String) = connection
+            .query_row(
+                "SELECT level, message, data_json FROM job_logs WHERE job_id = 'job-2'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("log row");
+        assert_eq!((level.as_str(), message.as_str()), ("WARN", "failed"));
+        assert_eq!(
+            data,
+            r#"{"error":"Slack said cant_update_message","ts":"1.0"}"#
+        );
+
+        drop(connection);
+        let _ = fs::remove_file(db_path);
     }
 
     #[test]

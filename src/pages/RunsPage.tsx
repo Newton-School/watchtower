@@ -130,7 +130,11 @@ export function RunsPage({
   useEffect(() => {
     if (!detailRunId) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setDetailRunId(null);
+      if (e.key !== 'Escape' || e.defaultPrevented) return;
+      // Escape in a text box backs out of that box, not the page.
+      if (e.target instanceof HTMLElement && e.target.closest('input, textarea, select, [contenteditable="true"]'))
+        return;
+      setDetailRunId(null);
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);

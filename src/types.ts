@@ -186,6 +186,7 @@ export type SlackMessage = {
   edited?: { ts: string };
   reactions?: SlackReaction[];
   files?: SlackFile[];
+  blocks?: { type: string }[];
 };
 
 export type RunThread = {
@@ -199,6 +200,10 @@ export type RunThread = {
   botUserId: string;
   permalink: string | null;
   messages: SlackMessage[];
+  /** Replies per Slack; can exceed what `messages` holds. */
+  replyCount: number;
+  /** True when the thread is longer than the app reads. */
+  truncated: boolean;
   users: Record<string, SlackUser>;
   /** Set when the app could not read the thread. */
   readError: SlackReadError | null;

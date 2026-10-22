@@ -1341,7 +1341,8 @@ h3 {
   max-height: 560px;
   overflow-y: auto;
   margin: 0 -12px;
-  padding: 4px 0;
+  /* Room above the first message for its hover actions. */
+  padding: 16px 0 4px;
 }
 
 .slack-message {
@@ -1591,14 +1592,9 @@ h3 {
   color: var(--text-strong);
 }
 
-.slack-picker-anchor {
-  position: absolute;
-  top: 22px;
-  right: 12px;
-  z-index: 5;
-}
-
 .emoji-picker {
+  position: fixed;
+  z-index: 50;
   width: 300px;
   padding: 8px;
   border: 1px solid var(--line-strong);
@@ -1620,8 +1616,10 @@ h3 {
 .emoji-picker-grid {
   display: grid;
   grid-template-columns: repeat(8, 1fr);
+  align-content: start;
   gap: 2px;
-  max-height: 220px;
+  /* A fixed height, so a picker opened upward doesn't grow over its button. */
+  height: 220px;
   overflow-y: auto;
 }
 
@@ -1702,6 +1700,12 @@ h3 {
 
 .slack-thread-action-error {
   margin-top: 8px;
+}
+
+.slack-thread-warning {
+  margin-bottom: 8px;
+  color: var(--warning);
+  font-size: 0.8125rem;
 }
 
 .detail-error {
