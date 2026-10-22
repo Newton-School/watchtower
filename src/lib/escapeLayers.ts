@@ -10,7 +10,8 @@ const layers: Array<{ close: () => void }> = [];
  * a click, so the key can come from anywhere.
  */
 function onKeyDown(e: KeyboardEvent) {
-  if (e.key !== 'Escape' || e.isComposing) return;
+  // WebKit ends an IME composition before the keydown; keyCode 229 still marks it.
+  if (e.key !== 'Escape' || e.isComposing || e.keyCode === 229) return;
   const top = layers[layers.length - 1];
   if (!top) return;
   e.preventDefault();

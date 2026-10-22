@@ -247,22 +247,18 @@ export function SlackThread({ jobId, onOpenRun }: SlackThreadProps) {
     return () => window.clearInterval(timer);
   }, [startedId, startedWaiting, load]);
 
-  // A posted ask that miniOG turned down would wait for an answer forever,
-  // so it's taken back.
-  const orphanAskTs =
-    started && !isWaiting(started.status) && !started.status?.jobId && !started.askCleanup ? started.askTs : null;
-  useEffect(() => {
-    if (!orphanAskTs || !startedId) return;
-    void invoke('delete_miniog_message', { jobId, ts: orphanAskTs })
-      .then(
-        () => 'removed' as const,
-        () => 'failed' as const,
-      )
-      .then(askCleanup => {
-        setStarted(current => (current?.requestId === startedId ? { ...current, askCleanup } : current));
-        void load();
-      });
-  }, [orphanAskTs, startedId, jobId, load]);
+  // Drops a run miniOG hasn't taken yet; the sidecar never sees it.
+  const cancelStarted = async () => {
+    if (!started) return;
+    const { requestId } = started;
+    if (await act('cancel_started_run', { requestId }, setControlError)) {
+      setStarted(current =>
+        current?.requestId === requestId
+          ? { ...current, cancelled: true, status: { status: 'FAILED', jobId: null, error: null } }
+          : current,
+      );
+    }
+  };
 
   const startRun = async (
     kind: StartedRunView['kind'],
@@ -368,6 +364,7 @@ export function SlackThread({ jobId, onOpenRun }: SlackThreadProps) {
           onStop={() => act('stop_run', {}, setControlError)}
           onRerun={postAsk => startRun('rerun', 'rerun_in_thread', { postAsk }, setControlError)}
           onDismissStarted={() => setStarted(null)}
+          onCancelStarted={() => void cancelStarted()}
           onOpenRun={onOpenRun}
         />
       ) : null}
@@ -424,6 +421,7 @@ export function SlackThread({ jobId, onOpenRun }: SlackThreadProps) {
                   busy={busy}
                   editing={editing?.ts === message.ts ? editing.text : null}
                   confirmingDelete={confirmDelete === message.ts}
+                  stopsRun={message.ts === thread.triggerTs && Boolean(controls?.canStop)}
                   picker={pickerFor?.ts === message.ts ? pickerFor.anchor : null}
                   onReact={name => toggleReaction(message, name)}
                   onTogglePicker={anchor => togglePicker(message.ts, anchor)}
@@ -468,6 +466,8 @@ type MessageRowProps = {
   busy: boolean;
   editing: string | null;
   confirmingDelete: boolean;
+  /** Deleting this message stops the run going in the thread. */
+  stopsRun: boolean;
   /** The button the picker is open from, when it's open on this message. */
   picker: HTMLElement | null;
   onReact: (name: string) => void;
@@ -489,6 +489,7 @@ function MessageRow({
   busy,
   editing,
   confirmingDelete,
+  stopsRun,
   picker,
   onReact,
   onTogglePicker,
@@ -619,7 +620,11 @@ function MessageRow({
 
         {confirmingDelete ? (
           <div className="slack-confirm">
-            <span>Delete this message for everyone?</span>
+            <span>
+              {stopsRun
+                ? 'Delete this message for everyone? It started this run, so the run stops too.'
+                : 'Delete this message for everyone?'}
+            </span>
             <button className="ghost-button" type="button" onClick={onCancelDelete}>
               Cancel
             </button>

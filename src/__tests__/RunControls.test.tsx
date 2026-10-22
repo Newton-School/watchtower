@@ -41,12 +41,17 @@ const idle: RunControls = {
 // One directory for the whole file: the app shares its first read.
 const directory = { people: [{ id: 'UASKER', name: 'rahul', realName: 'Rahul K', avatarUrl: null }], groups: [] };
 
-type Overrides = { started?: StartedRunStatus[]; askTs?: string | null; fail?: Record<string, string> };
+type Overrides = {
+  started?: StartedRunStatus[];
+  askTs?: string | null;
+  fail?: Record<string, string>;
+  read?: RunThread;
+};
 
-function respondWith(controls: RunControls, { started = [], askTs = null, fail = {} }: Overrides = {}) {
+function respondWith(controls: RunControls, { started = [], askTs = null, fail = {}, read = thread }: Overrides = {}) {
   invoke.mockImplementation((command: string) => {
     if (fail[command]) return Promise.reject(fail[command]);
-    if (command === 'get_run_thread') return Promise.resolve(thread);
+    if (command === 'get_run_thread') return Promise.resolve(read);
     if (command === 'get_run_controls') return Promise.resolve(controls);
     if (command === 'get_slack_directory') return Promise.resolve(directory);
     if (command === 'rerun_in_thread' || command === 'ask_miniog_in_thread')
@@ -209,12 +214,18 @@ describe('run controls in the thread view', () => {
     expect((reply as HTMLTextAreaElement).value).toBe('');
   });
 
-  it("takes back a posted ask that miniOG didn't start, and says why", async () => {
+  it("says why miniOG didn't start a run", async () => {
     respondWith(
       { ...idle, rerunAsk: null },
       {
         askTs: '100.000009',
-        started: [{ status: 'SKIPPED', jobId: null, error: 'miniOG is already working in this thread.' }],
+        started: [
+          {
+            status: 'SKIPPED',
+            jobId: null,
+            error: 'miniOG is already working in this thread. The posted ask was taken back.',
+          },
+        ],
       },
     );
     render(<SlackThread jobId="job-1" />);
@@ -231,7 +242,35 @@ describe('run controls in the thread view', () => {
         { timeout: 3000 },
       ),
     ).toBeTruthy();
-    expect(invoke).toHaveBeenCalledWith('delete_miniog_message', { jobId: 'job-1', ts: '100.000009' });
+  });
+
+  it('cancels a run miniOG has not picked up', async () => {
+    respondWith({ ...idle, rerunAsk: null }, { started: [{ status: 'PENDING', jobId: null, error: null }] });
+    render(<SlackThread jobId="job-1" />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Ask miniOG' }));
+    const box = screen.getByRole('textbox', { name: 'Ask miniOG' });
+    fireEvent.change(box, { target: { value: 'check it' } });
+    fireEvent.keyDown(box, { key: 'Enter' });
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith('cancel_started_run', { jobId: 'job-1', requestId: 'req-1' }),
+    );
+    expect(await screen.findByText('Cancelled your ask before miniOG took it.')).toBeTruthy();
+  });
+
+  it('warns that deleting the message that started a running run stops it', async () => {
+    // A posted ask: miniOG's own message started the run.
+    respondWith({ ...idle, canStop: true, busyJobId: 'job-1' }, { read: { ...thread, triggerTs: '100.000002' } });
+    render(<SlackThread jobId="job-1" />);
+    await screen.findByText('miniOG is working on this run.');
+
+    const trigger = document.querySelector('[data-ts="100.000002"]') as HTMLElement;
+    fireEvent.click(within(trigger).getByRole('button', { name: 'Delete message' }));
+    expect(
+      within(trigger).getByText('Delete this message for everyone? It started this run, so the run stops too.'),
+    ).toBeTruthy();
   });
 
   it('lets a paste into an ask through, even when it carries an image', async () => {

@@ -591,6 +591,7 @@ pub fn run() {
             run_controls::rerun_in_thread,
             run_controls::ask_miniog_in_thread,
             run_controls::get_started_run,
+            run_controls::cancel_started_run,
             get_job_cost_summary,
             get_performance_overview,
             list_dossiers,

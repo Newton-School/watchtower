@@ -18,8 +18,8 @@ export type StartedRunView = {
   /** The posted ask, when the ask was posted. */
   askTs: string | null;
   status: StartedRunStatus | null;
-  /** What happened to the posted ask after miniOG turned the run down. */
-  askCleanup?: 'removed' | 'failed';
+  /** Cancelled from here before miniOG took it. */
+  cancelled?: boolean;
 };
 
 /** Waiting for the sidecar to take the request. */
@@ -50,6 +50,7 @@ type RunControlsBarProps = {
   onStop: () => Promise<boolean>;
   onRerun: (postAsk: boolean) => Promise<boolean>;
   onDismissStarted: () => void;
+  onCancelStarted: () => void;
   onOpenRun?: (jobId: string) => void;
 };
 
@@ -65,6 +66,7 @@ export function RunControlsBar({
   onStop,
   onRerun,
   onDismissStarted,
+  onCancelStarted,
   onOpenRun,
 }: RunControlsBarProps) {
   const [confirmingStop, setConfirmingStop] = useState(false);
@@ -230,7 +232,14 @@ export function RunControlsBar({
       ) : null}
 
       {started ? (
-        <StartedRunLine started={started} jobId={jobId} onDismiss={onDismissStarted} onOpenRun={onOpenRun} />
+        <StartedRunLine
+          started={started}
+          jobId={jobId}
+          busy={busy}
+          onDismiss={onDismissStarted}
+          onCancel={onCancelStarted}
+          onOpenRun={onOpenRun}
+        />
       ) : null}
     </div>
   );
@@ -239,12 +248,16 @@ export function RunControlsBar({
 function StartedRunLine({
   started,
   jobId,
+  busy,
   onDismiss,
+  onCancel,
   onOpenRun,
 }: {
   started: StartedRunView;
   jobId: string;
+  busy: boolean;
   onDismiss: () => void;
+  onCancel: () => void;
   onOpenRun?: (jobId: string) => void;
 }) {
   // Re-render now and then so a slow pickup gets noticed.
@@ -267,17 +280,13 @@ function StartedRunLine({
         : `miniOG hasn't picked up your ${what} yet. Check that it's running.`;
   } else if (newRun) {
     text = `miniOG took your ${what}.`;
+  } else if (started.cancelled) {
+    text = `Cancelled your ${what} before miniOG took it.`;
   } else {
     const why = status?.error ?? (status?.status === 'SKIPPED' ? 'it was skipped' : 'it failed');
-    const cleanup =
-      started.askCleanup === 'removed'
-        ? ' The posted ask was taken back.'
-        : started.askCleanup === 'failed'
-          ? ' Delete the posted ask in Slack.'
-          : '';
-    text = `miniOG didn't start your ${what}: ${why}${cleanup}`;
+    text = `miniOG didn't start your ${what}: ${why}`;
   }
-  const trouble = !waiting && !newRun;
+  const trouble = !waiting && !newRun && !started.cancelled;
 
   return (
     <div className={trouble ? 'run-controls-started slack-thread-error' : 'run-controls-started'}>
@@ -285,6 +294,11 @@ function StartedRunLine({
       {newRun && onOpenRun ? (
         <button className="run-controls-link" type="button" onClick={() => onOpenRun(newRun)}>
           Open the new run →
+        </button>
+      ) : null}
+      {waiting ? (
+        <button className="run-controls-link" type="button" disabled={busy} onClick={onCancel}>
+          Cancel
         </button>
       ) : null}
       <button className="slack-action" type="button" aria-label="Dismiss" onClick={onDismiss}>

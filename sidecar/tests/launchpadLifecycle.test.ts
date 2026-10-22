@@ -62,8 +62,12 @@ describe('launchpadLifecycle', () => {
     });
     expect(vi.mocked(notifyDesktop)).toHaveBeenCalledWith('Watchtower miniOG complete', 'Feature shipped.', 'success');
   });
-  it('posts no fallback for a stopped or skipped run', async () => {
-    for (const status of ['CANCELLED', 'SKIPPED'] as const) {
+  it('posts no fallback for a stopped or skipped run in a Slack thread, but still tells the DM', async () => {
+    for (const [status, originThread] of [
+      ['CANCELLED', true],
+      ['SKIPPED', true],
+      ['SKIPPED', false],
+    ] as const) {
       const slack = { chat: { postMessage: vi.fn().mockResolvedValue({ ok: true }) } };
       const store = { markLaunchpadRequestRunning: vi.fn(), markLaunchpadRequestFinished: vi.fn() };
       await finalizeLaunchpadWorkflowResult({
@@ -77,7 +81,7 @@ describe('launchpadLifecycle', () => {
           text: '<@UBOT1> check it',
           ingestSource: 'launchpad',
           launchpadRequestId: 'req-2',
-          rawEvent: {},
+          rawEvent: { originThread },
         },
         result: {
           workflow: 'OWNER_AUTOPILOT',
@@ -89,7 +93,7 @@ describe('launchpadLifecycle', () => {
         slack: slack as unknown as WebClient,
         store,
       });
-      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+      expect(slack.chat.postMessage).toHaveBeenCalledTimes(originThread ? 0 : 1);
       expect(store.markLaunchpadRequestFinished).toHaveBeenCalledWith(
         expect.objectContaining({ id: 'req-2', status: status === 'CANCELLED' ? 'FAILED' : 'SKIPPED' }),
       );

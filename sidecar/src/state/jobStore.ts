@@ -1317,24 +1317,28 @@ export class JobStore {
    * from the app's thread view, or a retrigger) that waited longer than
    * `maxAgeMinutes` without starting. Run now, maybe days later, they would
    * surprise the thread. Requests from the Launchpad page still retry.
-   * Returns the number of rows closed.
+   * Returns the requests closed, so a posted ask can be taken back.
    */
-  expireStaleOriginLaunchpadRequests(maxAgeMinutes: number): number {
+  expireStaleOriginLaunchpadRequests(
+    maxAgeMinutes: number,
+  ): Array<{ id: string; originChannelId: string; originEventTs?: string }> {
     const now = new Date();
     const cutoff = new Date(now.getTime() - maxAgeMinutes * 60_000).toISOString();
-    const result = this.db
-      .prepare(
-        `UPDATE launchpad_requests
-         SET status = 'FAILED',
-             error_message = ?,
-             updated_at = ?
-         WHERE status IN ('PENDING', 'CLAIMED', 'QUEUED')
+    const stale = `status IN ('PENDING', 'CLAIMED', 'QUEUED')
            AND job_id IS NULL
            AND origin_channel_id IS NOT NULL
-           AND created_at < ?`,
-      )
+           AND created_at < ?`;
+    const rows = this.db
+      .prepare(`SELECT id, origin_channel_id, origin_event_ts FROM launchpad_requests WHERE ${stale}`)
+      .all(cutoff) as Array<{ id: string; origin_channel_id: string; origin_event_ts?: string | null }>;
+    this.db
+      .prepare(`UPDATE launchpad_requests SET status = 'FAILED', error_message = ?, updated_at = ? WHERE ${stale}`)
       .run(`Not started within ${maxAgeMinutes} minutes, so it was dropped.`, now.toISOString(), cutoff);
-    return result.changes;
+    return rows.map(row => ({
+      id: row.id,
+      originChannelId: row.origin_channel_id,
+      originEventTs: row.origin_event_ts ?? undefined,
+    }));
   }
 
   /** The thread a job ran in, and the launchpad request behind it, if any. */
@@ -1410,6 +1414,7 @@ export class JobStore {
     const row = this.db
       .prepare(
         `SELECT id, target, prompt, owner_user_id, status, job_id, slack_channel_id, anchor_ts,
+                requested_for_user_id, origin_channel_id, origin_thread_ts, origin_event_ts,
                 result_json, error_message, created_at, updated_at
          FROM launchpad_requests
          WHERE id = ?
@@ -1425,6 +1430,10 @@ export class JobStore {
           job_id?: string | null;
           slack_channel_id?: string | null;
           anchor_ts?: string | null;
+          requested_for_user_id?: string | null;
+          origin_channel_id?: string | null;
+          origin_thread_ts?: string | null;
+          origin_event_ts?: string | null;
           result_json?: string | null;
           error_message?: string | null;
           created_at: string;
@@ -1445,6 +1454,10 @@ export class JobStore {
       jobId: row.job_id ?? undefined,
       slackChannelId: row.slack_channel_id ?? undefined,
       anchorTs: row.anchor_ts ?? undefined,
+      requestedForUserId: row.requested_for_user_id ?? undefined,
+      originChannelId: row.origin_channel_id ?? undefined,
+      originThreadTs: row.origin_thread_ts ?? undefined,
+      originEventTs: row.origin_event_ts ?? undefined,
       resultJson: row.result_json ?? undefined,
       errorMessage: row.error_message ?? undefined,
       createdAt: row.created_at,

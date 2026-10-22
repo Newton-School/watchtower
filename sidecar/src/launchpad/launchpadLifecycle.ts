@@ -62,9 +62,11 @@ export async function finalizeLaunchpadWorkflowResult(params: {
   }
 
   let fallbackPosted = false;
-  // A stopped or skipped run has nothing to report: a stop was already
-  // announced, and a skip ("staying silent") must stay silent.
-  const reportable = result.status !== 'CANCELLED' && result.status !== 'SKIPPED';
+  // In a Slack thread, a stopped or skipped run has nothing to report: the
+  // stop was already announced, and a skip ("staying silent") must stay
+  // silent. The owner's DM still hears how a Launchpad-page request ended.
+  const inThread = event.rawEvent.originThread === true;
+  const reportable = !inThread || (result.status !== 'CANCELLED' && result.status !== 'SKIPPED');
   if (!result.slackPosted && reportable) {
     const text = fallbackCompletionText(result.message);
     try {

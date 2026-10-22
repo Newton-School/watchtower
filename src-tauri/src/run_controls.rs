@@ -559,6 +559,65 @@ fn insert_request(
 }
 
 #[tauri::command]
+pub(crate) async fn cancel_started_run(
+    job_id: String,
+    request_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let result = cancel_request(&state.db_path, &job_id, &request_id).await;
+    slack::traced(
+        &state.db_path,
+        &job_id,
+        "watchtower.run.cancel_start",
+        "Cancelled a run started from Watchtower before miniOG took it.",
+        "Cancelling a run started from Watchtower failed.",
+        serde_json::json!({ "requestId": request_id }),
+        result,
+    )
+}
+
+/// Drops a request miniOG hasn't taken yet, and takes back its posted ask.
+/// Only while it waits: once the sidecar has it, the run is stopped instead.
+async fn cancel_request(db_path: &Path, job_id: &str, request_id: &str) -> Result<(), String> {
+    let (token, channel, ask_ts) = {
+        let connection =
+            Connection::open(db_path).map_err(|err| format!("db open failed: {err}"))?;
+        let target = slack::require_target(slack::job_slack_target(&connection, job_id)?)?;
+        let ask_ts: Option<String> = connection
+            .query_row(
+                "SELECT origin_event_ts FROM launchpad_requests
+                 WHERE id = ? AND origin_channel_id = ? AND origin_thread_ts = ?",
+                params![request_id, target.channel, target.thread_ts],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| format!("db query launchpad request failed: {err}"))?
+            .ok_or_else(|| "That run request is gone.".to_string())?;
+        let cancelled = connection
+            .execute(
+                "UPDATE launchpad_requests
+                 SET status = 'FAILED', error_message = 'Cancelled from Watchtower.', updated_at = ?
+                 WHERE id = ? AND status = 'PENDING' AND job_id IS NULL",
+                params![now_iso(), request_id],
+            )
+            .map_err(|err| format!("db cancel launchpad request failed: {err}"))?;
+        if cancelled == 0 {
+            return Err(
+                "miniOG is picking it up right now. Stop the run once it starts.".to_string(),
+            );
+        }
+        let token = read_app_settings(&connection)?.slack_bot_token;
+        (token, target.channel, ask_ts)
+    };
+    // A silent run's timestamp names no message, so this fails harmlessly.
+    if let Some(ts) = ask_ts {
+        let _ =
+            slack::slack_call(&token, "chat.delete", &[("channel", &channel), ("ts", &ts)]).await;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 pub(crate) async fn get_started_run(
     request_id: String,
     state: State<'_, AppState>,
@@ -820,6 +879,39 @@ mod tests {
         assert_eq!(status.status, "PENDING");
         assert_eq!(status.job_id, None);
         assert!(started_run_status(&connection, "missing").is_err());
+
+        // Cancelled while it waits; once taken, it can't be.
+        insert_job(
+            &connection,
+            "thread",
+            "Ev9",
+            "SUCCESS",
+            "1.0",
+            serde_json::json!({ "eventTs": "1.0" }),
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let waiting = insert_request(&connection, OWNER, "a", None, &target, None).unwrap();
+        runtime
+            .block_on(cancel_request(&db_path, "thread", &waiting))
+            .unwrap();
+        let status = started_run_status(&connection, &waiting).unwrap();
+        assert_eq!(
+            (status.status.as_str(), status.error.as_deref()),
+            ("FAILED", Some("Cancelled from Watchtower."))
+        );
+        let taken = insert_request(&connection, OWNER, "b", None, &target, None).unwrap();
+        connection
+            .execute(
+                "UPDATE launchpad_requests SET status = 'QUEUED' WHERE id = ?",
+                params![taken],
+            )
+            .unwrap();
+        assert!(runtime
+            .block_on(cancel_request(&db_path, "thread", &taken))
+            .is_err());
+        assert!(runtime
+            .block_on(cancel_request(&db_path, "retrigger", "missing"))
+            .is_err());
 
         drop(connection);
         let _ = fs::remove_file(db_path);

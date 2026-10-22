@@ -17,7 +17,7 @@ import {
   finalizeLaunchpadWorkflowResult,
   markLaunchpadJobCreated,
 } from './launchpad/launchpadLifecycle.js';
-import { startLaunchpadRequestPoller } from './launchpad/launchpadIntake.js';
+import { startLaunchpadRequestPoller, takeBackPostedAsk } from './launchpad/launchpadIntake.js';
 import { logger } from './logging/logger.js';
 import { configureButtons } from './slack/buttonReplies.js';
 import { runPrFollowUp } from './workflows/prFollowUp.js';
@@ -922,9 +922,20 @@ const ORIGIN_REQUEST_MAX_AGE_MIN = 30;
  * Closes the launchpad request behind an event that will not start a run.
  * Left QUEUED, it would never finish, and the next sidecar start would run it.
  */
-function closeLaunchpadRequest(event: SlackEventEnvelope, status: 'SKIPPED' | 'FAILED', reason: string): void {
+async function closeLaunchpadRequest(
+  event: SlackEventEnvelope,
+  client: WebClient,
+  status: 'SKIPPED' | 'FAILED',
+  reason: string,
+): Promise<void> {
   if (!event.launchpadRequestId) return;
-  store.markLaunchpadRequestFinished({ id: event.launchpadRequestId, status, errorMessage: reason });
+  const request = store.getLaunchpadRequest(event.launchpadRequestId);
+  const takenBack = request ? await takeBackPostedAsk(client, request) : false;
+  store.markLaunchpadRequestFinished({
+    id: event.launchpadRequestId,
+    status,
+    errorMessage: takenBack ? `${reason} The posted ask was taken back.` : reason,
+  });
 }
 
 async function processEventClaimed(event: SlackEventEnvelope, client: WebClient): Promise<void> {
@@ -967,7 +978,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
       },
       'skipped: thread already has an active job',
     );
-    closeLaunchpadRequest(event, 'SKIPPED', 'miniOG is already working in this thread.');
+    await closeLaunchpadRequest(event, client, 'SKIPPED', 'miniOG is already working in this thread.');
     return;
   }
 
@@ -981,6 +992,17 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
   // that column as OWNER_AUTOPILOT even when the classifier later routed
   // them to PR_REVIEW. Read the actual pause cause from job_logs instead.
   const pausedJob = store.pausedJobForThread(event.channelId, event.threadTs);
+  // A run started from the app is never the answer to a question miniOG
+  // asked: answering is for a reply in the thread.
+  if (pausedJob && event.launchpadRequestId) {
+    store.recordEvent(event.eventId, event.channelId, event.threadTs);
+    logger.info(
+      { eventId: event.eventId, pausedJobId: pausedJob.id },
+      'launchpad request skipped: thread awaits an answer',
+    );
+    await closeLaunchpadRequest(event, client, 'SKIPPED', 'miniOG is waiting for an answer in this thread.');
+    return;
+  }
   const routeQuestion = pausedJob ? store.pausedRouteQuestion(pausedJob.id) : undefined;
   const pauseSignal = pausedJob
     ? store.isPausedAwaitingPrUrl(pausedJob.id)
@@ -1087,7 +1109,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
   if (!task.mentionDetected) {
     logger.info({ eventId: event.eventId }, 'skip non-mention message');
     await removeReaction(client, event.channelId, event.eventTs, 'eyes');
-    closeLaunchpadRequest(event, 'SKIPPED', 'miniOG did not see a request in it.');
+    await closeLaunchpadRequest(event, client, 'SKIPPED', 'miniOG did not see a request in it.');
     return;
   }
 
@@ -1129,7 +1151,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
       .catch(() => {});
     await removeReaction(client, event.channelId, event.eventTs, 'eyes');
     await addReaction(client, event.channelId, event.eventTs, 'no_entry_sign');
-    closeLaunchpadRequest(event, 'FAILED', policyDecision.reason);
+    await closeLaunchpadRequest(event, client, 'FAILED', policyDecision.reason);
     return;
   }
 
@@ -1865,9 +1887,10 @@ async function main(): Promise<void> {
   // the intake poller picks them up again. Without this, a sidecar crash
   // between claim and job-link leaves the desktop-originated request
   // silently never executing and never recovering.
+  // Their posted asks are taken back once the Slack client is up.
   const expiredLaunchpad = store.expireStaleOriginLaunchpadRequests(ORIGIN_REQUEST_MAX_AGE_MIN);
-  if (expiredLaunchpad > 0) {
-    logger.warn({ expiredLaunchpad }, 'dropped thread launchpad requests that never started');
+  if (expiredLaunchpad.length > 0) {
+    logger.warn({ expiredLaunchpad: expiredLaunchpad.length }, 'dropped thread launchpad requests that never started');
   }
   const strandedLaunchpad = store.recoverStrandedLaunchpadRequests();
   if (strandedLaunchpad > 0) {
@@ -1900,6 +1923,7 @@ async function main(): Promise<void> {
       await processReactionFeedback(event, webClient as WebClient);
     },
   );
+  for (const request of expiredLaunchpad) void takeBackPostedAsk(client.webClient, request);
 
   process.on('SIGINT', () => {
     logger.info('received SIGINT');

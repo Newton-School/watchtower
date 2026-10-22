@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { v4 as uuidv4 } from 'uuid';
-import { runLaunchpadRequestPoller } from '../src/launchpad/launchpadIntake.js';
+import { runLaunchpadRequestPoller, takeBackPostedAsk } from '../src/launchpad/launchpadIntake.js';
 import { JobStore } from '../src/state/jobStore.js';
 import type { AppConfig, SlackEventEnvelope } from '../src/types/contracts.js';
 
@@ -319,7 +319,12 @@ describe('launchpadIntake', () => {
 
     const db = (store as any).db;
     db.prepare(`UPDATE launchpad_requests SET created_at = '2026-01-01T00:00:00.000Z'`).run();
-    expect(store.expireStaleOriginLaunchpadRequests(30)).toBe(2);
+    expect(
+      store
+        .expireStaleOriginLaunchpadRequests(30)
+        .map(request => request.id)
+        .sort(),
+    ).toEqual(['req-old', 'req-wait']);
     expect(store.getLaunchpadRequest('req-old')).toMatchObject({
       status: 'FAILED',
       errorMessage: 'Not started within 30 minutes, so it was dropped.',
@@ -329,5 +334,14 @@ describe('launchpadIntake', () => {
 
     store.close();
     fs.rmSync(dbPath, { force: true });
+  });
+  it('takes back only a posted ask, and never throws', async () => {
+    const remove = vi.fn().mockResolvedValue({ ok: true });
+    const webClient = { chat: { delete: remove } } as any;
+    expect(await takeBackPostedAsk(webClient, { originChannelId: 'C1' })).toBe(false);
+    expect(await takeBackPostedAsk(webClient, { originChannelId: 'C1', originEventTs: '1.5' })).toBe(true);
+    expect(remove).toHaveBeenCalledWith({ channel: 'C1', ts: '1.5' });
+    remove.mockRejectedValueOnce(new Error('message_not_found'));
+    expect(await takeBackPostedAsk(webClient, { originChannelId: 'C1', originEventTs: '1.6' })).toBe(false);
   });
 });
