@@ -932,6 +932,8 @@ pub(crate) struct DirectoryPerson {
     id: String,
     name: String,
     real_name: Option<String>,
+    /// The Slack username (`member.name`), which people type after an @.
+    username: Option<String>,
     avatar_url: Option<String>,
 }
 
@@ -1001,13 +1003,15 @@ fn directory_person(member: &serde_json::Value) -> Option<DirectoryPerson> {
     };
     let real_name =
         text(profile.and_then(|p| p.get("real_name"))).or_else(|| text(member.get("real_name")));
+    let username = text(member.get("name"));
     let name = text(profile.and_then(|p| p.get("display_name")))
         .or_else(|| real_name.clone())
-        .or_else(|| text(member.get("name")))?;
+        .or_else(|| username.clone())?;
     Some(DirectoryPerson {
         id: member.get("id")?.as_str()?.to_string(),
         name,
         real_name,
+        username,
         avatar_url: text(profile.and_then(|p| p.get("image_48"))),
     })
 }
@@ -1521,8 +1525,12 @@ mod tests {
         });
         let found = directory_person(&person).expect("person");
         assert_eq!(
-            (found.name.as_str(), found.real_name.as_deref()),
-            ("Aditya Sisodia", Some("Aditya Sisodia"))
+            (
+                found.name.as_str(),
+                found.real_name.as_deref(),
+                found.username.as_deref()
+            ),
+            ("Aditya Sisodia", Some("Aditya Sisodia"), Some("aditya"))
         );
         for skipped in [
             serde_json::json!({ "id": "U2", "name": "gone", "deleted": true }),

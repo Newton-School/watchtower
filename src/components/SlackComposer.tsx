@@ -194,7 +194,13 @@ export function SlackComposer({
     const q = mentionQuery.text.toLowerCase();
     const inThread = new Set(participants);
     const people = directory.people
-      .filter(person => !q || wordsStartWith(person.name, q) || wordsStartWith(person.realName, q))
+      .filter(
+        person =>
+          !q ||
+          wordsStartWith(person.name, q) ||
+          wordsStartWith(person.realName, q) ||
+          wordsStartWith(person.username, q),
+      )
       .sort((a, b) => Number(inThread.has(b.id)) - Number(inThread.has(a.id)) || a.name.localeCompare(b.name))
       .map(person => ({
         key: person.id,

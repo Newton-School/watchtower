@@ -288,6 +288,7 @@ export function BundleEditor() {
               ids={parseIds(draft.manualUserIds)}
               onChange={ids => patchDraft(bundle.name, { manualUserIds: ids.join(',') })}
               directory={directory}
+              loading={!directory && !directoryError}
             />
             {bundle.name === 'admin' || bundle.name === 'owner' ? (
               <p className="field-hint">The owners are always on this bundle.</p>

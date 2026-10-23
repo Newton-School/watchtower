@@ -183,6 +183,8 @@ export type DirectoryPerson = {
   id: string;
   name: string;
   realName: string | null;
+  /** The Slack username, typed after an @ (e.g. "dipesh.rajoria"). */
+  username: string | null;
   avatarUrl: string | null;
 };
 

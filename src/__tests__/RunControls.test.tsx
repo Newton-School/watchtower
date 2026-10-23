@@ -49,7 +49,10 @@ const waitingOnPlan: RunControls = {
 };
 
 // One directory for the whole file: the app shares its first read.
-const directory = { people: [{ id: 'UASKER', name: 'rahul', realName: 'Rahul K', avatarUrl: null }], groups: [] };
+const directory = {
+  people: [{ id: 'UASKER', name: 'rahul', realName: 'Rahul K', username: 'rahul', avatarUrl: null }],
+  groups: [],
+};
 
 type Overrides = {
   started?: StartedRunStatus[];
