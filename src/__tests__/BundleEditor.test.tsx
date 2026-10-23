@@ -9,9 +9,9 @@ import type { Bundle } from '../types';
 
 const directory = {
   people: [
-    { id: 'U1', name: 'Asha', realName: 'Asha Rao', avatarUrl: null },
-    { id: 'U2', name: 'Vik', realName: 'Vikram S', avatarUrl: null },
-    { id: 'U3', name: 'Neha', realName: 'Neha K', avatarUrl: null },
+    { id: 'U1', name: 'Asha', realName: 'Asha Rao', username: 'asha', avatarUrl: null },
+    { id: 'U2', name: 'Vik', realName: 'Vikram S', username: 'vikram', avatarUrl: null },
+    { id: 'U3', name: 'Neha', realName: 'Neha K', username: 'neha', avatarUrl: null },
   ],
   groups: [],
 };

@@ -8,9 +8,9 @@ import { SlackComposer, applyMentions } from '../components/SlackComposer';
 
 const directory = {
   people: [
-    { id: 'U1', name: 'Aditya Sisodia', realName: 'Aditya Sisodia', avatarUrl: null },
-    { id: 'U2', name: 'theOG', realName: 'Dipesh Rajoria', avatarUrl: null },
-    { id: 'U3', name: 'Adi K', realName: 'Aditi Kumar', avatarUrl: null },
+    { id: 'U1', name: 'Aditya Sisodia', realName: 'Aditya Sisodia', username: 'aditya', avatarUrl: null },
+    { id: 'U2', name: 'theOG', realName: 'Dipesh Rajoria', username: 'dipesh.rajoria', avatarUrl: null },
+    { id: 'U3', name: 'Adi K', realName: 'Aditi Kumar', username: 'aditi', avatarUrl: null },
   ],
   groups: [{ id: 'S1', handle: 'core-dev', name: 'Core dev' }],
 };
@@ -53,6 +53,18 @@ describe('SlackComposer', () => {
     fireEvent.keyDown(box, { key: 'Enter' });
     await waitFor(() => {
       expect(onSend).toHaveBeenCalledWith({ text: 'thanks <@U1> for this', broadcast: false, files: [] });
+    });
+  });
+
+  it('finds a person by their Slack username', async () => {
+    const { onSend, box } = setup();
+
+    type(box, 'cc @dipesh.r');
+    fireEvent.click(await screen.findByRole('button', { name: /theOG/ }));
+    fireEvent.keyDown(box, { key: 'Enter' });
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith({ text: 'cc <@U2>', broadcast: false, files: [] });
     });
   });
 

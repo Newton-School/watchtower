@@ -17,6 +17,8 @@ type PeoplePickerProps = {
   onChange: (ids: string[]) => void;
   /** The workspace's people; null while it loads or when it could not be read. */
   directory: SlackDirectory | null;
+  /** The workspace is still being read (the first read takes a few seconds). */
+  loading?: boolean;
   /** Shown above the list, e.g. "People". */
   label: string;
   /** What screen readers call the list, e.g. "People on builder". */
@@ -27,12 +29,22 @@ function displayName(person: DirectoryPerson): string {
   return person.realName ?? person.name;
 }
 
+/** What tells two people with the same name apart: their Slack display name and @username. */
+function otherNames(person: DirectoryPerson): string {
+  return [
+    person.name !== displayName(person) ? person.name : null,
+    person.username && person.username !== person.name ? `@${person.username}` : null,
+  ]
+    .filter(Boolean)
+    .join(' · ');
+}
+
 /**
- * People listed by name, added by searching the Slack workspace. A Slack user
- * ID can be typed in when the person can't be found (or the workspace could
- * not be read).
+ * People listed by name, added by searching the Slack workspace by name or
+ * @username. A Slack user ID can be typed in when the person can't be found
+ * (or the workspace could not be read).
  */
-export function PeoplePicker({ ids, onChange, directory, label, accessibleName }: PeoplePickerProps) {
+export function PeoplePicker({ ids, onChange, directory, loading = false, label, accessibleName }: PeoplePickerProps) {
   const [query, setQuery] = useState('');
   const [highlight, setHighlight] = useState(0);
   const listId = useId();
@@ -40,18 +52,25 @@ export function PeoplePicker({ ids, onChange, directory, label, accessibleName }
   const byId = useMemo(() => new Map((directory?.people ?? []).map(person => [person.id, person])), [directory]);
 
   const suggestions = useMemo((): Suggestion[] => {
-    const q = query.trim().toLowerCase();
+    // "@dipesh" is how people are named in Slack; the @ is not part of the name.
+    const typed = query.trim().replace(/^@/, '');
+    const q = typed.toLowerCase();
     if (!q) return [];
     const listed = new Set(ids);
+    const exact = (person: DirectoryPerson) => person.username?.toLowerCase() === q || person.name.toLowerCase() === q;
     const found: Suggestion[] = (directory?.people ?? [])
       .filter(person => !listed.has(person.id))
       .filter(
-        person => wordsStartWith(person.name, q) || wordsStartWith(person.realName, q) || person.id.toLowerCase() === q,
+        person =>
+          wordsStartWith(person.name, q) ||
+          wordsStartWith(person.realName, q) ||
+          wordsStartWith(person.username, q) ||
+          person.id.toLowerCase() === q,
       )
-      .sort((a, b) => displayName(a).localeCompare(displayName(b)))
+      .sort((a, b) => Number(exact(b)) - Number(exact(a)) || displayName(a).localeCompare(displayName(b)))
       .slice(0, MAX_SUGGESTIONS)
       .map(person => ({ id: person.id, person }));
-    const typedId = query.trim().toUpperCase();
+    const typedId = typed.toUpperCase();
     if (found.length === 0 && SLACK_USER_ID.test(typedId) && !listed.has(typedId)) {
       return [{ id: typedId, person: null }];
     }
@@ -100,7 +119,13 @@ export function PeoplePicker({ ids, onChange, directory, label, accessibleName }
               <li
                 key={id}
                 className={person || !directory ? 'people-chip' : 'people-chip people-chip-unknown'}
-                title={person ? id : directory ? `${id} is not in the Slack workspace` : id}
+                title={
+                  person
+                    ? [person.username ? `@${person.username}` : null, id].filter(Boolean).join(' · ')
+                    : directory
+                      ? `${id} is not in the Slack workspace`
+                      : id
+                }
               >
                 {person?.avatarUrl ? (
                   <img className="people-chip-avatar" src={person.avatarUrl} alt="" />
@@ -135,7 +160,13 @@ export function PeoplePicker({ ids, onChange, directory, label, accessibleName }
           }}
           onKeyDown={onKeyDown}
           onBlur={() => setQuery('')}
-          placeholder={directory ? 'Add a person…' : 'Add a person by Slack user ID…'}
+          placeholder={
+            directory
+              ? 'Add a person by name or @username…'
+              : loading
+                ? 'Loading people from Slack…'
+                : 'Add a person by Slack user ID…'
+          }
           aria-label={`Add a person to ${accessibleName}`}
           role="combobox"
           aria-expanded={suggesting}
@@ -170,16 +201,19 @@ export function PeoplePicker({ ids, onChange, directory, label, accessibleName }
                   <span className="slack-mention-name">
                     {suggestion.person ? displayName(suggestion.person) : `Add user ID ${suggestion.id}`}
                   </span>
-                  {suggestion.person &&
-                  suggestion.person.realName &&
-                  suggestion.person.name !== suggestion.person.realName ? (
-                    <span className="muted">{suggestion.person.name}</span>
+                  {suggestion.person && otherNames(suggestion.person) ? (
+                    <span className="muted">{otherNames(suggestion.person)}</span>
                   ) : null}
                   {!suggestion.person && directory ? <span className="muted">not in the workspace</span> : null}
                 </button>
               </li>
             ))}
           </ul>
+        ) : null}
+        {loading && query.trim() && !suggesting ? (
+          <p className="field-hint" role="status">
+            Still loading people from Slack…
+          </p>
         ) : null}
       </div>
     </div>
