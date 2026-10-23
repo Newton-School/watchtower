@@ -147,6 +147,40 @@ describe('a revised plan is the plan the feedback asked for', () => {
     }
   });
 
+  it('keeps access enforced in a group DM even when it is only audited elsewhere', async () => {
+    const audited = {
+      ...runInput().config,
+      accessControl: { mode: 'audit' },
+      bundles: [
+        {
+          name: 'builder',
+          slackUserGroupHandle: '',
+          manualUserIds: 'UBUILDER',
+          resolvedUserIds: ['UBUILDER'],
+          capabilities: ['start_implementation'],
+          allowedChannelIds: ['C1'],
+          allowIm: false,
+          allowMpim: false,
+        },
+      ],
+    } as any;
+    const event = { threadTs: '1.1', userId: 'UREQ', text: 'shift the years' };
+    vi.mocked(waitForApproval)
+      .mockReset()
+      .mockResolvedValue({ outcome: 'approved', userReply: 'yes', approverId: 'UREQ', replyTs: '400' });
+
+    await runApprovalLoop({ ...runInput(), config: audited, task: { event: { ...event, channelId: 'C1' } } as any });
+    await runApprovalLoop({
+      ...runInput(),
+      config: audited,
+      task: { event: { ...event, channelId: 'G1', channelType: 'mpim' } } as any,
+    });
+
+    const [channel, groupDm] = vi.mocked(waitForApproval).mock.calls.map(call => call[0].canApprove);
+    expect(channel?.('UANYONE')).toBe(true);
+    expect([groupDm?.('UREQ'), groupDm?.('UANYONE')]).toEqual([true, false]);
+  });
+
   it('asks what to change after a no, so a "yes" does not go ahead with the plan just turned down', async () => {
     vi.mocked(waitForApproval)
       .mockReset()

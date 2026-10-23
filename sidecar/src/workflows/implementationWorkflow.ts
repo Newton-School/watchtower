@@ -835,10 +835,14 @@ Reply with the complete revised plan as markdown and nothing else, in the same f
 /**
  * Who can decide a plan besides the admins: the requester, and anyone who
  * could have asked for the change in this channel themselves. Waiting on an
- * admin for every plan was friction. Without enforced access, anyone.
+ * admin for every plan was friction. Without enforced access, anyone. The
+ * requester is the person the run is for, even when it runs on an owner's
+ * authority (a tag of the owner, or an ask from the app for them).
  */
 function planDecidersFor(config: AppConfig, task: NormalizedTask): (userId: string) => boolean {
-  const enforced = getConfiguredAccessControl(config).mode === 'enforce';
+  // The router enforces access in DMs and group DMs even in audit mode.
+  const dm = task.event.channelType === 'im' || task.event.channelType === 'mpim';
+  const enforced = getConfiguredAccessControl(config).mode === 'enforce' || dm;
   return userId =>
     userId === requesterOf(task) ||
     !enforced ||

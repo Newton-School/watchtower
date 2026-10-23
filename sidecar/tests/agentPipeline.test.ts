@@ -2238,7 +2238,7 @@ describe('waitForApproval', () => {
       await vi.advanceTimersByTimeAsync(12_000);
 
       expect(texts()).toEqual([
-        '<@UOFFLIST> only the person who asked or people who can ask me for code changes can approve this plan.',
+        '<@UOFFLIST> only the person who asked or people who can ask me for code changes here can approve this plan.',
       ]);
       controller.abort();
       expect((await promise).outcome).toBe('cancelled');

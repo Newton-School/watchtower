@@ -613,7 +613,7 @@ async function pollForApproval(params: {
   const { slack, channelId, threadTs, approverUserIds, approvalPromptTs, logStep, botUserId, signal } = params;
   const { reminders, canApprove } = params;
   /** Who, besides the person who asked, is named when someone else tries to decide. */
-  const deciders = canApprove ? 'people who can ask me for code changes' : undefined;
+  const deciders = canApprove ? 'people who can ask me for code changes here' : undefined;
   const requester =
     params.requesterToConfirm && !approverUserIds.includes(params.requesterToConfirm)
       ? params.requesterToConfirm
@@ -750,7 +750,7 @@ async function pollForApproval(params: {
       /** What the exact-phrase patterns read; the classifier and the result keep `text`. */
       const command = approvalReplyCommand(text, botUserId);
       const isAdmin = approverUserIds.includes(reply.user);
-      // Another bot's "looks good" is not a yes, and it is never answered: two bots could talk forever.
+      // Another bot's "looks good" is not a yes, and no notice goes to one: two bots could talk forever.
       const fromPerson = Boolean(reply.user) && !reply.botId && reply.subtype !== 'bot_message';
       const isApprover = isAdmin || (fromPerson && Boolean(canApprove?.(reply.user)));
 
