@@ -238,7 +238,7 @@ export interface HumanWait {
   threadTs: string;
   /** The question the gate posted; only replies after it count. */
   promptTs: string;
-  /** Who the gate takes an answer from. */
+  /** Who the gate takes an answer from. Empty when it is not a fixed list of people. */
   allowedUserIds: string[];
   /** The exact phrase a confirm gate takes, when it takes nothing else. */
   expects?: string;

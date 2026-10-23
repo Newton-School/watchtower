@@ -11,7 +11,7 @@ import type {
   WorkflowResult,
   WorkflowStepLogger,
 } from '../types/contracts.js';
-import { getAdminUserIds } from '../access/control.js';
+import { evaluateCapability, getAdminUserIds, getConfiguredAccessControl } from '../access/control.js';
 import { composeChangeReply, requesterIsEngineer, sanitizeRequesterSummary } from './shared/changeReply.js';
 import { approvalBlocks, confirmationBlocks, postGatePrompt, yesNoBlocks } from '../slack/buttonReplies.js';
 import { connectorsFor, withConnectors } from '../backends/connectors.js';
@@ -412,6 +412,7 @@ export async function runApprovalLoop(input: {
   } = input;
 
   const adminUserIds = getAdminUserIds(config);
+  const canApprove = planDecidersFor(config, task);
   let { planMarkdown, planAffectedFiles, planScope, plannerOutput, plannerSessionId, planMessageTs } = initial;
   let feedbackRounds = feedbackRoundsStart;
   let pauseCount = pauseCountStart;
@@ -488,7 +489,7 @@ export async function runApprovalLoop(input: {
       channelId: task.event.channelId,
       threadTs: task.event.threadTs,
       approverUserIds: adminUserIds,
-      anyoneCanApprove: true,
+      canApprove,
       triggerUserId: requesterOf(task),
       approvalPromptTs,
       logStep: logStep ?? (() => {}),
@@ -548,7 +549,8 @@ export async function runApprovalLoop(input: {
         const askResult = await slack.chat.postMessage({
           channel: task.event.channelId,
           thread_ts: task.event.threadTs,
-          text: 'Got it. Would you like to change the task or the approach? Reply with what you\'d like different, or say "cancel" to stop.',
+          // An open question: "Would you like to change it?" drew a "yes", which went ahead with the plan just turned down.
+          text: 'Got it. What should I change? Reply with what you\'d like different, "go" to use the plan as it is, or "cancel" to stop.',
         });
         askReviseTs = askResult.ts ?? undefined;
       } catch {
@@ -564,7 +566,7 @@ export async function runApprovalLoop(input: {
         channelId: task.event.channelId,
         threadTs: task.event.threadTs,
         approverUserIds: adminUserIds,
-        anyoneCanApprove: true,
+        canApprove,
         triggerUserId: requesterOf(task),
         approvalPromptTs: askReviseTs,
         logStep: logStep ?? (() => {}),
@@ -828,6 +830,25 @@ Reply with the complete revised plan as markdown and nothing else, in the same f
 - First the "## For the approver" block with all its lines, rewritten for the revised plan. Do not copy the old block: every line must be true of the revised plan, including "Behaviour change" and "Outside the repo".
 - Then a section headed exactly "## Changed since the last plan", with one bullet for each thing you changed because of the feedback.
 - Then the rest of the plan: the intent, the "## Files to change" section, the steps, and the "Scope:" and "Requires code changes:" tags.`;
+}
+
+/**
+ * Who can decide a plan besides the admins: the requester, and anyone who
+ * could have asked for the change in this channel themselves. Waiting on an
+ * admin for every plan was friction. Without enforced access, anyone.
+ */
+function planDecidersFor(config: AppConfig, task: NormalizedTask): (userId: string) => boolean {
+  const enforced = getConfiguredAccessControl(config).mode === 'enforce';
+  return userId =>
+    userId === requesterOf(task) ||
+    !enforced ||
+    evaluateCapability({
+      config,
+      userId,
+      channelId: task.event.channelId,
+      channelType: task.event.channelType,
+      capability: 'start_implementation',
+    }).allowed;
 }
 
 /**

@@ -1708,7 +1708,7 @@ describe('waitForApproval', () => {
     const MIN = 60_000;
     const reminders = {
       afterMs: [15 * MIN, 120 * MIN],
-      text: "<!subteam^S1> <@UTRIGGER>'s plan above still needs a yes or no.",
+      text: '<@UTRIGGER> the plan above still needs a yes or no.',
     };
     const reminderPosts = () =>
       mockSlack.chat.postMessage.mock.calls.filter((call: any[]) => call[0].text === reminders.text).length;
@@ -2106,10 +2106,10 @@ describe('waitForApproval', () => {
   });
 
   // A plan is the thread's to decide: admins only was friction for every ask.
-  describe('when anyone in the thread can approve', () => {
+  describe('when anyone who could have asked can approve', () => {
     const texts = () => mockSlack.chat.postMessage.mock.calls.map((call: any[]) => call[0].text as string);
     const openRun = (overrides?: Partial<Parameters<typeof waitForApproval>[0]>) =>
-      runApproval({ anyoneCanApprove: true, ...overrides });
+      runApproval({ canApprove: userId => userId !== 'UOFFLIST', ...overrides });
     const held =
       'Thanks <@UOTHER>. <@UREQUESTER>, before I start: is the plan above what you want? Reply *yes*, or tell me what to change. (An admin can reply `approve without confirmation` to go ahead without that.)';
 
@@ -2207,6 +2207,41 @@ describe('waitForApproval', () => {
 
       expect(await promise).toMatchObject({ outcome: 'approved', approverId: 'UCOREDEV' });
       controller.abort();
+    });
+
+    it("does not count another bot's yes, and does not answer it", async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([
+        { text: 'yes', user: 'UOTHERBOT', ts: '200.00', botId: 'B1' },
+        { text: 'stop', user: '', ts: '201.00', subtype: 'bot_message' },
+      ]);
+      const controller = new AbortController();
+      let settled = false;
+      const promise = openRun({ signal: controller.signal }).then(result => {
+        settled = true;
+        return result;
+      });
+      await vi.advanceTimersByTimeAsync(12_000);
+
+      expect(settled).toBe(false);
+      expect(texts()).toEqual([]);
+      controller.abort();
+      await promise;
+    });
+
+    it('tells someone who could not have asked that they cannot decide it, once', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([
+        { text: 'yes', user: 'UOFFLIST', ts: '200.00' },
+        { text: 'no', user: 'UOFFLIST', ts: '201.00' },
+      ]);
+      const controller = new AbortController();
+      const promise = openRun({ signal: controller.signal });
+      await vi.advanceTimersByTimeAsync(12_000);
+
+      expect(texts()).toEqual([
+        '<@UOFFLIST> only the person who asked or people who can ask me for code changes can approve this plan.',
+      ]);
+      controller.abort();
+      expect((await promise).outcome).toBe('cancelled');
     });
 
     it('records the wait for the app with no one listed, so the owner can answer it', async () => {

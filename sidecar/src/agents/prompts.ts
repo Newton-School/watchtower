@@ -226,7 +226,7 @@ Workflow: ${ctx.workflowIntent}
 Repository: ${ctx.repoPath}
 Policy: ${policyBlock(ctx)}
 
-Approved plan (the admin signed off on THIS — review against it):
+Approved plan (this is what was signed off — review against it):
 ${planMarkdown || 'No plan markdown available.'}
 ${affectedFiles.length > 0 ? `Planned files: ${affectedFiles.map(f => `\`${f}\``).join(', ')}` : ''}
 Plan scope: ${scope}
