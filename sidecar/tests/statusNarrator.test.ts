@@ -134,7 +134,7 @@ describe('narrateStep — workflow stages', () => {
 
   it('marks human-wait gates as suspend so the status is not pinned for hours', () => {
     const approval = narrateStep({ stage: 'pipeline.approval.waiting', message: '' });
-    expect(approval).toEqual({ text: 'is waiting for admin approval', suspend: true });
+    expect(approval).toEqual({ text: 'is waiting for approval', suspend: true });
 
     const clarify = narrateStep({ stage: 'pipeline.clarification.waiting', message: '' });
     expect(clarify).toEqual({ text: 'is waiting for your answer', suspend: true });

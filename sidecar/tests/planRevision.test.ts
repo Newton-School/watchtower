@@ -52,31 +52,31 @@ describe('a revised plan is the plan the feedback asked for', () => {
     },
     filesUploadV2: vi.fn(async () => ({ ok: true })),
   } as any;
-  const run = () =>
-    runApprovalLoop({
-      slack,
-      config: { botUserId: 'UBOT', ownerSlackUserIds: ['UADMIN'], coreDevSlackUserIds: ['UADMIN'] } as any,
-      task: {
-        event: { channelId: 'C1', threadTs: '1.1', userId: 'UADMIN', text: 'shift the years' },
-        intent: 'IMPLEMENTATION',
-      } as any,
-      initial: {
-        planMarkdown: V1,
-        planAffectedFiles: ['src/components/forms/rcb-form.tsx'],
-        planScope: 'small',
-        plannerOutput: { summary: V1 },
-      },
-      pipelineCwd: '/ws/newton-marketing-web/1-1',
-      iterationStart: 0,
-      feedbackRoundsStart: 0,
-      pauseCountStart: 0,
-      plannerSchemaPath: '/schema.json',
-      plannerProfile: { model: 'opus' } as any,
-      plannerBackend: 'claude-code',
-      workflowTimeoutMs: 2_700_000,
-      workflowIntent: 'IMPLEMENTATION',
-      logStep: vi.fn(),
-    });
+  const runInput = (): Parameters<typeof runApprovalLoop>[0] => ({
+    slack,
+    config: { botUserId: 'UBOT', ownerSlackUserIds: ['UADMIN'], coreDevSlackUserIds: ['UADMIN'] } as any,
+    task: {
+      event: { channelId: 'C1', threadTs: '1.1', userId: 'UADMIN', text: 'shift the years' },
+      intent: 'IMPLEMENTATION',
+    } as any,
+    initial: {
+      planMarkdown: V1,
+      planAffectedFiles: ['src/components/forms/rcb-form.tsx'],
+      planScope: 'small',
+      plannerOutput: { summary: V1 },
+    },
+    pipelineCwd: '/ws/newton-marketing-web/1-1',
+    iterationStart: 0,
+    feedbackRoundsStart: 0,
+    pauseCountStart: 0,
+    plannerSchemaPath: '/schema.json',
+    plannerProfile: { model: 'opus' } as any,
+    plannerBackend: 'claude-code',
+    workflowTimeoutMs: 2_700_000,
+    workflowIntent: 'IMPLEMENTATION',
+    logStep: vi.fn(),
+  });
+  const run = () => runApprovalLoop(runInput());
 
   beforeEach(() => {
     posted.length = 0;
@@ -109,6 +109,89 @@ describe('a revised plan is the plan the feedback asked for', () => {
     expect(revisedMessage).toContain('• The stored values change to `2013_2026` and `2027`, as asked.');
     expect(revisedMessage).toContain('the backend allowlist must accept them first');
     expect(revisedMessage).not.toContain('stored values stay');
+  });
+
+  // Waiting on an admin for every plan was friction: the requester, and anyone who could have asked, decide it.
+  it('lets the requester and anyone who could have asked decide the plan, and no one else', async () => {
+    vi.mocked(runCodex).mockResolvedValue({ ok: true, exitCode: 0, parsedJson: { summary: V2 } } as any);
+    const enforced = {
+      botUserId: 'UBOT',
+      ownerSlackUserIds: ['UADMIN'],
+      coreDevSlackUserIds: ['UADMIN'],
+      accessControl: { mode: 'enforce' },
+      bundles: [
+        {
+          name: 'builder',
+          slackUserGroupHandle: '',
+          manualUserIds: 'UBUILDER',
+          resolvedUserIds: ['UBUILDER'],
+          capabilities: ['start_implementation'],
+          allowedChannelIds: ['C1'],
+          allowIm: false,
+          allowMpim: false,
+        },
+      ],
+    } as any;
+
+    await runApprovalLoop({
+      ...runInput(),
+      config: enforced,
+      task: { event: { channelId: 'C1', threadTs: '1.1', userId: 'UREQ', text: 'shift the years' } } as any,
+    });
+
+    const calls = vi.mocked(waitForApproval).mock.calls.map(call => call[0]);
+    expect(calls.length).toBeGreaterThan(0);
+    for (const { canApprove } of calls) {
+      expect(['UREQ', 'UBUILDER'].map(id => canApprove?.(id))).toEqual([true, true]);
+      expect(['UVIEWER', 'UGUEST'].map(id => canApprove?.(id))).toEqual([false, false]);
+    }
+  });
+
+  it('keeps access enforced in a group DM even when it is only audited elsewhere', async () => {
+    const audited = {
+      ...runInput().config,
+      accessControl: { mode: 'audit' },
+      bundles: [
+        {
+          name: 'builder',
+          slackUserGroupHandle: '',
+          manualUserIds: 'UBUILDER',
+          resolvedUserIds: ['UBUILDER'],
+          capabilities: ['start_implementation'],
+          allowedChannelIds: ['C1'],
+          allowIm: false,
+          allowMpim: false,
+        },
+      ],
+    } as any;
+    const event = { threadTs: '1.1', userId: 'UREQ', text: 'shift the years' };
+    vi.mocked(waitForApproval)
+      .mockReset()
+      .mockResolvedValue({ outcome: 'approved', userReply: 'yes', approverId: 'UREQ', replyTs: '400' });
+
+    await runApprovalLoop({ ...runInput(), config: audited, task: { event: { ...event, channelId: 'C1' } } as any });
+    await runApprovalLoop({
+      ...runInput(),
+      config: audited,
+      task: { event: { ...event, channelId: 'G1', channelType: 'mpim' } } as any,
+    });
+
+    const [channel, groupDm] = vi.mocked(waitForApproval).mock.calls.map(call => call[0].canApprove);
+    expect(channel?.('UANYONE')).toBe(true);
+    expect([groupDm?.('UREQ'), groupDm?.('UANYONE')]).toEqual([true, false]);
+  });
+
+  it('asks what to change after a no, so a "yes" does not go ahead with the plan just turned down', async () => {
+    vi.mocked(waitForApproval)
+      .mockReset()
+      .mockResolvedValueOnce({ outcome: 'rejected', userReply: 'no', approverId: 'UREQ', replyTs: '200' })
+      .mockResolvedValueOnce({ outcome: 'cancelled', userReply: 'cancel', approverId: 'UREQ', replyTs: '400' });
+
+    await run();
+
+    expect(posted).toContain(
+      'Got it. What should I change? Reply with what you\'d like different, "go" to use the plan as it is, or "cancel" to stop.',
+    );
   });
 
   it('says the revision failed, and keeps the plan, when it brings back no plan', async () => {

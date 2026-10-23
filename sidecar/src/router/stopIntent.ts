@@ -95,7 +95,8 @@ export type StopDecision =
  * Whether this message stops the job running in its thread. It must be
  * addressed to the bot, be nothing but a stop, and come from the person who
  * asked for the job, an admin or an owner — a bystander cannot cancel
- * someone else's work.
+ * someone else's work. A plan waiting for approval is the exception: anyone
+ * who may approve it can also stop it there (`waitForApproval`).
  */
 export function decideStop(params: {
   isBotMention: boolean;

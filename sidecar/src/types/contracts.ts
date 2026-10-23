@@ -238,7 +238,7 @@ export interface HumanWait {
   threadTs: string;
   /** The question the gate posted; only replies after it count. */
   promptTs: string;
-  /** Who the gate takes an answer from. */
+  /** Who the gate takes an answer from. Empty when it is not a fixed list of people. */
   allowedUserIds: string[];
   /** The exact phrase a confirm gate takes, when it takes nothing else. */
   expects?: string;
@@ -625,7 +625,7 @@ export interface WorkflowResult {
 
 /**
  * Implementation workflow paused at the plan-approval gate, waiting for either
- * an admin approve/reject/feedback OR (now) a "wait" + later @-mention to resume.
+ * an approve/reject/feedback from anyone in the thread OR a "wait" + later @-mention to resume.
  */
 export interface ImplementationApprovalResume {
   workflow: 'IMPLEMENTATION' | 'OWNER_AUTOPILOT';

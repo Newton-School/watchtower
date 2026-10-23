@@ -165,7 +165,7 @@ const STAGE_TEXT: Record<string, StageRule> = {
   // Human-wait gates. Only a gate's entry stage narrates: its outcome stages
   // (approved, answered, resolved, cancelled…) share the family prefix and must
   // not read as still waiting once the human has replied.
-  'pipeline.approval.waiting': { text: 'is waiting for admin approval', suspend: true },
+  'pipeline.approval.waiting': { text: 'is waiting for approval', suspend: true },
   'pipeline.clarification.waiting': { text: 'is waiting for your answer', suspend: true },
   'pipeline.repo_choice.waiting': { text: 'is waiting for you to pick a repo', suspend: true },
   'implementation.approval.revising': { text: 'is revising the plan…' },

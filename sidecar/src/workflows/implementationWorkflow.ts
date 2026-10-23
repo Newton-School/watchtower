@@ -11,7 +11,7 @@ import type {
   WorkflowResult,
   WorkflowStepLogger,
 } from '../types/contracts.js';
-import { formatAdminMention, getAdminUserIds } from '../access/control.js';
+import { evaluateCapability, getAdminUserIds, getConfiguredAccessControl } from '../access/control.js';
 import { composeChangeReply, requesterIsEngineer, sanitizeRequesterSummary } from './shared/changeReply.js';
 import { approvalBlocks, confirmationBlocks, postGatePrompt, yesNoBlocks } from '../slack/buttonReplies.js';
 import { connectorsFor, withConnectors } from '../backends/connectors.js';
@@ -412,6 +412,7 @@ export async function runApprovalLoop(input: {
   } = input;
 
   const adminUserIds = getAdminUserIds(config);
+  const canApprove = planDecidersFor(config, task);
   let { planMarkdown, planAffectedFiles, planScope, plannerOutput, plannerSessionId, planMessageTs } = initial;
   let feedbackRounds = feedbackRoundsStart;
   let pauseCount = pauseCountStart;
@@ -460,8 +461,8 @@ export async function runApprovalLoop(input: {
     } else {
       const promptText =
         iteration === 0
-          ? `Here's my plan. ${requesterToConfirm ? 'I start once the requester confirms it is what they want and an admin approves' : 'An admin needs to approve before I proceed'}:\n• "yes" or "go" — I'll start coding\n• "stop" or "cancel" — I'll drop it\n• "no", or changes you'd like — I'll adjust the plan`
-          : `Here's the revised plan. "yes" to proceed, "stop" to drop it, or reply with more changes.${requesterToConfirm ? ' I start once the requester confirms it and an admin approves.' : ''}`;
+          ? `Here's my plan. ${requesterToConfirm ? 'I start once the requester confirms it is what they want' : 'Anyone here can approve it'}:\n• "yes" or "go" — I'll start coding\n• "stop" or "cancel" — I'll drop it\n• "no", or changes you'd like — I'll adjust the plan`
+          : `Here's the revised plan. "yes" to proceed, "stop" to drop it, or reply with more changes.${requesterToConfirm ? ' I start once the requester confirms it.' : ''}`;
 
       try {
         approvalPromptTs = await postGatePrompt(slack, {
@@ -480,15 +481,15 @@ export async function runApprovalLoop(input: {
 
     logStep?.({
       stage: 'implementation.approval.waiting',
-      message: `Waiting for admin approval of plan (iteration ${iteration + 1}).`,
+      message: `Waiting for approval of the plan (iteration ${iteration + 1}).`,
     });
 
-    const approverMention = formatAdminMention(config);
     let approval = await waitForApproval({
       slack,
       channelId: task.event.channelId,
       threadTs: task.event.threadTs,
       approverUserIds: adminUserIds,
+      canApprove,
       triggerUserId: requesterOf(task),
       approvalPromptTs,
       logStep: logStep ?? (() => {}),
@@ -496,9 +497,8 @@ export async function runApprovalLoop(input: {
       signal,
       reminders: {
         afterMs: PLAN_APPROVAL_REMINDERS_MS,
-        text: `${approverMention} <@${requesterOf(task)}>'s plan above still needs a yes or no.`,
+        text: `<@${requesterOf(task)}> the plan above still needs a yes or no.`,
       },
-      approverMention,
       requesterToConfirm,
     });
 
@@ -549,7 +549,8 @@ export async function runApprovalLoop(input: {
         const askResult = await slack.chat.postMessage({
           channel: task.event.channelId,
           thread_ts: task.event.threadTs,
-          text: 'Got it. Would you like to change the task or the approach? Reply with what you\'d like different, or say "cancel" to stop.',
+          // An open question: "Would you like to change it?" drew a "yes", which went ahead with the plan just turned down.
+          text: 'Got it. What should I change? Reply with what you\'d like different, "go" to use the plan as it is, or "cancel" to stop.',
         });
         askReviseTs = askResult.ts ?? undefined;
       } catch {
@@ -557,7 +558,7 @@ export async function runApprovalLoop(input: {
       }
 
       if (!askReviseTs) {
-        return { kind: 'rejected_then_cancelled', message: 'Plan rejected by admin.' };
+        return { kind: 'rejected_then_cancelled', message: 'Plan turned down.' };
       }
 
       const followUp = await waitForApproval({
@@ -565,6 +566,7 @@ export async function runApprovalLoop(input: {
         channelId: task.event.channelId,
         threadTs: task.event.threadTs,
         approverUserIds: adminUserIds,
+        canApprove,
         triggerUserId: requesterOf(task),
         approvalPromptTs: askReviseTs,
         logStep: logStep ?? (() => {}),
@@ -602,7 +604,7 @@ export async function runApprovalLoop(input: {
             text: 'Understood, cancelling.',
           })
           .catch(() => {});
-        return { kind: 'rejected_then_cancelled', message: 'Plan rejected by admin after revision prompt.' };
+        return { kind: 'rejected_then_cancelled', message: 'Plan turned down after the revision prompt.' };
       }
 
       if (followUp.outcome === 'approved') {
@@ -657,7 +659,7 @@ export async function runApprovalLoop(input: {
           : `You previously produced this plan:
 ${JSON.stringify(plannerOutput, null, 2)}
 
-It was reviewed, and this feedback came back (from an admin, or from the requester saying what they want):
+It was reviewed, and this feedback came back (from someone in the thread, or from the requester saying what they want):
 
 "${approval.userReply}"
 
@@ -818,7 +820,7 @@ export function revisionPromptMarkdown(previousPlan: string, feedback: string): 
 
 ${previousPlan}
 
-It was reviewed, and this feedback came back (from an admin, or from the requester saying what they want):
+It was reviewed, and this feedback came back (from someone in the thread, or from the requester saying what they want):
 
 "${feedback}"
 
@@ -828,6 +830,29 @@ Reply with the complete revised plan as markdown and nothing else, in the same f
 - First the "## For the approver" block with all its lines, rewritten for the revised plan. Do not copy the old block: every line must be true of the revised plan, including "Behaviour change" and "Outside the repo".
 - Then a section headed exactly "## Changed since the last plan", with one bullet for each thing you changed because of the feedback.
 - Then the rest of the plan: the intent, the "## Files to change" section, the steps, and the "Scope:" and "Requires code changes:" tags.`;
+}
+
+/**
+ * Who can decide a plan besides the admins: the requester, and anyone who
+ * could have asked for the change in this channel themselves. Waiting on an
+ * admin for every plan was friction. Without enforced access, anyone. The
+ * requester is the person the run is for, even when it runs on an owner's
+ * authority (a tag of the owner, or an ask from the app for them).
+ */
+function planDecidersFor(config: AppConfig, task: NormalizedTask): (userId: string) => boolean {
+  // The router enforces access in DMs and group DMs even in audit mode.
+  const dm = task.event.channelType === 'im' || task.event.channelType === 'mpim';
+  const enforced = getConfiguredAccessControl(config).mode === 'enforce' || dm;
+  return userId =>
+    userId === requesterOf(task) ||
+    !enforced ||
+    evaluateCapability({
+      config,
+      userId,
+      channelId: task.event.channelId,
+      channelType: task.event.channelType,
+      capability: 'start_implementation',
+    }).allowed;
 }
 
 /**
@@ -1703,8 +1728,8 @@ Write your response as a ready-to-post Slack message describing what you did.
       }
     }
 
-    // Fail closed: admin approval is mandatory for fresh implementation runs,
-    // and the only thread the admin can react to is the plan message. If the
+    // Fail closed: approval is mandatory for fresh implementation runs,
+    // and the only thing the thread can approve is the plan message. If the
     // planner produced no plan content, or the plan post failed, we have no
     // reviewable artifact and no approval prompt \u2014 proceeding would let the
     // coder/reviewer/verifier write code unsupervised.
@@ -1712,7 +1737,7 @@ Write your response as a ready-to-post Slack message describing what you did.
       const reason =
         planMarkdown.length === 0
           ? 'Planner returned no plan content \u2014 cannot proceed without a reviewable plan.'
-          : 'Failed to post the plan to Slack \u2014 cannot proceed without an admin approval prompt.';
+          : 'Failed to post the plan to Slack \u2014 cannot proceed without an approval prompt.';
       logStep?.({
         stage: 'implementation.approval.unreachable',
         message: reason,
@@ -1726,7 +1751,7 @@ Write your response as a ready-to-post Slack message describing what you did.
         .postMessage({
           channel: task.event.channelId,
           thread_ts: task.event.threadTs,
-          text: `Couldn't reach an admin approval gate \u2014 ${reason} Cancelling.`,
+          text: `Couldn't post the plan for approval \u2014 ${reason} Cancelling.`,
         })
         .catch(() => {});
       return {
