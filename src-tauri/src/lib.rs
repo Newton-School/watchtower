@@ -1867,8 +1867,10 @@ struct BundleRecord {
     updated_at: Option<String>,
 }
 
-/// What a save says when the bundle changed after the UI read it.
+/// What a save says when the bundle changed, or went, after the UI read it.
+/// BundleEditor reloads the bundle on "since Settings loaded it".
 const BUNDLE_CHANGED: &str = "This bundle changed since Settings loaded it (miniOG may have just added people to it). It has been reloaded: make your change again.";
+const BUNDLE_GONE: &str = "This bundle was deleted since Settings loaded it.";
 
 /// Notify the sidecar that the bundles table has been edited from the
 /// desktop. The sidecar's per-workflow access check compares this signal's
@@ -1981,7 +1983,12 @@ fn save_bundle_inner(connection: &Connection, bundle: &BundleRecord) -> Result<(
                 )
                 .map_err(|err| format!("db save bundle failed: {err}"))?;
             if changed == 0 {
-                return Err(BUNDLE_CHANGED.to_string());
+                let exists = connection
+                    .query_row("SELECT 1 FROM bundles WHERE name = ?", params![name], |_| Ok(()))
+                    .optional()
+                    .map_err(|err| format!("db read bundle failed: {err}"))?
+                    .is_some();
+                return Err(if exists { BUNDLE_CHANGED } else { BUNDLE_GONE }.to_string());
             }
         }
         None => {
@@ -4813,6 +4820,16 @@ mod tests {
         // A new bundle needs a name nobody has.
         let err = save_bundle_inner(&connection, &edit("", None)).expect_err("duplicate");
         assert!(err.contains("already exists"));
+
+        // Deleted elsewhere: said so, not recreated.
+        connection.execute("DELETE FROM bundles", []).expect("delete");
+        let err = save_bundle_inner(&connection, &edit("U1", Some("v4"))).expect_err("gone");
+        assert_eq!(err, BUNDLE_GONE);
+
+        // BundleEditor reloads on this phrase.
+        for message in [BUNDLE_CHANGED, BUNDLE_GONE] {
+            assert!(message.contains("since Settings loaded it"));
+        }
 
         drop(connection);
         let _ = fs::remove_file(db_path);

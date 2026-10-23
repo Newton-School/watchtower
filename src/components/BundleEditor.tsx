@@ -151,8 +151,9 @@ export function BundleEditor() {
         await refresh(name);
       } catch (err) {
         const message = String(err);
-        // Changed elsewhere since the page read it: show the stored version.
-        if (message.includes('changed since Settings loaded it')) await refresh(name);
+        // Changed or deleted elsewhere since the page read it (save_bundle):
+        // show what is stored now.
+        if (message.includes('since Settings loaded it')) await refresh(name);
         setError(`Failed to save bundle ${name}: ${message}`);
       } finally {
         setSavingName(null);
