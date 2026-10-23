@@ -1,13 +1,8 @@
 import path from 'node:path';
 import { v4 as uuidv4 } from 'uuid';
 import { WebClient } from '@slack/web-api';
-import {
-  formatAdminMention,
-  getAdminUserIds,
-  getConfiguredAccessControl,
-  hydrateBundleUserIds,
-  setResolvedGroupMembers,
-} from './access/control.js';
+import { getAdminUserIds, hydrateBundleUserIds } from './access/control.js';
+import { copySlackGroupMembers } from './access/slackGroupMembers.js';
 import { shouldResumeFromReaction } from './router/investigationResumeGate.js';
 import { loadConfigFromDb, readAgentBackend, readSettingsForAlert, MiniOgRepoRootViolationError } from './config.js';
 import { setActiveBackend } from './codex/runCodex.js';
@@ -53,7 +48,6 @@ import { startProfileSynthesizerScheduler, stopProfileSynthesizerScheduler } fro
 import { narrateStep } from './slack/statusNarrator.js';
 import { fetchThreadContext } from './slack/threadContext.js';
 import { createThreadStatus, type ThreadStatus } from './slack/threadStatus.js';
-import { resolveUserGroup } from './slack/userGroupResolver.js';
 import { isOlderVersion, readSidecarBuild } from './runtime/buildInfo.js';
 import { recoveryFor } from './runtime/restartRecovery.js';
 import { connectorAlertText, connectorsToAlert, onConnectorStatuses } from './runtime/connectorAlerts.js';
@@ -69,7 +63,7 @@ import {
 import { decideStop } from './router/stopIntent.js';
 import { JobStore } from './state/jobStore.js';
 import { settleAbortedResult } from './workflows/shared/cancelState.js';
-import type { AccessGroupKey, SlackEventEnvelope, SlackReactionEvent, WorkflowStepLog } from './types/contracts.js';
+import type { SlackEventEnvelope, SlackReactionEvent, WorkflowStepLog } from './types/contracts.js';
 
 assertMacOS();
 loadPolicies();
@@ -150,6 +144,7 @@ let bundlesLoadedAt = new Date().toISOString();
     for (const bundle of config.bundles) {
       store.setBundle(bundle);
     }
+    store.carryLegacySlackGroups();
     logger.info(
       { bundleCount: config.bundles.length },
       'seeded bundles table from legacy AccessControlConfig (one-time)',
@@ -1184,6 +1179,8 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     payload: {
       text: event.text,
       requestUserId: event.userId,
+      // Who the run is for, when someone asked for it on their behalf (`requesterOf`).
+      requestedForUserId: event.requestedForUserId ?? null,
       mentionType: task.mentionType,
       intent: task.intent,
       eventTs: event.eventTs,
@@ -2003,90 +2000,24 @@ async function main(): Promise<void> {
   await client.start();
   logger.info('autonomous feed/digest/incident posting disabled; mention-triggered replies only');
 
-  const refreshAccessGroups = async () => {
-    const accessControl = getConfiguredAccessControl(config);
-    // handle → subteam ID, shared across groups and the legacy core-dev
-    // resolution below so each handle costs one Slack round-trip per tick.
-    const resolvedHandleIds = new Map<string, string>();
-    for (const groupKey of Object.keys(accessControl.groups) as AccessGroupKey[]) {
-      const group = accessControl.groups[groupKey];
-      const handles = group.slackUserGroupHandle
-        .split(',')
-        .map(h => h.trim())
-        .filter(Boolean);
-      if (handles.length === 0) {
-        continue;
+  // Bundles list people directly now; copy in the people of the Slack user
+  // groups they used to read, once, trying again while Slack cannot be read.
+  const copyAccessGroupMembers = async (): Promise<void> => {
+    let pending = true;
+    try {
+      const result = await copySlackGroupMembers({ store, slack: client.webClient });
+      if (result.copied.length > 0) {
+        config.bundles = hydrateBundleUserIds(store.getBundles(), config.ownerSlackUserIds);
       }
-
-      const allMembers: string[] = [];
-      const subteamIds: string[] = [];
-      let anyHandleFailed = false;
-      for (const handle of handles) {
-        try {
-          const resolved = await resolveUserGroup(client.webClient, handle);
-          if (resolved) {
-            allMembers.push(...resolved.members);
-            subteamIds.push(resolved.id);
-            resolvedHandleIds.set(resolved.handle, resolved.id);
-          }
-        } catch (error) {
-          logger.warn({ groupKey, handle, error: String(error) }, 'access group handle refresh failed');
-          anyHandleFailed = true;
-        }
-      }
-
-      // Don't overwrite the live allowlist with a partial / empty membership
-      // when any configured handle failed to resolve — that would lock out
-      // group-only users on a transient Slack outage. Retain the
-      // last-known-good cache; the next refresh tick (30m) will retry.
-      if (anyHandleFailed) {
-        logger.warn(
-          {
-            groupKey,
-            handles,
-            memberCount: getConfiguredAccessControl(config).groups[groupKey].resolvedUserIds.length,
-          },
-          'access group refresh skipped: handle failure(s); retaining last-known-good membership',
-        );
-        continue;
-      }
-
-      setResolvedGroupMembers({ config, groupKey, members: allMembers, subteamIds });
-      logger.info(
-        {
-          groupKey,
-          handles,
-          memberCount: getConfiguredAccessControl(config).groups[groupKey].resolvedUserIds.length,
-          subteamIds,
-        },
-        'access group resolved',
-      );
+      pending = result.pending.length > 0;
+    } catch (error) {
+      logger.warn({ error: String(error) }, 'access: copying Slack user group members failed; trying again later');
     }
-
-    // Legacy installs configure only core_dev_slack_user_group (no admin
-    // group row). Resolve its subteam ID too so formatAdminMention can emit
-    // a working mention; same last-known-good discipline on failure.
-    const legacyHandle = (config.coreDevSlackUserGroup ?? '').replace(/^@/, '').trim().toLowerCase();
-    if (legacyHandle) {
-      const cached = resolvedHandleIds.get(legacyHandle);
-      if (cached) {
-        config.resolvedCoreDevSubteamIds = [cached];
-      } else {
-        try {
-          const resolved = await resolveUserGroup(client.webClient, legacyHandle);
-          config.resolvedCoreDevSubteamIds = resolved ? [resolved.id] : [];
-        } catch (error) {
-          logger.warn(
-            { handle: legacyHandle, error: String(error) },
-            'core-dev subteam id refresh failed; retaining last-known-good',
-          );
-        }
-      }
+    if (pending) {
+      setTimeout(() => void copyAccessGroupMembers(), 30 * 60 * 1000);
     }
   };
-
-  await refreshAccessGroups();
-  setInterval(refreshAccessGroups, 30 * 60 * 1000);
+  await copyAccessGroupMembers();
 
   // Say which features the installed token cannot serve, once per change
   // rather than one failed request at a time (issue #433). Rechecked so a
@@ -2133,7 +2064,6 @@ async function main(): Promise<void> {
         store,
         slack: client.webClient,
         githubToken: await resolveGithubTokenForCodex(),
-        mergeMention: formatAdminMention(config) || 'Admins,',
         botMention: `<@${config.botUserId}>`,
         dateKey,
       });

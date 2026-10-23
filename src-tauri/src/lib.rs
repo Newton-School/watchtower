@@ -393,7 +393,6 @@ struct AppSettings {
     pm_slack_user_ids: String,
     pm_task_timeout_ms: i64,
     core_dev_slack_user_ids: String,
-    core_dev_slack_user_group: String,
     vault_path: String,
     vault_enabled: bool,
     mini_og_repo_root: String,
@@ -403,7 +402,6 @@ struct AppSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AccessGroupSettings {
-    slack_user_group_handle: String,
     manual_user_ids: String,
     allowed_channel_ids: String,
     allow_im: bool,
@@ -423,7 +421,6 @@ fn access_group_keys() -> [&'static str; 5] {
 
 fn default_access_group_settings() -> AccessGroupSettings {
     AccessGroupSettings {
-        slack_user_group_handle: String::new(),
         manual_user_ids: String::new(),
         allowed_channel_ids: String::new(),
         allow_im: false,
@@ -494,7 +491,6 @@ impl Default for AppSettings {
             pm_slack_user_ids: String::new(),
             pm_task_timeout_ms: 600_000,
             core_dev_slack_user_ids: String::new(),
-            core_dev_slack_user_group: String::new(),
             vault_path: String::new(),
             vault_enabled: false,
             mini_og_repo_root: "/Users/dipesh/code/mini-og".to_string(),
@@ -1851,15 +1847,15 @@ async fn get_user_memories(
 
 /// Capability bundle as seen from the desktop UI. Mirrors the sidecar's
 /// `Bundle` interface in `sidecar/src/types/contracts.ts`. `resolved_user_ids`
-/// is NOT persisted in the table (subteam membership lives in Slack); the
-/// sidecar hydrates it after load via `hydrateBundleUserIds`. The UI sees an
-/// empty array on reads and is not expected to send a non-empty one — it's
-/// included here for round-trip type compatibility.
+/// is NOT persisted in the table; the sidecar hydrates it after load via
+/// `hydrateBundleUserIds`. The UI sees an empty array on reads and is not
+/// expected to send a non-empty one — it's included here for round-trip type
+/// compatibility. `updated_at` is the version the UI read; a save of an
+/// existing bundle sends it back, and none for a new one.
 #[derive(Serialize, Deserialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 struct BundleRecord {
     name: String,
-    slack_user_group_handle: String,
     manual_user_ids: String,
     #[serde(default)]
     resolved_user_ids: Vec<String>,
@@ -1867,7 +1863,14 @@ struct BundleRecord {
     allowed_channel_ids: Vec<String>,
     allow_im: bool,
     allow_mpim: bool,
+    #[serde(default)]
+    updated_at: Option<String>,
 }
+
+/// What a save says when the bundle changed, or went, after the UI read it.
+/// BundleEditor reloads the bundle on "since Settings loaded it".
+const BUNDLE_CHANGED: &str = "This bundle changed since Settings loaded it (miniOG may have just added people to it). It has been reloaded: make your change again.";
+const BUNDLE_GONE: &str = "This bundle was deleted since Settings loaded it.";
 
 /// Notify the sidecar that the bundles table has been edited from the
 /// desktop. The sidecar's per-workflow access check compares this signal's
@@ -1892,18 +1895,18 @@ async fn get_bundles(state: State<'_, AppState>) -> Result<Vec<BundleRecord>, St
         Connection::open(&*state.db_path).map_err(|err| format!("db open failed: {err}"))?;
     let mut stmt = connection
         .prepare(
-            "SELECT name, slack_user_group_handle, manual_user_ids, capabilities,
-                    allowed_channel_ids, allow_im, allow_mpim
+            "SELECT name, manual_user_ids, capabilities,
+                    allowed_channel_ids, allow_im, allow_mpim, updated_at
              FROM bundles
              ORDER BY name",
         )
         .map_err(|err| format!("db prepare bundles failed: {err}"))?;
     let rows = stmt
         .query_map([], |row| {
-            let capabilities_json: String = row.get(3)?;
-            let allowed_channels_csv: String = row.get(4)?;
-            let allow_im: i64 = row.get(5)?;
-            let allow_mpim: i64 = row.get(6)?;
+            let capabilities_json: String = row.get(2)?;
+            let allowed_channels_csv: String = row.get(3)?;
+            let allow_im: i64 = row.get(4)?;
+            let allow_mpim: i64 = row.get(5)?;
             let capabilities: Vec<String> = serde_json::from_str(&capabilities_json).unwrap_or_default();
             let allowed_channel_ids = allowed_channels_csv
                 .split(',')
@@ -1912,13 +1915,13 @@ async fn get_bundles(state: State<'_, AppState>) -> Result<Vec<BundleRecord>, St
                 .collect();
             Ok(BundleRecord {
                 name: row.get(0)?,
-                slack_user_group_handle: row.get(1)?,
-                manual_user_ids: row.get(2)?,
+                manual_user_ids: row.get(1)?,
                 resolved_user_ids: Vec::new(),
                 capabilities,
                 allowed_channel_ids,
                 allow_im: allow_im != 0,
                 allow_mpim: allow_mpim != 0,
+                updated_at: Some(row.get(6)?),
             })
         })
         .map_err(|err| format!("db query bundles failed: {err}"))?;
@@ -1931,6 +1934,19 @@ async fn get_bundles(state: State<'_, AppState>) -> Result<Vec<BundleRecord>, St
 
 #[tauri::command]
 async fn save_bundle(bundle: BundleRecord, state: State<'_, AppState>) -> Result<(), String> {
+    let connection =
+        Connection::open(&*state.db_path).map_err(|err| format!("db open failed: {err}"))?;
+    save_bundle_inner(&connection, &bundle)?;
+    write_access_cache_signal(&connection)?;
+    Ok(())
+}
+
+/// Saves a bundle the UI edited. An existing bundle is written only if it is
+/// still the version the UI read: the sidecar adds people to bundles too (the
+/// one-time copy of their Slack user groups), and a page opened before that
+/// must not write its older list over them. A bundle's old Slack user groups
+/// are left alone: the sidecar copies their people onto it, then clears them.
+fn save_bundle_inner(connection: &Connection, bundle: &BundleRecord) -> Result<(), String> {
     let name = bundle.name.trim().to_string();
     if name.is_empty() {
         return Err("bundle name cannot be empty".to_string());
@@ -1944,35 +1960,59 @@ async fn save_bundle(bundle: BundleRecord, state: State<'_, AppState>) -> Result
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join(",");
-    let connection =
-        Connection::open(&*state.db_path).map_err(|err| format!("db open failed: {err}"))?;
     let now = Utc::now().to_rfc3339();
-    connection
-        .execute(
-            "INSERT INTO bundles(name, slack_user_group_handle, manual_user_ids, capabilities,
-                                 allowed_channel_ids, allow_im, allow_mpim, updated_at)
-             VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(name) DO UPDATE SET
-               slack_user_group_handle = excluded.slack_user_group_handle,
-               manual_user_ids = excluded.manual_user_ids,
-               capabilities = excluded.capabilities,
-               allowed_channel_ids = excluded.allowed_channel_ids,
-               allow_im = excluded.allow_im,
-               allow_mpim = excluded.allow_mpim,
-               updated_at = excluded.updated_at",
-            params![
-                name,
-                bundle.slack_user_group_handle,
-                bundle.manual_user_ids,
-                capabilities_json,
-                allowed_channels_csv,
-                if bundle.allow_im { 1 } else { 0 },
-                if bundle.allow_mpim { 1 } else { 0 },
-                now,
-            ],
-        )
-        .map_err(|err| format!("db save bundle failed: {err}"))?;
-    write_access_cache_signal(&connection)?;
+    let allow_im = if bundle.allow_im { 1 } else { 0 };
+    let allow_mpim = if bundle.allow_mpim { 1 } else { 0 };
+    match &bundle.updated_at {
+        Some(read_at) => {
+            let changed = connection
+                .execute(
+                    "UPDATE bundles SET manual_user_ids = ?, capabilities = ?,
+                       allowed_channel_ids = ?, allow_im = ?, allow_mpim = ?, updated_at = ?
+                     WHERE name = ? AND updated_at = ?",
+                    params![
+                        bundle.manual_user_ids,
+                        capabilities_json,
+                        allowed_channels_csv,
+                        allow_im,
+                        allow_mpim,
+                        now,
+                        name,
+                        read_at,
+                    ],
+                )
+                .map_err(|err| format!("db save bundle failed: {err}"))?;
+            if changed == 0 {
+                let exists = connection
+                    .query_row("SELECT 1 FROM bundles WHERE name = ?", params![name], |_| Ok(()))
+                    .optional()
+                    .map_err(|err| format!("db read bundle failed: {err}"))?
+                    .is_some();
+                return Err(if exists { BUNDLE_CHANGED } else { BUNDLE_GONE }.to_string());
+            }
+        }
+        None => {
+            let added = connection
+                .execute(
+                    "INSERT OR IGNORE INTO bundles(name, manual_user_ids, capabilities,
+                                                   allowed_channel_ids, allow_im, allow_mpim, updated_at)
+                     VALUES(?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        name,
+                        bundle.manual_user_ids,
+                        capabilities_json,
+                        allowed_channels_csv,
+                        allow_im,
+                        allow_mpim,
+                        now,
+                    ],
+                )
+                .map_err(|err| format!("db save bundle failed: {err}"))?;
+            if added == 0 {
+                return Err(format!("A bundle named \"{name}\" already exists."));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -3189,7 +3229,6 @@ fn initialize_db(path: &PathBuf) -> Result<(), String> {
     let _ = connection.execute("ALTER TABLE app_settings ADD COLUMN pm_slack_user_ids TEXT NOT NULL DEFAULT ''", []);
     let _ = connection.execute("ALTER TABLE app_settings ADD COLUMN pm_task_timeout_ms INTEGER NOT NULL DEFAULT 600000", []);
     let _ = connection.execute("ALTER TABLE app_settings ADD COLUMN core_dev_slack_user_ids TEXT NOT NULL DEFAULT ''", []);
-    let _ = connection.execute("ALTER TABLE app_settings ADD COLUMN core_dev_slack_user_group TEXT NOT NULL DEFAULT ''", []);
     let _ = connection.execute("ALTER TABLE app_settings ADD COLUMN vault_path TEXT NOT NULL DEFAULT ''", []);
     let _ = connection.execute("ALTER TABLE app_settings ADD COLUMN vault_enabled INTEGER NOT NULL DEFAULT 0", []);
     // mini_og_repo_root: read_app_settings selects this column unconditionally. Fresh-install
@@ -3293,13 +3332,12 @@ fn ensure_access_control_seeded(connection: &Connection) -> Result<(), String> {
             .execute(
                 "INSERT OR IGNORE INTO access_control_groups(
                    group_key,
-                   slack_user_group_handle,
                    manual_user_ids,
                    allowed_channel_ids,
                    allow_im,
                    allow_mpim,
                    updated_at
-                 ) VALUES(?, '', '', '', 0, 0, ?)",
+                 ) VALUES(?, '', '', 0, 0, ?)",
                 params![key, now],
             )
             .map_err(|err| format!("db seed access_control_groups failed: {err}"))?;
@@ -3313,23 +3351,16 @@ fn ensure_access_control_seeded(connection: &Connection) -> Result<(), String> {
         .query_row(
             "SELECT
                COALESCE(bugs_and_updates_channel_id, ''),
-               COALESCE(core_dev_slack_user_ids, ''),
-               COALESCE(core_dev_slack_user_group, '')
+               COALESCE(core_dev_slack_user_ids, '')
              FROM app_settings
              WHERE id = 1
              LIMIT 1",
             [],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()
         .map_err(|err| format!("db read legacy access seed failed: {err}"))?
-        .unwrap_or_else(|| (String::new(), String::new(), String::new()));
+        .unwrap_or_else(|| (String::new(), String::new()));
 
     connection
         .execute(
@@ -3356,14 +3387,13 @@ fn ensure_access_control_seeded(connection: &Connection) -> Result<(), String> {
     connection
         .execute(
             "UPDATE access_control_groups
-             SET slack_user_group_handle = ?,
-                 manual_user_ids = ?,
+             SET manual_user_ids = ?,
                  allowed_channel_ids = ?,
                  allow_im = 1,
                  allow_mpim = 1,
                  updated_at = ?
              WHERE group_key = 'admin'",
-            params![legacy.2.trim(), legacy.1.trim(), legacy.0.trim(), now],
+            params![legacy.1.trim(), legacy.0.trim(), now],
         )
         .map_err(|err| format!("db seed admin access group failed: {err}"))?;
 
@@ -3396,7 +3426,6 @@ fn read_access_control_settings(connection: &Connection) -> Result<AccessControl
         .prepare(
             "SELECT
                group_key,
-               slack_user_group_handle,
                manual_user_ids,
                allowed_channel_ids,
                allow_im,
@@ -3410,11 +3439,10 @@ fn read_access_control_settings(connection: &Connection) -> Result<AccessControl
             Ok((
                 row.get::<_, String>(0)?,
                 AccessGroupSettings {
-                    slack_user_group_handle: row.get(1)?,
-                    manual_user_ids: row.get(2)?,
-                    allowed_channel_ids: row.get(3)?,
-                    allow_im: row.get::<_, i64>(4)? != 0,
-                    allow_mpim: row.get::<_, i64>(5)? != 0,
+                    manual_user_ids: row.get(1)?,
+                    allowed_channel_ids: row.get(2)?,
+                    allow_im: row.get::<_, i64>(3)? != 0,
+                    allow_mpim: row.get::<_, i64>(4)? != 0,
                 },
             ))
         })
@@ -3458,15 +3486,13 @@ fn persist_access_control_settings(
             .execute(
                 "INSERT INTO access_control_groups(
                    group_key,
-                   slack_user_group_handle,
                    manual_user_ids,
                    allowed_channel_ids,
                    allow_im,
                    allow_mpim,
                    updated_at
-                 ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                 ) VALUES(?, ?, ?, ?, ?, ?)
                  ON CONFLICT(group_key) DO UPDATE SET
-                   slack_user_group_handle = excluded.slack_user_group_handle,
                    manual_user_ids = excluded.manual_user_ids,
                    allowed_channel_ids = excluded.allowed_channel_ids,
                    allow_im = excluded.allow_im,
@@ -3474,7 +3500,6 @@ fn persist_access_control_settings(
                    updated_at = excluded.updated_at",
                 params![
                     key,
-                    group.slack_user_group_handle.trim(),
                     group.manual_user_ids.trim(),
                     group.allowed_channel_ids.trim(),
                     if group.allow_im { 1 } else { 0 },
@@ -3537,7 +3562,6 @@ fn read_app_settings(connection: &Connection) -> Result<AppSettings, String> {
               COALESCE(pm_slack_user_ids, '') as pm_slack_user_ids,
               COALESCE(pm_task_timeout_ms, 600000) as pm_task_timeout_ms,
               COALESCE(core_dev_slack_user_ids, '') as core_dev_slack_user_ids,
-              COALESCE(core_dev_slack_user_group, '') as core_dev_slack_user_group,
               COALESCE(vault_path, '') as vault_path,
               COALESCE(vault_enabled, 0) as vault_enabled,
               COALESCE(mini_og_repo_root, '/Users/dipesh/code/mini-og') as mini_og_repo_root,
@@ -3577,11 +3601,10 @@ fn read_app_settings(connection: &Connection) -> Result<AppSettings, String> {
                 pm_slack_user_ids: row.get(23)?,
                 pm_task_timeout_ms: row.get(24)?,
                 core_dev_slack_user_ids: row.get(25)?,
-                core_dev_slack_user_group: row.get(26)?,
-                vault_path: row.get(27)?,
-                vault_enabled: row.get::<_, i64>(28)? != 0,
-                mini_og_repo_root: row.get(29)?,
-                newton_marketing_web_path: row.get(30)?,
+                vault_path: row.get(26)?,
+                vault_enabled: row.get::<_, i64>(27)? != 0,
+                mini_og_repo_root: row.get(28)?,
+                newton_marketing_web_path: row.get(29)?,
                 access_control: AccessControlSettings::default(),
             })
         })
@@ -3626,11 +3649,10 @@ fn persist_app_settings(connection: &Connection, settings: &AppSettings) -> Resu
               pm_slack_user_ids,
               pm_task_timeout_ms,
               core_dev_slack_user_ids,
-              core_dev_slack_user_group,
               vault_path,
               vault_enabled,
               updated_at
-             ) VALUES(1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ) VALUES(1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
               slack_bot_token=excluded.slack_bot_token,
               slack_app_token=excluded.slack_app_token,
@@ -3659,7 +3681,6 @@ fn persist_app_settings(connection: &Connection, settings: &AppSettings) -> Resu
               pm_slack_user_ids=excluded.pm_slack_user_ids,
               pm_task_timeout_ms=excluded.pm_task_timeout_ms,
               core_dev_slack_user_ids=excluded.core_dev_slack_user_ids,
-              core_dev_slack_user_group=excluded.core_dev_slack_user_group,
               vault_path=excluded.vault_path,
               vault_enabled=excluded.vault_enabled,
               updated_at=excluded.updated_at",
@@ -3691,7 +3712,6 @@ fn persist_app_settings(connection: &Connection, settings: &AppSettings) -> Resu
                 settings.pm_slack_user_ids.trim(),
                 settings.pm_task_timeout_ms,
                 settings.core_dev_slack_user_ids.trim(),
-                settings.core_dev_slack_user_group.trim(),
                 settings.vault_path.trim(),
                 if settings.vault_enabled { 1_i64 } else { 0_i64 },
                 Utc::now().to_rfc3339(),
@@ -4740,6 +4760,82 @@ mod tests {
     }
 
     #[test]
+    fn save_bundle_refuses_a_version_the_sidecar_has_since_changed() {
+        let db_path = test_db_path();
+        let connection = Connection::open(&db_path).expect("open db");
+        // The sidecar creates the table.
+        connection
+            .execute_batch(
+                "CREATE TABLE bundles (
+                   name TEXT PRIMARY KEY,
+                   slack_user_group_handle TEXT NOT NULL DEFAULT '',
+                   manual_user_ids TEXT NOT NULL DEFAULT '',
+                   capabilities TEXT NOT NULL DEFAULT '[]',
+                   allowed_channel_ids TEXT NOT NULL DEFAULT '',
+                   allow_im INTEGER NOT NULL DEFAULT 0,
+                   allow_mpim INTEGER NOT NULL DEFAULT 0,
+                   updated_at TEXT NOT NULL
+                 );
+                 INSERT INTO bundles(name, slack_user_group_handle, manual_user_ids, updated_at)
+                   VALUES('admin', 'core-dev', 'U1', 'v1');",
+            )
+            .expect("create bundles");
+        let people = |connection: &Connection| -> (String, String) {
+            connection
+                .query_row(
+                    "SELECT manual_user_ids, slack_user_group_handle FROM bundles WHERE name = 'admin'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read bundle")
+        };
+        let edit = |manual: &str, read_at: Option<&str>| BundleRecord {
+            name: "admin".to_string(),
+            manual_user_ids: manual.to_string(),
+            updated_at: read_at.map(str::to_string),
+            ..BundleRecord::default()
+        };
+
+        // The page read v1; the sidecar then copied @core-dev's people in.
+        connection
+            .execute(
+                "UPDATE bundles SET manual_user_ids = 'U1,U2,U3', slack_user_group_handle = '', updated_at = 'v2'",
+                [],
+            )
+            .expect("copy");
+        let err = save_bundle_inner(&connection, &edit("U1,U9", Some("v1"))).expect_err("stale save");
+        assert_eq!(err, BUNDLE_CHANGED);
+        assert_eq!(people(&connection), ("U1,U2,U3".to_string(), String::new()));
+
+        save_bundle_inner(&connection, &edit("U1,U2,U3,U9", Some("v2"))).expect("current save");
+        assert_eq!(people(&connection).0, "U1,U2,U3,U9");
+
+        // A save leaves a group that is not copied yet.
+        connection
+            .execute("UPDATE bundles SET slack_user_group_handle = 'core-dev', updated_at = 'v3'", [])
+            .expect("reset");
+        save_bundle_inner(&connection, &edit("U1", Some("v3"))).expect("save");
+        assert_eq!(people(&connection), ("U1".to_string(), "core-dev".to_string()));
+
+        // A new bundle needs a name nobody has.
+        let err = save_bundle_inner(&connection, &edit("", None)).expect_err("duplicate");
+        assert!(err.contains("already exists"));
+
+        // Deleted elsewhere: said so, not recreated.
+        connection.execute("DELETE FROM bundles", []).expect("delete");
+        let err = save_bundle_inner(&connection, &edit("U1", Some("v4"))).expect_err("gone");
+        assert_eq!(err, BUNDLE_GONE);
+
+        // BundleEditor reloads on this phrase.
+        for message in [BUNDLE_CHANGED, BUNDLE_GONE] {
+            assert!(message.contains("since Settings loaded it"));
+        }
+
+        drop(connection);
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
     fn initialize_db_seeds_access_control_from_legacy_fields() {
         let db_path = test_db_path();
         initialize_db(&db_path).expect("initialize db");
@@ -4749,10 +4845,9 @@ mod tests {
             .execute(
                 "UPDATE app_settings
                  SET bugs_and_updates_channel_id = ?,
-                     core_dev_slack_user_ids = ?,
-                     core_dev_slack_user_group = ?
+                     core_dev_slack_user_ids = ?
                  WHERE id = 1",
-                params!["C-BUGS,C-OPS", "UCOREDEV1", "core-dev"],
+                params!["C-BUGS,C-OPS", "UCOREDEV1"],
             )
             .expect("update legacy fields");
         connection
@@ -4766,10 +4861,6 @@ mod tests {
         assert_eq!(
             access.groups.get("builder").expect("builder").allowed_channel_ids,
             "C-BUGS,C-OPS"
-        );
-        assert_eq!(
-            access.groups.get("admin").expect("admin").slack_user_group_handle,
-            "core-dev"
         );
         assert_eq!(
             access.groups.get("admin").expect("admin").manual_user_ids,

@@ -28,42 +28,36 @@ function makeSettings(): AppSettings {
     failureNotificationAudioCustomPath: '',
     agentBackend: 'codex',
     coreDevSlackUserIds: '',
-    coreDevSlackUserGroup: '',
     vaultPath: '',
     vaultEnabled: false,
     accessControl: {
       mode: 'audit',
       groups: {
         viewer: {
-          slackUserGroupHandle: '',
           manualUserIds: 'UVIEWER',
           allowedChannelIds: 'C-VIEW',
           allowIm: true,
           allowMpim: false,
         },
         reviewer: {
-          slackUserGroupHandle: '',
           manualUserIds: 'UREVIEW',
           allowedChannelIds: 'C-REVIEW',
           allowIm: false,
           allowMpim: false,
         },
         builder: {
-          slackUserGroupHandle: '',
           manualUserIds: 'UBUILDER',
           allowedChannelIds: 'C-BUILD',
           allowIm: false,
           allowMpim: false,
         },
         admin: {
-          slackUserGroupHandle: '',
           manualUserIds: 'UADMIN',
           allowedChannelIds: 'C-ADMIN',
           allowIm: true,
           allowMpim: true,
         },
         owner: {
-          slackUserGroupHandle: '',
           manualUserIds: '',
           allowedChannelIds: '',
           allowIm: false,

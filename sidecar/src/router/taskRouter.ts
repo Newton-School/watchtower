@@ -500,7 +500,6 @@ export async function routeTask(params: {
   const requiredLevel = resolveRequiredAccessLevel(resolvedIntent);
   const accessDecision = evaluateAccess({
     config,
-    accessControl,
     userId: task.event.userId,
     channelId: task.event.channelId,
     channelType: task.event.channelType,
@@ -594,7 +593,6 @@ export async function routeTask(params: {
         accessDecision.denyReason === 'CHANNEL_NOT_ENABLED'
           ? channelDenialHint({
               config,
-              accessControl,
               userId: task.event.userId,
               channelId: task.event.channelId,
               channelType: task.event.channelType,

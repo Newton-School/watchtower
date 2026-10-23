@@ -80,7 +80,6 @@ function makeConfig(mode: 'audit' | 'enforce'): AppConfig {
     bundleTargets: ['app', 'dmg'],
     ownerSlackUserIds: ['UOWNER1'],
     coreDevSlackUserIds: ['UOWNER1'],
-    coreDevSlackUserGroup: '',
     botUserId: 'UBOT1',
     slackBotToken: 'xoxb-test',
     slackAppToken: 'xapp-test',
@@ -106,35 +105,30 @@ function makeConfig(mode: 'audit' | 'enforce'): AppConfig {
         mode,
         groups: {
           viewer: {
-            slackUserGroupHandle: '',
             manualUserIds: 'UVIEWER',
             allowedChannelIds: 'C-VIEW',
             allowIm: true,
             allowMpim: false,
           },
           reviewer: {
-            slackUserGroupHandle: '',
             manualUserIds: 'UREVIEW',
             allowedChannelIds: 'C-REVIEW',
             allowIm: false,
             allowMpim: false,
           },
           builder: {
-            slackUserGroupHandle: '',
             manualUserIds: 'UBUILDER',
             allowedChannelIds: 'C-BUILD',
             allowIm: false,
             allowMpim: false,
           },
           admin: {
-            slackUserGroupHandle: '',
             manualUserIds: 'UADMIN',
             allowedChannelIds: 'C-ADMIN',
             allowIm: true,
             allowMpim: true,
           },
           owner: {
-            slackUserGroupHandle: '',
             manualUserIds: '',
             allowedChannelIds: '',
             allowIm: false,

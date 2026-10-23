@@ -122,7 +122,6 @@ describe('a revised plan is the plan the feedback asked for', () => {
       bundles: [
         {
           name: 'builder',
-          slackUserGroupHandle: '',
           manualUserIds: 'UBUILDER',
           resolvedUserIds: ['UBUILDER'],
           capabilities: ['start_implementation'],
@@ -154,7 +153,6 @@ describe('a revised plan is the plan the feedback asked for', () => {
       bundles: [
         {
           name: 'builder',
-          slackUserGroupHandle: '',
           manualUserIds: 'UBUILDER',
           resolvedUserIds: ['UBUILDER'],
           capabilities: ['start_implementation'],

@@ -370,7 +370,6 @@ describe('loadConfigFromDb', () => {
 
     const config = loadConfigFromDb(dbPath);
     expect(config.accessControl?.mode).toBe('enforce');
-    expect(config.accessControl?.groups.viewer.slackUserGroupHandle).toBe('eng-viewers');
     expect(config.accessControl?.groups.viewer.resolvedUserIds).toEqual(['U3']);
     expect(config.accessControl?.groups.admin.resolvedUserIds).toEqual(['U1', 'U2', 'U6']);
     expect(config.accessControl?.groups.admin.allowIm).toBe(true);

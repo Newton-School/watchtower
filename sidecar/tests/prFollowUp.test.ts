@@ -43,7 +43,6 @@ describe('buildFollowUpLine', () => {
         prUrl: url,
         state: open({ mergeableState: 'dirty' }),
         now,
-        mergeMention: '<!subteam^S1>',
         botMention: BOT,
       }),
     ).toBe(
@@ -57,7 +56,6 @@ describe('buildFollowUpLine', () => {
         prUrl: url,
         state: open({ requestedReviewers: ['kapatia'] }),
         now,
-        mergeMention: 'x',
         botMention: BOT,
       }),
     ).toBe(`PR #1406 is still open for 2 days: ${url} Waiting on a review from kapatia.`);
@@ -69,23 +67,19 @@ describe('buildFollowUpLine', () => {
         prUrl: url,
         state: open({ reviews: [{ login: 'mihir', state: 'CHANGES_REQUESTED' }] }),
         now,
-        mergeMention: 'x',
         botMention: BOT,
       }),
     ).toBe(`PR #1406 is still open for 2 days: ${url} Changes were requested by mihir.`);
   });
 
-  it('tells the admins an approved, clean PR is ready to merge', () => {
-    expect(
-      buildFollowUpLine({
-        prUrl: url,
-        state: open({ reviews: [{ login: 'kapatia', state: 'APPROVED' }], createdAt: '2026-10-18T09:00:00Z' }),
-        now,
-        mergeMention: '<!subteam^S1>',
-        botMention: BOT,
-      }),
-    ).toBe(
-      `PR #1406 is still open since yesterday: ${url} Approved by kapatia. <!subteam^S1> it is ready to merge: reply \`<@UBOT> merge it\` when you want it in.`,
+  it('tells the person who asked that an approved, clean PR is ready to merge', () => {
+    const approved = open({ reviews: [{ login: 'kapatia', state: 'APPROVED' }], createdAt: '2026-10-18T09:00:00Z' });
+    expect(buildFollowUpLine({ prUrl: url, state: approved, now, requesterId: 'UASKER', botMention: BOT })).toBe(
+      `PR #1406 is still open since yesterday: ${url} Approved by kapatia. <@UASKER> it is ready to merge: reply \`<@UBOT> merge it\` when you want it in.`,
+    );
+    // A run with nobody on record tags no one.
+    expect(buildFollowUpLine({ prUrl: url, state: approved, now, botMention: BOT })).toBe(
+      `PR #1406 is still open since yesterday: ${url} Approved by kapatia. It is ready to merge: reply \`<@UBOT> merge it\` when you want it in.`,
     );
   });
 
@@ -95,7 +89,6 @@ describe('buildFollowUpLine', () => {
         prUrl: url,
         state: open({ mergeableState: 'behind' }),
         now,
-        mergeMention: 'x',
         botMention: BOT,
       }),
     ).toContain("It is behind main; reply `<@UBOT> sync it` and I'll bring it up to date.");
@@ -108,7 +101,6 @@ describe('buildFollowUpLine', () => {
         prUrl: url,
         state: open({ reviews: approved, draft: true }),
         now,
-        mergeMention: 'x',
         botMention: BOT,
       }),
     ).toBe(`PR #1406 is still open for 2 days: ${url} It is still a draft.`);
@@ -117,7 +109,6 @@ describe('buildFollowUpLine', () => {
         prUrl: url,
         state: open({ reviews: approved, mergeableState }),
         now,
-        mergeMention: 'x',
         botMention: BOT,
       });
       expect(text).toBe(`PR #1406 is still open for 2 days: ${url} Approved by kapatia.`);
@@ -130,19 +121,14 @@ describe('buildFollowUpLine', () => {
         prUrl: url,
         state: open({ requestedReviewers: ['team core-dev'] }),
         now,
-        mergeMention: 'x',
         botMention: BOT,
       }),
     ).toContain('Waiting on a review from team core-dev.');
   });
 
   it('says nothing for a merged or closed PR', () => {
-    expect(
-      buildFollowUpLine({ prUrl: url, state: open({ state: 'merged' }), now, mergeMention: 'x', botMention: BOT }),
-    ).toBeUndefined();
-    expect(
-      buildFollowUpLine({ prUrl: url, state: open({ state: 'closed' }), now, mergeMention: 'x', botMention: BOT }),
-    ).toBeUndefined();
+    expect(buildFollowUpLine({ prUrl: url, state: open({ state: 'merged' }), now, botMention: BOT })).toBeUndefined();
+    expect(buildFollowUpLine({ prUrl: url, state: open({ state: 'closed' }), now, botMention: BOT })).toBeUndefined();
   });
 });
 
@@ -192,7 +178,6 @@ describe('runPrFollowUp', () => {
     const first = await runPrFollowUp({
       store,
       slack: slack as never,
-      mergeMention: 'x',
       now,
       dateKey: '2026-10-19',
       fetcher,
@@ -208,7 +193,6 @@ describe('runPrFollowUp', () => {
     const again = await runPrFollowUp({
       store,
       slack: slack as never,
-      mergeMention: 'x',
       now,
       dateKey: '2026-10-19',
       fetcher,
@@ -219,7 +203,6 @@ describe('runPrFollowUp', () => {
     const tomorrow = await runPrFollowUp({
       store,
       slack: slack as never,
-      mergeMention: 'x',
       now: now + 86_400_000,
       dateKey: '2026-10-20',
       fetcher,
@@ -235,7 +218,6 @@ describe('runPrFollowUp', () => {
     const result = await runPrFollowUp({
       store,
       slack: slack as never,
-      mergeMention: 'x',
       now,
       dateKey: '2026-10-19',
       fetcher,

@@ -4,7 +4,6 @@ import { buildHelpReply, isHelpRequest } from '../src/router/helpReply.js';
 import type { AppConfig } from '../src/types/contracts.js';
 
 const group = (manualUserIds: string, allowedChannelIds: string, allowIm = false) => ({
-  slackUserGroupHandle: '',
   manualUserIds,
   allowedChannelIds,
   allowIm,

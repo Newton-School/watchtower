@@ -2,7 +2,7 @@ import type { WebClient } from '@slack/web-api';
 import { logger } from '../logging/logger.js';
 
 export interface ResolvedUserGroup {
-  /** Slack subteam ID (e.g. "S02HXP05ZNJ") — the only thing `<!subteam^…>` mentions accept. */
+  /** Slack subteam ID (e.g. "S02HXP05ZNJ"). */
   id: string;
   handle: string;
   members: string[];
@@ -16,7 +16,10 @@ export interface ResolvedUserGroup {
  * Returns undefined when the handle doesn't exist (not a failure — the caller
  * skips it, matching the previous empty-members semantics).
  */
-export async function resolveUserGroup(slack: WebClient, handle: string): Promise<ResolvedUserGroup | undefined> {
+export async function resolveUserGroup(
+  slack: Pick<WebClient, 'usergroups'>,
+  handle: string,
+): Promise<ResolvedUserGroup | undefined> {
   const normalizedHandle = handle.replace(/^@/, '').trim().toLowerCase();
   if (!normalizedHandle) return undefined;
 
@@ -40,11 +43,8 @@ export async function resolveUserGroup(slack: WebClient, handle: string): Promis
 
     return { id: group.id, handle: normalizedHandle, members };
   } catch (error) {
-    // Re-throw on Slack API failure so the caller can decide whether to
-    // overwrite the access-group cache. Returning an empty result here
-    // previously caused setResolvedGroupMembers() to wipe the live allowlist
-    // on transient outages, locking out legitimate group-only users until
-    // the next successful refresh.
+    // Re-throw on Slack API failure: an empty result would read as a group
+    // with nobody in it, and the people in it would lose access.
     logger.error({ handle: normalizedHandle, error: String(error) }, 'failed to resolve Slack user group');
     throw error;
   }

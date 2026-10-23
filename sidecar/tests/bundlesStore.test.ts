@@ -13,7 +13,6 @@ function tempDbPath(): string {
 function makeBundle(overrides: Partial<Bundle> = {}): Bundle {
   return {
     name: 'reviewer',
-    slackUserGroupHandle: 'SDEV',
     manualUserIds: 'U1,U2',
     resolvedUserIds: ['U1', 'U2'],
     capabilities: ['query_codebase', 'submit_pr_review', 'comment_pr', 'investigate'],
@@ -39,7 +38,6 @@ describe('JobStore bundles CRUD', () => {
     expect(rows).toHaveLength(1);
     const fetched = rows[0];
     expect(fetched.name).toBe('reviewer');
-    expect(fetched.slackUserGroupHandle).toBe('SDEV');
     expect(fetched.manualUserIds).toBe('U1,U2');
     expect(fetched.capabilities).toEqual(['query_codebase', 'submit_pr_review', 'comment_pr', 'investigate']);
     expect(fetched.allowedChannelIds).toEqual(['C-REVIEW']);
@@ -131,7 +129,6 @@ describe('hydrateBundleUserIds', () => {
     const raw: Bundle[] = [
       {
         name: 'reviewer',
-        slackUserGroupHandle: '',
         manualUserIds: 'U1, U2 ,U3',
         resolvedUserIds: [],
         capabilities: ['submit_pr_review'],
@@ -149,7 +146,6 @@ describe('hydrateBundleUserIds', () => {
     const raw: Bundle[] = [
       {
         name: 'admin',
-        slackUserGroupHandle: '',
         manualUserIds: 'UCORE1',
         resolvedUserIds: [],
         capabilities: ['deploy_prod'],
@@ -159,7 +155,6 @@ describe('hydrateBundleUserIds', () => {
       },
       {
         name: 'owner',
-        slackUserGroupHandle: '',
         manualUserIds: '',
         resolvedUserIds: [],
         capabilities: ['manage_access'],
@@ -169,7 +164,6 @@ describe('hydrateBundleUserIds', () => {
       },
       {
         name: 'viewer',
-        slackUserGroupHandle: '',
         manualUserIds: 'UV1',
         resolvedUserIds: [],
         capabilities: ['query_codebase'],
@@ -197,7 +191,6 @@ describe('hydrateBundleUserIds', () => {
     const raw: Bundle[] = [
       {
         name: 'admin',
-        slackUserGroupHandle: '',
         manualUserIds: 'UOWNER1,UCORE1',
         resolvedUserIds: [],
         capabilities: ['deploy_prod'],

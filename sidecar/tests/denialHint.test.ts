@@ -4,7 +4,6 @@ import { channelDenialHint } from '../src/access/denialHint.js';
 import type { AppConfig } from '../src/types/contracts.js';
 
 const group = (manualUserIds: string, allowedChannelIds: string, allowIm = false) => ({
-  slackUserGroupHandle: '',
   manualUserIds,
   allowedChannelIds,
   allowIm,
@@ -41,12 +40,6 @@ describe('placesAllowingLevel', () => {
       channels: [],
       dm: false,
     });
-  });
-
-  it('reads an explicit access-control config the same way, as the router passes it', () => {
-    expect(
-      placesAllowingLevel({ config: {} as AppConfig, accessControl, userId: 'UDESIGNER', requiredLevel: 'builder' }),
-    ).toEqual({ channels: ['C-PM', 'C-BUGS'], dm: false });
   });
 });
 

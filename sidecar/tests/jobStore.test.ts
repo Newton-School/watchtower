@@ -936,6 +936,7 @@ describe('listChangeRunPrs (issue #603)', () => {
       workflow: 'IMPLEMENTATION' | 'PR_REVIEW',
       result: Record<string, unknown>,
       executed?: string,
+      requestedForUserId: string | null = null,
     ) => {
       store.createJob({
         id,
@@ -944,7 +945,7 @@ describe('listChangeRunPrs (issue #603)', () => {
         workflow,
         channelId: 'C1',
         threadTs: `${id}.1`,
-        payload: { requestUserId: 'UREQ' },
+        payload: { requestUserId: 'UREQ', requestedForUserId },
       });
       store.markJob(id, 'SUCCESS', { result, executedWorkflow: (executed ?? workflow) as never });
     };
@@ -952,7 +953,14 @@ describe('listChangeRunPrs (issue #603)', () => {
     add('review-1', 'PR_REVIEW', {
       outcomes: [{ prUrl: 'https://github.com/Newton-School/newton-web/pull/2', status: 'SUCCESS' }],
     });
-    add('change-2', 'IMPLEMENTATION', { prUrl: 'https://github.com/Newton-School/newton-marketing-web/pull/3' });
+    // Asked from the app for someone else: the PR is theirs.
+    add(
+      'change-2',
+      'IMPLEMENTATION',
+      { prUrl: 'https://github.com/Newton-School/newton-marketing-web/pull/3' },
+      undefined,
+      'UFOR',
+    );
     add('change-no-pr', 'IMPLEMENTATION', { externalChanges: [] });
 
     const rows = store.listChangeRunPrs('2020-01-01T00:00:00.000Z');
@@ -961,7 +969,8 @@ describe('listChangeRunPrs (issue #603)', () => {
       'https://github.com/Newton-School/newton-marketing-web/pull/3',
       'https://github.com/Newton-School/newton-web/pull/1',
     ]);
-    expect(rows[0]).toMatchObject({ jobId: 'change-2', channelId: 'C1', threadTs: 'change-2.1' });
+    expect(rows[0]).toMatchObject({ jobId: 'change-2', channelId: 'C1', threadTs: 'change-2.1', requesterId: 'UFOR' });
+    expect(rows[1].requesterId).toBe('UREQ');
     expect(store.listChangeRunPrs(new Date(Date.now() + 60_000).toISOString())).toEqual([]);
     store.close();
   });

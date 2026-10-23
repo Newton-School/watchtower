@@ -393,7 +393,6 @@ export type AccessMode = 'audit' | 'enforce';
 export type AccessGroupKey = 'viewer' | 'reviewer' | 'builder' | 'admin' | 'owner';
 
 export type AccessGroupSettings = {
-  slackUserGroupHandle: string;
   manualUserIds: string;
   allowedChannelIds: string;
   allowIm: boolean;
@@ -426,13 +425,15 @@ export type Capability =
 
 export type Bundle = {
   name: string;
-  slackUserGroupHandle: string;
+  /** The people on the bundle, as comma-separated Slack user IDs. */
   manualUserIds: string;
   resolvedUserIds: string[];
   capabilities: Capability[];
   allowedChannelIds: string[];
   allowIm: boolean;
   allowMpim: boolean;
+  /** The stored version, from `get_bundles`; saving sends it back. None for a new bundle. */
+  updatedAt?: string | null;
 };
 
 export type AppSettings = {
@@ -459,7 +460,6 @@ export type AppSettings = {
   failureNotificationAudioCustomPath: string;
   agentBackend: AgentBackendId;
   coreDevSlackUserIds: string;
-  coreDevSlackUserGroup: string;
   vaultPath: string;
   vaultEnabled: boolean;
   accessControl: AccessControlSettings;
