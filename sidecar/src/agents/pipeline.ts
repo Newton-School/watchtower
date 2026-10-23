@@ -457,7 +457,7 @@ async function classifyApprovalIntent(
   recentThread: string[],
   logStep: WorkflowStepLogger,
 ): Promise<ApprovalIntent | null> {
-  const prompt = `You are a classifier for a developer bot called miniOG. miniOG just posted a plan in a Slack thread and asked for admin approval ("yes"/"go" to proceed, "no" to turn the plan down, "stop"/"cancel" to drop the job, or reply with feedback).
+  const prompt = `You are a classifier for a developer bot called miniOG. miniOG just posted a plan in a Slack thread and asked for approval ("yes"/"go" to proceed, "no" to turn the plan down, "stop"/"cancel" to drop the job, or reply with feedback).
 
 A new message appeared in the thread. Classify the message into one of six categories:
 
@@ -550,14 +550,14 @@ export function waitForApproval(params: Parameters<typeof pollForApproval>[0]): 
   );
 }
 
-/** The approval wait as the app sees it: approvers decide, the requester may stop or confirm. */
+/** The approval wait as the app sees it: approvers decide (no one listed: anyone), the requester may stop or confirm. */
 function approvalWait(params: Parameters<typeof pollForApproval>[0]) {
   return {
     kind: 'approval' as const,
     channelId: params.channelId,
     threadTs: params.threadTs,
     promptTs: params.approvalPromptTs,
-    allowedUserIds: [...params.approverUserIds],
+    allowedUserIds: params.anyoneCanApprove ? [] : [...params.approverUserIds],
   };
 }
 
@@ -594,19 +594,23 @@ async function pollForApproval(params: {
    * delay in `afterMs` has passed. The wait has no other way to be noticed.
    */
   reminders?: { afterMs: number[]; text: string };
-  /** Who can approve, as a Slack mention. Used once when someone who cannot approve says yes. */
-  approverMention?: string;
+  /**
+   * The plan is the thread's to decide: anyone in it can approve, turn it
+   * down, change or stop it. `approverUserIds` are still the admins, the only
+   * ones who can go ahead without the requester's confirmation.
+   */
+  anyoneCanApprove?: boolean;
   /**
    * The requester, when the plan changes behaviour or rests on assumptions
-   * and they are not an approver (issue #437). An approver's yes then waits
-   * for the requester's, and the requester may reply with what they want
-   * instead, which revises the plan. An approver can skip them with exactly
+   * and they are not an admin (issue #437). Anyone else's yes then waits for
+   * the requester's, and the requester may reply with what they want
+   * instead, which revises the plan. An admin can skip them with exactly
    * "approve without confirmation".
    */
   requesterToConfirm?: string;
 }): Promise<ApprovalResult> {
   const { slack, channelId, threadTs, approverUserIds, approvalPromptTs, logStep, botUserId, signal } = params;
-  const { reminders, approverMention } = params;
+  const { reminders, anyoneCanApprove } = params;
   const requester =
     params.requesterToConfirm && !approverUserIds.includes(params.requesterToConfirm)
       ? params.requesterToConfirm
@@ -629,7 +633,7 @@ async function pollForApproval(params: {
     if (requesterConfirmed) {
       logStep({
         stage: 'pipeline.approval.approved',
-        message: `Core-dev member <@${result.approverId}> approved the plan: "${result.userReply}"`,
+        message: `<@${result.approverId}> approved the plan: "${result.userReply}"`,
       });
       return result;
     }
@@ -649,16 +653,15 @@ async function pollForApproval(params: {
   const waitStartedAt = Date.now();
   const reminderDelays = [...(reminders?.afterMs ?? [])].sort((a, b) => a - b);
   let remindersSent = 0;
-  let approversTagged = false;
   const cancelled = (): ApprovalResult => {
     logStep({ stage: 'pipeline.approval.cancelled', message: 'Job cancelled while waiting for approval.' });
     return { outcome: 'cancelled', userReply: '', approverId: '', replyTs: '' };
   };
   // Callers post the prompt before calling, and posting clears Slack's thread
-  // status — this is what puts "is waiting for admin approval" back up.
+  // status — this is what puts "is waiting for approval" back up.
   logStep({
     stage: 'pipeline.approval.waiting',
-    message: 'Waiting for an admin to approve.',
+    message: anyoneCanApprove ? 'Waiting for someone in the thread to approve.' : 'Waiting for an admin to approve.',
   });
   const pollIntervalMs = 5_000;
   const notifiedUsers = new Set<string>();
@@ -741,7 +744,8 @@ async function pollForApproval(params: {
       const text = reply.text.trim();
       /** What the exact-phrase patterns read; the classifier and the result keep `text`. */
       const command = approvalReplyCommand(text, botUserId);
-      const isApprover = approverUserIds.includes(reply.user);
+      const isAdmin = approverUserIds.includes(reply.user);
+      const isApprover = anyoneCanApprove || isAdmin;
 
       // Pause detection runs on EVERY non-bot reply (not admin-gated). Anyone in
       // the thread can park miniOG with a "wait" message; the workflow returns
@@ -792,9 +796,14 @@ async function pollForApproval(params: {
           if (heldApproval) {
             logStep({
               stage: 'pipeline.approval.approved',
-              message: `Core-dev member <@${heldApproval.approverId}> approved the plan, and the requester confirmed it.`,
+              message: `<@${heldApproval.approverId}> approved the plan, and the requester confirmed it.`,
             });
             return { ...heldApproval, replyTs: reply.ts > heldApproval.replyTs ? reply.ts : heldApproval.replyTs };
+          }
+          // Anyone can approve this plan, the requester too: their yes is both.
+          if (anyoneCanApprove) {
+            logStep({ stage: 'pipeline.approval.approved', message: `<@${reply.user}> approved the plan: "${text}"` });
+            return { outcome: 'approved', userReply: text, approverId: reply.user, replyTs: reply.ts };
           }
           postOnce('confirmed', `Thanks <@${reply.user}>. Waiting for an admin to approve.`);
           continue;
@@ -817,15 +826,15 @@ async function pollForApproval(params: {
       }
 
       const isOverride = OVERRIDE_CONFIRMATION_RE.test(command);
-      if (isApprover && isOverride) {
+      if (isAdmin && isOverride) {
         logStep({
           stage: 'pipeline.approval.approved',
-          message: `Core-dev member <@${reply.user}> approved the plan without the requester's confirmation: "${text}"`,
+          message: `<@${reply.user}> approved the plan without the requester's confirmation: "${text}"`,
         });
         return { outcome: 'approved', userReply: text, approverId: reply.user, replyTs: reply.ts };
       }
 
-      // The override from someone who cannot approve is an approval attempt like any other.
+      // The override from someone who is not an admin is an approval like any other.
       if (isOverride || APPROVE_PATTERNS.test(command)) {
         if (!isApprover) {
           if (!notifiedUsers.has(reply.user)) {
@@ -835,19 +844,13 @@ async function pollForApproval(params: {
               message: `Non-admin user <@${reply.user}> attempted to approve.`,
               level: 'WARN',
             });
-            const tagApprovers = Boolean(approverMention) && !approversTagged;
             slack.chat
               .postMessage({
                 channel: channelId,
                 thread_ts: threadTs,
-                // Say who can, and tag them once: "waiting for an admin" told
-                // the requester nothing and reached no admin (issue #436).
-                text: tagApprovers
-                  ? `<@${reply.user}> only admins can approve plans. ${approverMention}, this one is waiting for you.`
-                  : `<@${reply.user}> Only admins can approve plans. Waiting for an admin to respond.`,
+                text: `<@${reply.user}> Only admins can approve plans. Waiting for an admin to respond.`,
               })
               .catch(() => {});
-            if (tagApprovers) approversTagged = true;
           }
           continue;
         }
@@ -877,7 +880,7 @@ async function pollForApproval(params: {
         }
         logStep({
           stage: 'pipeline.approval.rejected',
-          message: `Core-dev member <@${reply.user}> rejected the plan: "${text}"`,
+          message: `<@${reply.user}> rejected the plan: "${text}"`,
         });
         return { outcome: 'rejected', userReply: text, approverId: reply.user, replyTs: reply.ts };
       }
@@ -903,14 +906,14 @@ async function pollForApproval(params: {
         if (intent === 'feedback') {
           logStep({
             stage: 'pipeline.approval.feedback',
-            message: `Core-dev member <@${reply.user}> provided feedback: "${text}"`,
+            message: `<@${reply.user}> provided feedback: "${text}"`,
           });
           return { outcome: 'feedback', userReply: text, approverId: reply.user, replyTs: reply.ts };
         }
         if (intent === 'reject') {
           logStep({
             stage: 'pipeline.approval.rejected',
-            message: `Core-dev member <@${reply.user}> rejected the plan: "${text}"`,
+            message: `<@${reply.user}> rejected the plan: "${text}"`,
           });
           return { outcome: 'rejected', userReply: text, approverId: reply.user, replyTs: reply.ts };
         }
@@ -918,13 +921,13 @@ async function pollForApproval(params: {
         if (intent === 'pause') {
           logStep({
             stage: 'pipeline.approval.paused',
-            message: `Core-dev member <@${reply.user}> asked miniOG to wait: "${text}"`,
+            message: `<@${reply.user}> asked miniOG to wait: "${text}"`,
           });
           return { outcome: 'paused', userReply: text, approverId: reply.user, replyTs: reply.ts };
         }
         logStep({
           stage: 'pipeline.approval.ignored',
-          message: `Ignored admin message not directed at bot: "${text}"`,
+          message: `Ignored a message not directed at miniOG: "${text}"`,
           data: { user: reply.user },
         });
         continue;
@@ -1982,10 +1985,10 @@ async function runAgentPipelineBody(
         }
       }
 
-      // Approval gate: wait for an admin to confirm the plan before proceeding
+      // Approval gate: wait for a yes on the plan before proceeding
       if (ctx.pipelineConfig.requireApproval && planMessageTs) {
         const gatePrompt =
-          'Here\'s my plan. An admin needs to approve before I proceed:\n• "yes" or "go" — I\'ll start coding\n• "stop" or "cancel" — I\'ll drop it\n• "no", or changes you\'d like — I\'ll adjust the plan';
+          'Here\'s my plan. Anyone here can approve it:\n• "yes" or "go" — I\'ll start coding\n• "stop" or "cancel" — I\'ll drop it\n• "no", or changes you\'d like — I\'ll adjust the plan';
         const gateButtons = buttonsEnabled();
         const approvalPromptTs = await postSlackProgress({
           slack,
@@ -1998,13 +2001,14 @@ async function runAgentPipelineBody(
         }
 
         if (approvalPromptTs) {
-          await progress?.hold('waiting for an admin to approve the plan');
+          await progress?.hold('waiting for someone to approve the plan');
           const adminUserIds = getAdminUserIds(ctx.config);
           const approval = await waitForApproval({
             slack,
             channelId: ctx.task.event.channelId,
             threadTs: ctx.task.event.threadTs,
             approverUserIds: adminUserIds,
+            anyoneCanApprove: true,
             triggerUserId: ctx.task.event.userId,
             approvalPromptTs,
             logStep,

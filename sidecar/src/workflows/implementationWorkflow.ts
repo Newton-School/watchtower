@@ -11,7 +11,7 @@ import type {
   WorkflowResult,
   WorkflowStepLogger,
 } from '../types/contracts.js';
-import { formatAdminMention, getAdminUserIds } from '../access/control.js';
+import { getAdminUserIds } from '../access/control.js';
 import { composeChangeReply, requesterIsEngineer, sanitizeRequesterSummary } from './shared/changeReply.js';
 import { approvalBlocks, confirmationBlocks, postGatePrompt, yesNoBlocks } from '../slack/buttonReplies.js';
 import { connectorsFor, withConnectors } from '../backends/connectors.js';
@@ -460,8 +460,8 @@ export async function runApprovalLoop(input: {
     } else {
       const promptText =
         iteration === 0
-          ? `Here's my plan. ${requesterToConfirm ? 'I start once the requester confirms it is what they want and an admin approves' : 'An admin needs to approve before I proceed'}:\n• "yes" or "go" — I'll start coding\n• "stop" or "cancel" — I'll drop it\n• "no", or changes you'd like — I'll adjust the plan`
-          : `Here's the revised plan. "yes" to proceed, "stop" to drop it, or reply with more changes.${requesterToConfirm ? ' I start once the requester confirms it and an admin approves.' : ''}`;
+          ? `Here's my plan. ${requesterToConfirm ? 'I start once the requester confirms it is what they want' : 'Anyone here can approve it'}:\n• "yes" or "go" — I'll start coding\n• "stop" or "cancel" — I'll drop it\n• "no", or changes you'd like — I'll adjust the plan`
+          : `Here's the revised plan. "yes" to proceed, "stop" to drop it, or reply with more changes.${requesterToConfirm ? ' I start once the requester confirms it.' : ''}`;
 
       try {
         approvalPromptTs = await postGatePrompt(slack, {
@@ -480,15 +480,15 @@ export async function runApprovalLoop(input: {
 
     logStep?.({
       stage: 'implementation.approval.waiting',
-      message: `Waiting for admin approval of plan (iteration ${iteration + 1}).`,
+      message: `Waiting for approval of the plan (iteration ${iteration + 1}).`,
     });
 
-    const approverMention = formatAdminMention(config);
     let approval = await waitForApproval({
       slack,
       channelId: task.event.channelId,
       threadTs: task.event.threadTs,
       approverUserIds: adminUserIds,
+      anyoneCanApprove: true,
       triggerUserId: requesterOf(task),
       approvalPromptTs,
       logStep: logStep ?? (() => {}),
@@ -496,9 +496,8 @@ export async function runApprovalLoop(input: {
       signal,
       reminders: {
         afterMs: PLAN_APPROVAL_REMINDERS_MS,
-        text: `${approverMention} <@${requesterOf(task)}>'s plan above still needs a yes or no.`,
+        text: `<@${requesterOf(task)}> the plan above still needs a yes or no.`,
       },
-      approverMention,
       requesterToConfirm,
     });
 
@@ -557,7 +556,7 @@ export async function runApprovalLoop(input: {
       }
 
       if (!askReviseTs) {
-        return { kind: 'rejected_then_cancelled', message: 'Plan rejected by admin.' };
+        return { kind: 'rejected_then_cancelled', message: 'Plan turned down.' };
       }
 
       const followUp = await waitForApproval({
@@ -565,6 +564,7 @@ export async function runApprovalLoop(input: {
         channelId: task.event.channelId,
         threadTs: task.event.threadTs,
         approverUserIds: adminUserIds,
+        anyoneCanApprove: true,
         triggerUserId: requesterOf(task),
         approvalPromptTs: askReviseTs,
         logStep: logStep ?? (() => {}),
@@ -602,7 +602,7 @@ export async function runApprovalLoop(input: {
             text: 'Understood, cancelling.',
           })
           .catch(() => {});
-        return { kind: 'rejected_then_cancelled', message: 'Plan rejected by admin after revision prompt.' };
+        return { kind: 'rejected_then_cancelled', message: 'Plan turned down after the revision prompt.' };
       }
 
       if (followUp.outcome === 'approved') {
@@ -657,7 +657,7 @@ export async function runApprovalLoop(input: {
           : `You previously produced this plan:
 ${JSON.stringify(plannerOutput, null, 2)}
 
-It was reviewed, and this feedback came back (from an admin, or from the requester saying what they want):
+It was reviewed, and this feedback came back (from someone in the thread, or from the requester saying what they want):
 
 "${approval.userReply}"
 
@@ -818,7 +818,7 @@ export function revisionPromptMarkdown(previousPlan: string, feedback: string): 
 
 ${previousPlan}
 
-It was reviewed, and this feedback came back (from an admin, or from the requester saying what they want):
+It was reviewed, and this feedback came back (from someone in the thread, or from the requester saying what they want):
 
 "${feedback}"
 
@@ -1703,8 +1703,8 @@ Write your response as a ready-to-post Slack message describing what you did.
       }
     }
 
-    // Fail closed: admin approval is mandatory for fresh implementation runs,
-    // and the only thread the admin can react to is the plan message. If the
+    // Fail closed: approval is mandatory for fresh implementation runs,
+    // and the only thing the thread can approve is the plan message. If the
     // planner produced no plan content, or the plan post failed, we have no
     // reviewable artifact and no approval prompt \u2014 proceeding would let the
     // coder/reviewer/verifier write code unsupervised.
@@ -1712,7 +1712,7 @@ Write your response as a ready-to-post Slack message describing what you did.
       const reason =
         planMarkdown.length === 0
           ? 'Planner returned no plan content \u2014 cannot proceed without a reviewable plan.'
-          : 'Failed to post the plan to Slack \u2014 cannot proceed without an admin approval prompt.';
+          : 'Failed to post the plan to Slack \u2014 cannot proceed without an approval prompt.';
       logStep?.({
         stage: 'implementation.approval.unreachable',
         message: reason,
@@ -1726,7 +1726,7 @@ Write your response as a ready-to-post Slack message describing what you did.
         .postMessage({
           channel: task.event.channelId,
           thread_ts: task.event.threadTs,
-          text: `Couldn't reach an admin approval gate \u2014 ${reason} Cancelling.`,
+          text: `Couldn't post the plan for approval \u2014 ${reason} Cancelling.`,
         })
         .catch(() => {});
       return {

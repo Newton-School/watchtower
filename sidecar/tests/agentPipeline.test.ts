@@ -17,6 +17,7 @@ import { currentConnectors, withConnectors } from '../src/backends/connectors.js
 import { fetchThreadContext } from '../src/slack/threadContext.js';
 import { __resetButtonRepliesForTests, recordButtonReply, rememberPrompt } from '../src/slack/buttonReplies.js';
 import { checkCoderProducedChanges } from '../src/workspaces/gitState.js';
+import { agentCallContext } from '../src/state/runContext.js';
 import type { AgentContext, PipelineConfig } from '../src/agents/types.js';
 import type { AppConfig, NormalizedTask } from '../src/types/contracts.js';
 
@@ -2087,29 +2088,7 @@ describe('waitForApproval', () => {
   describe('a yes from someone who cannot approve', () => {
     const texts = () => mockSlack.chat.postMessage.mock.calls.map((call: any[]) => call[0].text as string);
 
-    it('names who can approve and tags them once', async () => {
-      vi.mocked(fetchThreadContext).mockResolvedValue([
-        { text: 'yes', user: 'UREQUESTER', ts: '200.00' },
-        { text: 'yes', user: 'UOTHER', ts: '201.00' },
-      ]);
-      const controller = new AbortController();
-      const promise = runApproval({ approverMention: '<!subteam^S1>', signal: controller.signal });
-      await vi.advanceTimersByTimeAsync(6000);
-
-      expect(texts()).toEqual([
-        '<@UREQUESTER> only admins can approve plans. <!subteam^S1>, this one is waiting for you.',
-        '<@UOTHER> Only admins can approve plans. Waiting for an admin to respond.',
-      ]);
-
-      // And it is not repeated on later polls.
-      await vi.advanceTimersByTimeAsync(30_000);
-      expect(texts()).toHaveLength(2);
-
-      controller.abort();
-      await promise;
-    });
-
-    it('keeps the plain reply when it does not know who can approve', async () => {
+    it('says only admins can, once', async () => {
       vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'yes', user: 'UREQUESTER', ts: '200.00' }]);
       const controller = new AbortController();
       const promise = runApproval({ signal: controller.signal });
@@ -2117,8 +2096,130 @@ describe('waitForApproval', () => {
 
       expect(texts()).toEqual(['<@UREQUESTER> Only admins can approve plans. Waiting for an admin to respond.']);
 
+      // And it is not repeated on later polls.
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(texts()).toHaveLength(1);
+
       controller.abort();
       await promise;
+    });
+  });
+
+  // A plan is the thread's to decide: admins only was friction for every ask.
+  describe('when anyone in the thread can approve', () => {
+    const texts = () => mockSlack.chat.postMessage.mock.calls.map((call: any[]) => call[0].text as string);
+    const openRun = (overrides?: Partial<Parameters<typeof waitForApproval>[0]>) =>
+      runApproval({ anyoneCanApprove: true, ...overrides });
+    const held =
+      'Thanks <@UOTHER>. <@UREQUESTER>, before I start: is the plan above what you want? Reply *yes*, or tell me what to change. (An admin can reply `approve without confirmation` to go ahead without that.)';
+
+    it("starts on a bystander's yes, and tells no one that only admins can", async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'yes', user: 'UOTHER', ts: '200.00' }]);
+
+      const promise = openRun();
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect(await promise).toEqual({ outcome: 'approved', userReply: 'yes', approverId: 'UOTHER', replyTs: '200.00' });
+      expect(texts()).toEqual([]);
+    });
+
+    it("turns the plan down on a bystander's no, and drops it on their stop", async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'no', user: 'UOTHER', ts: '200.00' }]);
+      const rejected = openRun();
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(await rejected).toMatchObject({ outcome: 'rejected', approverId: 'UOTHER' });
+
+      vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'stop', user: 'UOTHER', ts: '200.00' }]);
+      const stopped = openRun();
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(await stopped).toMatchObject({ outcome: 'cancelled', approverId: 'UOTHER' });
+      expect(texts()).toEqual([]);
+    });
+
+    it("revises the plan from a bystander's change", async () => {
+      vi.mocked(runCodex).mockResolvedValue({ ok: true, parsedJson: { intent: 'feedback' } } as any);
+      vi.mocked(fetchThreadContext).mockResolvedValue([
+        { text: 'use the v2 endpoint instead', user: 'UOTHER', ts: '200.00' },
+      ]);
+
+      const promise = openRun();
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect(await promise).toMatchObject({ outcome: 'feedback', approverId: 'UOTHER' });
+    });
+
+    it('starts on the yes of a requester who has to confirm: it is both', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'yes', user: 'UREQUESTER', ts: '200.00' }]);
+
+      const promise = openRun({ requesterToConfirm: 'UREQUESTER' });
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect(await promise).toEqual({
+        outcome: 'approved',
+        userReply: 'yes',
+        approverId: 'UREQUESTER',
+        replyTs: '200.00',
+      });
+      expect(texts()).toEqual([]);
+    });
+
+    it("holds someone else's yes until the requester confirms", async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'yes', user: 'UOTHER', ts: '200.00' }]);
+      let settled = false;
+      const promise = openRun({ requesterToConfirm: 'UREQUESTER' }).then(result => {
+        settled = true;
+        return result;
+      });
+      await vi.advanceTimersByTimeAsync(16_000);
+
+      expect(settled).toBe(false);
+      expect(texts()).toEqual([held]);
+
+      vi.mocked(fetchThreadContext).mockResolvedValue([
+        { text: 'yes', user: 'UOTHER', ts: '200.00' },
+        { text: 'yes', user: 'UREQUESTER', ts: '210.00' },
+      ]);
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect(await promise).toEqual({ outcome: 'approved', userReply: 'yes', approverId: 'UOTHER', replyTs: '210.00' });
+    });
+
+    it('keeps the override for admins: from anyone else it is a yes held for the requester', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([
+        { text: 'approve without confirmation', user: 'UOTHER', ts: '200.00' },
+      ]);
+      const controller = new AbortController();
+      let settled = false;
+      const promise = openRun({ requesterToConfirm: 'UREQUESTER', signal: controller.signal }).then(result => {
+        settled = true;
+        return result;
+      });
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect(settled).toBe(false);
+      expect(texts()).toEqual([held]);
+
+      vi.mocked(fetchThreadContext).mockResolvedValue([
+        { text: 'approve without confirmation', user: 'UOTHER', ts: '200.00' },
+        { text: 'approve without confirmation', user: 'UCOREDEV', ts: '210.00' },
+      ]);
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect(await promise).toMatchObject({ outcome: 'approved', approverId: 'UCOREDEV' });
+      controller.abort();
+    });
+
+    it('records the wait for the app with no one listed, so the owner can answer it', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue([{ text: 'yes', user: 'UOTHER', ts: '200.00' }]);
+      const store = { beginHumanWait: vi.fn(), endHumanWait: vi.fn() } as any;
+
+      const promise = agentCallContext.run({ jobId: 'job-1', store }, () => openRun());
+      await vi.advanceTimersByTimeAsync(6000);
+      await promise;
+
+      expect(store.beginHumanWait).toHaveBeenCalledWith(
+        expect.objectContaining({ jobId: 'job-1', kind: 'approval', promptTs: '150.00', allowedUserIds: [] }),
+      );
     });
   });
 

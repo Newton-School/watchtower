@@ -625,7 +625,7 @@ export interface WorkflowResult {
 
 /**
  * Implementation workflow paused at the plan-approval gate, waiting for either
- * an admin approve/reject/feedback OR (now) a "wait" + later @-mention to resume.
+ * an approve/reject/feedback from anyone in the thread OR a "wait" + later @-mention to resume.
  */
 export interface ImplementationApprovalResume {
   workflow: 'IMPLEMENTATION' | 'OWNER_AUTOPILOT';

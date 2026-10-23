@@ -69,7 +69,7 @@ export const TOOLS: readonly ToolSpec[] = [
     sideEffect: 'mutating',
     irreversible: false,
     routerSelectable: true,
-    description: 'Build, change or fix something in a repository, through a plan an admin approves.',
+    description: 'Build, change or fix something in a repository, through a plan that is approved first.',
     expectation:
       "On it. I'll post a plan for approval in a few minutes; the change itself usually takes under an hour after that.",
   },
