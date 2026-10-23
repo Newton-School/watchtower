@@ -626,8 +626,10 @@ export class JobStore {
 
       -- Capability bundles (replacement for the legacy 5-tier access_control_*
       -- tables introduced in the bundles redesign). Each row is a named set
-      -- of capabilities assigned to users via a Slack subteam handle and/or
-      -- a comma-delimited list of manual user IDs. Bundles are peers (no
+      -- of capabilities given to the people in manual_user_ids (Slack user
+      -- IDs, comma-delimited). slack_user_group_handle is only read to copy
+      -- the people of the Slack user groups bundles used to take members
+      -- from, once (copySlackGroupMembers). Bundles are peers (no
       -- hierarchy); a user is granted the union of capabilities across every
       -- bundle they belong to. Per-bundle channel scope preserves the exact
       -- legacy evaluateAccess semantics through the migration.
@@ -2241,6 +2243,26 @@ export class JobStore {
   }
 
   /**
+   * Gives freshly seeded bundles the Slack user groups the legacy access
+   * groups name, so `copySlackGroupMembers` copies their people in: the seed
+   * (`deriveBundlesFromLegacy`) carries only the people listed by ID.
+   */
+  carryLegacySlackGroups(): void {
+    // The desktop app creates the legacy table; a database it never opened has none.
+    const legacy = this.db
+      .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'access_control_groups'`)
+      .get();
+    if (!legacy) return;
+    this.db
+      .prepare(
+        `UPDATE bundles SET slack_user_group_handle = COALESCE(
+           (SELECT slack_user_group_handle FROM access_control_groups WHERE group_key = bundles.name), '')
+         WHERE slack_user_group_handle = ''`,
+      )
+      .run();
+  }
+
+  /**
    * Bundles that still name Slack user groups: bundles took their people from
    * them before they listed people directly (`copySlackGroupMembers`).
    */
@@ -3121,6 +3143,9 @@ export class JobStore {
         `SELECT id, channel_id, thread_ts, created_at,
                 json_extract(result_json, '$.prUrl') AS pr_url,
                 COALESCE(json_extract(payload_json, '$.requestedForUserId'),
+                         -- Runs from before the payload carried it.
+                         (SELECT requested_for_user_id FROM launchpad_requests
+                           WHERE job_id = jobs.id AND requested_for_user_id IS NOT NULL LIMIT 1),
                          json_extract(payload_json, '$.requestUserId')) AS requester_id
          FROM jobs
          WHERE created_at >= ?

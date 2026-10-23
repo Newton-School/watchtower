@@ -22,13 +22,13 @@ function Picker({ initial, dir, onSubmit }: { initial: string[]; dir: SlackDirec
         onSubmit?.();
       }}
     >
-      <PeoplePicker label="People" ids={ids} onChange={setIds} directory={dir} />
+      <PeoplePicker label="People" accessibleName="People on builder" ids={ids} onChange={setIds} directory={dir} />
     </form>
   );
 }
 
 const chips = () => screen.queryAllByRole('listitem').filter(item => item.className.includes('people-chip'));
-const box = () => screen.getByRole('combobox', { name: 'Add a person to People' });
+const box = () => screen.getByRole('combobox', { name: 'Add a person to People on builder' });
 
 describe('PeoplePicker', () => {
   it('shows the people on the bundle by name, and an unknown ID as itself', () => {
@@ -60,8 +60,20 @@ describe('PeoplePicker', () => {
     render(<Picker initial={[]} dir={null} />);
     expect(screen.getByText('Nobody yet.')).toBeTruthy();
 
+    // A name is not taken for an ID.
+    fireEvent.change(box(), { target: { value: 'williams' } });
+    expect(screen.queryAllByRole('option')).toEqual([]);
+
     fireEvent.change(box(), { target: { value: 'u0abc1234' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Add U0ABC1234' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Add user ID U0ABC1234' }));
     expect(chips().map(chip => chip.textContent)).toEqual(['UU0ABC1234×']);
+  });
+
+  it('does not pick a suggestion on the Enter that ends an IME composition', () => {
+    render(<Picker initial={[]} dir={directory} />);
+    fireEvent.change(box(), { target: { value: 'adi' } });
+    fireEvent.keyDown(box(), { key: 'Enter', keyCode: 229 });
+    expect(chips()).toEqual([]);
+    expect(box().getAttribute('aria-activedescendant')).toBeTruthy();
   });
 });

@@ -432,6 +432,8 @@ export type Bundle = {
   allowedChannelIds: string[];
   allowIm: boolean;
   allowMpim: boolean;
+  /** The stored version, from `get_bundles`; saving sends it back. None for a new bundle. */
+  updatedAt?: string | null;
 };
 
 export type AppSettings = {

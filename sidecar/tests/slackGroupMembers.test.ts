@@ -116,3 +116,24 @@ describe('copySlackGroupMembers', () => {
     expect(store.getBundles().find(b => b.name === 'builder')?.manualUserIds).toBe('UMANUAL,UP1,UD1');
   });
 });
+
+describe('JobStore.carryLegacySlackGroups', () => {
+  it('gives freshly seeded bundles the Slack groups of the legacy access groups', () => {
+    const dbPath = tempDbPath();
+    const store = new JobStore(dbPath);
+    store.carryLegacySlackGroups(); // No legacy table yet: nothing to carry.
+
+    const db = new Database(dbPath);
+    db.exec(
+      `CREATE TABLE access_control_groups (group_key TEXT PRIMARY KEY, slack_user_group_handle TEXT NOT NULL DEFAULT '')`,
+    );
+    db.prepare(`INSERT INTO access_control_groups VALUES (?, ?)`).run('admin', 'core-dev');
+    db.prepare(`INSERT INTO access_control_groups VALUES (?, ?)`).run('viewer', '');
+    store.setBundle(bundle('admin', 'UOLD'));
+    store.setBundle(bundle('viewer', ''));
+    store.setBundle(bundle('custom', ''));
+
+    store.carryLegacySlackGroups();
+    expect(store.listBundleSlackGroups()).toEqual([{ name: 'admin', handles: ['core-dev'] }]);
+  });
+});

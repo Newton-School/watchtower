@@ -144,6 +144,7 @@ let bundlesLoadedAt = new Date().toISOString();
     for (const bundle of config.bundles) {
       store.setBundle(bundle);
     }
+    store.carryLegacySlackGroups();
     logger.info(
       { bundleCount: config.bundles.length },
       'seeded bundles table from legacy AccessControlConfig (one-time)',

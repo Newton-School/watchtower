@@ -92,15 +92,20 @@ export function BundleEditor() {
     };
   }, []);
 
-  const refresh = useCallback(async () => {
+  // Unsaved edits to other bundles survive a reload; `reloaded` (just saved,
+  // or refused because it changed elsewhere) takes the stored version.
+  const refresh = useCallback(async (reloaded?: string) => {
     try {
       const fetched = await invoke<Bundle[]>('get_bundles');
       setBundles(fetched);
-      const nextDrafts: Record<string, DirtyState> = {};
-      for (const b of fetched) {
-        nextDrafts[bundleKey(b)] = { draft: b, dirty: false };
-      }
-      setDrafts(nextDrafts);
+      setDrafts(prev => {
+        const next: Record<string, DirtyState> = {};
+        for (const b of fetched) {
+          const kept = prev[bundleKey(b)];
+          next[bundleKey(b)] = kept?.dirty && b.name !== reloaded ? kept : { draft: b, dirty: false };
+        }
+        return next;
+      });
       setError(null);
     } catch (err) {
       setError(`Failed to load bundles: ${String(err)}`);
@@ -143,9 +148,12 @@ export function BundleEditor() {
       setError(null);
       try {
         await invoke('save_bundle', { bundle: current.draft });
-        await refresh();
+        await refresh(name);
       } catch (err) {
-        setError(`Failed to save bundle ${name}: ${String(err)}`);
+        const message = String(err);
+        // Changed elsewhere since the page read it: show the stored version.
+        if (message.includes('changed since Settings loaded it')) await refresh(name);
+        setError(`Failed to save bundle ${name}: ${message}`);
       } finally {
         setSavingName(null);
       }
@@ -156,7 +164,7 @@ export function BundleEditor() {
   const deleteBundle = useCallback(
     async (name: string) => {
       if (SEED_NAMES.includes(name as (typeof SEED_NAMES)[number])) {
-        if (!confirm(`Delete the default "${name}" bundle? It will be recreated on next sidecar restart.`)) {
+        if (!confirm(`Delete the default "${name}" bundle? Everyone on it loses what it grants.`)) {
           return;
         }
       } else if (!confirm(`Delete bundle "${name}"?`)) {
@@ -275,6 +283,7 @@ export function BundleEditor() {
 
             <PeoplePicker
               label="People"
+              accessibleName={`People on ${bundle.name}`}
               ids={parseIds(draft.manualUserIds)}
               onChange={ids => patchDraft(bundle.name, { manualUserIds: ids.join(',') })}
               directory={directory}

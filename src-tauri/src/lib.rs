@@ -1847,10 +1847,11 @@ async fn get_user_memories(
 
 /// Capability bundle as seen from the desktop UI. Mirrors the sidecar's
 /// `Bundle` interface in `sidecar/src/types/contracts.ts`. `resolved_user_ids`
-/// is NOT persisted in the table (subteam membership lives in Slack); the
-/// sidecar hydrates it after load via `hydrateBundleUserIds`. The UI sees an
-/// empty array on reads and is not expected to send a non-empty one — it's
-/// included here for round-trip type compatibility.
+/// is NOT persisted in the table; the sidecar hydrates it after load via
+/// `hydrateBundleUserIds`. The UI sees an empty array on reads and is not
+/// expected to send a non-empty one — it's included here for round-trip type
+/// compatibility. `updated_at` is the version the UI read; a save of an
+/// existing bundle sends it back, and none for a new one.
 #[derive(Serialize, Deserialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 struct BundleRecord {
@@ -1862,7 +1863,12 @@ struct BundleRecord {
     allowed_channel_ids: Vec<String>,
     allow_im: bool,
     allow_mpim: bool,
+    #[serde(default)]
+    updated_at: Option<String>,
 }
+
+/// What a save says when the bundle changed after the UI read it.
+const BUNDLE_CHANGED: &str = "This bundle changed since Settings loaded it (miniOG may have just added people to it). It has been reloaded: make your change again.";
 
 /// Notify the sidecar that the bundles table has been edited from the
 /// desktop. The sidecar's per-workflow access check compares this signal's
@@ -1888,7 +1894,7 @@ async fn get_bundles(state: State<'_, AppState>) -> Result<Vec<BundleRecord>, St
     let mut stmt = connection
         .prepare(
             "SELECT name, manual_user_ids, capabilities,
-                    allowed_channel_ids, allow_im, allow_mpim
+                    allowed_channel_ids, allow_im, allow_mpim, updated_at
              FROM bundles
              ORDER BY name",
         )
@@ -1913,6 +1919,7 @@ async fn get_bundles(state: State<'_, AppState>) -> Result<Vec<BundleRecord>, St
                 allowed_channel_ids,
                 allow_im: allow_im != 0,
                 allow_mpim: allow_mpim != 0,
+                updated_at: Some(row.get(6)?),
             })
         })
         .map_err(|err| format!("db query bundles failed: {err}"))?;
@@ -1925,6 +1932,19 @@ async fn get_bundles(state: State<'_, AppState>) -> Result<Vec<BundleRecord>, St
 
 #[tauri::command]
 async fn save_bundle(bundle: BundleRecord, state: State<'_, AppState>) -> Result<(), String> {
+    let connection =
+        Connection::open(&*state.db_path).map_err(|err| format!("db open failed: {err}"))?;
+    save_bundle_inner(&connection, &bundle)?;
+    write_access_cache_signal(&connection)?;
+    Ok(())
+}
+
+/// Saves a bundle the UI edited. An existing bundle is written only if it is
+/// still the version the UI read: the sidecar adds people to bundles too (the
+/// one-time copy of their Slack user groups), and a page opened before that
+/// must not write its older list over them. A bundle's old Slack user groups
+/// are left alone: the sidecar copies their people onto it, then clears them.
+fn save_bundle_inner(connection: &Connection, bundle: &BundleRecord) -> Result<(), String> {
     let name = bundle.name.trim().to_string();
     if name.is_empty() {
         return Err("bundle name cannot be empty".to_string());
@@ -1938,35 +1958,54 @@ async fn save_bundle(bundle: BundleRecord, state: State<'_, AppState>) -> Result
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join(",");
-    let connection =
-        Connection::open(&*state.db_path).map_err(|err| format!("db open failed: {err}"))?;
     let now = Utc::now().to_rfc3339();
-    // A bundle's old Slack user groups are left alone: the sidecar copies
-    // their people onto it once, then clears them.
-    connection
-        .execute(
-            "INSERT INTO bundles(name, manual_user_ids, capabilities,
-                                 allowed_channel_ids, allow_im, allow_mpim, updated_at)
-             VALUES(?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(name) DO UPDATE SET
-               manual_user_ids = excluded.manual_user_ids,
-               capabilities = excluded.capabilities,
-               allowed_channel_ids = excluded.allowed_channel_ids,
-               allow_im = excluded.allow_im,
-               allow_mpim = excluded.allow_mpim,
-               updated_at = excluded.updated_at",
-            params![
-                name,
-                bundle.manual_user_ids,
-                capabilities_json,
-                allowed_channels_csv,
-                if bundle.allow_im { 1 } else { 0 },
-                if bundle.allow_mpim { 1 } else { 0 },
-                now,
-            ],
-        )
-        .map_err(|err| format!("db save bundle failed: {err}"))?;
-    write_access_cache_signal(&connection)?;
+    let allow_im = if bundle.allow_im { 1 } else { 0 };
+    let allow_mpim = if bundle.allow_mpim { 1 } else { 0 };
+    match &bundle.updated_at {
+        Some(read_at) => {
+            let changed = connection
+                .execute(
+                    "UPDATE bundles SET manual_user_ids = ?, capabilities = ?,
+                       allowed_channel_ids = ?, allow_im = ?, allow_mpim = ?, updated_at = ?
+                     WHERE name = ? AND updated_at = ?",
+                    params![
+                        bundle.manual_user_ids,
+                        capabilities_json,
+                        allowed_channels_csv,
+                        allow_im,
+                        allow_mpim,
+                        now,
+                        name,
+                        read_at,
+                    ],
+                )
+                .map_err(|err| format!("db save bundle failed: {err}"))?;
+            if changed == 0 {
+                return Err(BUNDLE_CHANGED.to_string());
+            }
+        }
+        None => {
+            let added = connection
+                .execute(
+                    "INSERT OR IGNORE INTO bundles(name, manual_user_ids, capabilities,
+                                                   allowed_channel_ids, allow_im, allow_mpim, updated_at)
+                     VALUES(?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        name,
+                        bundle.manual_user_ids,
+                        capabilities_json,
+                        allowed_channels_csv,
+                        allow_im,
+                        allow_mpim,
+                        now,
+                    ],
+                )
+                .map_err(|err| format!("db save bundle failed: {err}"))?;
+            if added == 0 {
+                return Err(format!("A bundle named \"{name}\" already exists."));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -4708,6 +4747,72 @@ mod tests {
             reread.newton_marketing_web_path,
             "/Users/dipesh/code/mini-og/newton-marketing-web"
         );
+
+        drop(connection);
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn save_bundle_refuses_a_version_the_sidecar_has_since_changed() {
+        let db_path = test_db_path();
+        let connection = Connection::open(&db_path).expect("open db");
+        // The sidecar creates the table.
+        connection
+            .execute_batch(
+                "CREATE TABLE bundles (
+                   name TEXT PRIMARY KEY,
+                   slack_user_group_handle TEXT NOT NULL DEFAULT '',
+                   manual_user_ids TEXT NOT NULL DEFAULT '',
+                   capabilities TEXT NOT NULL DEFAULT '[]',
+                   allowed_channel_ids TEXT NOT NULL DEFAULT '',
+                   allow_im INTEGER NOT NULL DEFAULT 0,
+                   allow_mpim INTEGER NOT NULL DEFAULT 0,
+                   updated_at TEXT NOT NULL
+                 );
+                 INSERT INTO bundles(name, slack_user_group_handle, manual_user_ids, updated_at)
+                   VALUES('admin', 'core-dev', 'U1', 'v1');",
+            )
+            .expect("create bundles");
+        let people = |connection: &Connection| -> (String, String) {
+            connection
+                .query_row(
+                    "SELECT manual_user_ids, slack_user_group_handle FROM bundles WHERE name = 'admin'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read bundle")
+        };
+        let edit = |manual: &str, read_at: Option<&str>| BundleRecord {
+            name: "admin".to_string(),
+            manual_user_ids: manual.to_string(),
+            updated_at: read_at.map(str::to_string),
+            ..BundleRecord::default()
+        };
+
+        // The page read v1; the sidecar then copied @core-dev's people in.
+        connection
+            .execute(
+                "UPDATE bundles SET manual_user_ids = 'U1,U2,U3', slack_user_group_handle = '', updated_at = 'v2'",
+                [],
+            )
+            .expect("copy");
+        let err = save_bundle_inner(&connection, &edit("U1,U9", Some("v1"))).expect_err("stale save");
+        assert_eq!(err, BUNDLE_CHANGED);
+        assert_eq!(people(&connection), ("U1,U2,U3".to_string(), String::new()));
+
+        save_bundle_inner(&connection, &edit("U1,U2,U3,U9", Some("v2"))).expect("current save");
+        assert_eq!(people(&connection).0, "U1,U2,U3,U9");
+
+        // A save leaves a group that is not copied yet.
+        connection
+            .execute("UPDATE bundles SET slack_user_group_handle = 'core-dev', updated_at = 'v3'", [])
+            .expect("reset");
+        save_bundle_inner(&connection, &edit("U1", Some("v3"))).expect("save");
+        assert_eq!(people(&connection), ("U1".to_string(), "core-dev".to_string()));
+
+        // A new bundle needs a name nobody has.
+        let err = save_bundle_inner(&connection, &edit("", None)).expect_err("duplicate");
+        assert!(err.contains("already exists"));
 
         drop(connection);
         let _ = fs::remove_file(db_path);

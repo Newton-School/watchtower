@@ -5,7 +5,9 @@ import { wordsStartWith } from '../lib/slackText';
 import { useEscapeLayer } from '../lib/escapeLayers';
 
 const MAX_SUGGESTIONS = 8;
-const SLACK_USER_ID = /^[UW][A-Z0-9]{6,}$/;
+// A Slack user ID: U or W, then letters and at least one digit, so a typed
+// name like "william" is not taken for one.
+const SLACK_USER_ID = /^[UW](?=[A-Z]*\d)[A-Z0-9]{8,}$/;
 
 type Suggestion = { id: string; person: DirectoryPerson | null };
 
@@ -15,7 +17,10 @@ type PeoplePickerProps = {
   onChange: (ids: string[]) => void;
   /** The workspace's people; null while it loads or when it could not be read. */
   directory: SlackDirectory | null;
+  /** Shown above the list, e.g. "People". */
   label: string;
+  /** What screen readers call the list, e.g. "People on builder". */
+  accessibleName: string;
 };
 
 function displayName(person: DirectoryPerson): string {
@@ -27,7 +32,7 @@ function displayName(person: DirectoryPerson): string {
  * ID can be typed in when the person can't be found (or the workspace could
  * not be read).
  */
-export function PeoplePicker({ ids, onChange, directory, label }: PeoplePickerProps) {
+export function PeoplePicker({ ids, onChange, directory, label, accessibleName }: PeoplePickerProps) {
   const [query, setQuery] = useState('');
   const [highlight, setHighlight] = useState(0);
   const listId = useId();
@@ -60,20 +65,24 @@ export function PeoplePicker({ ids, onChange, directory, label }: PeoplePickerPr
   };
 
   const suggesting = suggestions.length > 0;
+  // The list can change under the highlight (the directory arrives, a person is added).
+  const active = highlight < suggestions.length ? highlight : 0;
   useEscapeLayer(suggesting, () => setQuery(''));
 
   const onKeyDown = (e: ReactKeyboardEvent<HTMLInputElement>) => {
+    // WebKit ends an IME composition with an Enter; keyCode 229 still marks it.
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
     if (e.key === 'Enter') {
       // The Settings page is one form; Enter here must not save it.
       e.preventDefault();
-      const picked = suggestions[highlight];
+      const picked = suggestions[active];
       if (picked) add(picked.id);
     } else if (e.key === 'ArrowDown' && suggesting) {
       e.preventDefault();
-      setHighlight(current => (current + 1) % suggestions.length);
+      setHighlight((active + 1) % suggestions.length);
     } else if (e.key === 'ArrowUp' && suggesting) {
       e.preventDefault();
-      setHighlight(current => (current - 1 + suggestions.length) % suggestions.length);
+      setHighlight((active - 1 + suggestions.length) % suggestions.length);
     }
   };
 
@@ -83,7 +92,7 @@ export function PeoplePicker({ ids, onChange, directory, label }: PeoplePickerPr
         {label} <span className="muted">{ids.length}</span>
       </span>
       {ids.length > 0 ? (
-        <ul className="people-chips" aria-label={label}>
+        <ul className="people-chips" aria-label={accessibleName}>
           {ids.map(id => {
             const person = byId.get(id);
             const name = person ? displayName(person) : id;
@@ -127,19 +136,26 @@ export function PeoplePicker({ ids, onChange, directory, label }: PeoplePickerPr
           onKeyDown={onKeyDown}
           onBlur={() => setQuery('')}
           placeholder={directory ? 'Add a person…' : 'Add a person by Slack user ID…'}
-          aria-label={`Add a person to ${label}`}
+          aria-label={`Add a person to ${accessibleName}`}
           role="combobox"
           aria-expanded={suggesting}
           aria-controls={listId}
+          aria-activedescendant={suggesting ? `${listId}-${active}` : undefined}
           aria-autocomplete="list"
         />
         {suggesting ? (
-          <ul id={listId} className="slack-mention-list people-picker-list" role="listbox" aria-label="People">
+          <ul
+            id={listId}
+            className="slack-mention-list people-picker-list"
+            role="listbox"
+            aria-label={`People to add to ${accessibleName}`}
+          >
             {suggestions.map((suggestion, index) => (
-              <li key={suggestion.id} role="option" aria-selected={index === highlight}>
+              <li key={suggestion.id} id={`${listId}-${index}`} role="option" aria-selected={index === active}>
                 <button
                   type="button"
-                  className={index === highlight ? 'slack-mention-option slack-mention-active' : 'slack-mention-option'}
+                  tabIndex={-1}
+                  className={index === active ? 'slack-mention-option slack-mention-active' : 'slack-mention-option'}
                   onMouseDown={e => e.preventDefault()}
                   onMouseEnter={() => setHighlight(index)}
                   onClick={() => add(suggestion.id)}
@@ -152,7 +168,7 @@ export function PeoplePicker({ ids, onChange, directory, label }: PeoplePickerPr
                     </span>
                   )}
                   <span className="slack-mention-name">
-                    {suggestion.person ? displayName(suggestion.person) : `Add ${suggestion.id}`}
+                    {suggestion.person ? displayName(suggestion.person) : `Add user ID ${suggestion.id}`}
                   </span>
                   {suggestion.person &&
                   suggestion.person.realName &&
