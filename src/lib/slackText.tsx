@@ -21,6 +21,13 @@ function escapeMarkup(text: string): string {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+/** Whether `text`, or one of its words, starts with `query` (lowercase). */
+export function wordsStartWith(text: string | null, query: string): boolean {
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  return lower.startsWith(query) || lower.split(/[\s._-]+/).some(word => word.startsWith(query));
+}
+
 /** Text typed in the app, ready for Slack: &, < and > escaped, except inside mention and link tokens. */
 export function toSlackText(input: string): string {
   let out = '';

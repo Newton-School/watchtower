@@ -850,7 +850,7 @@ export function SettingsPage({
 
                 <SectionCard
                   title="Capability Bundles"
-                  subtitle="Each bundle grants a set of capabilities to users matched by Slack subteam handle or manual IDs. Bundles are peers — a user gets the union of capabilities across every bundle they belong to."
+                  subtitle="Each bundle grants a set of capabilities to the people listed on it. Bundles are peers — a person gets the union of capabilities across every bundle they are on."
                 >
                   <BundleEditor />
                 </SectionCard>

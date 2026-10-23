@@ -19,7 +19,6 @@ const baseConfig = (): AppConfig => ({
   bundleTargets: ['app', 'dmg'],
   ownerSlackUserIds: ['UOWNER'],
   coreDevSlackUserIds: ['UOWNER'],
-  coreDevSlackUserGroup: '',
   botUserId: 'UBOT',
   slackBotToken: 'x',
   slackAppToken: 'x',
@@ -62,7 +61,6 @@ const adminAccessControl = () => ({
     builder: emptyGroup('builder'),
     admin: {
       key: 'admin' as const,
-      slackUserGroupHandle: '',
       manualUserIds: 'UADMIN',
       allowedChannelIds: '',
       allowIm: false,
@@ -77,7 +75,6 @@ const adminAccessControl = () => ({
 function emptyGroup<K extends 'viewer' | 'reviewer' | 'builder' | 'owner'>(key: K) {
   return {
     key,
-    slackUserGroupHandle: '',
     manualUserIds: '',
     allowedChannelIds: '',
     allowIm: false,
@@ -244,7 +241,6 @@ describe('resolveRepoOrAsk', () => {
     });
     const config = baseConfig();
     config.accessControl = adminAccessControl();
-    config.coreDevSlackUserGroup = 'S0CORE';
     const task = baseTask('update the copy');
     task.event.userId = 'UREQUESTER';
 

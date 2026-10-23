@@ -2,7 +2,7 @@ import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import type { ClipboardEvent as ReactClipboardEvent, DragEvent as ReactDragEvent } from 'react';
 import type { AnswerKind, SlackDirectory } from '../types';
 import { loadSlackDirectory } from '../lib/slackCache';
-import { toSlackText } from '../lib/slackText';
+import { toSlackText, wordsStartWith } from '../lib/slackText';
 import { readFlag, writeFlag } from '../lib/prefs';
 import { useEscapeLayer } from '../lib/escapeLayers';
 import { EmojiPicker } from './EmojiPicker';
@@ -73,12 +73,6 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function wordsStartWith(text: string | null, query: string): boolean {
-  if (!text) return false;
-  const lower = text.toLowerCase();
-  return lower.startsWith(query) || lower.split(/[\s._-]+/).some(word => word.startsWith(query));
 }
 
 type SlackComposerProps = {

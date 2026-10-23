@@ -19,6 +19,8 @@ export interface TrackedPr {
   threadTs: string;
   prUrl: string;
   createdAt: string;
+  /** Who asked for the change. */
+  requesterId?: string;
 }
 
 /** How far back the job store is read for PRs to follow up. */
@@ -46,18 +48,20 @@ function ageText(days: number): string {
 /**
  * The one line for the thread. Who it waits on comes from GitHub: a requested
  * reviewer or team, a reviewer who asked for changes, or, with an approval and
- * a clean merge, an admin to merge it. The replies it offers carry miniOG's
- * mention: a bare reply in a thread whose job has ended is not read.
+ * a clean merge, the person who asked for the change, who can have miniOG
+ * merge it. The replies it offers carry miniOG's mention: a bare reply in a
+ * thread whose job has ended is not read.
  */
 export function buildFollowUpLine(params: {
   prUrl: string;
   state: PrFollowUpState;
   now: number;
-  mergeMention: string;
+  /** Who asked for the change; tagged when the PR is ready to merge. */
+  requesterId?: string;
   /** miniOG's own mention, e.g. `<@U0AG8P9B3FW>`. */
   botMention: string;
 }): string | undefined {
-  const { prUrl, state, now, mergeMention, botMention } = params;
+  const { prUrl, state, now, requesterId, botMention } = params;
   if (state.state !== 'open') return undefined;
   const number = parsePrUrl(prUrl)?.number;
   const name = number ? `PR #${number}` : 'The PR';
@@ -85,7 +89,8 @@ export function buildFollowUpLine(params: {
   } else if (state.mergeableState === 'behind') {
     parts.push(`It is behind ${base}; reply \`${botMention} sync it\` and I'll bring it up to date.`);
   } else if (!state.draft && approved.length > 0 && changesRequested.length === 0 && state.mergeableState === 'clean') {
-    parts.push(`${mergeMention} it is ready to merge: reply \`${botMention} merge it\` when you want it in.`);
+    const ready = `reply \`${botMention} merge it\` when you want it in.`;
+    parts.push(requesterId ? `<@${requesterId}> it is ready to merge: ${ready}` : `It is ready to merge: ${ready}`);
   }
   return parts.join(' ');
 }
@@ -109,13 +114,12 @@ export async function runPrFollowUp(params: {
   store: FollowUpStore;
   slack: Pick<WebClient, 'chat'>;
   githubToken?: string;
-  mergeMention: string;
   botMention: string;
   now?: number;
   dateKey: string;
   fetcher?: Fetcher;
 }): Promise<{ posted: number; closed: number; skipped: number }> {
-  const { store, slack, githubToken, mergeMention, botMention, fetcher, dateKey } = params;
+  const { store, slack, githubToken, botMention, fetcher, dateKey } = params;
   const now = params.now ?? Date.now();
   const since = new Date(now - FOLLOW_UP_WINDOW_DAYS * 86_400_000).toISOString();
   const seen = new Set<string>();
@@ -151,7 +155,7 @@ export async function runPrFollowUp(params: {
       closed += 1;
       continue;
     }
-    const line = buildFollowUpLine({ prUrl: tracked.prUrl, state, now, mergeMention, botMention });
+    const line = buildFollowUpLine({ prUrl: tracked.prUrl, state, now, requesterId: tracked.requesterId, botMention });
     if (!line) continue;
     try {
       await slack.chat.postMessage({ channel: tracked.channelId, thread_ts: tracked.threadTs, text: line });

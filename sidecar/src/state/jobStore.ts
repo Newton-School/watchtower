@@ -2161,14 +2161,13 @@ export class JobStore {
   getBundles(): Bundle[] {
     const rows = this.db
       .prepare(
-        `SELECT name, slack_user_group_handle, manual_user_ids, capabilities,
+        `SELECT name, manual_user_ids, capabilities,
                 allowed_channel_ids, allow_im, allow_mpim
          FROM bundles
          ORDER BY name`,
       )
       .all() as Array<{
       name: string;
-      slack_user_group_handle: string;
       manual_user_ids: string;
       capabilities: string;
       allowed_channel_ids: string;
@@ -2192,11 +2191,8 @@ export class JobStore {
         .filter(Boolean);
       return {
         name: row.name,
-        slackUserGroupHandle: row.slack_user_group_handle,
         manualUserIds: row.manual_user_ids,
-        // resolvedUserIds is rebuilt from the legacy resolution path
-        // (`setResolvedGroupMembers`) — not stored in the table itself
-        // because subteam membership lives in Slack, not in our DB.
+        // Filled in by `hydrateBundleUserIds`, which adds the owners.
         resolvedUserIds: [],
         capabilities,
         allowedChannelIds,
@@ -2209,18 +2205,18 @@ export class JobStore {
   /**
    * Upsert a single bundle. Stores `capabilities` as JSON (matching the
    * `mission_swarm_runs.roles_json` pattern). The `resolvedUserIds` field is
-   * NOT persisted — it's derived at runtime from subteam membership.
+   * NOT persisted — it's derived at runtime (`hydrateBundleUserIds`). A
+   * bundle's old Slack user groups are left for `copySlackGroupMembers`.
    */
   setBundle(bundle: Bundle): void {
     const now = new Date().toISOString();
     this.db
       .prepare(
         `INSERT INTO bundles(
-           name, slack_user_group_handle, manual_user_ids, capabilities,
+           name, manual_user_ids, capabilities,
            allowed_channel_ids, allow_im, allow_mpim, updated_at
-         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+         ) VALUES(?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(name) DO UPDATE SET
-           slack_user_group_handle = excluded.slack_user_group_handle,
            manual_user_ids = excluded.manual_user_ids,
            capabilities = excluded.capabilities,
            allowed_channel_ids = excluded.allowed_channel_ids,
@@ -2230,7 +2226,6 @@ export class JobStore {
       )
       .run(
         bundle.name,
-        bundle.slackUserGroupHandle,
         bundle.manualUserIds,
         JSON.stringify(bundle.capabilities),
         bundle.allowedChannelIds.join(','),
@@ -2243,6 +2238,52 @@ export class JobStore {
   deleteBundle(name: string): boolean {
     const result = this.db.prepare(`DELETE FROM bundles WHERE name = ?`).run(name);
     return result.changes > 0;
+  }
+
+  /**
+   * Bundles that still name Slack user groups: bundles took their people from
+   * them before they listed people directly (`copySlackGroupMembers`).
+   */
+  listBundleSlackGroups(): Array<{ name: string; handles: string[] }> {
+    const rows = this.db
+      .prepare(
+        `SELECT name, slack_user_group_handle FROM bundles
+         WHERE TRIM(slack_user_group_handle) != ''
+         ORDER BY name`,
+      )
+      .all() as Array<{ name: string; slack_user_group_handle: string }>;
+    return rows.map(row => ({
+      name: row.name,
+      handles: row.slack_user_group_handle
+        .split(',')
+        .map(handle => handle.trim())
+        .filter(Boolean),
+    }));
+  }
+
+  /**
+   * Adds `userIds` to the people on bundle `name` and forgets its Slack user
+   * groups, in one write. Returns the people who were not on it already.
+   */
+  addSlackGroupMembersToBundle(name: string, userIds: string[]): string[] {
+    return this.db.transaction(() => {
+      const row = this.db.prepare(`SELECT manual_user_ids FROM bundles WHERE name = ?`).get(name) as
+        | { manual_user_ids: string }
+        | undefined;
+      if (!row) return [];
+      const listed = row.manual_user_ids
+        .split(',')
+        .map(id => id.trim())
+        .filter(Boolean);
+      const added = [...new Set(userIds)].filter(id => id && !listed.includes(id));
+      this.db
+        .prepare(
+          `UPDATE bundles SET manual_user_ids = ?, slack_user_group_handle = '', updated_at = ?
+           WHERE name = ?`,
+        )
+        .run([...listed, ...added].join(','), new Date().toISOString(), name);
+      return added;
+    })();
   }
 
   /**
@@ -3073,11 +3114,14 @@ export class JobStore {
     threadTs: string;
     prUrl: string;
     createdAt: string;
+    requesterId?: string;
   }> {
     const rows = this.db
       .prepare(
         `SELECT id, channel_id, thread_ts, created_at,
-                json_extract(result_json, '$.prUrl') AS pr_url
+                json_extract(result_json, '$.prUrl') AS pr_url,
+                COALESCE(json_extract(payload_json, '$.requestedForUserId'),
+                         json_extract(payload_json, '$.requestUserId')) AS requester_id
          FROM jobs
          WHERE created_at >= ?
            AND COALESCE(executed_workflow, workflow) IN ('IMPLEMENTATION', 'OWNER_AUTOPILOT')
@@ -3090,6 +3134,7 @@ export class JobStore {
       thread_ts: string;
       created_at: string;
       pr_url: string;
+      requester_id: string | null;
     }>;
     return rows.map(row => ({
       jobId: row.id,
@@ -3097,6 +3142,7 @@ export class JobStore {
       threadTs: row.thread_ts,
       prUrl: row.pr_url,
       createdAt: row.created_at,
+      requesterId: row.requester_id ?? undefined,
     }));
   }
 

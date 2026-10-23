@@ -41,7 +41,6 @@ export type AccessDecision = {
 
 export function createDefaultAccessGroupSettings(): AccessGroupSettings {
   return {
-    slackUserGroupHandle: '',
     manualUserIds: '',
     allowedChannelIds: '',
     allowIm: false,
@@ -107,7 +106,6 @@ function toResolvedAccessGroup(key: AccessGroupKey, group: AccessGroupSettings, 
 export function buildLegacyAccessControlConfig(input: {
   ownerSlackUserIds: string[];
   coreDevSlackUserIds?: string[];
-  coreDevSlackUserGroup?: string;
   allowedChannelsForBugFix?: string[];
 }): AccessControlConfig {
   const defaults = hydrateAccessControlSettings();
@@ -117,7 +115,6 @@ export function buildLegacyAccessControlConfig(input: {
   defaults.groups.admin.allowIm = true;
   defaults.groups.admin.allowMpim = true;
   defaults.groups.admin.manualUserIds = uniqueList(input.coreDevSlackUserIds ?? []).join(',');
-  defaults.groups.admin.slackUserGroupHandle = input.coreDevSlackUserGroup?.trim() ?? '';
 
   return toResolvedAccessControlConfig(defaults, input.ownerSlackUserIds);
 }
@@ -207,15 +204,10 @@ const LEVEL_TO_REPRESENTATIVE_CAPABILITY: Record<AccessLevel, Capability> = {
 };
 
 /**
- * Resolves `bundle.resolvedUserIds` from `manualUserIds` plus (for admin /
- * owner bundles) the configured owner user IDs. Slack subteam-handle
- * expansion happens later via the 30-min `setResolvedGroupMembers` refresh;
- * this just gives us a sane starting set immediately after a load.
- *
- * Mirrors the legacy `toResolvedAccessGroup` semantics: only admin/owner
- * bundles auto-include `ownerSlackUserIds`. Other bundles (viewer, reviewer,
- * builder, custom) get only their parsed `manualUserIds` until subteam
- * resolution runs.
+ * Resolves `bundle.resolvedUserIds`: the people listed on the bundle, plus
+ * the owners on the admin and owner bundles (the legacy `toResolvedAccessGroup`
+ * semantics). Other bundles (viewer, reviewer, builder, custom) get only the
+ * people listed on them.
  */
 export function hydrateBundleUserIds(bundles: Bundle[], ownerSlackUserIds: string[]): Bundle[] {
   return bundles.map(bundle => {
@@ -229,17 +221,13 @@ export function hydrateBundleUserIds(bundles: Bundle[], ownerSlackUserIds: strin
 /**
  * Builds the capability-bundles view of a legacy `AccessControlConfig`.
  * Called by `mapSettingsToConfig` so `AppConfig.bundles` is always populated
- * when `accessControl` is. Each bundle's `resolvedUserIds` is a snapshot —
- * `setResolvedGroupMembers` mutates both `accessControl.groups[X].resolvedUserIds`
- * AND the matching `bundles[X].resolvedUserIds` so live subteam-membership
- * updates flow through to capability checks without a restart.
+ * when `accessControl` is; the bundles table replaces it once loaded.
  */
 export function deriveBundlesFromLegacy(accessControl: AccessControlConfig): Bundle[] {
   return ACCESS_GROUP_KEYS.map(key => {
     const group = accessControl.groups[key];
     return {
       name: key,
-      slackUserGroupHandle: group.slackUserGroupHandle,
       manualUserIds: group.manualUserIds,
       resolvedUserIds: [...group.resolvedUserIds],
       capabilities: [...LEGACY_TIER_TO_CAPABILITIES[key]],
@@ -321,104 +309,15 @@ export function getAdminUserIds(config: AppConfig): string[] {
   return uniqueList([...config.ownerSlackUserIds, ...(config.coreDevSlackUserIds ?? [])]);
 }
 
-/** Slack subteam IDs look like S02HXP05ZNJ — `<!subteam^…>` accepts nothing else. */
-const SLACK_SUBTEAM_ID_RE = /^S[A-Z0-9]{6,}$/;
-
-/**
- * Build a concise Slack mention string for an admin-approval prompt.
- * Prefers the core-dev Slack user group (a single `<!subteam^…>` mention
- * that pings the whole group) over tagging every individual admin, which
- * turns the thread into a wall of twenty `<@U…>` pings.
- *
- * `<!subteam^…>` only accepts the subteam ID, never the handle — a raw
- * handle renders as dead text and pings nobody (issue #334, bug C). The IDs
- * are pre-resolved by the 30-min access refresh; a configured value that
- * already looks like an ID is used as-is. When no ID is available
- * (unresolved handle, cold start), fall back to tagging owners directly,
- * and to an empty string if nothing is available.
- */
-export function formatAdminMention(config: AppConfig): string {
-  const adminIds = config.accessControl?.groups.admin.resolvedSubteamIds?.filter(Boolean) ?? [];
-  const coreDevIds = config.resolvedCoreDevSubteamIds?.filter(Boolean) ?? [];
-  const resolvedIds = adminIds.length > 0 ? adminIds : coreDevIds;
-  if (resolvedIds.length > 0) {
-    return resolvedIds.map(id => `<!subteam^${id}>`).join(' ');
-  }
-
-  // Back-compat: installs that configured the subteam ID directly where the
-  // handle goes keep working without a resolution round-trip.
-  const configured =
-    (config.accessControl?.groups.admin.slackUserGroupHandle ?? '').trim() ||
-    (config.coreDevSlackUserGroup ?? '').trim();
-  const literalIds = configured
-    .split(',')
-    .map(part => part.trim().replace(/^@/, ''))
-    .filter(part => SLACK_SUBTEAM_ID_RE.test(part));
-  if (literalIds.length > 0) {
-    return literalIds.map(id => `<!subteam^${id}>`).join(' ');
-  }
-
-  const owners = (config.ownerSlackUserIds ?? []).filter(Boolean);
-  if (owners.length > 0) {
-    return owners.map(id => `<@${id}>`).join(' ');
-  }
-  return '';
-}
-
 export function getConfiguredAccessControl(config: AppConfig): AccessControlConfig {
   return (
     config.accessControl ??
     buildLegacyAccessControlConfig({
       ownerSlackUserIds: config.ownerSlackUserIds,
       coreDevSlackUserIds: config.coreDevSlackUserIds,
-      coreDevSlackUserGroup: config.coreDevSlackUserGroup,
       allowedChannelsForBugFix: config.allowedChannelsForBugFix,
     })
   );
-}
-
-export function setResolvedGroupMembers(params: {
-  config: AppConfig;
-  groupKey: AccessGroupKey;
-  members: string[];
-  /** Slack subteam IDs backing this group's handle(s) — see formatAdminMention. */
-  subteamIds?: string[];
-}): void {
-  const accessControl = getConfiguredAccessControl(params.config);
-  // Post-D5 the `bundles` table is the source of truth for membership — the
-  // desktop bundle editor writes there, not into `access_control_groups`.
-  // Read `manualUserIds` from the bundle when present so the 30-min subteam
-  // refresh doesn't overwrite freshly-added members with stale legacy data.
-  // Falls back to the legacy table only when no matching bundle exists
-  // (e.g. fresh install before bundles are seeded).
-  const bundle = params.config.bundles?.find(b => b.name === params.groupKey);
-  const manualUserIds = parseDelimitedIds(bundle?.manualUserIds ?? accessControl.groups[params.groupKey].manualUserIds);
-  const includesOwners = params.groupKey === 'admin' || params.groupKey === 'owner';
-  const nextMembers = includesOwners
-    ? uniqueList([...params.config.ownerSlackUserIds, ...manualUserIds, ...params.members])
-    : uniqueList([...manualUserIds, ...params.members]);
-
-  accessControl.groups[params.groupKey].resolvedUserIds = nextMembers;
-  if (params.subteamIds !== undefined) {
-    accessControl.groups[params.groupKey].resolvedSubteamIds = uniqueList(params.subteamIds);
-  }
-  params.config.accessControl = accessControl;
-
-  // Mirror into the capability-bundles view so live subteam-membership
-  // changes (refreshed every 30 min) propagate to `evaluateCapability`
-  // without a config reload. Bundle name == legacy tier key during the
-  // migration, so the lookup is direct.
-  //
-  // Note: the bundle hot-reload path (index.ts, access cache signal) rebuilds
-  // config.bundles via hydrateBundleUserIds WITHOUT resolvedSubteamIds; that's
-  // harmless today because formatAdminMention reads accessControl, not
-  // bundles — keep it that way (or carry the IDs) if that read ever moves.
-  if (bundle) {
-    bundle.resolvedUserIds = [...nextMembers];
-    if (params.subteamIds !== undefined) {
-      bundle.resolvedSubteamIds = uniqueList(params.subteamIds);
-    }
-  }
 }
 
 /**
@@ -446,7 +345,7 @@ function channelAllowedForBundle(bundle: Bundle, channelId: string, channelType?
  * is undefined. The fallback is what keeps legacy test fixtures (and any
  * caller that builds `AppConfig` by hand) working without changes.
  */
-function getBundlesForConfig(config: AppConfig): Bundle[] {
+export function getBundlesForConfig(config: AppConfig): Bundle[] {
   if (config.bundles) return config.bundles;
   return deriveBundlesFromLegacy(getConfiguredAccessControl(config));
 }
@@ -534,28 +433,19 @@ export function evaluateCapability(params: {
  * `evaluateCapability` — translates `requiredLevel` → representative
  * `Capability` and delegates. Removed in D6 once the router cuts over.
  *
- * The `accessControl` param is honored when provided (test fixtures that
- * pass a one-off config without bundles still work via the
- * `getBundlesForConfig` legacy fallback).
+ * Reads the bundles, like every access check. The router once passed the
+ * legacy groups here instead, so bundle edits in Settings never reached it.
  */
 export function evaluateAccess(params: {
   config: AppConfig;
-  accessControl?: AccessControlConfig;
   userId: string;
   channelId: string;
   channelType?: string;
   requiredLevel: AccessLevel;
 }): AccessDecision {
-  // If a caller passed an explicit accessControl override, translate it to
-  // bundles for the duration of this call so the override still wins. This
-  // is exercised by the test fixtures in `accessControl.test.ts`.
-  const effectiveConfig: AppConfig = params.accessControl
-    ? { ...params.config, accessControl: params.accessControl, bundles: deriveBundlesFromLegacy(params.accessControl) }
-    : params.config;
-
   const capability = LEVEL_TO_REPRESENTATIVE_CAPABILITY[params.requiredLevel];
   const decision = evaluateCapability({
-    config: effectiveConfig,
+    config: params.config,
     userId: params.userId,
     channelId: params.channelId,
     channelType: params.channelType,
@@ -573,15 +463,11 @@ export function evaluateAccess(params: {
  * and whether one of those bundles lets them DM miniOG. Used to say where to
  * ask instead when a channel is not enabled for them.
  */
-export function placesAllowingLevel(params: {
-  config: AppConfig;
-  accessControl?: AccessControlConfig;
-  userId: string;
-  requiredLevel: AccessLevel;
-}): { channels: string[]; dm: boolean } {
-  const bundles = params.accessControl
-    ? deriveBundlesFromLegacy(params.accessControl)
-    : getBundlesForConfig(params.config);
+export function placesAllowingLevel(params: { config: AppConfig; userId: string; requiredLevel: AccessLevel }): {
+  channels: string[];
+  dm: boolean;
+} {
+  const bundles = getBundlesForConfig(params.config);
   const capability = LEVEL_TO_REPRESENTATIVE_CAPABILITY[params.requiredLevel];
   const granting = bundles
     .filter(bundle => bundle.name !== 'owner')

@@ -36,8 +36,7 @@ export type Capability =
   | 'manage_access';
 
 /**
- * A named set of capabilities that can be assigned to users via a Slack
- * subteam handle and/or a comma-delimited list of manual user IDs. Bundles
+ * A named set of capabilities given to the people listed on it. Bundles
  * are peers (no hierarchy) — a user is granted the union of capabilities
  * across every bundle they belong to.
  *
@@ -48,22 +47,13 @@ export type Capability =
  */
 export interface Bundle {
   name: string;
-  slackUserGroupHandle: string;
+  /** The people on this bundle, as comma-separated Slack user IDs. */
   manualUserIds: string;
   /**
-   * Resolved user IDs for this bundle — the union of `manualUserIds`
-   * (parsed) and the members of `slackUserGroupHandle` (after Slack subteam
-   * expansion, refreshed every 30 min by `setResolvedGroupMembers`).
-   * Mutating this in place is the expected hot-reload path for live subteam
-   * membership changes.
+   * `manualUserIds` parsed, plus the owners on the admin and owner bundles
+   * (`hydrateBundleUserIds`).
    */
   resolvedUserIds: string[];
-  /**
-   * Slack subteam IDs resolved from `slackUserGroupHandle` (refreshed
-   * alongside `resolvedUserIds`). Needed because `<!subteam^…>` mentions
-   * only accept the ID — a raw handle renders as dead text.
-   */
-  resolvedSubteamIds?: string[];
   capabilities: Capability[];
   allowedChannelIds: string[];
   allowIm: boolean;
@@ -124,7 +114,6 @@ export type LaunchpadRequestStatus =
   | 'SKIPPED';
 
 export interface AccessGroupSettings {
-  slackUserGroupHandle: string;
   manualUserIds: string;
   allowedChannelIds: string;
   allowIm: boolean;
@@ -140,8 +129,6 @@ export interface ResolvedAccessGroup extends AccessGroupSettings {
   key: AccessGroupKey;
   resolvedChannelIds: string[];
   resolvedUserIds: string[];
-  /** Slack subteam IDs for `slackUserGroupHandle` — see Bundle.resolvedSubteamIds. */
-  resolvedSubteamIds?: string[];
 }
 
 export interface AccessControlConfig {
@@ -154,13 +141,6 @@ export interface AppConfig {
   bundleTargets: Array<'app' | 'dmg'>;
   ownerSlackUserIds: string[];
   coreDevSlackUserIds: string[];
-  coreDevSlackUserGroup: string;
-  /**
-   * Slack subteam IDs resolved from `coreDevSlackUserGroup` by the 30-min
-   * access refresh. Covers legacy installs without an accessControl admin
-   * group; `formatAdminMention` falls back to these.
-   */
-  resolvedCoreDevSubteamIds?: string[];
   botUserId: string;
   slackBotToken: string;
   slackAppToken: string;

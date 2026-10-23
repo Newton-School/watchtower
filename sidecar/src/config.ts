@@ -30,7 +30,6 @@ const settingsSchema = z.object({
   pm_slack_user_ids: z.string().default(''),
   pm_task_timeout_ms: z.number().int().positive().default(600000),
   core_dev_slack_user_ids: z.string().default(''),
-  core_dev_slack_user_group: z.string().default(''),
   mini_og_repo_root: z.string().default('/Users/dipesh/code/mini-og'),
   watchtower_path: z.string().default(''),
   metabase_mcp_url: z.string().default(METABASE_MCP_URL_DEFAULT),
@@ -124,7 +123,6 @@ function loadAccessControlSettings(db: Database.Database): AccessControlSettings
     .prepare(
       `SELECT
       group_key,
-      COALESCE(slack_user_group_handle, '') AS slack_user_group_handle,
       COALESCE(manual_user_ids, '') AS manual_user_ids,
       COALESCE(allowed_channel_ids, '') AS allowed_channel_ids,
       COALESCE(allow_im, 0) AS allow_im,
@@ -133,7 +131,6 @@ function loadAccessControlSettings(db: Database.Database): AccessControlSettings
     )
     .all() as Array<{
     group_key?: string;
-    slack_user_group_handle?: string;
     manual_user_ids?: string;
     allowed_channel_ids?: string;
     allow_im?: number;
@@ -144,15 +141,14 @@ function loadAccessControlSettings(db: Database.Database): AccessControlSettings
     const key = row.group_key;
     // The `owner` row is accepted so the schema stays uniform across groups, but it
     // is intentionally not editable from the Settings UI — owners are configured via
-    // `ownerSlackUserIds`. Any `manual_user_ids` / `slack_user_group_handle` seeded on
-    // this row by direct SQL will be loaded and granted rank-4 access; treat the row
-    // as system-managed and don't populate it by hand.
+    // `ownerSlackUserIds`. Any `manual_user_ids` seeded on this row by direct SQL will
+    // be loaded and granted rank-4 access; treat the row as system-managed and don't
+    // populate it by hand.
     if (key !== 'viewer' && key !== 'reviewer' && key !== 'builder' && key !== 'admin' && key !== 'owner') {
       continue;
     }
 
     defaults.groups[key] = {
-      slackUserGroupHandle: row.slack_user_group_handle ?? '',
       manualUserIds: row.manual_user_ids ?? '',
       allowedChannelIds: row.allowed_channel_ids ?? '',
       allowIm: Boolean(row.allow_im),
@@ -217,7 +213,6 @@ export function loadConfigFromDb(dbPath: string): AppConfig {
           COALESCE(pm_slack_user_ids, '') AS pm_slack_user_ids,
           COALESCE(pm_task_timeout_ms, 600000) AS pm_task_timeout_ms,
           COALESCE(core_dev_slack_user_ids, '') AS core_dev_slack_user_ids,
-          COALESCE(core_dev_slack_user_group, '') AS core_dev_slack_user_group,
           COALESCE(mini_og_repo_root, '/Users/dipesh/code/mini-og') AS mini_og_repo_root,
           COALESCE(watchtower_path, '') AS watchtower_path,
           COALESCE(metabase_mcp_url, '${METABASE_MCP_URL_DEFAULT}') AS metabase_mcp_url
@@ -361,7 +356,6 @@ function mapSettingsToConfig(settings: SettingsRow, accessControlSettings?: Acce
       : buildLegacyAccessControlConfig({
           ownerSlackUserIds,
           coreDevSlackUserIds,
-          coreDevSlackUserGroup: settings.core_dev_slack_user_group.trim(),
           allowedChannelsForBugFix: bugFixChannelIds,
         });
 
@@ -370,7 +364,6 @@ function mapSettingsToConfig(settings: SettingsRow, accessControlSettings?: Acce
     bundleTargets: ['app', 'dmg'],
     ownerSlackUserIds,
     coreDevSlackUserIds,
-    coreDevSlackUserGroup: settings.core_dev_slack_user_group.trim(),
     botUserId: settings.bot_user_id.trim(),
     slackBotToken: settings.slack_bot_token.trim(),
     slackAppToken: settings.slack_app_token.trim(),

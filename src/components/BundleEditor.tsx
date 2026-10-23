@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import type { Bundle, Capability } from '../types';
+import type { Bundle, Capability, SlackDirectory } from '../types';
+import { loadSlackDirectory } from '../lib/slackCache';
+import { PeoplePicker } from './PeoplePicker';
 
 type CapabilityOption = {
   id: Capability;
@@ -37,7 +39,6 @@ const SEED_NAMES = ['viewer', 'reviewer', 'builder', 'admin', 'owner'] as const;
 function emptyBundle(name: string): Bundle {
   return {
     name,
-    slackUserGroupHandle: '',
     manualUserIds: '',
     resolvedUserIds: [],
     capabilities: [],
@@ -56,6 +57,17 @@ function bundleKey(b: Bundle): string {
   return b.name;
 }
 
+function parseIds(raw: string): string[] {
+  return [
+    ...new Set(
+      raw
+        .split(',')
+        .map(id => id.trim())
+        .filter(Boolean),
+    ),
+  ];
+}
+
 export function BundleEditor() {
   const [bundles, setBundles] = useState<Bundle[] | null>(null);
   const [drafts, setDrafts] = useState<Record<string, DirtyState>>({});
@@ -63,6 +75,22 @@ export function BundleEditor() {
   const [deletingName, setDeletingName] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [newBundleName, setNewBundleName] = useState('');
+  const [directory, setDirectory] = useState<SlackDirectory | null>(null);
+  const [directoryError, setDirectoryError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    loadSlackDirectory()
+      .then(next => {
+        if (live) setDirectory(next);
+      })
+      .catch(err => {
+        if (live) setDirectoryError(String(err));
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -208,6 +236,13 @@ export function BundleEditor() {
         <p className="field-hint">No bundles yet. The sidecar will seed the 5 default bundles on next restart.</p>
       ) : null}
 
+      {directoryError ? (
+        <p className="field-hint">
+          Couldn&apos;t load people from Slack ({directoryError}). People show as Slack user IDs, and you can add
+          someone by their ID.
+        </p>
+      ) : null}
+
       {bundles.map(bundle => {
         const ds = drafts[bundleKey(bundle)];
         if (!ds) return null;
@@ -238,27 +273,17 @@ export function BundleEditor() {
               </div>
             </header>
 
+            <PeoplePicker
+              label="People"
+              ids={parseIds(draft.manualUserIds)}
+              onChange={ids => patchDraft(bundle.name, { manualUserIds: ids.join(',') })}
+              directory={directory}
+            />
+            {bundle.name === 'admin' || bundle.name === 'owner' ? (
+              <p className="field-hint">The owners are always on this bundle.</p>
+            ) : null}
+
             <div className="settings-fields">
-              <label className="field">
-                <span>Slack User Group Handle</span>
-                <input
-                  type="text"
-                  value={draft.slackUserGroupHandle}
-                  onChange={event => patchDraft(bundle.name, { slackUserGroupHandle: event.target.value })}
-                  placeholder="e.g. platform-admins"
-                />
-              </label>
-
-              <label className="field">
-                <span>Manual User IDs</span>
-                <input
-                  type="text"
-                  value={draft.manualUserIds}
-                  onChange={event => patchDraft(bundle.name, { manualUserIds: event.target.value })}
-                  placeholder="U01234567,U07654321"
-                />
-              </label>
-
               <label className="field">
                 <span>Allowed Channel IDs</span>
                 <input

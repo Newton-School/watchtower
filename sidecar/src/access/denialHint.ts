@@ -1,5 +1,5 @@
 import { placesAllowingLevel } from './control.js';
-import type { AccessControlConfig, AccessLevel, AppConfig } from '../types/contracts.js';
+import type { AccessLevel, AppConfig } from '../types/contracts.js';
 
 /** At most this many channels are named; past it the line gets long and the first few are enough. */
 const MAX_CHANNELS = 3;
@@ -20,7 +20,6 @@ const MAX_CHANNELS = 3;
  */
 export function channelDenialHint(params: {
   config: AppConfig;
-  accessControl?: AccessControlConfig;
   userId: string;
   channelId: string;
   channelType?: string;
@@ -29,7 +28,7 @@ export function channelDenialHint(params: {
   const { config, userId, channelId, channelType, requiredLevel } = params;
   // A replayed DM can arrive without a type; its id still says what it is.
   const inOneToOneDm = channelType === 'im' || (!channelType && channelId.startsWith('D'));
-  const places = placesAllowingLevel({ config, accessControl: params.accessControl, userId, requiredLevel });
+  const places = placesAllowingLevel({ config, userId, requiredLevel });
   const channels = places.channels.filter(id => id !== channelId).slice(0, MAX_CHANNELS);
   const dm = places.dm && !inOneToOneDm;
 

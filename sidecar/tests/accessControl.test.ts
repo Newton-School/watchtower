@@ -4,11 +4,10 @@ import {
   deriveBundlesFromLegacy,
   evaluateAccess,
   evaluateCapability,
-  formatAdminMention,
   getAdminUserIds,
+  hydrateBundleUserIds,
   intentToCapability,
   resolveRequiredAccessLevel,
-  setResolvedGroupMembers,
   toResolvedAccessControlConfig,
   workflowSideEffect,
 } from '../src/access/control.js';
@@ -23,35 +22,30 @@ function makeConfig(overrides?: Partial<AppConfig>): AppConfig {
         mode: 'enforce',
         groups: {
           viewer: {
-            slackUserGroupHandle: '',
             manualUserIds: 'UVIEWER',
             allowedChannelIds: 'C-VIEW',
             allowIm: true,
             allowMpim: false,
           },
           reviewer: {
-            slackUserGroupHandle: '',
             manualUserIds: 'UREVIEW',
             allowedChannelIds: 'C-REVIEW',
             allowIm: false,
             allowMpim: false,
           },
           builder: {
-            slackUserGroupHandle: '',
             manualUserIds: 'UBUILDER',
             allowedChannelIds: 'C-BUILD',
             allowIm: false,
             allowMpim: false,
           },
           admin: {
-            slackUserGroupHandle: '',
             manualUserIds: 'UADMIN',
             allowedChannelIds: 'C-ADMIN',
             allowIm: true,
             allowMpim: true,
           },
           owner: {
-            slackUserGroupHandle: '',
             manualUserIds: '',
             allowedChannelIds: '',
             allowIm: false,
@@ -67,7 +61,6 @@ function makeConfig(overrides?: Partial<AppConfig>): AppConfig {
     bundleTargets: ['app', 'dmg'],
     ownerSlackUserIds,
     coreDevSlackUserIds: ['UOWNER1'],
-    coreDevSlackUserGroup: '',
     botUserId: 'UBOT1',
     slackBotToken: 'xoxb-test',
     slackAppToken: 'xapp-test',
@@ -89,11 +82,22 @@ function makeConfig(overrides?: Partial<AppConfig>): AppConfig {
     bugFixTimeoutMs: 120_000,
     pmTaskTimeoutMs: 120_000,
     accessControl,
-    // Production loads bundles via `mapSettingsToConfig`; the test fixture
-    // mirrors that so `setResolvedGroupMembers` has something to sync into.
+    // Production loads bundles via `mapSettingsToConfig`; the test fixture mirrors that.
     bundles: deriveBundlesFromLegacy(accessControl),
     ...overrides,
   };
+}
+
+/** Lists `userId` on bundle `name`, as Settings does. */
+function addToBundle(config: AppConfig, name: string, userId: string): void {
+  config.bundles = hydrateBundleUserIds(
+    (config.bundles ?? []).map(bundle =>
+      bundle.name === name
+        ? { ...bundle, manualUserIds: [bundle.manualUserIds, userId].filter(Boolean).join(',') }
+        : bundle,
+    ),
+    config.ownerSlackUserIds,
+  );
 }
 
 describe('access control evaluator', () => {
@@ -222,24 +226,12 @@ describe('access control evaluator', () => {
     expect(decision.ownerBypass).toBe(true);
   });
 
-  it('pre-resolves channel IDs and merges refreshed members with manual and owner overrides', () => {
+  it('pre-resolves channel IDs and adds the owners to the admin group', () => {
     const config = makeConfig();
 
     expect(config.accessControl?.groups.builder.resolvedChannelIds).toEqual(['C-BUILD']);
-
-    setResolvedGroupMembers({
-      config,
-      groupKey: 'reviewer',
-      members: ['UREVIEW2'],
-    });
-    expect(config.accessControl?.groups.reviewer.resolvedUserIds).toEqual(['UREVIEW', 'UREVIEW2']);
-
-    setResolvedGroupMembers({
-      config,
-      groupKey: 'admin',
-      members: ['UADMIN2', 'UOWNER1'],
-    });
-    expect(config.accessControl?.groups.admin.resolvedUserIds).toEqual(['UOWNER1', 'UADMIN', 'UADMIN2']);
+    expect(config.accessControl?.groups.reviewer.resolvedUserIds).toEqual(['UREVIEW']);
+    expect(config.accessControl?.groups.admin.resolvedUserIds).toEqual(['UOWNER1', 'UADMIN']);
   });
 
   describe('owner access level', () => {
@@ -268,11 +260,7 @@ describe('access control evaluator', () => {
       // so the early bypass at evaluateAccess does not fire and the rank-4 group path
       // is exercised on its own.
       const config = makeConfig({ ownerSlackUserIds: [] });
-      setResolvedGroupMembers({
-        config,
-        groupKey: 'owner',
-        members: ['UPROMOTED'],
-      });
+      addToBundle(config, 'owner', 'UPROMOTED');
 
       const decision = evaluateAccess({
         config,
@@ -288,11 +276,7 @@ describe('access control evaluator', () => {
 
     it('surfaces owner-group members via getAdminUserIds for admin mentions and approval gates', () => {
       const config = makeConfig({ ownerSlackUserIds: [] });
-      setResolvedGroupMembers({
-        config,
-        groupKey: 'owner',
-        members: ['UPROMOTED'],
-      });
+      addToBundle(config, 'owner', 'UPROMOTED');
 
       expect(getAdminUserIds(config)).toContain('UPROMOTED');
     });
@@ -314,11 +298,7 @@ describe('access control evaluator', () => {
       const config = makeConfig({
         ownerSlackUserIds: [],
       });
-      setResolvedGroupMembers({
-        config,
-        groupKey: 'owner',
-        members: ['UPROMOTED'],
-      });
+      addToBundle(config, 'owner', 'UPROMOTED');
 
       const decision = evaluateAccess({
         config,
@@ -414,7 +394,6 @@ describe('access control evaluator', () => {
     const accessControl = buildLegacyAccessControlConfig({
       ownerSlackUserIds: ['UOWNER1'],
       coreDevSlackUserIds: ['UCOREDEV1'],
-      coreDevSlackUserGroup: 'core-dev',
       allowedChannelsForBugFix: ['C-BUGS', 'C-OPS'],
     });
 
@@ -424,234 +403,6 @@ describe('access control evaluator', () => {
     expect(accessControl.groups.admin.allowedChannelIds).toBe('C-BUGS,C-OPS');
     expect(accessControl.groups.admin.allowIm).toBe(true);
     expect(accessControl.groups.admin.resolvedUserIds).toEqual(['UOWNER1', 'UCOREDEV1']);
-  });
-});
-
-describe('formatAdminMention', () => {
-  function baseConfig(overrides?: Partial<AppConfig>): AppConfig {
-    return {
-      platformPolicy: 'macos_only',
-      bundleTargets: ['app', 'dmg'],
-      ownerSlackUserIds: ['UOWNER1'],
-      coreDevSlackUserIds: ['UOWNER1', 'UCORE2', 'UCORE3'],
-      coreDevSlackUserGroup: '',
-      botUserId: 'UBOT',
-      slackBotToken: 'x',
-      slackAppToken: 'x',
-      bugsAndUpdatesChannelId: 'C-B',
-      allowedChannelsForBugFix: ['C-B'],
-      repoPaths: { newtonWeb: '/a', newtonApi: '/b' },
-      unknownTaskPolicy: 'desktop_only',
-      uncertainRepoPolicy: 'desktop_only',
-      unmappedPrRepoPolicy: 'desktop_only',
-      maxConcurrentJobs: 2,
-      repoClassifierThreshold: 0.75,
-      allowedPrOrg: 'Newton-School',
-      multiAgentEnabled: false,
-      agentBackend: 'codex',
-      prReviewTimeoutMs: 120_000,
-      bugFixTimeoutMs: 120_000,
-      pmTaskTimeoutMs: 120_000,
-      ...overrides,
-    };
-  }
-
-  it('pings the core-dev subteam once when a group handle is set', () => {
-    const config = baseConfig({ coreDevSlackUserGroup: 'S02HXP05ZNJ' });
-    expect(formatAdminMention(config)).toBe('<!subteam^S02HXP05ZNJ>');
-  });
-
-  it('prefers the access-control admin group handle when present', () => {
-    const config = baseConfig({
-      coreDevSlackUserGroup: 'S02HXP05ZNJ',
-      accessControl: toResolvedAccessControlConfig(
-        {
-          mode: 'enforce',
-          groups: {
-            viewer: {
-              slackUserGroupHandle: '',
-              manualUserIds: '',
-              allowedChannelIds: '',
-              allowIm: false,
-              allowMpim: false,
-            },
-            reviewer: {
-              slackUserGroupHandle: '',
-              manualUserIds: '',
-              allowedChannelIds: '',
-              allowIm: false,
-              allowMpim: false,
-            },
-            builder: {
-              slackUserGroupHandle: '',
-              manualUserIds: '',
-              allowedChannelIds: '',
-              allowIm: false,
-              allowMpim: false,
-            },
-            admin: {
-              slackUserGroupHandle: 'SADMIN99',
-              manualUserIds: 'UOWNER1,UCORE2',
-              allowedChannelIds: '',
-              allowIm: true,
-              allowMpim: false,
-            },
-            owner: {
-              slackUserGroupHandle: '',
-              manualUserIds: '',
-              allowedChannelIds: '',
-              allowIm: false,
-              allowMpim: false,
-            },
-          },
-        },
-        ['UOWNER1'],
-      ),
-    });
-    expect(formatAdminMention(config)).toBe('<!subteam^SADMIN99>');
-  });
-
-  it('falls back to owner mentions when no group handle is set', () => {
-    const config = baseConfig({ ownerSlackUserIds: ['UOWNER1', 'UOWNER2'] });
-    expect(formatAdminMention(config)).toBe('<@UOWNER1> <@UOWNER2>');
-  });
-
-  it('returns empty string when there is nothing to mention', () => {
-    const config = baseConfig({ ownerSlackUserIds: [], coreDevSlackUserIds: [] });
-    expect(formatAdminMention(config)).toBe('');
-  });
-
-  it('never emits a raw handle as a subteam mention — falls back to owner tags (issue #334 bug C)', () => {
-    // The incident: coreDevSlackUserGroup='core-dev' produced
-    // '<!subteam^core-dev>' which Slack renders as dead text, so the
-    // admin-clarify prompt pinged nobody. Unresolved handles must fall
-    // through to owner tags.
-    const config = baseConfig({ coreDevSlackUserGroup: 'core-dev', ownerSlackUserIds: ['UOWNER1'] });
-    const mention = formatAdminMention(config);
-    expect(mention).toBe('<@UOWNER1>');
-    expect(mention).not.toContain('core-dev');
-  });
-
-  it('prefers pre-resolved admin-group subteam IDs over everything else', () => {
-    const config = baseConfig({ coreDevSlackUserGroup: 'core-dev' });
-    config.accessControl = toResolvedAccessControlConfig(
-      {
-        mode: 'enforce',
-        groups: {
-          viewer: {
-            slackUserGroupHandle: '',
-            manualUserIds: '',
-            allowedChannelIds: '',
-            allowIm: false,
-            allowMpim: false,
-          },
-          reviewer: {
-            slackUserGroupHandle: '',
-            manualUserIds: '',
-            allowedChannelIds: '',
-            allowIm: false,
-            allowMpim: false,
-          },
-          builder: {
-            slackUserGroupHandle: '',
-            manualUserIds: '',
-            allowedChannelIds: '',
-            allowIm: false,
-            allowMpim: false,
-          },
-          admin: {
-            slackUserGroupHandle: 'core-dev',
-            manualUserIds: '',
-            allowedChannelIds: '',
-            allowIm: true,
-            allowMpim: false,
-          },
-          owner: {
-            slackUserGroupHandle: '',
-            manualUserIds: '',
-            allowedChannelIds: '',
-            allowIm: false,
-            allowMpim: false,
-          },
-        },
-      },
-      ['UOWNER1'],
-    );
-    config.accessControl.groups.admin.resolvedSubteamIds = ['S02HXP05ZNJ'];
-    expect(formatAdminMention(config)).toBe('<!subteam^S02HXP05ZNJ>');
-  });
-
-  it('uses resolvedCoreDevSubteamIds for legacy installs without an admin group handle', () => {
-    const config = baseConfig({
-      coreDevSlackUserGroup: 'core-dev',
-      resolvedCoreDevSubteamIds: ['S0LEGACY99'],
-    });
-    expect(formatAdminMention(config)).toBe('<!subteam^S0LEGACY99>');
-  });
-
-  it('setResolvedGroupMembers stores subteam IDs on the group and mirrors them onto the bundle', () => {
-    const config = baseConfig();
-    config.accessControl = toResolvedAccessControlConfig(
-      {
-        mode: 'enforce',
-        groups: {
-          viewer: {
-            slackUserGroupHandle: '',
-            manualUserIds: '',
-            allowedChannelIds: '',
-            allowIm: false,
-            allowMpim: false,
-          },
-          reviewer: {
-            slackUserGroupHandle: '',
-            manualUserIds: '',
-            allowedChannelIds: '',
-            allowIm: false,
-            allowMpim: false,
-          },
-          builder: {
-            slackUserGroupHandle: '',
-            manualUserIds: '',
-            allowedChannelIds: '',
-            allowIm: false,
-            allowMpim: false,
-          },
-          admin: {
-            slackUserGroupHandle: 'core-dev',
-            manualUserIds: '',
-            allowedChannelIds: '',
-            allowIm: true,
-            allowMpim: false,
-          },
-          owner: {
-            slackUserGroupHandle: '',
-            manualUserIds: '',
-            allowedChannelIds: '',
-            allowIm: false,
-            allowMpim: false,
-          },
-        },
-      },
-      ['UOWNER1'],
-    );
-    config.bundles = [
-      {
-        name: 'admin',
-        slackUserGroupHandle: 'core-dev',
-        manualUserIds: '',
-        resolvedUserIds: [],
-        capabilities: [],
-        allowedChannelIds: [],
-        allowIm: true,
-        allowMpim: false,
-      },
-    ];
-
-    setResolvedGroupMembers({ config, groupKey: 'admin', members: ['UCORE2'], subteamIds: ['S02HXP05ZNJ'] });
-
-    expect(config.accessControl.groups.admin.resolvedSubteamIds).toEqual(['S02HXP05ZNJ']);
-    expect(config.bundles[0].resolvedSubteamIds).toEqual(['S02HXP05ZNJ']);
-    expect(formatAdminMention(config)).toBe('<!subteam^S02HXP05ZNJ>');
   });
 });
 
@@ -845,7 +596,6 @@ describe('capability-bundles read path (D3)', () => {
       bundleTargets: ['app', 'dmg'],
       ownerSlackUserIds: ['UOWNER1'],
       coreDevSlackUserIds: ['UOWNER1'],
-      coreDevSlackUserGroup: '',
       botUserId: 'UBOT1',
       slackBotToken: 'xoxb-test',
       slackAppToken: 'xapp-test',
@@ -870,7 +620,6 @@ describe('capability-bundles read path (D3)', () => {
       bundles: [
         {
           name: 'reviewer',
-          slackUserGroupHandle: '',
           manualUserIds: 'UONLYREVIEW',
           resolvedUserIds: ['UONLYREVIEW'],
           capabilities: ['query_codebase', 'submit_pr_review', 'comment_pr', 'investigate'],
@@ -948,29 +697,18 @@ describe('capability-bundles read path (D3)', () => {
     expect(decision.matchedGroups).toContain('admin');
   });
 
-  it('setResolvedGroupMembers syncs the matching bundle so live subteam changes propagate', () => {
+  it('evaluateAccess reads the bundles, not the legacy groups, so Settings edits reach the router', () => {
     const config = makeConfig({ ownerSlackUserIds: [] });
-    // Promote UNEW into the admin tier via setResolvedGroupMembers (simulates the
-    // 30-min subteam refresh in `index.ts`).
-    setResolvedGroupMembers({
-      config,
-      groupKey: 'admin',
-      members: ['UNEW'],
-    });
+    // Settings moved the builder bundle to someone new; the legacy groups still list UBUILDER.
+    config.bundles = hydrateBundleUserIds(
+      (config.bundles ?? []).map(bundle => (bundle.name === 'builder' ? { ...bundle, manualUserIds: 'UNEW' } : bundle)),
+      [],
+    );
+    expect(config.accessControl?.groups.builder.resolvedUserIds).toEqual(['UBUILDER']);
 
-    // Legacy view sees the new member.
-    expect(config.accessControl?.groups.admin.resolvedUserIds).toContain('UNEW');
-    // Bundle view sees it too — without this sync, evaluateCapability would
-    // silently miss the live subteam update.
-    expect(config.bundles?.find(b => b.name === 'admin')?.resolvedUserIds).toContain('UNEW');
-
-    // And the capability check honors it.
-    const decision = evaluateCapability({
-      config,
-      userId: 'UNEW',
-      channelId: 'C-ADMIN',
-      capability: 'deploy_prod',
-    });
-    expect(decision.allowed).toBe(true);
+    const ask = (userId: string) =>
+      evaluateAccess({ config, userId, channelId: 'C-BUILD', requiredLevel: 'builder' }).allowed;
+    expect(ask('UNEW')).toBe(true);
+    expect(ask('UBUILDER')).toBe(false);
   });
 });

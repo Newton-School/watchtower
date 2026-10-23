@@ -393,7 +393,6 @@ struct AppSettings {
     pm_slack_user_ids: String,
     pm_task_timeout_ms: i64,
     core_dev_slack_user_ids: String,
-    core_dev_slack_user_group: String,
     vault_path: String,
     vault_enabled: bool,
     mini_og_repo_root: String,
@@ -403,7 +402,6 @@ struct AppSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AccessGroupSettings {
-    slack_user_group_handle: String,
     manual_user_ids: String,
     allowed_channel_ids: String,
     allow_im: bool,
@@ -423,7 +421,6 @@ fn access_group_keys() -> [&'static str; 5] {
 
 fn default_access_group_settings() -> AccessGroupSettings {
     AccessGroupSettings {
-        slack_user_group_handle: String::new(),
         manual_user_ids: String::new(),
         allowed_channel_ids: String::new(),
         allow_im: false,
@@ -494,7 +491,6 @@ impl Default for AppSettings {
             pm_slack_user_ids: String::new(),
             pm_task_timeout_ms: 600_000,
             core_dev_slack_user_ids: String::new(),
-            core_dev_slack_user_group: String::new(),
             vault_path: String::new(),
             vault_enabled: false,
             mini_og_repo_root: "/Users/dipesh/code/mini-og".to_string(),
@@ -1859,7 +1855,6 @@ async fn get_user_memories(
 #[serde(rename_all = "camelCase")]
 struct BundleRecord {
     name: String,
-    slack_user_group_handle: String,
     manual_user_ids: String,
     #[serde(default)]
     resolved_user_ids: Vec<String>,
@@ -1892,7 +1887,7 @@ async fn get_bundles(state: State<'_, AppState>) -> Result<Vec<BundleRecord>, St
         Connection::open(&*state.db_path).map_err(|err| format!("db open failed: {err}"))?;
     let mut stmt = connection
         .prepare(
-            "SELECT name, slack_user_group_handle, manual_user_ids, capabilities,
+            "SELECT name, manual_user_ids, capabilities,
                     allowed_channel_ids, allow_im, allow_mpim
              FROM bundles
              ORDER BY name",
@@ -1900,10 +1895,10 @@ async fn get_bundles(state: State<'_, AppState>) -> Result<Vec<BundleRecord>, St
         .map_err(|err| format!("db prepare bundles failed: {err}"))?;
     let rows = stmt
         .query_map([], |row| {
-            let capabilities_json: String = row.get(3)?;
-            let allowed_channels_csv: String = row.get(4)?;
-            let allow_im: i64 = row.get(5)?;
-            let allow_mpim: i64 = row.get(6)?;
+            let capabilities_json: String = row.get(2)?;
+            let allowed_channels_csv: String = row.get(3)?;
+            let allow_im: i64 = row.get(4)?;
+            let allow_mpim: i64 = row.get(5)?;
             let capabilities: Vec<String> = serde_json::from_str(&capabilities_json).unwrap_or_default();
             let allowed_channel_ids = allowed_channels_csv
                 .split(',')
@@ -1912,8 +1907,7 @@ async fn get_bundles(state: State<'_, AppState>) -> Result<Vec<BundleRecord>, St
                 .collect();
             Ok(BundleRecord {
                 name: row.get(0)?,
-                slack_user_group_handle: row.get(1)?,
-                manual_user_ids: row.get(2)?,
+                manual_user_ids: row.get(1)?,
                 resolved_user_ids: Vec::new(),
                 capabilities,
                 allowed_channel_ids,
@@ -1947,13 +1941,14 @@ async fn save_bundle(bundle: BundleRecord, state: State<'_, AppState>) -> Result
     let connection =
         Connection::open(&*state.db_path).map_err(|err| format!("db open failed: {err}"))?;
     let now = Utc::now().to_rfc3339();
+    // A bundle's old Slack user groups are left alone: the sidecar copies
+    // their people onto it once, then clears them.
     connection
         .execute(
-            "INSERT INTO bundles(name, slack_user_group_handle, manual_user_ids, capabilities,
+            "INSERT INTO bundles(name, manual_user_ids, capabilities,
                                  allowed_channel_ids, allow_im, allow_mpim, updated_at)
-             VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES(?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(name) DO UPDATE SET
-               slack_user_group_handle = excluded.slack_user_group_handle,
                manual_user_ids = excluded.manual_user_ids,
                capabilities = excluded.capabilities,
                allowed_channel_ids = excluded.allowed_channel_ids,
@@ -1962,7 +1957,6 @@ async fn save_bundle(bundle: BundleRecord, state: State<'_, AppState>) -> Result
                updated_at = excluded.updated_at",
             params![
                 name,
-                bundle.slack_user_group_handle,
                 bundle.manual_user_ids,
                 capabilities_json,
                 allowed_channels_csv,
@@ -3189,7 +3183,6 @@ fn initialize_db(path: &PathBuf) -> Result<(), String> {
     let _ = connection.execute("ALTER TABLE app_settings ADD COLUMN pm_slack_user_ids TEXT NOT NULL DEFAULT ''", []);
     let _ = connection.execute("ALTER TABLE app_settings ADD COLUMN pm_task_timeout_ms INTEGER NOT NULL DEFAULT 600000", []);
     let _ = connection.execute("ALTER TABLE app_settings ADD COLUMN core_dev_slack_user_ids TEXT NOT NULL DEFAULT ''", []);
-    let _ = connection.execute("ALTER TABLE app_settings ADD COLUMN core_dev_slack_user_group TEXT NOT NULL DEFAULT ''", []);
     let _ = connection.execute("ALTER TABLE app_settings ADD COLUMN vault_path TEXT NOT NULL DEFAULT ''", []);
     let _ = connection.execute("ALTER TABLE app_settings ADD COLUMN vault_enabled INTEGER NOT NULL DEFAULT 0", []);
     // mini_og_repo_root: read_app_settings selects this column unconditionally. Fresh-install
@@ -3293,13 +3286,12 @@ fn ensure_access_control_seeded(connection: &Connection) -> Result<(), String> {
             .execute(
                 "INSERT OR IGNORE INTO access_control_groups(
                    group_key,
-                   slack_user_group_handle,
                    manual_user_ids,
                    allowed_channel_ids,
                    allow_im,
                    allow_mpim,
                    updated_at
-                 ) VALUES(?, '', '', '', 0, 0, ?)",
+                 ) VALUES(?, '', '', 0, 0, ?)",
                 params![key, now],
             )
             .map_err(|err| format!("db seed access_control_groups failed: {err}"))?;
@@ -3313,23 +3305,16 @@ fn ensure_access_control_seeded(connection: &Connection) -> Result<(), String> {
         .query_row(
             "SELECT
                COALESCE(bugs_and_updates_channel_id, ''),
-               COALESCE(core_dev_slack_user_ids, ''),
-               COALESCE(core_dev_slack_user_group, '')
+               COALESCE(core_dev_slack_user_ids, '')
              FROM app_settings
              WHERE id = 1
              LIMIT 1",
             [],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()
         .map_err(|err| format!("db read legacy access seed failed: {err}"))?
-        .unwrap_or_else(|| (String::new(), String::new(), String::new()));
+        .unwrap_or_else(|| (String::new(), String::new()));
 
     connection
         .execute(
@@ -3356,14 +3341,13 @@ fn ensure_access_control_seeded(connection: &Connection) -> Result<(), String> {
     connection
         .execute(
             "UPDATE access_control_groups
-             SET slack_user_group_handle = ?,
-                 manual_user_ids = ?,
+             SET manual_user_ids = ?,
                  allowed_channel_ids = ?,
                  allow_im = 1,
                  allow_mpim = 1,
                  updated_at = ?
              WHERE group_key = 'admin'",
-            params![legacy.2.trim(), legacy.1.trim(), legacy.0.trim(), now],
+            params![legacy.1.trim(), legacy.0.trim(), now],
         )
         .map_err(|err| format!("db seed admin access group failed: {err}"))?;
 
@@ -3396,7 +3380,6 @@ fn read_access_control_settings(connection: &Connection) -> Result<AccessControl
         .prepare(
             "SELECT
                group_key,
-               slack_user_group_handle,
                manual_user_ids,
                allowed_channel_ids,
                allow_im,
@@ -3410,11 +3393,10 @@ fn read_access_control_settings(connection: &Connection) -> Result<AccessControl
             Ok((
                 row.get::<_, String>(0)?,
                 AccessGroupSettings {
-                    slack_user_group_handle: row.get(1)?,
-                    manual_user_ids: row.get(2)?,
-                    allowed_channel_ids: row.get(3)?,
-                    allow_im: row.get::<_, i64>(4)? != 0,
-                    allow_mpim: row.get::<_, i64>(5)? != 0,
+                    manual_user_ids: row.get(1)?,
+                    allowed_channel_ids: row.get(2)?,
+                    allow_im: row.get::<_, i64>(3)? != 0,
+                    allow_mpim: row.get::<_, i64>(4)? != 0,
                 },
             ))
         })
@@ -3458,15 +3440,13 @@ fn persist_access_control_settings(
             .execute(
                 "INSERT INTO access_control_groups(
                    group_key,
-                   slack_user_group_handle,
                    manual_user_ids,
                    allowed_channel_ids,
                    allow_im,
                    allow_mpim,
                    updated_at
-                 ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                 ) VALUES(?, ?, ?, ?, ?, ?)
                  ON CONFLICT(group_key) DO UPDATE SET
-                   slack_user_group_handle = excluded.slack_user_group_handle,
                    manual_user_ids = excluded.manual_user_ids,
                    allowed_channel_ids = excluded.allowed_channel_ids,
                    allow_im = excluded.allow_im,
@@ -3474,7 +3454,6 @@ fn persist_access_control_settings(
                    updated_at = excluded.updated_at",
                 params![
                     key,
-                    group.slack_user_group_handle.trim(),
                     group.manual_user_ids.trim(),
                     group.allowed_channel_ids.trim(),
                     if group.allow_im { 1 } else { 0 },
@@ -3537,7 +3516,6 @@ fn read_app_settings(connection: &Connection) -> Result<AppSettings, String> {
               COALESCE(pm_slack_user_ids, '') as pm_slack_user_ids,
               COALESCE(pm_task_timeout_ms, 600000) as pm_task_timeout_ms,
               COALESCE(core_dev_slack_user_ids, '') as core_dev_slack_user_ids,
-              COALESCE(core_dev_slack_user_group, '') as core_dev_slack_user_group,
               COALESCE(vault_path, '') as vault_path,
               COALESCE(vault_enabled, 0) as vault_enabled,
               COALESCE(mini_og_repo_root, '/Users/dipesh/code/mini-og') as mini_og_repo_root,
@@ -3577,11 +3555,10 @@ fn read_app_settings(connection: &Connection) -> Result<AppSettings, String> {
                 pm_slack_user_ids: row.get(23)?,
                 pm_task_timeout_ms: row.get(24)?,
                 core_dev_slack_user_ids: row.get(25)?,
-                core_dev_slack_user_group: row.get(26)?,
-                vault_path: row.get(27)?,
-                vault_enabled: row.get::<_, i64>(28)? != 0,
-                mini_og_repo_root: row.get(29)?,
-                newton_marketing_web_path: row.get(30)?,
+                vault_path: row.get(26)?,
+                vault_enabled: row.get::<_, i64>(27)? != 0,
+                mini_og_repo_root: row.get(28)?,
+                newton_marketing_web_path: row.get(29)?,
                 access_control: AccessControlSettings::default(),
             })
         })
@@ -3626,11 +3603,10 @@ fn persist_app_settings(connection: &Connection, settings: &AppSettings) -> Resu
               pm_slack_user_ids,
               pm_task_timeout_ms,
               core_dev_slack_user_ids,
-              core_dev_slack_user_group,
               vault_path,
               vault_enabled,
               updated_at
-             ) VALUES(1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ) VALUES(1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
               slack_bot_token=excluded.slack_bot_token,
               slack_app_token=excluded.slack_app_token,
@@ -3659,7 +3635,6 @@ fn persist_app_settings(connection: &Connection, settings: &AppSettings) -> Resu
               pm_slack_user_ids=excluded.pm_slack_user_ids,
               pm_task_timeout_ms=excluded.pm_task_timeout_ms,
               core_dev_slack_user_ids=excluded.core_dev_slack_user_ids,
-              core_dev_slack_user_group=excluded.core_dev_slack_user_group,
               vault_path=excluded.vault_path,
               vault_enabled=excluded.vault_enabled,
               updated_at=excluded.updated_at",
@@ -3691,7 +3666,6 @@ fn persist_app_settings(connection: &Connection, settings: &AppSettings) -> Resu
                 settings.pm_slack_user_ids.trim(),
                 settings.pm_task_timeout_ms,
                 settings.core_dev_slack_user_ids.trim(),
-                settings.core_dev_slack_user_group.trim(),
                 settings.vault_path.trim(),
                 if settings.vault_enabled { 1_i64 } else { 0_i64 },
                 Utc::now().to_rfc3339(),
@@ -4749,10 +4723,9 @@ mod tests {
             .execute(
                 "UPDATE app_settings
                  SET bugs_and_updates_channel_id = ?,
-                     core_dev_slack_user_ids = ?,
-                     core_dev_slack_user_group = ?
+                     core_dev_slack_user_ids = ?
                  WHERE id = 1",
-                params!["C-BUGS,C-OPS", "UCOREDEV1", "core-dev"],
+                params!["C-BUGS,C-OPS", "UCOREDEV1"],
             )
             .expect("update legacy fields");
         connection
@@ -4766,10 +4739,6 @@ mod tests {
         assert_eq!(
             access.groups.get("builder").expect("builder").allowed_channel_ids,
             "C-BUGS,C-OPS"
-        );
-        assert_eq!(
-            access.groups.get("admin").expect("admin").slack_user_group_handle,
-            "core-dev"
         );
         assert_eq!(
             access.groups.get("admin").expect("admin").manual_user_ids,

@@ -26,7 +26,6 @@ const config: AppConfig = {
   bundleTargets: ['app', 'dmg'],
   ownerSlackUserIds: ['UOWNER1'],
   coreDevSlackUserIds: ['UOWNER1'],
-  coreDevSlackUserGroup: '',
   botUserId: 'UBOT1',
   slackBotToken: 'xoxb-test',
   slackAppToken: 'xapp-test',
