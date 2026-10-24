@@ -136,7 +136,9 @@ export async function runWithInfraRetry(
 
     watch = activeClock.stopwatch();
     const waited = await __infraRetry.sleep(delayMs, request.signal);
-    infraWaitMs += lostTime(delayMs);
+    // A sleep can run past the end of the wait, so count the awake part of
+    // it, not the planned delay minus the sleep.
+    infraWaitMs += watch.sleptMs() > 0 ? watch.elapsedMs() : delayMs;
     if (!waited) break;
 
     const sessionId = options.resume ? result.sessionId : undefined;

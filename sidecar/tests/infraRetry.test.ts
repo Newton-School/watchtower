@@ -64,6 +64,30 @@ describe('runWithInfraRetry (issue #439)', () => {
     }
   });
 
+  it('counts the awake part of a retry wait that a sleep ran past (issue #586)', async () => {
+    vi.useFakeTimers();
+    activeClock.stop();
+    try {
+      run.mockResolvedValueOnce(dropped({ durationMs: 60_000 })).mockResolvedValueOnce(ok());
+      sleep.mockImplementationOnce(async () => {
+        // Four minutes into the wait the lid closes for 30 minutes; the wait ends on waking.
+        await vi.advanceTimersByTimeAsync(4 * 60_000);
+        vi.setSystemTime(Date.now() + 30 * 60_000);
+        await vi.advanceTimersByTimeAsync(5_000);
+        return true;
+      });
+
+      const result = await runWithInfraRetry(request, { label: 'coder' });
+
+      // The minute lost to the drop and the four awake minutes of the wait.
+      expect(result.infraWaitMs).toBeGreaterThanOrEqual(60_000 + 4 * 60_000);
+      expect(result.infraWaitMs).toBeLessThan(60_000 + 4 * 60_000 + 15_000);
+    } finally {
+      activeClock.stop();
+      vi.useRealTimers();
+    }
+  });
+
   it('returns a run that worked as it is, without waiting', async () => {
     run.mockResolvedValueOnce(ok());
 
