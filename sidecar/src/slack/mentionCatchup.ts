@@ -8,6 +8,8 @@ import type { JobStore } from '../state/jobStore.js';
 import { catchUpParkedAnswers } from './parkedAnswerCatchup.js';
 
 const CATCHUP_STATE_KEY = 'mention_catchup_cursor_ts';
+// Start of the gap a thread sweep has not finished yet (epoch seconds), or ''.
+const SWEEP_STATE_KEY = 'mention_catchup_sweep_since';
 const CATCHUP_INTERVAL_MS = 2 * 60 * 1000;
 const CATCHUP_LOOKBACK_SECONDS = 60 * 60 * 24;
 const CATCHUP_PAGE_SIZE = 200;
@@ -75,6 +77,8 @@ type CatchupDeps = {
   enqueue: (event: SlackEventEnvelope, client: WebClient, source: 'socket' | 'catchup') => Promise<void>;
   /** Messages the live socket delivered in this process: already handled, never replayed. */
   deliveredLive?: (channelId: string, ts: string) => boolean;
+  /** Whether a job runs in the thread right now; without it, the jobs table's view when the pass began. */
+  threadActive?: (channelId: string, threadTs: string) => boolean;
   nowMs?: () => number;
   /** Gap between a sweep's Slack calls; tests set 0. */
   paceMs?: number;
@@ -82,13 +86,11 @@ type CatchupDeps = {
 
 /** What one scan or sweep carries over to the next. */
 export type CatchupState = {
-  /** Sweep every thread with replies since then (epoch seconds); taken by the next sweep. */
-  sweepSince: number | null;
   replayed: Set<string>;
 };
 
 export function newCatchupState(): CatchupState {
-  return { sweepSince: null, replayed: new Set() };
+  return { replayed: new Set() };
 }
 
 export interface MentionCatchup {
@@ -120,39 +122,105 @@ export function skipWhileRunning(work: () => Promise<void>, what: string): () =>
   };
 }
 
-export function startMentionCatchup(deps: CatchupDeps): MentionCatchup {
-  const state = newCatchupState();
-  // The intake runs a queued job to its end before it returns, so a scan that
-  // waited on it would stop for the whole job.
-  const detached: CatchupDeps = {
-    ...deps,
-    enqueue: async (event, client, source) => {
-      void deps.enqueue(event, client, source).catch(error => {
+/**
+ * Queue recovered events without waiting for them: the intake runs a queued
+ * job to its end before it returns, so a scan that waited would stop for the
+ * whole job. Events in one thread still go one after another, each once the
+ * last is processed, as when the scan waited: queued together, two of them
+ * could both pass the one-job-per-thread check before either registered, and
+ * a stop would then end only one. A stop itself never waits: it is for the
+ * job ahead of it.
+ */
+export function detachPerThread(enqueue: CatchupDeps['enqueue']): CatchupDeps['enqueue'] {
+  const threads = new Map<string, Promise<void>>();
+  return async (event, client, source) => {
+    const run = () =>
+      enqueue(event, client, source).catch(error => {
         logger.warn({ component: 'slack-catchup', eventId: event.eventId, error: String(error) }, 'replay failed');
       });
-    },
-  };
-  const scan = skipWhileRunning(() => runMentionCatchup(detached, state), 'missed mention catch-up scan');
-  // Off the scan's path: a sweep is paced and can take minutes.
-  const sweep = skipWhileRunning(async () => {
-    while (state.sweepSince !== null) {
-      const since = state.sweepSince;
-      state.sweepSince = null;
-      await runThreadSweep(detached, state, since);
+    if (isStopCommand(event.text)) {
+      void run();
+      return;
     }
-  }, 'thread sweep');
+    const key = `${event.channelId}:${event.threadTs}`;
+    const next = (threads.get(key) ?? Promise.resolve()).then(run);
+    threads.set(key, next);
+    void next.finally(() => {
+      if (threads.get(key) === next) threads.delete(key);
+    });
+  };
+}
+
+/**
+ * Sweeps after a gap, one at a time and off the scan's path: a sweep is paced
+ * and can take minutes. Until one finishes, the gap's start stays in
+ * sidecar_state, so a crash mid-sweep sweeps it again on the next start,
+ * rather than from the scan position the 2-minute scans have moved past it.
+ */
+export class ThreadSweeper {
+  private pending: number | null = null;
+  private inProgress: number | null = null;
+  private unfinished: number | null = null;
+  private readonly runQueued: () => Promise<void>;
+
+  constructor(
+    private readonly deps: CatchupDeps,
+    private readonly state: CatchupState,
+  ) {
+    this.runQueued = skipWhileRunning(async () => {
+      while (this.pending !== null) {
+        const since = this.pending;
+        this.pending = null;
+        this.inProgress = since;
+        this.save();
+        try {
+          await runThreadSweep(this.deps, this.state, since);
+        } catch (error) {
+          // Kept for the next request, and the next start; not retried in a loop.
+          this.unfinished = this.unfinished === null ? since : Math.min(this.unfinished, since);
+          logger.warn({ component: 'slack-catchup', since, error: String(error) }, 'thread sweep failed');
+        } finally {
+          this.inProgress = null;
+          this.save();
+        }
+      }
+    }, 'thread sweep');
+  }
+
+  /** At start: the gap a sweep never finished, or else the last scan before the stop. */
+  resume(lastScanBoundary: number): Promise<void> {
+    const saved = Number(this.deps.store.getState(SWEEP_STATE_KEY) || 0);
+    return this.request(Number.isFinite(saved) && saved > 0 ? Math.min(saved, lastScanBoundary) : lastScanBoundary);
+  }
+
+  request(sinceEpochSeconds: number): Promise<void> {
+    this.pending = Math.min(sinceEpochSeconds, this.pending ?? Infinity, this.unfinished ?? Infinity);
+    this.unfinished = null;
+    this.save();
+    return this.runQueued();
+  }
+
+  private save(): void {
+    const open = [this.pending, this.inProgress, this.unfinished].filter((since): since is number => since !== null);
+    this.deps.store.setState(SWEEP_STATE_KEY, open.length > 0 ? String(Math.min(...open)) : '');
+  }
+}
+
+export function startMentionCatchup(deps: CatchupDeps): MentionCatchup {
+  const state = newCatchupState();
+  const detached: CatchupDeps = { ...deps, enqueue: detachPerThread(deps.enqueue) };
+  const scan = skipWhileRunning(() => runMentionCatchup(detached, state), 'missed mention catch-up scan');
+  const sweeper = new ThreadSweeper(detached, state);
 
   // While the sidecar was down nothing at all was delivered, thread replies
   // included: sweep threads from the last scan before it.
   const storedCursor = Number(deps.store.getState(CATCHUP_STATE_KEY) ?? 0);
-  state.sweepSince = effectiveOldestTs(storedCursor, Math.floor(now(deps) / 1000), CATCHUP_LOOKBACK_SECONDS);
   void scan();
-  void sweep();
+  void sweeper.resume(effectiveOldestTs(storedCursor, Math.floor(now(deps) / 1000), CATCHUP_LOOKBACK_SECONDS));
   setInterval(() => void scan(), CATCHUP_INTERVAL_MS);
   return {
     sweepThreadsSince(epochSeconds) {
-      state.sweepSince = state.sweepSince === null ? epochSeconds : Math.min(state.sweepSince, epochSeconds);
-      void sweep();
+      void sweeper.request(epochSeconds);
     },
   };
 }
@@ -211,7 +279,9 @@ async function recoverThreadMentions(
     const answeredLater = replies.some(
       other => String(other.user ?? '') === config.botUserId && toEpochSeconds(String(other.ts ?? '')) > replyEpoch,
     );
-    if (answeredLater && !(thread.active && isStopCommand(candidate.text))) {
+    // Asked now, not when the pass began: a job may have started since.
+    const active = deps.threadActive ? deps.threadActive(channelId, parentTs) : thread.active;
+    if (answeredLater && !(active && isStopCommand(candidate.text))) {
       store.recordEvent(replayEventId, channelId, parentTs);
       continue;
     }
@@ -318,6 +388,8 @@ export async function runMentionCatchup(deps: CatchupDeps, state: CatchupState =
         continue;
       }
       const replayEventId = replayIdFor(channelId, eventTs);
+      // Before the await below, so a sweep running alongside never queues it too.
+      remember(state, replayEventId);
 
       const threadTs = String(message.thread_ts ?? message.ts ?? '');
       const alreadyResponded = await hasBotResponseAfterMention(
@@ -343,7 +415,6 @@ export async function runMentionCatchup(deps: CatchupDeps, state: CatchupState =
         rawEvent: message as Record<string, unknown>,
       };
 
-      remember(state, replayEventId);
       await enqueue(envelope, webClient, 'catchup');
       recovered += 1;
     }
@@ -393,11 +464,13 @@ export async function runThreadSweep(deps: CatchupDeps, state: CatchupState, sin
   const since = Math.max(nowTs - CATCHUP_LOOKBACK_SECONDS, sinceEpochSeconds);
   const paceMs = deps.paceMs ?? SWEEP_PACE_MS;
   const pace = () => (paceMs > 0 ? new Promise(resolve => setTimeout(resolve, paceMs)) : Promise.resolve());
-  const jobThreads = new Map(
-    store
-      .threadsWithRecentJobs(recentJobThreadsSince(deps))
-      .map(thread => [`${thread.channelId}:${thread.threadTs}`, thread.active]),
-  );
+  const jobThreads = deps.threadActive
+    ? new Map<string, boolean>()
+    : new Map(
+        store
+          .threadsWithRecentJobs(recentJobThreadsSince(deps))
+          .map(thread => [`${thread.channelId}:${thread.threadTs}`, thread.active]),
+      );
 
   const threads: Array<{ channelId: string; parentTs: string; latestReply: number }> = [];
   for (const channelId of await discoverChannels(webClient, store, config)) {

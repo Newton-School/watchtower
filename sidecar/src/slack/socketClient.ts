@@ -13,6 +13,7 @@ type SocketStateHandler = (state: 'connected' | 'closed') => void;
 type SocketModeConnection = {
   on(event: 'connected' | 'close', listener: () => void): unknown;
   removeListener(event: 'connected' | 'close', listener: () => void): unknown;
+  removeAllListeners(event: 'disconnected'): unknown;
   disconnect(): Promise<void>;
 };
 
@@ -38,7 +39,6 @@ function withinTimeout<T>(work: Promise<T>, what: string): Promise<T> {
 
 /** socket-mode internals a retired client is stopped through; private in its types. */
 type SocketModeInternals = {
-  autoReconnectEnabled?: boolean;
   webClient?: { axios?: { interceptors?: { request?: { use(onRequest: () => unknown): unknown } } } };
   websocket?: { terminate?: () => void } | null;
 };
@@ -47,16 +47,31 @@ type SocketModeInternals = {
  * Close a Socket Mode connection for good. A dead connection never answers
  * the close frame (ws waits 30s and more), so after a few seconds the
  * websocket is dropped outright. The client is never started again, and it
- * stops trying by itself: auto-reconnect goes off, and the
- * apps.connections.open retries it may still have running (up to 100 of
- * them) are parked on a request that never settles. Not failed: socket-mode's
- * reconnect chain has no catch, so a rejection there would be unhandled and
- * take the sidecar down. If a reconnect connects anyway, it is closed too.
+ * stops trying by itself. socket-mode's own reconnect calls start() with no
+ * catch, so nothing here may make that start() reject (Node would end the
+ * sidecar on the unhandled rejection):
+ * - start() rejects when the client says `disconnected` before Slack's
+ *   hello, which disconnect() does to a websocket still mid-handshake: its
+ *   listener goes first;
+ * - auto-reconnect stays on: disconnect() marks the client shutting down,
+ *   which parks its retries, while auto-reconnect off would make a failed
+ *   apps.connections.open throw instead;
+ * - apps.connections.open retries still running (up to 100 of them) are
+ *   parked on a request that never settles, rather than failed.
+ * If a reconnect connects anyway, it is closed too.
  */
 export async function retireSocketConnection(socket: SocketModeConnection, graceMs = RETIRE_GRACE_MS): Promise<void> {
-  const internals = socket as SocketModeInternals;
-  internals.autoReconnectEnabled = false;
-  internals.webClient?.axios?.interceptors?.request?.use(() => new Promise(() => {}));
+  const internals = socket as SocketModeConnection & SocketModeInternals;
+  socket.removeAllListeners('disconnected');
+  const requests = internals.webClient?.axios?.interceptors?.request;
+  if (requests) {
+    requests.use(() => new Promise(() => {}));
+  } else {
+    logger.warn(
+      { component: 'slack' },
+      "socket-mode's internals changed: a retired socket client may keep calling apps.connections.open",
+    );
+  }
   const closeAgain = () => void socket.disconnect().catch(() => {});
   socket.on('connected', closeAgain);
   let timer: ReturnType<typeof setTimeout> | undefined;

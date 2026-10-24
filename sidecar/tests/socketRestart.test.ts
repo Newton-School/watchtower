@@ -105,10 +105,14 @@ describe('retireSocketConnection', () => {
     expect(socket.disconnects).toBe(2);
   });
 
-  it('stops the client retrying: no auto-reconnect, and its API requests park instead of failing', async () => {
+  it('stops the client retrying without making its start() reject: requests park, disconnected listeners go', async () => {
     const socket = new FakeConnection(true);
+    let startRejected = false;
+    socket.on('disconnected', () => (startRejected = true)); // what a pending start() listens with
     await retireSocketConnection(socket, 50);
-    expect(socket.autoReconnectEnabled).toBe(false);
+    socket.emit('disconnected');
+    expect(startRejected).toBe(false);
+    expect(socket.autoReconnectEnabled).toBe(true); // off would make a failed apps.connections.open throw
     expect(socket.interceptors.length).toBe(1);
     const parked = socket.interceptors[0]() as Promise<unknown>;
     const settled = await Promise.race([

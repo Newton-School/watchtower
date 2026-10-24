@@ -153,7 +153,7 @@ let bundlesLoadedAt = new Date().toISOString();
   }
 }
 
-const queue: Array<{ event: SlackEventEnvelope; client: WebClient }> = [];
+const queue: Array<{ event: SlackEventEnvelope; client: WebClient; processed?: () => void }> = [];
 // How many jobs run at once, and what happens when one stops needing its slot.
 jobSlots.configure({
   max: () => config.maxConcurrentJobs,
@@ -747,18 +747,31 @@ function _startIncidentCommanderFeed(client: WebClient): void {
   }, INCIDENT_TICK_MS);
 }
 
+/**
+ * Queue an event. Resolves once the queue has moved on, which may be before
+ * this event's turn when every slot is taken; `untilProcessed` waits for this
+ * event itself to be processed (catch-up runs a thread's events in order).
+ */
 async function enqueueSlackEvent(
   event: SlackEventEnvelope,
   client: WebClient,
   source: 'socket' | 'catchup' | 'launchpad',
+  opts: { untilProcessed?: boolean } = {},
 ): Promise<void> {
   // A stop must not wait in the queue behind the job it is meant to stop.
   if (source !== 'launchpad' && (await tryHandleStopControl(event, client))) {
     return;
   }
-  queue.push({ event, client });
+  const item: (typeof queue)[number] = { event, client };
+  const processed = opts.untilProcessed
+    ? new Promise<void>(resolve => {
+        item.processed = resolve;
+      })
+    : undefined;
+  queue.push(item);
   logger.info({ queueDepth: queue.length, eventId: event.eventId, source }, 'event queued for processing');
   await processNext();
+  await processed;
 }
 
 /** Stop messages already acted on. Slack delivers one message as both `app_mention` and `message`. */
@@ -838,6 +851,7 @@ async function processNext(): Promise<void> {
   try {
     await jobSlots.run(() => processEvent(item.event, item.client));
   } finally {
+    item.processed?.();
     await processNext();
   }
 }
@@ -2224,6 +2238,7 @@ async function main(): Promise<void> {
     config,
     store,
     deliveredLive: (channelId, ts) => socketWatchdog.wasDelivered(channelId, ts),
+    threadActive: (channelId, threadTs) => Boolean(activeJobForThread(channelId, threadTs)),
     enqueue: async (event, webClient, source) => {
       // A bot mention only catch-up found is evidence the socket is dead.
       socketWatchdog.noteCatchupRecovery({
@@ -2232,7 +2247,7 @@ async function main(): Promise<void> {
         mentionType: detectMention(event.text, config).type,
         edited: Boolean((event.rawEvent as { edited?: unknown } | undefined)?.edited),
       });
-      await enqueueSlackEvent(event, webClient, source);
+      await enqueueSlackEvent(event, webClient, source, { untilProcessed: true });
     },
   });
 

@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import type { WebClient } from '@slack/web-api';
 import {
+  detachPerThread,
   newCatchupState,
   runMentionCatchup,
   runThreadSweep,
   skipWhileRunning,
+  ThreadSweeper,
   type CatchupState,
 } from '../src/slack/mentionCatchup.js';
 import type { AppConfig, SlackEventEnvelope } from '../src/types/contracts.js';
@@ -318,5 +320,182 @@ describe('skipWhileRunning', () => {
     await run();
     await run();
     expect(runs).toBe(2);
+  });
+});
+
+describe('mention catch-up: a stop and a job started mid-pass', () => {
+  it('asks the live job registry, not the view when the sweep began', async () => {
+    const stop = at(300);
+    const jobParent = at(3000);
+    // The jobs table had no running job here when the sweep began; the wake scan has started one since.
+    const { store } = makeStore();
+    const { client } = makeSlack(
+      [{ ts: jobParent, user: 'U1', text: `<@${BOT}> review #12`, reply_count: 2, latest_reply: at(200) }],
+      {
+        [jobParent]: [
+          { ts: stop, user: 'U1', text: `<@${BOT}> stop` },
+          { ts: at(200), user: BOT, text: 'Reviewing…' },
+        ],
+      },
+    );
+    const queued: SlackEventEnvelope[] = [];
+    await runThreadSweep(
+      {
+        webClient: client,
+        config: makeConfig(),
+        store: store as never,
+        enqueue: async event => {
+          queued.push(event);
+        },
+        threadActive: (channelId, threadTs) => channelId === 'C1' && threadTs === jobParent,
+        nowMs: () => NOW_MS,
+        paceMs: 0,
+      },
+      newCatchupState(),
+      NOW - 3600,
+    );
+    expect(queued.map(e => e.eventTs)).toEqual([stop]);
+  });
+});
+
+describe('mention catch-up: a scan and a sweep at once', () => {
+  it('queues a reply both can see once', async () => {
+    const parent = at(1800);
+    const reply = at(60);
+    const { store } = makeStore({ jobThreads: [{ channelId: 'C1', threadTs: parent, active: false }] });
+    const { client } = makeSlack(
+      [{ ts: parent, user: 'U1', text: `<@${BOT}> first`, reply_count: 1, latest_reply: reply }],
+      { [parent]: [{ ts: reply, user: 'U1', text: `<@${BOT}> and this?` }] },
+    );
+    const state = newCatchupState();
+    const queued: SlackEventEnvelope[] = [];
+    const deps = {
+      webClient: client,
+      config: makeConfig(),
+      store: store as never,
+      enqueue: async (event: SlackEventEnvelope) => {
+        queued.push(event);
+      },
+      nowMs: () => NOW_MS,
+      paceMs: 0,
+    };
+    await Promise.all([runMentionCatchup(deps, state), runThreadSweep(deps, state, NOW - 3600)]);
+    expect(queued.map(e => e.eventTs)).toEqual([reply]);
+  });
+});
+
+describe('detachPerThread', () => {
+  const event = (eventTs: string, threadTs: string, text = `<@${BOT}> review #12`) =>
+    ({ eventId: `replay:C1:${eventTs}`, channelId: 'C1', threadTs, eventTs, userId: 'U1', text }) as SlackEventEnvelope;
+
+  it('runs one thread’s events one after another, other threads at once, and never holds a stop', async () => {
+    const started: string[] = [];
+    const finish = new Map<string, () => void>();
+    const detached = detachPerThread(async replay => {
+      started.push(replay.eventTs);
+      await new Promise<void>(resolve => finish.set(replay.eventTs, resolve));
+    });
+    const settle = () => new Promise(resolve => setTimeout(resolve, 0));
+
+    await detached(event('1.1', 'T1'), {} as WebClient, 'catchup');
+    await detached(event('1.2', 'T1', `<@${BOT}> ?`), {} as WebClient, 'catchup');
+    await detached(event('2.1', 'T2'), {} as WebClient, 'catchup');
+    await detached(event('1.3', 'T1', `<@${BOT}> stop`), {} as WebClient, 'catchup');
+    await settle();
+    // The scan did not wait; T1's second ask waits for its first; T2 and the stop go at once.
+    expect(started).toEqual(['1.1', '2.1', '1.3']);
+
+    finish.get('1.1')?.();
+    await settle();
+    expect(started).toEqual(['1.1', '2.1', '1.3', '1.2']);
+  });
+
+  it('goes on to the next event in the thread when one fails', async () => {
+    const started: string[] = [];
+    const detached = detachPerThread(async replay => {
+      started.push(replay.eventTs);
+      if (replay.eventTs === '1.1') throw new Error('intake failed');
+    });
+    await detached(event('1.1', 'T1'), {} as WebClient, 'catchup');
+    await detached(event('1.2', 'T1'), {} as WebClient, 'catchup');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(started).toEqual(['1.1', '1.2']);
+  });
+});
+
+describe('ThreadSweeper', () => {
+  function keyedStore(initial: Record<string, string> = {}) {
+    const values = new Map(Object.entries(initial));
+    const base = makeStore().store;
+    return {
+      values,
+      store: {
+        ...base,
+        getState: (key: string) => values.get(key),
+        setState: (key: string, value: string) => {
+          values.set(key, value);
+        },
+      },
+    };
+  }
+
+  function slackHangingOnReplies(parentTs: string) {
+    const oldestAsked: string[] = [];
+    const client = {
+      users: { conversations: async () => ({ channels: [], response_metadata: {} }) },
+      conversations: {
+        history: async () => ({
+          messages: [{ ts: parentTs, user: 'U1', text: 'thread', reply_count: 1, latest_reply: at(60) }],
+          response_metadata: {},
+        }),
+        replies: ({ oldest }: { oldest: string }) => {
+          oldestAsked.push(oldest);
+          return new Promise(() => {}); // the sidecar stops mid-sweep
+        },
+      },
+    } as unknown as WebClient;
+    return { client, oldestAsked };
+  }
+
+  const depsFor = (client: WebClient, store: unknown) => ({
+    webClient: client,
+    config: makeConfig(),
+    store: store as never,
+    enqueue: async () => {},
+    nowMs: () => NOW_MS,
+    paceMs: 0,
+  });
+
+  it('keeps the gap in sidecar_state until the sweep finishes', async () => {
+    const { store, values } = keyedStore();
+    const { client } = makeSlack([], {});
+    await new ThreadSweeper(depsFor(client, store), newCatchupState()).request(NOW - 3600);
+    expect(values.get('mention_catchup_sweep_since')).toBe('');
+  });
+
+  it('sweeps an unfinished gap again on the next start, not from the scan position', async () => {
+    const parent = at(7200);
+    const { store, values } = keyedStore();
+    const first = slackHangingOnReplies(parent);
+    void new ThreadSweeper(depsFor(first.client, store), newCatchupState()).request(NOW - 3600);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(values.get('mention_catchup_sweep_since')).toBe(String(NOW - 3600));
+
+    // Restarted; the 2-minute scans had moved the scan position on to a minute ago.
+    const second = slackHangingOnReplies(parent);
+    void new ThreadSweeper(depsFor(second.client, store), newCatchupState()).resume(NOW - 60);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(second.oldestAsked).toEqual([String(NOW - 3600)]);
+  });
+
+  it('keeps the earlier gap when another is asked for mid-sweep', async () => {
+    const parent = at(7200);
+    const { store, values } = keyedStore();
+    const { client } = slackHangingOnReplies(parent);
+    const sweeper = new ThreadSweeper(depsFor(client, store), newCatchupState());
+    void sweeper.request(NOW - 3600);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    void sweeper.request(NOW - 600);
+    expect(values.get('mention_catchup_sweep_since')).toBe(String(NOW - 3600));
   });
 });
