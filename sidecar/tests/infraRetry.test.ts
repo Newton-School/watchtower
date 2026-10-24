@@ -8,6 +8,7 @@ import {
   killedFromOutsideReply,
   runWithInfraRetry,
 } from '../src/codex/infraRetry.js';
+import { activeClock } from '../src/runtime/activeClock.js';
 import type { CodexRunRequest, CodexRunResult } from '../src/types/contracts.js';
 
 const base = { exitCode: 0, timedOut: false, stdout: '', stderr: '', lastMessage: '' };
@@ -39,6 +40,53 @@ describe('runWithInfraRetry (issue #439)', () => {
     __infraRetry.sleep = sleep;
   });
   afterEach(() => Object.assign(__infraRetry, original));
+
+  it('leaves out of the lost time a sleep that dropped the connection: the pipeline already does not count it (issue #586)', async () => {
+    vi.useFakeTimers();
+    activeClock.stop();
+    try {
+      run
+        .mockImplementationOnce(async () => {
+          // Asleep for 30 min of the attempt's 31; the drop shows on waking.
+          vi.setSystemTime(Date.now() + 30 * 60_000);
+          await vi.advanceTimersByTimeAsync(60_000);
+          return dropped({ durationMs: 31 * 60_000 });
+        })
+        .mockResolvedValueOnce(ok());
+
+      const result = await runWithInfraRetry(request, { label: 'coder' });
+
+      // The minute awake and the wait; not the 30 min asleep.
+      expect(result.infraWaitMs).toBe(60_000 + INFRA_RETRY_DELAYS_MS[0]);
+    } finally {
+      activeClock.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it('counts the awake part of a retry wait that a sleep ran past (issue #586)', async () => {
+    vi.useFakeTimers();
+    activeClock.stop();
+    try {
+      run.mockResolvedValueOnce(dropped({ durationMs: 60_000 })).mockResolvedValueOnce(ok());
+      sleep.mockImplementationOnce(async () => {
+        // Four minutes into the wait the lid closes for 30 minutes; the wait ends on waking.
+        await vi.advanceTimersByTimeAsync(4 * 60_000);
+        vi.setSystemTime(Date.now() + 30 * 60_000);
+        await vi.advanceTimersByTimeAsync(5_000);
+        return true;
+      });
+
+      const result = await runWithInfraRetry(request, { label: 'coder' });
+
+      // The minute lost to the drop and the four awake minutes of the wait.
+      expect(result.infraWaitMs).toBeGreaterThanOrEqual(60_000 + 4 * 60_000);
+      expect(result.infraWaitMs).toBeLessThan(60_000 + 4 * 60_000 + 15_000);
+    } finally {
+      activeClock.stop();
+      vi.useRealTimers();
+    }
+  });
 
   it('returns a run that worked as it is, without waiting', async () => {
     run.mockResolvedValueOnce(ok());

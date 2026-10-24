@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   buildUnfinishedRunMessage,
   coderReportedPrUrl,
@@ -7,6 +7,7 @@ import {
   unfinishedReason,
 } from '../src/agents/unfinishedRun.js';
 import { runAgentPipeline } from '../src/agents/pipeline.js';
+import { activeClock } from '../src/runtime/activeClock.js';
 import { buildReviewerPrompt, buildVerifierPrompt } from '../src/agents/prompts.js';
 import { diagnoseFailure } from '../src/learning/failureDoctor.js';
 import { runCodex } from '../src/codex/runCodex.js';
@@ -156,12 +157,18 @@ describe('the time limit, when it runs out right after a coder pass', () => {
   } as unknown as AgentContext;
   const ok = (parsedJson: Record<string, unknown>) =>
     ({ ok: true, exitCode: 0, timedOut: false, stdout: '', stderr: '', lastMessage: '', parsedJson }) as any;
-  let now = 0;
+  // Agents work while the timers run: a clock that jumped with no timer in
+  // between would read as the host asleep, which the budget leaves out (issue #586).
+  const work = (ms: number) => vi.advanceTimersByTimeAsync(ms);
 
   beforeEach(() => {
-    now = 1_000_000;
-    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    vi.useFakeTimers();
+    activeClock.stop();
     vi.mocked(runCodex).mockReset();
+  });
+  afterEach(() => {
+    activeClock.stop();
+    vi.useRealTimers();
   });
 
   it('says the latest changes were not reviewed again', async () => {
@@ -181,15 +188,15 @@ describe('the time limit, when it runs out right after a coder pass', () => {
     } as any;
     vi.mocked(runCodex)
       .mockImplementationOnce(async () => {
-        now += 30 * 60_000;
+        await work(30 * 60_000);
         return ok({ status: 'done', summary: 'Added the dialog.', prUrl: PR });
       })
       .mockImplementationOnce(async () => {
-        now += 5 * 60_000;
+        await work(5 * 60_000);
         return ok({ approved: false, findings: [{ severity: 'high', category: 'c', message: 'No Escape handling.' }] });
       })
       .mockImplementationOnce(async () => {
-        now += 11 * 60_000;
+        await work(11 * 60_000);
         return ok({ status: 'done', summary: 'Handled Escape.', prUrl: '' });
       });
 
