@@ -1856,6 +1856,24 @@ describe('the opening line (issue #588)', () => {
 
     expect(slack.chat.postMessage.mock.calls[0][0].text).toContain('post a plan for approval');
   });
+
+  it('does not promise a plan for "merge it" about the thread\'s only PR, which skips the planner (issue #605)', async () => {
+    const slack = makeSlack();
+    routerPicks('IMPLEMENTATION');
+    const task = makeTask({
+      userId: 'UOWNER1',
+      channelId: 'C-BUILD',
+      text: '<@UBOT1> merge it',
+      intent: 'IMPLEMENTATION',
+    });
+    task.prContexts = [pr('thread')];
+    task.event.eventTs = recent();
+
+    await routeTask({ task, config: makeConfig('enforce'), slack: slack as never, store: {} as never });
+
+    expect(slack.chat.postMessage).not.toHaveBeenCalled();
+    expect(runImplementationWorkflow).toHaveBeenCalledOnce();
+  });
 });
 
 describe('a marketing staging deploy ask', () => {
