@@ -1,6 +1,6 @@
 [package]
 name = "watchtower"
-version = "0.6.173"
+version = "0.6.174"
 description = "Watchtower (macOS-only Slack mention automation)"
 authors = ["Dipesh"]
 edition = "2021"
