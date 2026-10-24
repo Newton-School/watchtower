@@ -79,7 +79,8 @@ export async function retireSocketConnection(socket: SocketModeConnection, grace
       "socket-mode's internals changed: a retired socket client may keep calling apps.connections.open",
     );
   }
-  const closeAgain = () => void socket.disconnect();
+  // disconnect() only rejects if closing the websocket throws; never let that end the sidecar.
+  const closeAgain = () => void socket.disconnect().catch(() => {});
   socket.on('connected', closeAgain);
   let timer: ReturnType<typeof setTimeout> | undefined;
   const closed = new Promise<void>(resolve => {
@@ -94,7 +95,7 @@ export async function retireSocketConnection(socket: SocketModeConnection, grace
     }, graceMs);
   });
   // Its promise waits on the swallowed `disconnected`; the close shows on our own event.
-  void socket.disconnect();
+  void socket.disconnect().catch(() => {});
   await closed;
   if (timer) clearTimeout(timer);
 }
