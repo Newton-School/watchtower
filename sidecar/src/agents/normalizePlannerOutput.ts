@@ -201,6 +201,15 @@ export function extractFilesToChange(markdown: string): string[] | undefined {
   return [...files];
 }
 
+/**
+ * Whether the plan lists the files it will edit (a "Files to change" section,
+ * or the files block a JSON plan is rendered with), rather than leaving
+ * `affectedFiles` to a guess from every path-shaped token in it.
+ */
+export function planListsFiles(markdown: string): boolean {
+  return (extractFilesToChange(markdown)?.length ?? 0) > 0 || /^\*\*Affected files:\*\*$/m.test(markdown);
+}
+
 const APPROVER_HEADING_RE = /^#{1,6}\s*for\s+the\s+approver\b/i;
 const APPROVER_LINE_RE =
   /^[\s>*-]*\**\s*(what changes|where|behaviou?r change|assumptions to confirm|outside the repo|risk)\s*\**\s*:\s*\**\s*(.*)$/i;

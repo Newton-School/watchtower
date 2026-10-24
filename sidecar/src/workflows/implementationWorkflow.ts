@@ -35,7 +35,7 @@ import {
   coderDeclaredBlocked,
   formatExternalChanges,
 } from '../agents/pipeline.js';
-import { normalizePlannerOutput } from '../agents/normalizePlannerOutput.js';
+import { normalizePlannerOutput, planListsFiles } from '../agents/normalizePlannerOutput.js';
 import { inferRepoFromAffectedFiles, readRepoAffinity, repoPathFor, resolveRepoOrAsk } from './shared/repoResolver.js';
 import { enabledRepoKeys, getRepo, repoKeyForWorkspacePath } from '../repos/registry.js';
 import type { RepoAffinity } from '../router/repoClassifier.js';
@@ -44,12 +44,13 @@ import { requesterOf } from './shared/requester.js';
 import type { ClarificationRound } from './shared/clarificationGuards.js';
 import { profileForAgentRole } from '../codex/modelProfiles.js';
 import { buildPlannerPrompt, buildPlannerPlanModePrompt } from '../agents/prompts.js';
-import { resolveWorkspace } from '../workspaces/workspaceManager.js';
+import { refreshWorktreeToBase, resolveWorkspace } from '../workspaces/workspaceManager.js';
 import { createPrFromWorkspace, findRunPr } from '../github/postPipelinePr.js';
 import { buildUnfinishedRunMessage, coderReportedPrUrl } from '../agents/unfinishedRun.js';
 import { fetchMergeState, fetchUnresolvedReviewThreadCount, type MergeState } from '../github/prReviewComments.js';
 import { waitForExactConfirmation } from './shared/confirmationGate.js';
 import { cancelledResult } from './shared/cancelState.js';
+import { headsUpOnSameFiles, type OpenPr } from './shared/sameFileGuard.js';
 import type { PipelineStore } from '../agents/pipeline.js';
 import type { AgentStepResult, PipelineConfig } from '../agents/types.js';
 import type { InvestigationStore } from '../state/investigationStore.js';
@@ -1262,6 +1263,60 @@ export function plannerFailureReply(
 }
 
 /**
+ * The last step before the coder (issue #602). A heads-up when another run
+ * or an open miniOG PR is changing the same files, then the worktree moved to
+ * the latest base: the plan may have waited hours for approval, and anything
+ * merged since belongs under this change. Nothing in the worktree is lost:
+ * the planner only reads (plan mode, or a read-only run), the plan itself is
+ * in memory, and attachments are downloaded outside it. A refresh that fails
+ * leaves the worktree as it was and the approved run carries on.
+ */
+export async function prepareForCoder(params: {
+  jobId?: string;
+  task: NormalizedTask;
+  config: AppConfig;
+  pipelineCwd: string;
+  planMarkdown: string;
+  planAffectedFiles: string[];
+  threadTexts: string[];
+  slack: WebClient;
+  logStep?: WorkflowStepLogger;
+  /** Test seams. */
+  deps?: { listOpenPrs?: (cwd: string) => Promise<OpenPr[]>; refresh?: typeof refreshWorktreeToBase };
+}): Promise<void> {
+  const { jobId, task, config, pipelineCwd, planMarkdown, slack, logStep } = params;
+  const repoKey = repoKeyForWorkspacePath(pipelineCwd, config);
+  await headsUpOnSameFiles({
+    jobId,
+    channelId: task.event.channelId,
+    threadTs: task.event.threadTs,
+    repo: repoKey ?? path.dirname(pipelineCwd),
+    cwd: pipelineCwd,
+    // Files the plan lists, never a guess from every path in it.
+    files: planListsFiles(planMarkdown) ? params.planAffectedFiles : [],
+    context: [task.event.text ?? '', ...params.threadTexts, planMarkdown],
+    slack,
+    logStep,
+    listOpenPrs: params.deps?.listOpenPrs,
+  });
+  const refresh = await (params.deps?.refresh ?? refreshWorktreeToBase)(pipelineCwd);
+  if (refresh.ok) {
+    logStep?.({
+      stage: 'implementation.workspace.refreshed',
+      message: `Moved the worktree to the latest ${refresh.base} before the coder starts.`,
+      data: { pipelineCwd, base: refresh.base, head: refresh.head },
+    });
+  } else if (!refresh.skipped) {
+    logStep?.({
+      stage: 'implementation.refresh.failed',
+      message: "Couldn't move the worktree to the latest base; the coder starts from where the plan was made.",
+      level: 'WARN',
+      data: { pipelineCwd, reason: refresh.reason },
+    });
+  }
+}
+
+/**
  * A code change keeps Figma, to read the design it implements, and for an
  * admin-tier requester the Newton admin upload tools. Every agent the workflow
  * starts gets that list instead of the host user's connectors (issue #443);
@@ -1994,6 +2049,21 @@ async function runImplementationWorkflowBody(params: {
     // pipeline below must run against that worktree, not the one chosen at
     // initial repo classification.
     pipelineCwd = loopOutcome.pipelineCwd;
+
+    await prepareForCoder({
+      jobId,
+      task,
+      config,
+      pipelineCwd,
+      planMarkdown,
+      planAffectedFiles,
+      threadTexts: (ctx.threadMessages ?? []).map(message => message.text),
+      slack,
+      logStep,
+    });
+    if (signal?.aborted) {
+      return cancelledResult('IMPLEMENTATION');
+    }
 
     // Build the plannerStep for downstream consumption
     const plannerStep: AgentStepResult = {

@@ -51,8 +51,11 @@ import { marketingStagingReply } from '../repos/registry.js';
 import { acknowledgementText, pickupDelayMs } from './acknowledgement.js';
 import { RESTART_EVENT_PREFIX } from '../runtime/restartRecovery.js';
 import { looksLikeFixAffirmation } from './resumeIntentParser.js';
+import { askKindOf, askTextOf, duplicateAskReply, mayCheckForDuplicate, resolveDuplicateAsk } from './duplicateAsk.js';
+import { currentWork, noteAsk } from '../state/workLedger.js';
+import { requesterOf } from '../workflows/shared/requester.js';
 
-import { isPresencePing } from '../workflows/shared/workflowUtils.js';
+import { buildSlackThreadLink, isPresencePing } from '../workflows/shared/workflowUtils.js';
 
 // Confidence below which a decision is not acted on as given when it would
 // drop the access tier of the default seed and could claim work was done. RCA
@@ -155,7 +158,10 @@ export async function routeTask(params: {
    */
   onEngage?: () => Promise<void> | void;
   /** Test seam. */
-  deps?: { resolveMembership?: (userId: string) => Promise<WorkspaceMembership> };
+  deps?: {
+    resolveMembership?: (userId: string) => Promise<WorkspaceMembership>;
+    prOpen?: (prUrl: string) => Promise<boolean>;
+  };
 }): Promise<WorkflowResult> {
   const { task, config, slack, store, jobId, logStep, signal, onEngage, deps } = params;
   let resolvedIntent: WorkflowIntent = task.intent;
@@ -782,6 +788,52 @@ export async function routeTask(params: {
   }
   const runWorkflow = WORKFLOW_RUNNERS[resolvedIntent];
   if (runWorkflow) {
+    // The same ask sent again from another thread is pointed at the first one
+    // instead of becoming a second plan and PR (issue #602).
+    const askKind = askKindOf(resolvedIntent);
+    if (askKind && !signal?.aborted && mayCheckForDuplicate(routedTask)) {
+      const first = await resolveDuplicateAsk({
+        task: routedTask,
+        kind: askKind,
+        jobId,
+        work: currentWork(),
+        prOpen: deps?.prOpen,
+      });
+      if (first && !signal?.aborted) {
+        const text = duplicateAskReply(first, buildSlackThreadLink(first.channelId, first.threadTs));
+        logStep?.({
+          stage: 'router.duplicate_ask',
+          message: `The same ${askKind === 'change' ? 'change' : 'question'} is already in hand in another thread — pointed there and ran nothing.`,
+          data: {
+            intent: resolvedIntent,
+            firstJobId: first.jobId,
+            firstChannelId: first.channelId,
+            firstThreadTs: first.threadTs,
+            firstPrUrl: first.prUrl ?? null,
+          },
+        });
+        await slack.chat.postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text });
+        return {
+          workflow: resolvedIntent,
+          status: 'SKIPPED',
+          message: `Same request as job ${first.jobId}, already in hand in another thread.`,
+          notifyDesktop: false,
+          slackPosted: true,
+        };
+      }
+    }
+    if (askKind && jobId) {
+      noteAsk({
+        jobId,
+        requesterId: requesterOf(routedTask),
+        channelId: task.event.channelId,
+        channelType: task.event.channelType,
+        threadTs: task.event.threadTs,
+        kind: askKind,
+        text: askTextOf(routedTask),
+        startedAtMs: Date.now(),
+      });
+    }
     // The first line the requester reads: what to expect, and an apology when
     // the pickup was late (issue #588). Never fatal, never for a cancelled job.
     const ack = acknowledgementText({
