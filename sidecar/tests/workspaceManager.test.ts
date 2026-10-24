@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
@@ -13,8 +13,13 @@ const ORIGINAL_HOME = process.env.HOME;
 const TEST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'wt-home-'));
 process.env.HOME = TEST_HOME;
 
-const { resolveWorkspace, cleanupThreadWorkspaces, refreshSharedRepoToDefaultBranch } =
-  await import('../src/workspaces/workspaceManager.js');
+const {
+  resolveWorkspace,
+  cleanupThreadWorkspaces,
+  refreshSharedRepoToDefaultBranch,
+  removeWorktreeByPath,
+  WorkspaceSetupError,
+} = await import('../src/workspaces/workspaceManager.js');
 
 const WS_ROOT = path.join(TEST_HOME, '.watchtower', 'workspaces');
 const execFileAsync = promisify(execFile);
@@ -141,8 +146,8 @@ describe('resolveWorkspace refresh-on-reuse', () => {
     await git(repo, ['add', '.gitignore']);
     await git(repo, ['commit', '-qm', 'add gitignore']);
     await git(repo, ['push', '-q', 'origin', 'main']);
-    // Parent clone needs a node_modules for the worktree symlink to be created.
-    fs.mkdirSync(path.join(repo, 'node_modules'), { recursive: true });
+    // Parent clone needs a populated node_modules for the worktree symlink to be created.
+    fs.mkdirSync(path.join(repo, 'node_modules', 'left-pad'), { recursive: true });
 
     const ws = await resolveWorkspace(repo, thread);
 
@@ -157,7 +162,7 @@ describe('resolveWorkspace refresh-on-reuse', () => {
     await git(repo, ['add', '.gitignore']);
     await git(repo, ['commit', '-qm', 'add gitignore']);
     await git(repo, ['push', '-q', 'origin', 'main']);
-    fs.mkdirSync(path.join(repo, 'node_modules'), { recursive: true });
+    fs.mkdirSync(path.join(repo, 'node_modules', 'left-pad'), { recursive: true });
 
     const ws1 = await resolveWorkspace(repo, thread);
     expect(fs.existsSync(path.join(ws1, 'node_modules'))).toBe(true);
@@ -171,6 +176,82 @@ describe('resolveWorkspace refresh-on-reuse', () => {
     expect(ws2).toBe(ws1);
     expect(fs.lstatSync(path.join(ws2, 'node_modules')).isSymbolicLink()).toBe(true);
     expect(await git(ws2, ['status', '--porcelain'])).toBe('');
+  });
+
+  it('moves a real node_modules out before removing a worktree, and leaves no registration behind (#611)', async () => {
+    const ws = await resolveWorkspace(repo, thread);
+    // A worktree's own install (depCache.ts): newton-web's is 200k files, more than git deletes in its timeout.
+    fs.mkdirSync(path.join(ws, 'node_modules', 'next'), { recursive: true });
+    fs.writeFileSync(path.join(ws, 'node_modules', 'next', 'index.js'), 'x');
+    const rename = vi.spyOn(fs, 'renameSync');
+
+    try {
+      expect(await removeWorktreeByPath(ws)).toBe(true);
+      expect(rename).toHaveBeenCalledWith(
+        path.join(ws, 'node_modules'),
+        expect.stringContaining(path.join(TEST_HOME, '.watchtower', 'dep-cache', '.trash') + path.sep),
+      );
+    } finally {
+      rename.mockRestore();
+    }
+    expect(fs.existsSync(ws)).toBe(false);
+    expect(await git(repo, ['worktree', 'list', '--porcelain'])).not.toContain(ws);
+  });
+
+  it('when git cannot remove a worktree, deletes the directory and prunes its registration (#611)', async () => {
+    const ws = await resolveWorkspace(repo, thread);
+    // A `git` first on PATH that fails `worktree remove`, as a timed-out one did.
+    const realGit = (await execFileAsync('which', ['git'])).stdout.trim();
+    const fakeBin = await mkdtemp(path.join(os.tmpdir(), 'wt-fakegit-'));
+    const script = [
+      '#!/bin/sh',
+      'if [ "$1" = worktree ] && [ "$2" = remove ]; then echo "fatal: killed" >&2; exit 1; fi',
+      `exec "${realGit}" "$@"`,
+    ].join('\n');
+    fs.writeFileSync(path.join(fakeBin, 'git'), `${script}\n`, { mode: 0o755 });
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${fakeBin}${path.delimiter}${originalPath}`;
+    try {
+      expect(await removeWorktreeByPath(ws)).toBe(true);
+    } finally {
+      process.env.PATH = originalPath;
+      await rm(fakeBin, { recursive: true, force: true });
+    }
+
+    expect(fs.existsSync(ws)).toBe(false);
+    expect(await git(repo, ['worktree', 'list', '--porcelain'])).not.toContain(ws);
+  });
+
+  it('a removal cut short does not stop the next run in the thread, nor send it to the shared clone (#611)', async () => {
+    const ws = await resolveWorkspace(repo, thread);
+    // What a killed `git worktree remove` left: the directory gone, the registration still there.
+    fs.rmSync(ws, { recursive: true, force: true });
+    expect(await git(repo, ['worktree', 'list', '--porcelain'])).toContain(ws);
+
+    const again = await resolveWorkspace(repo, thread);
+
+    expect(again).toBe(ws);
+    expect(fs.existsSync(path.join(again, 'file.txt'))).toBe(true);
+  });
+
+  it('throws instead of handing back the shared clone when it cannot make a worktree', async () => {
+    const notARepo = await mkdtemp(path.join(os.tmpdir(), 'wt-plain-'));
+    try {
+      await expect(resolveWorkspace(notARepo, thread)).rejects.toBeInstanceOf(WorkspaceSetupError);
+      await expect(resolveWorkspace(notARepo, thread)).rejects.toThrow(
+        /couldn't set up my own copy of wt-plain-\w+ to work in, so I stopped here/,
+      );
+    } finally {
+      await rm(notARepo, { recursive: true, force: true });
+    }
+  });
+
+  it('does not link an empty node_modules: agents read it as "installed" (#611)', async () => {
+    fs.mkdirSync(path.join(repo, 'node_modules'), { recursive: true });
+
+    const ws = await resolveWorkspace(repo, thread);
+
+    expect(fs.existsSync(path.join(ws, 'node_modules'))).toBe(false);
   });
 
   it('reuse discards stale tracked + untracked leftovers from a prior run', async () => {

@@ -38,7 +38,8 @@ import { startThreadSweeper, stopThreadSweeper } from './conversation/threadSwee
 import { startThreadSynthesizerScheduler, stopThreadSynthesizerScheduler } from './conversation/threadSynthesizer.js';
 import { configureGithubPublisher, shutdownGithubPublisher } from './egress/githubPublisher.js';
 import { runConversationBackfill } from './conversation/threadBackfill.js';
-import { cleanupStaleWorkspaces, cleanupThreadWorkspaces } from './workspaces/workspaceManager.js';
+import { cleanupStaleWorkspaces, cleanupThreadWorkspaces, WorkspaceSetupError } from './workspaces/workspaceManager.js';
+import { sweepDepCache } from './workspaces/depCache.js';
 import { sweepLookupWorkspaces } from './workspaces/lookupWorkspace.js';
 import { configureAgentSandbox } from './backends/agentSandbox.js';
 import { enabledRepoPaths } from './repos/registry.js';
@@ -1586,7 +1587,11 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
       return;
     }
 
-    const errorMessage = `Workflow failed after retries: ${String(lastError)}`;
+    // No worktree (issue #611) says so in its own words: retries don't explain it.
+    const errorMessage =
+      lastError instanceof WorkspaceSetupError
+        ? lastError.message
+        : `Workflow failed after retries: ${String(lastError)}`;
     const diagnosis = diagnoseFailure({
       workflow: task.intent,
       message: errorMessage,
@@ -1792,6 +1797,8 @@ async function main(): Promise<void> {
     appDataDir: path.dirname(path.resolve(dbPath)),
   });
   await cleanupStaleWorkspaces();
+  // Dependency installs a restart left half-deleted (issue #611): gigabytes, so not waited on.
+  void sweepDepCache();
   // A lookup's copy of the repos left by a sidecar that stopped mid-lookup (issue #446).
   const sweptLookups = await sweepLookupWorkspaces(config);
   if (sweptLookups > 0) logger.info({ sweptLookups }, 'removed lookup workspaces left by an earlier run');

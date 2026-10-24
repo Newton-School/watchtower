@@ -4,6 +4,7 @@ import os from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { logger } from '../logging/logger.js';
+import { discardInBackground } from './depCache.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -66,6 +67,14 @@ async function excludeNodeModulesFromGit(wsPath: string): Promise<void> {
   }
 }
 
+function hasEntries(dir: string): boolean {
+  try {
+    return fs.readdirSync(dir).length > 0;
+  } catch {
+    return false;
+  }
+}
+
 function sanitizeThreadTs(threadTs: string): string {
   return threadTs.replace(/[^a-zA-Z0-9.-]/g, '_');
 }
@@ -90,11 +99,25 @@ async function resolveDefaultRemoteBranch(repoPath: string): Promise<string> {
 }
 
 /**
+ * `resolveWorkspace` could not make an isolated worktree. The message is for
+ * the person who asked: nothing ran in the shared clone.
+ */
+export class WorkspaceSetupError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'WorkspaceSetupError';
+  }
+}
+
+/**
  * Resolves an isolated workspace for the given repo + thread.
  * Uses `git worktree` to create a lightweight checkout starting from
  * the default remote branch (origin/master or origin/main), NOT from
  * the local HEAD which may be on an unrelated feature branch.
- * Returns the original repoPath if worktree creation fails.
+ *
+ * Throws `WorkspaceSetupError` when the worktree cannot be made. It used to
+ * return the shared `repoPath` instead, and the PR checkout, the coder or the
+ * review then ran in the owner's real clone.
  */
 export async function resolveWorkspace(repoPath: string, threadTs: string): Promise<string> {
   const wsPath = workspacePath(repoPath, threadTs);
@@ -125,8 +148,7 @@ export async function resolveWorkspace(repoPath: string, threadTs: string): Prom
       // Couldn't guarantee a clean, current base (fetch or reset failed).
       // Don't hand back a possibly-stale/dirty worktree — discard it and fall
       // through to fresh creation below, which is itself fetch-guarded. If the
-      // teardown also fails, the creation path's own failure handling returns
-      // the shared repo path.
+      // teardown also fails, creation fails and says so.
       logger.warn(
         { repoPath, threadTs, wsPath, error: String(error) },
         'failed to refresh reused workspace; recreating it fresh',
@@ -145,14 +167,24 @@ export async function resolveWorkspace(repoPath: string, threadTs: string): Prom
       logger.warn({ repoPath }, 'git fetch failed before worktree creation, proceeding with local state');
     }
 
+    // A worktree whose directory is gone but which is still registered (a
+    // removal that was cut short) makes `worktree add` refuse its path:
+    // "missing but already registered".
+    await git(['worktree', 'prune'], { cwd: repoPath, timeoutMs: 30_000 }).catch(error =>
+      logger.warn({ repoPath, error: String(error) }, 'git worktree prune failed before worktree creation'),
+    );
+
     // Create a detached worktree from the default remote branch (not local HEAD)
     const defaultBranch = await resolveDefaultRemoteBranch(repoPath);
     await git(['worktree', 'add', '--detach', wsPath, defaultBranch], { cwd: repoPath, timeoutMs: 30_000 });
 
-    // Symlink parent node_modules so tools (Jest, ESLint, etc.) are available in the worktree
+    // Symlink parent node_modules so tools (Jest, ESLint, etc.) are available in the worktree.
+    // Runs that execute the repo's gates replace it with an install for the
+    // worktree's own lockfile (depCache.ts, issue #611). Not an empty one: a link
+    // to an empty directory only told agents the deps were "installed".
     const parentNodeModules = path.join(repoPath, 'node_modules');
     const worktreeNodeModules = path.join(wsPath, 'node_modules');
-    if (fs.existsSync(parentNodeModules) && !fs.existsSync(worktreeNodeModules)) {
+    if (hasEntries(parentNodeModules) && !fs.existsSync(worktreeNodeModules)) {
       try {
         fs.symlinkSync(parentNodeModules, worktreeNodeModules, 'junction');
         logger.info({ wsPath }, 'symlinked node_modules into worktree');
@@ -167,11 +199,11 @@ export async function resolveWorkspace(repoPath: string, threadTs: string): Prom
     logger.info({ repoPath, threadTs, wsPath, startPoint: defaultBranch }, 'created workspace via git worktree');
     return wsPath;
   } catch (error) {
-    logger.warn(
-      { repoPath, threadTs, wsPath, error: String(error) },
-      'failed to create workspace, falling back to shared repo path',
+    // The cause (git's own words, with local paths) goes to the log, not Slack.
+    logger.error({ repoPath, threadTs, wsPath, error: String(error) }, 'failed to create workspace');
+    throw new WorkspaceSetupError(
+      `I couldn't set up my own copy of ${repoNameFromPath(repoPath)} to work in, so I stopped here. Ask me again in a few minutes.`,
     );
-    return repoPath;
   }
 }
 
@@ -293,38 +325,54 @@ export async function refreshSharedRepoToDefaultBranch(repoPath: string): Promis
   return { ...state, staleReason: ahead ? 'diverged' : 'not_fast_forwardable' };
 }
 
+/** The clone a worktree belongs to, from its `.git` gitdir pointer. */
+function parentRepoOf(wsPath: string): string | undefined {
+  try {
+    const gitContent = fs.readFileSync(path.join(wsPath, '.git'), 'utf8').trim();
+    const gitdirMatch = gitContent.match(/^gitdir:\s*(.+)$/);
+    if (!gitdirMatch) return undefined;
+    // <repo>/.git/worktrees/<name> → up three levels is the parent repo root.
+    const parentRepo = path.resolve(gitdirMatch[1], '..', '..', '..');
+    return fs.existsSync(parentRepo) ? parentRepo : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Removes a single managed worktree directory. Prefers `git worktree remove`
- * via the parent repo (resolved from the worktree's `.git` gitdir pointer) so
- * git's worktree registry stays consistent; falls back to a plain recursive
- * delete. Best-effort — returns true if the directory is gone afterwards.
+ * via the parent repo so git's worktree registry stays consistent; falls back
+ * to a plain recursive delete and then prunes the registration. Best-effort —
+ * returns true if the directory is gone afterwards.
+ *
+ * A worktree can hold a real node_modules (depCache.ts, issue #611):
+ * newton-web's is 200k files, which git could not delete within its timeout.
+ * Git was killed, the synchronous fallback delete blocked the sidecar, and the
+ * worktree stayed registered, so the thread's next run could not create it.
+ * node_modules is moved out first and deleted in the background.
  */
 export async function removeWorktreeByPath(wsPath: string): Promise<boolean> {
-  try {
-    const gitDir = path.join(wsPath, '.git');
-    if (fs.existsSync(gitDir)) {
-      const gitContent = fs.readFileSync(gitDir, 'utf8').trim();
-      const gitdirMatch = gitContent.match(/^gitdir:\s*(.+)$/);
-      if (gitdirMatch) {
-        // <repo>/.git/worktrees/<name> → up three levels is the parent repo root.
-        const parentGitDir = path.resolve(gitdirMatch[1], '..', '..', '..');
-        if (fs.existsSync(parentGitDir)) {
-          await git(['worktree', 'remove', '--force', wsPath], { cwd: parentGitDir, timeoutMs: 15_000 });
-          return true;
-        }
-      }
-    }
-    fs.rmSync(wsPath, { recursive: true, force: true });
-    return true;
-  } catch {
-    // Last resort: a plain delete so the stale dir can't be reused stale.
+  await discardInBackground(path.join(wsPath, 'node_modules'));
+  const parentRepo = parentRepoOf(wsPath);
+  if (parentRepo) {
     try {
-      fs.rmSync(wsPath, { recursive: true, force: true });
+      await git(['worktree', 'remove', '--force', wsPath], { cwd: parentRepo, timeoutMs: 60_000 });
       return true;
-    } catch {
-      return false;
+    } catch (error) {
+      logger.warn({ wsPath, error: String(error) }, 'git worktree remove failed; deleting the directory instead');
     }
   }
+  try {
+    await fs.promises.rm(wsPath, { recursive: true, force: true });
+  } catch (error) {
+    logger.warn({ wsPath, error: String(error) }, 'could not delete a worktree directory');
+    return false;
+  }
+  if (parentRepo) {
+    // The directory is gone; drop its registration too, or `worktree add` refuses the path.
+    await git(['worktree', 'prune'], { cwd: parentRepo, timeoutMs: 30_000 }).catch(() => undefined);
+  }
+  return !fs.existsSync(wsPath);
 }
 
 /**

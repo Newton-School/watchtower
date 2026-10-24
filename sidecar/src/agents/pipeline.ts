@@ -33,6 +33,7 @@ import {
 import { isGateStop, normalizeControlText, slackMentionIds, stripSlackMentions } from '../router/stopIntent.js';
 import { createProgressMessage, formatElapsed, type ProgressMessage } from '../slack/progressMessage.js';
 import { currentHead, checkCoderProducedChanges, getDiffVsBase } from '../workspaces/gitState.js';
+import { prepareWorktreeDeps } from '../workspaces/depCache.js';
 
 export type PipelineStore = {
   createPipelineRun(input: {
@@ -1648,6 +1649,11 @@ async function runAgentPipelineBody(
     totalTimeoutMs,
     abortOnCriticalFinding,
   } = ctx.pipelineConfig;
+
+  // The coder, reviewer and verifier run the repo's typecheck, lint, tests and
+  // build, which need installed dependencies (issue #611). Before the clock
+  // starts: a first install of a new lockfile can take minutes.
+  await prepareWorktreeDeps(ctx.repoPath, { logStep, stage: 'pipeline.deps', signal });
 
   const pipelineStart = Date.now();
   // The budget runs on awake time: a laptop asleep mid-run is not the run's time (issue #586).
