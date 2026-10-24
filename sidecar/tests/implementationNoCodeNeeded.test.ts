@@ -17,7 +17,7 @@ import { refreshSharedRepoToDefaultBranch } from '../src/workspaces/workspaceMan
 import { __connectors, currentConnectors } from '../src/backends/connectors.js';
 import { collectThreadAttachments } from '../src/slack/threadAttachments.js';
 import { resolveGithubTokenForCodex } from '../src/github/githubAuth.js';
-import { fetchUnresolvedReviewThreadCount } from '../src/github/prReviewComments.js';
+import { fetchMergeState, fetchUnresolvedReviewThreadCount } from '../src/github/prReviewComments.js';
 
 // Regression coverage for #348 RC2: when the planner concludes no code changes
 // are needed AND the request is not an operational action, the implementation
@@ -46,6 +46,7 @@ vi.mock('../src/github/githubAuth.js', () => ({
 // What GitHub says about a merge: nothing in the way, unless a test says otherwise.
 vi.mock('../src/github/prReviewComments.js', () => ({
   fetchUnresolvedReviewThreadCount: vi.fn(async () => ({ unresolvedCount: 0, totalThreads: 0 })),
+  fetchMergeState: vi.fn(async () => ({ mergeStateStatus: 'CLEAN', isDraft: false })),
 }));
 
 vi.mock('../src/notify/desktopNotifier.js', () => ({
@@ -698,7 +699,16 @@ describe('implementationWorkflow — a PR operation needs no planner (#605)', ()
   afterEach(() => {
     vi.mocked(resolveGithubTokenForCodex).mockResolvedValue(undefined);
     vi.mocked(fetchUnresolvedReviewThreadCount).mockResolvedValue({ unresolvedCount: 0, totalThreads: 0 });
+    vi.mocked(fetchMergeState).mockResolvedValue({ mergeStateStatus: 'CLEAN', isDraft: false });
   });
+
+  /** GitHub's answers for the PR; the token makes the run read them. */
+  function github(threads: { unresolvedCount: number }, state: Awaited<ReturnType<typeof fetchMergeState>>) {
+    vi.mocked(resolveGithubTokenForCodex).mockResolvedValue('ghs_test');
+    vi.mocked(fetchUnresolvedReviewThreadCount).mockResolvedValue({ ...threads, totalThreads: 2 });
+    vi.mocked(fetchMergeState).mockResolvedValue(state);
+  }
+  const confirmPrompt = (posted: string[]) => posted.find(text => text.includes('confirm merge'));
 
   async function run(text: string, prContexts: ReturnType<typeof target>[], options: { byOwner?: boolean } = {}) {
     const slack = makeSlack();
@@ -770,32 +780,82 @@ describe('implementationWorkflow — a PR operation needs no planner (#605)', ()
   });
 
   it('says in the confirmation when the merge would go past a required review', async () => {
-    vi.mocked(resolveGithubTokenForCodex).mockResolvedValue('ghs_test');
-    vi.mocked(fetchUnresolvedReviewThreadCount).mockResolvedValue({
-      unresolvedCount: 1,
-      totalThreads: 2,
-      reviewDecision: 'REVIEW_REQUIRED',
-      mergeStateStatus: 'BLOCKED',
-    });
+    github({ unresolvedCount: 1 }, { reviewDecision: 'REVIEW_REQUIRED', mergeStateStatus: 'BLOCKED', isDraft: false });
 
     const { posted } = await run('<@UBOT1> merge it', [target(PR_URL, 'thread')]);
 
-    expect(fetchUnresolvedReviewThreadCount).toHaveBeenCalledWith(
-      expect.objectContaining({ owner: 'Newton-School', repo: 'newton-web', pullNumber: 9300 }),
-    );
-    expect(posted.find(text => text.includes('confirm merge'))).toContain(
+    const asked = expect.objectContaining({ owner: 'Newton-School', repo: 'newton-web', pullNumber: 9300 });
+    expect(fetchUnresolvedReviewThreadCount).toHaveBeenCalledWith(asked);
+    expect(fetchMergeState).toHaveBeenCalledWith(asked);
+    // Read once per run: the owner's own check and the confirmation share it.
+    expect(fetchMergeState).toHaveBeenCalledTimes(1);
+    expect(confirmPrompt(posted)).toContain(
       'It has 1 unresolved review comment. It still needs an approving review, so merging now uses admin rights. <@UOWNER1>, reply `confirm merge`',
     );
   });
 
+  it.each([
+    [
+      'behind the base branch',
+      { mergeStateStatus: 'BEHIND' },
+      "It's behind the base branch, so merging now skips the up-to-date rule.",
+    ],
+    ['a draft', { mergeStateStatus: 'DRAFT', isDraft: true }, "It's still a draft."],
+    ['still being worked out by GitHub', { mergeStateStatus: 'UNKNOWN' }, "I couldn't check branch protection."],
+    ['unreadable', undefined, "I couldn't check branch protection."],
+  ])('says so in the confirmation when the PR is %s', async (_case, state, note) => {
+    github({ unresolvedCount: 0 }, state);
+
+    const { posted } = await run('<@UBOT1> merge it', [target(PR_URL, 'thread')]);
+
+    expect(confirmPrompt(posted)).toBe(
+      `<@UBUILDER> asked me to merge ${PR_URL}. ${note} <@UOWNER1>, reply \`confirm merge\` within 10 minutes and I'll do it. Without that, nothing changes.`,
+    );
+  });
+
+  it('still counts unresolved comments when the merge state cannot be read', async () => {
+    github({ unresolvedCount: 2 }, undefined);
+    vi.mocked(fetchMergeState).mockRejectedValue(new Error('Resource not accessible'));
+
+    const { posted } = await run('<@UBOT1> merge it', [target(PR_URL, 'thread')]);
+
+    expect(confirmPrompt(posted)).toContain(
+      "It has 2 unresolved review comments. I couldn't check branch protection. <@UOWNER1>, reply `confirm merge`",
+    );
+  });
+
+  it.each([
+    ['for someone else', {}],
+    ['for the owner', { byOwner: true }],
+  ])('does not offer to merge a PR with conflicts %s, and runs no agent', async (_case, options) => {
+    github({ unresolvedCount: 1 }, { mergeStateStatus: 'DIRTY', isDraft: false });
+
+    const { result, posted } = await run('<@UBOT1> merge it', [target(PR_URL, 'thread')], options);
+
+    expect(posted).toEqual([
+      `${PR_URL} has conflicts with its base branch, so it can't be merged yet. Nothing was changed.`,
+    ]);
+    expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
+    expect(runCodex).not.toHaveBeenCalled();
+    expect(result.status).toBe('SKIPPED');
+  });
+
+  it('says a PR has conflicts in the confirmation when a planner read the ask, since it may be more than the merge', async () => {
+    github({ unresolvedCount: 0 }, { mergeStateStatus: 'DIRTY', isDraft: false });
+
+    const { posted, logs } = await run('<@UBOT1> merge it once CI is green', [target(PR_URL, 'thread')]);
+
+    expect(logs.map(entry => entry.stage)).toContain('pipeline.agent.planner.start');
+    expect(confirmPrompt(posted)).toContain(
+      "It has conflicts, so it can't be merged yet. <@UOWNER1>, reply `confirm merge`",
+    );
+  });
+
   it("says it in the owner's own unresolved-comments prompt too", async () => {
-    vi.mocked(resolveGithubTokenForCodex).mockResolvedValue('ghs_test');
-    vi.mocked(fetchUnresolvedReviewThreadCount).mockResolvedValue({
-      unresolvedCount: 2,
-      totalThreads: 2,
-      reviewDecision: 'CHANGES_REQUESTED',
-      mergeStateStatus: 'BLOCKED',
-    });
+    github(
+      { unresolvedCount: 2 },
+      { reviewDecision: 'CHANGES_REQUESTED', mergeStateStatus: 'BLOCKED', isDraft: false },
+    );
 
     // Stop the job once the prompt is up: the wait for a yes is not what this checks.
     const controller = new AbortController();
@@ -819,16 +879,11 @@ describe('implementationWorkflow — a PR operation needs no planner (#605)', ()
   });
 
   it('adds nothing to the confirmation when the branch lets the merge through', async () => {
-    vi.mocked(resolveGithubTokenForCodex).mockResolvedValue('ghs_test');
-    vi.mocked(fetchUnresolvedReviewThreadCount).mockResolvedValue({
-      unresolvedCount: 0,
-      totalThreads: 0,
-      mergeStateStatus: 'CLEAN',
-    });
+    github({ unresolvedCount: 0 }, { mergeStateStatus: 'CLEAN', isDraft: false });
 
     const { posted } = await run('<@UBOT1> merge it', [target(PR_URL, 'thread')]);
 
-    expect(posted.find(text => text.includes('confirm merge'))).toBe(
+    expect(confirmPrompt(posted)).toBe(
       `<@UBUILDER> asked me to merge ${PR_URL}. <@UOWNER1>, reply \`confirm merge\` within 10 minutes and I'll do it. Without that, nothing changes.`,
     );
   });

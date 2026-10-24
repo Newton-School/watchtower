@@ -747,7 +747,8 @@ export async function routeTask(params: {
       aboutExistingPr:
         (routedTask.prContexts
           ? routedTask.prContexts.some(pr => pr.source === 'trigger')
-          : Boolean(routedTask.prContext)) || Boolean(readPrActionAsk(routedTask)),
+          : Boolean(routedTask.prContext)) ||
+        Boolean(readPrActionAsk(routedTask, { botUserId: config.botUserId, ownerUserIds: config.ownerSlackUserIds })),
       replayed: task.event.ingestSource === 'launchpad' || task.event.eventId.startsWith(RESTART_EVENT_PREFIX),
     });
     if (ack && !signal?.aborted) {

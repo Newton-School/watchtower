@@ -47,7 +47,7 @@ import { buildPlannerPrompt, buildPlannerPlanModePrompt } from '../agents/prompt
 import { resolveWorkspace } from '../workspaces/workspaceManager.js';
 import { createPrFromWorkspace, findRunPr } from '../github/postPipelinePr.js';
 import { buildUnfinishedRunMessage, coderReportedPrUrl } from '../agents/unfinishedRun.js';
-import { fetchUnresolvedReviewThreadCount, type MergeChecks } from '../github/prReviewComments.js';
+import { fetchMergeState, fetchUnresolvedReviewThreadCount, type MergeState } from '../github/prReviewComments.js';
 import { waitForExactConfirmation } from './shared/confirmationGate.js';
 import { cancelledResult } from './shared/cancelState.js';
 import type { PipelineStore } from '../agents/pipeline.js';
@@ -236,20 +236,45 @@ export const __quickActionConfirm = { wait: waitForExactConfirmation };
  * What branch protection means for merging now (issue #605). A merge past a
  * required review goes through on admin rights; whoever says yes should know
  * that before they do, not learn it afterwards. Whether such a merge is
- * allowed is unchanged: this only says it. Empty when nothing blocks the merge
- * or GitHub could not say.
+ * allowed is unchanged: this only says it. Empty when nothing stands in the
+ * way.
  */
-export function mergeProtectionNote(checks: Pick<MergeChecks, 'reviewDecision' | 'mergeStateStatus'>): string {
-  if (checks.reviewDecision === 'REVIEW_REQUIRED') {
+export function mergeProtectionNote(state: MergeState | undefined): string {
+  if (!state) return "I couldn't check branch protection.";
+  if (state.mergeStateStatus === 'DIRTY') return "It has conflicts, so it can't be merged yet.";
+  if (state.isDraft || state.mergeStateStatus === 'DRAFT') return "It's still a draft.";
+  // The review decision is known even while GitHub is still working out the rest.
+  if (state.reviewDecision === 'REVIEW_REQUIRED') {
     return 'It still needs an approving review, so merging now uses admin rights.';
   }
-  if (checks.reviewDecision === 'CHANGES_REQUESTED') {
+  if (state.reviewDecision === 'CHANGES_REQUESTED') {
     return 'A reviewer asked for changes, so merging now uses admin rights.';
   }
-  if (checks.mergeStateStatus === 'BLOCKED') {
+  if (!state.mergeStateStatus || state.mergeStateStatus === 'UNKNOWN') return "I couldn't check branch protection.";
+  if (state.mergeStateStatus === 'BLOCKED') {
     return 'Branch protection still blocks it, so merging now uses admin rights.';
   }
+  if (state.mergeStateStatus === 'BEHIND') {
+    return "It's behind the base branch, so merging now skips the up-to-date rule.";
+  }
   return '';
+}
+
+/**
+ * What a merge checks on GitHub, read once: the unresolved review threads and
+ * the merge state come from separate queries, so a failure reading the state
+ * leaves the count, which gates the owner's own merges, intact.
+ */
+async function readMergeChecks(
+  pr: PrContext,
+  githubToken: string,
+): Promise<{ unresolvedCount: number; state: MergeState | undefined }> {
+  const target = { owner: pr.owner, repo: pr.repo, pullNumber: pr.number, githubToken };
+  const [threads, state] = await Promise.all([
+    fetchUnresolvedReviewThreadCount(target).catch(() => ({ unresolvedCount: 0, totalThreads: 0 })),
+    fetchMergeState(target).catch(() => undefined),
+  ]);
+  return { unresolvedCount: threads.unresolvedCount, state };
 }
 
 /**
@@ -387,22 +412,40 @@ async function runQuickAction(params: {
   action?: QuickPrAction;
 }): Promise<WorkflowResult> {
   const { task, config, slack, ctx, store, jobId, logStep, signal, plan, prs, checkPr } = params;
+  const prAction =
+    params.action ?? (QUICK_ACTION_PR_ACTION_RE.exec(task.event.text)?.[1].toLowerCase() as QuickPrAction | undefined);
+  const mergeIntent = params.action ? params.action === 'merge' : /\bmerge\b/i.test(task.event.text);
+  const mergeChecks =
+    (mergeIntent || prAction === 'merge') && checkPr && ctx.githubToken
+      ? await readMergeChecks(checkPr, ctx.githubToken)
+      : undefined;
+
+  // Nobody can merge a PR with conflicts, admin rights or not: a message that
+  // is only that merge gets no confirmation to answer and no agent (issue
+  // #605). After a planner the ask may be more than the merge, so its prompt
+  // says it instead.
+  if (params.action === 'merge' && checkPr && mergeChecks?.state?.mergeStateStatus === 'DIRTY') {
+    const reply = `${checkPr.url} has conflicts with its base branch, so it can't be merged yet. Nothing was changed.`;
+    logStep?.({
+      stage: 'implementation.quick_action.merge_conflicts',
+      message: 'The PR has conflicts — not asking to merge it.',
+      data: { prUrl: checkPr.url },
+    });
+    const posted = await slack.chat
+      .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: reply })
+      .then(() => true)
+      .catch(() => false);
+    return { workflow: 'IMPLEMENTATION', status: 'SKIPPED', message: reply, notifyDesktop: false, slackPosted: posted };
+  }
+
   // For merge requests: check for unresolved review comments before proceeding
   // Asked by someone else, the owner confirmation further down covers it
   // (and shows the same count), so this check is for the owner's own asks.
-  const mergeIntent = params.action ? params.action === 'merge' : /\bmerge\b/i.test(task.event.text);
-  if (mergeIntent && task.isOwnerAuthor && checkPr && ctx.githubToken) {
+  if (mergeIntent && task.isOwnerAuthor && mergeChecks) {
     const adminUserIds = getAdminUserIds(config);
-    const checks = await fetchUnresolvedReviewThreadCount({
-      owner: checkPr.owner,
-      repo: checkPr.repo,
-      pullNumber: checkPr.number,
-      githubToken: ctx.githubToken,
-    });
-
-    const { unresolvedCount } = checks;
+    const { unresolvedCount } = mergeChecks;
     if (unresolvedCount > 0) {
-      const protection = mergeProtectionNote(checks);
+      const protection = mergeProtectionNote(mergeChecks.state);
       const confirmMsg = `This PR has ${unresolvedCount} unresolved review comment${unresolvedCount > 1 ? 's' : ''}.${protection ? ` ${protection}` : ''} Should I still merge? Reply *yes* to proceed or *no* to cancel.`;
       // Yes or No: a No turns the merge down, it does not stop the job.
       const confirmTs = await postGatePrompt(slack, {
@@ -532,8 +575,6 @@ async function runQuickAction(params: {
     });
   }
 
-  const prAction =
-    params.action ?? (QUICK_ACTION_PR_ACTION_RE.exec(task.event.text)?.[1].toLowerCase() as QuickPrAction | undefined);
   const prUrls = [...new Set(prs.map(pr => pr.url))];
 
   // An approval from this agent would be submitted under the owner's
@@ -567,15 +608,7 @@ async function runQuickAction(params: {
     // the phrase: answering their question isn't saying yes to a merge.
     const forSomeoneElse = requesterOf(task) !== task.event.userId;
     if (!task.isOwnerAuthor || forSomeoneElse) {
-      let checks: MergeChecks | undefined;
-      if (prAction === 'merge' && checkPr && ctx.githubToken) {
-        checks = await fetchUnresolvedReviewThreadCount({
-          owner: checkPr.owner,
-          repo: checkPr.repo,
-          pullNumber: checkPr.number,
-          githubToken: ctx.githubToken,
-        }).catch(() => undefined);
-      }
+      const checks = prAction === 'merge' ? mergeChecks : undefined;
       const confirmation = await confirmQuickPrAction({
         task,
         config,
@@ -583,7 +616,7 @@ async function runQuickAction(params: {
         action: prAction,
         prUrls,
         unresolvedCount: checks?.unresolvedCount,
-        protectionNote: checks ? mergeProtectionNote(checks) : undefined,
+        protectionNote: checks ? mergeProtectionNote(checks.state) : undefined,
         logStep,
         signal,
       });
@@ -1364,7 +1397,7 @@ async function runImplementationWorkflowBody(params: {
     // "merge the PR" and nothing else needs no plan (issue #605): it goes
     // straight to the quick action, whose confirmations are the same ones a
     // planner verdict of "no code needed" reaches.
-    const prActionAsk = readPrActionAsk(task);
+    const prActionAsk = readPrActionAsk(task, { botUserId: config.botUserId, ownerUserIds: config.ownerSlackUserIds });
     if (prActionAsk) {
       logStep?.({
         stage: 'implementation.quick_action.no_planner',
