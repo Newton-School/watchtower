@@ -6,6 +6,7 @@ import { ORCHESTRATOR_PROMPT_MARKER } from '../src/agentic/prReviewOrchestrator.
 import { EMPTY_DISCOVERY } from '../src/agentic/reviewSkills.js';
 import { resolveGithubTokenForCodex } from '../src/github/githubAuth.js';
 import type { AppConfig, NormalizedTask } from '../src/types/contracts.js';
+import { WorkspaceSetupError } from '../src/workspaces/workspaceManager.js';
 
 vi.mock('../src/github/githubAuth.js', () => ({
   resolveGithubTokenForCodex: vi.fn().mockResolvedValue(undefined),
@@ -864,7 +865,6 @@ describe('agenticPrReview', () => {
           key: 'k',
           command: 'npm ci',
           installed: false,
-          linked: 'clone',
           ms: 10,
         };
       }),
@@ -887,6 +887,27 @@ describe('agenticPrReview', () => {
       .map((c: any[]) => c[0].prompt as string)
       .find(p => p.includes(ORCHESTRATOR_PROMPT_MARKER)) as string;
     expect(orchPrompt).toContain("Dependencies: installed in node_modules for this checkout's package-lock.json");
+  });
+
+  it('fails plainly when it cannot make its own worktree, and never checks the PR out in the shared clone', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const message =
+      "I couldn't set up my own copy of newton-web for this, so I didn't run anything. Ask me again in a few minutes.";
+    const deps = makeDeps({ resolveWorkspaceFn: vi.fn().mockRejectedValue(new WorkspaceSetupError(message)) });
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+    });
+
+    expect(result.status).toBe('FAILED');
+    expect(deps.checkoutPr).not.toHaveBeenCalled();
+    expect(deps.runAgent).not.toHaveBeenCalled();
+    const texts = slack.chat.postMessage.mock.calls.map((c: any) => c[0].text as string);
+    expect(texts).toContain(message);
   });
 
   it('does not install deps a second time when the build gate already ran', async () => {

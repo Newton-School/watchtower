@@ -244,9 +244,14 @@ function copyEnvFiles(baseRepoPath: string, worktreePath: string): number {
 export async function preparePrWorktree(params: PreparePrWorktreeParams): Promise<PreparedPrWorktree> {
   const { baseRepoPath, prContext, threadTs, githubToken, signal, logStep } = params;
 
-  // 1. Worktree. resolveWorkspace returns the SHARED repo path on failure —
-  //    never run a checkout/build against the user's real clone.
-  const worktreePath = await resolveWorkspace(baseRepoPath, `${threadTs}--pr-${prContext.number}`);
+  // 1. Worktree. Never run a checkout/build against the user's real clone:
+  //    resolveWorkspace throws when it can't make one.
+  let worktreePath: string;
+  try {
+    worktreePath = await resolveWorkspace(baseRepoPath, `${threadTs}--pr-${prContext.number}`);
+  } catch {
+    worktreePath = baseRepoPath;
+  }
   if (worktreePath === baseRepoPath) {
     throw new Error("Couldn't create an isolated worktree to test the PR safely.");
   }

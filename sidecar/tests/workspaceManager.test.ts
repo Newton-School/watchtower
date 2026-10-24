@@ -13,8 +13,13 @@ const ORIGINAL_HOME = process.env.HOME;
 const TEST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'wt-home-'));
 process.env.HOME = TEST_HOME;
 
-const { resolveWorkspace, cleanupThreadWorkspaces, refreshSharedRepoToDefaultBranch } =
-  await import('../src/workspaces/workspaceManager.js');
+const {
+  resolveWorkspace,
+  cleanupThreadWorkspaces,
+  refreshSharedRepoToDefaultBranch,
+  removeWorktreeByPath,
+  WorkspaceSetupError,
+} = await import('../src/workspaces/workspaceManager.js');
 
 const WS_ROOT = path.join(TEST_HOME, '.watchtower', 'workspaces');
 const execFileAsync = promisify(execFile);
@@ -171,6 +176,42 @@ describe('resolveWorkspace refresh-on-reuse', () => {
     expect(ws2).toBe(ws1);
     expect(fs.lstatSync(path.join(ws2, 'node_modules')).isSymbolicLink()).toBe(true);
     expect(await git(ws2, ['status', '--porcelain'])).toBe('');
+  });
+
+  it('moves a real node_modules out before removing a worktree, and leaves no registration behind (#611)', async () => {
+    const ws = await resolveWorkspace(repo, thread);
+    // A worktree's own install (depCache.ts): newton-web's is 200k files, more than git deletes in its timeout.
+    fs.mkdirSync(path.join(ws, 'node_modules', 'next'), { recursive: true });
+    fs.writeFileSync(path.join(ws, 'node_modules', 'next', 'index.js'), 'x');
+
+    expect(await removeWorktreeByPath(ws)).toBe(true);
+
+    expect(fs.existsSync(ws)).toBe(false);
+    expect(await git(repo, ['worktree', 'list', '--porcelain'])).not.toContain(ws);
+  });
+
+  it('a removal cut short does not stop the next run in the thread, nor send it to the shared clone (#611)', async () => {
+    const ws = await resolveWorkspace(repo, thread);
+    // What a killed `git worktree remove` left: the directory gone, the registration still there.
+    fs.rmSync(ws, { recursive: true, force: true });
+    expect(await git(repo, ['worktree', 'list', '--porcelain'])).toContain(ws);
+
+    const again = await resolveWorkspace(repo, thread);
+
+    expect(again).toBe(ws);
+    expect(fs.existsSync(path.join(again, 'file.txt'))).toBe(true);
+  });
+
+  it('throws instead of handing back the shared clone when it cannot make a worktree', async () => {
+    const notARepo = await mkdtemp(path.join(os.tmpdir(), 'wt-plain-'));
+    try {
+      await expect(resolveWorkspace(notARepo, thread)).rejects.toBeInstanceOf(WorkspaceSetupError);
+      await expect(resolveWorkspace(notARepo, thread)).rejects.toThrow(
+        /couldn't set up my own copy of wt-plain-\w+ for this, so I didn't run anything/,
+      );
+    } finally {
+      await rm(notARepo, { recursive: true, force: true });
+    }
   });
 
   it('does not link an empty node_modules: agents read it as "installed" (#611)', async () => {

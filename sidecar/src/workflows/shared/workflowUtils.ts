@@ -346,15 +346,21 @@ export async function prepareWorkflowContext(params: {
     if (repoOverride === 'broad') {
       cwd = resolveCombinedWorkspaceRoot(config);
     } else {
+      let repoPath: string | undefined;
       try {
-        const repoPath = repoPathFor(repoOverride, config);
-        repoName = repoOverride;
-        cwd = await resolveWorkspace(repoPath, task.event.threadTs);
+        repoPath = repoPathFor(repoOverride, config);
       } catch {
+        repoPath = undefined;
+      }
+      if (repoPath === undefined) {
         // The override names a repo that isn't configured on this host —
         // don't crash the workflow; surface it like an unresolvable repo.
         cwd = os.tmpdir();
         desktopOnly = { reason: `${repoOverride} is not configured on this host`, cancelled: false };
+      } else {
+        repoName = repoOverride;
+        // Throws when no worktree can be made: the run fails and says so, rather than reading the shared clone.
+        cwd = await resolveWorkspace(repoPath, task.event.threadTs);
       }
     }
   } else if (isOwnerAuthor) {

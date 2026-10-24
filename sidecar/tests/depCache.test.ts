@@ -6,6 +6,7 @@ import {
   __depCache,
   __resetDepCacheState,
   depsPromptLine,
+  installEnv,
   planDeps,
   prepareWorktreeDeps,
 } from '../src/workspaces/depCache.js';
@@ -17,6 +18,7 @@ import type { AgentContext } from '../src/agents/types.js';
 // typecheck, lint and build gates and change runs installed deps themselves.
 
 const original = { ...__depCache };
+const NPM_CI = 'npm ci --ignore-scripts --no-audit --no-fund --loglevel=error';
 let tmp: string;
 let installs: string[];
 
@@ -38,6 +40,16 @@ async function fakeInstall(dir: string): Promise<void> {
   write(path.join(dir, 'node_modules', 'next'), { 'index.js': 'module.exports = 1;' });
 }
 
+function deferred(): { promise: Promise<void>; release: () => void } {
+  let release: () => void = () => undefined;
+  const promise = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  return { promise, release };
+}
+
+const repoDir = () => path.join(__depCache.root, 'newton-marketing-web');
+
 beforeEach(() => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wt-depcache-'));
   installs = [];
@@ -49,7 +61,6 @@ beforeEach(() => {
     install: vi.fn(fakeInstall),
     copy: vi.fn(async (source: string, target: string) => {
       fs.cpSync(source, target, { recursive: true });
-      return 'clone' as const;
     }),
   });
 });
@@ -60,16 +71,20 @@ afterEach(() => {
 });
 
 describe('the cache key', () => {
-  it('follows the lockfile, the npm config and the Node major version, not the rest of package.json', () => {
+  it('follows package.json, the lockfile, the npm config and the Node major version', () => {
     const dir = worktree('a');
     const plan = planDeps(dir, '20.9.0');
     expect(plan).toMatchObject({ kind: 'install', manager: 'npm', lockfile: 'package-lock.json' });
     const key = plan.kind === 'install' ? plan.key : '';
 
-    write(dir, { 'package.json': '{"name":"site","scripts":{"lint":"eslint ."}}' });
     expect(planDeps(dir, '20.11.0')).toMatchObject({ key });
-
     expect(planDeps(dir, '22.1.0')).not.toMatchObject({ key });
+
+    write(dir, { 'package.json': '{"name":"site","dependencies":{"left-pad":"1.3.0"}}' });
+    expect(planDeps(dir, '20.9.0')).not.toMatchObject({ key });
+    write(dir, { 'package.json': '{"name":"site"}' });
+    expect(planDeps(dir, '20.9.0')).toMatchObject({ key });
+
     write(dir, { '.npmrc': 'legacy-peer-deps=true\n' });
     expect(planDeps(dir, '20.9.0')).not.toMatchObject({ key });
     fs.rmSync(path.join(dir, '.npmrc'));
@@ -80,7 +95,10 @@ describe('the cache key', () => {
   it('picks the package manager from the lockfile, and leaves out what it cannot install', () => {
     const pnpm = path.join(tmp, 'pnpm');
     write(pnpm, { 'package.json': '{}', 'pnpm-lock.yaml': 'lockfileVersion: 9' });
-    expect(planDeps(pnpm)).toMatchObject({ manager: 'pnpm', command: ['pnpm', 'install', '--frozen-lockfile'] });
+    expect(planDeps(pnpm)).toMatchObject({
+      manager: 'pnpm',
+      command: ['pnpm', 'install', '--frozen-lockfile', '--ignore-scripts'],
+    });
 
     const api = path.join(tmp, 'api');
     write(api, { 'requirements.txt': 'django' });
@@ -96,10 +114,37 @@ describe('the cache key', () => {
   });
 });
 
+describe('the install', () => {
+  it('runs no package scripts: it is outside the sandbox and shared between runs', () => {
+    const yarn = path.join(tmp, 'yarn');
+    write(yarn, { 'package.json': '{}', 'yarn.lock': '' });
+    for (const dir of [worktree('s'), yarn]) {
+      const plan = planDeps(dir);
+      expect(plan.kind === 'install' && plan.command).toContain('--ignore-scripts');
+    }
+  });
+
+  it("gets none of the sidecar's secrets", () => {
+    const env = installEnv({
+      PATH: '/usr/bin',
+      HOME: '/Users/x',
+      SSH_AUTH_SOCK: '/tmp/agent.sock',
+      GITHUB_TOKEN: 'ghp_secret',
+      GH_TOKEN: 'ghp_secret',
+      SLACK_BOT_TOKEN: 'xoxb-secret',
+      ANTHROPIC_API_KEY: 'sk-secret',
+      WATCHTOWER_DB_PATH: '/Users/x/Library/Application Support/watchtower.db',
+      NODE_OPTIONS: '--require /tmp/evil.js',
+    });
+
+    expect(env).toEqual({ PATH: '/usr/bin', HOME: '/Users/x', SSH_AUTH_SOCK: '/tmp/agent.sock', CI: '1' });
+  });
+});
+
 describe('prepareWorktreeDeps', () => {
   it('installs a lockfile once, and gives each worktree its own copy', async () => {
     const first = await prepareWorktreeDeps(worktree('111.1'));
-    expect(first).toMatchObject({ status: 'ready', installed: true, linked: 'clone' });
+    expect(first).toMatchObject({ status: 'ready', installed: true });
     expect(installs).toHaveLength(1);
     // The install ran in a temp dir beside the cache entry, with the manifest copied in.
     expect(installs[0]).toContain(`${path.sep}newton-marketing-web${path.sep}`);
@@ -118,17 +163,14 @@ describe('prepareWorktreeDeps', () => {
   });
 
   it('shares one install between runs that ask at the same time', async () => {
-    let release: () => void = () => undefined;
-    const gate = new Promise<void>(resolve => {
-      release = resolve;
-    });
+    const gate = deferred();
     __depCache.install = vi.fn(async (dir: string) => {
-      await gate;
+      await gate.promise;
       await fakeInstall(dir);
     });
 
     const runs = Promise.all([prepareWorktreeDeps(worktree('1.1')), prepareWorktreeDeps(worktree('2.2'))]);
-    release();
+    gate.release();
     const [a, b] = await runs;
 
     expect(__depCache.install).toHaveBeenCalledTimes(1);
@@ -137,12 +179,9 @@ describe('prepareWorktreeDeps', () => {
   });
 
   it('lets a stopped run stop waiting, while the install carries on for the others', async () => {
-    let release: () => void = () => undefined;
-    const gate = new Promise<void>(resolve => {
-      release = resolve;
-    });
+    const gate = deferred();
     __depCache.install = vi.fn(async (dir: string) => {
-      await gate;
+      await gate.promise;
       await fakeInstall(dir);
     });
     const stop = new AbortController();
@@ -151,7 +190,7 @@ describe('prepareWorktreeDeps', () => {
     const waiting = prepareWorktreeDeps(worktree('11.2'));
     stop.abort();
     expect(await stopped).toMatchObject({ status: 'unavailable', reason: 'the run was stopped during the install' });
-    release();
+    gate.release();
     expect(await waiting).toMatchObject({ status: 'ready' });
 
     // The stop is not held against the next run.
@@ -194,7 +233,7 @@ describe('prepareWorktreeDeps', () => {
 
     const result = await prepareWorktreeDeps(dir, { logStep });
 
-    expect(result).toMatchObject({ status: 'unavailable', command: 'npm ci --no-audit --no-fund --loglevel=error' });
+    expect(result).toMatchObject({ status: 'unavailable', command: NPM_CI });
     expect(result.status === 'unavailable' && result.reason).toContain('ERESOLVE');
     // Today's behaviour stays: the link to the shared clone's install.
     expect(fs.lstatSync(path.join(dir, 'node_modules')).isSymbolicLink()).toBe(true);
@@ -202,8 +241,7 @@ describe('prepareWorktreeDeps', () => {
     expect(depsPromptLine(dir)).toContain('miniOG could not install them for this checkout');
     expect(depsPromptLine(dir)).toContain('rm node_modules && npm ci');
     // No temp install left behind in the cache.
-    const repoDir = path.join(__depCache.root, 'newton-marketing-web');
-    expect(fs.readdirSync(repoDir).filter(name => name.includes('.tmp-'))).toEqual([]);
+    expect(fs.readdirSync(repoDir()).filter(name => name.includes('.tmp-'))).toEqual([]);
 
     const again = await prepareWorktreeDeps(worktree('5.5'));
     expect(again).toMatchObject({ status: 'unavailable' });
@@ -213,16 +251,69 @@ describe('prepareWorktreeDeps', () => {
     );
   });
 
+  it('removes a partial copy and reports the deps missing when the copy fails', async () => {
+    __depCache.copy = vi.fn(async (source: string, target: string) => {
+      fs.mkdirSync(path.join(target, 'next'), { recursive: true });
+      throw Object.assign(new Error('cp: write error: No space left on device'), { code: 'ENOSPC' });
+    });
+    const dir = worktree('12.1');
+
+    const result = await prepareWorktreeDeps(dir);
+
+    expect(result).toEqual({ status: 'unavailable', reason: 'the disk filled up during the copy', command: NPM_CI });
+    expect(fs.existsSync(path.join(dir, 'node_modules'))).toBe(false);
+    expect(depsPromptLine(dir)).toContain('NOT installed');
+  });
+
+  it('does not take a copy that came out incomplete for an install', async () => {
+    // The install was pruned from under the copy, which then "succeeded" with nothing.
+    __depCache.copy = vi.fn(async (_source: string, target: string) => {
+      fs.mkdirSync(target, { recursive: true });
+    });
+    const dir = worktree('12.2');
+
+    expect(await prepareWorktreeDeps(dir)).toMatchObject({ status: 'unavailable', reason: 'the copy is incomplete' });
+    expect(fs.existsSync(path.join(dir, 'node_modules'))).toBe(false);
+  });
+
   it('keeps only the most recently used installs of a repo', async () => {
     __depCache.keepPerRepo = 1;
     await prepareWorktreeDeps(worktree('6.1', '{"v":"old"}'));
     await prepareWorktreeDeps(worktree('6.2', '{"v":"new"}'));
 
-    const repoDir = path.join(__depCache.root, 'newton-marketing-web');
-    expect(fs.readdirSync(repoDir)).toHaveLength(1);
+    expect(fs.readdirSync(repoDir())).toHaveLength(1);
     // The worktree on the pruned install still has its own copy.
     expect(
       fs.existsSync(path.join(__depCache.workspacesRoot, 'newton-marketing-web', '6.1', 'node_modules', 'next')),
+    ).toBe(true);
+  });
+
+  it('does not prune an install while a worktree is being copied from it', async () => {
+    __depCache.keepPerRepo = 1;
+    await prepareWorktreeDeps(worktree('13.1', '{"v":"old"}'));
+    const oldEntry = fs.readdirSync(repoDir())[0];
+
+    // A second worktree on the old lockfile is mid-copy...
+    const copying = deferred();
+    const copyStarted = deferred();
+    __depCache.copy = vi.fn(async (source: string, target: string) => {
+      if (source.includes(oldEntry)) {
+        copyStarted.release();
+        await copying.promise;
+      }
+      fs.cpSync(source, target, { recursive: true });
+    });
+    const slow = prepareWorktreeDeps(worktree('13.2', '{"v":"old"}'));
+    await copyStarted.promise;
+
+    // ...when another run installs a new lockfile, which prunes down to one.
+    expect(await prepareWorktreeDeps(worktree('13.3', '{"v":"new"}'))).toMatchObject({ status: 'ready' });
+    expect(fs.readdirSync(repoDir())).toContain(oldEntry);
+
+    copying.release();
+    expect(await slow).toMatchObject({ status: 'ready' });
+    expect(
+      fs.existsSync(path.join(__depCache.workspacesRoot, 'newton-marketing-web', '13.2', 'node_modules', 'next')),
     ).toBe(true);
   });
 
@@ -232,7 +323,8 @@ describe('prepareWorktreeDeps', () => {
       __depCache.copy = original.copy;
       const dir = worktree('8.8');
 
-      expect(await prepareWorktreeDeps(dir)).toMatchObject({ status: 'ready', linked: 'clone' });
+      expect(await prepareWorktreeDeps(dir)).toMatchObject({ status: 'ready' });
+      expect(fs.lstatSync(path.join(dir, 'node_modules')).isSymbolicLink()).toBe(false);
       fs.writeFileSync(path.join(dir, 'node_modules', 'next', 'index.js'), 'changed by an agent');
 
       const other = worktree('9.9');
@@ -261,24 +353,11 @@ describe('prepareWorktreeDeps', () => {
     expect(buildCoderPrompt({ ...ctx, repoPath: '/elsewhere' })).toContain('Repository: /elsewhere\nPolicy:');
   });
 
-  it('tells the agents the deps are installed, and how to treat a shared link', async () => {
+  it('tells the agents the deps are installed, and that install scripts did not run', async () => {
     const dir = worktree('7.7');
     await prepareWorktreeDeps(dir);
     expect(depsPromptLine(dir)).toBe(
-      "Dependencies: installed in node_modules for this checkout's package-lock.json (with `npm ci --no-audit --no-fund --loglevel=error`, before you started). Run the repo's own typecheck, lint, test and build scripts directly; reinstall only if you change package.json or the lockfile.",
+      `Dependencies: installed in node_modules for this checkout's package-lock.json (with \`${NPM_CI}\`, before you started: packages' install scripts did not run). Run the repo's own typecheck, lint, test and build scripts directly; reinstall only if you change package.json or the lockfile.`,
     );
-
-    expect(
-      depsPromptLine(dir, {
-        status: 'ready',
-        manager: 'npm',
-        lockfile: 'package-lock.json',
-        key: 'k',
-        command: 'npm ci',
-        installed: false,
-        linked: 'symlink',
-        ms: 0,
-      }),
-    ).toContain('never install into it');
   });
 });

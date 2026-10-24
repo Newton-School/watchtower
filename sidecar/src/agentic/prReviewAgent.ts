@@ -46,7 +46,7 @@ import type {
   PrReviewRole,
 } from '../github/prReviewSupport.js';
 import { isAnchorInDiff, parseDiffHunks } from '../github/diffHunks.js';
-import { resolveWorkspace } from '../workspaces/workspaceManager.js';
+import { resolveWorkspace, WorkspaceSetupError } from '../workspaces/workspaceManager.js';
 import { depsPromptLine, prepareWorktreeDeps } from '../workspaces/depCache.js';
 import { applyFollowUpScope, formatFollowUpLine, type FollowUpStats } from './reReview.js';
 import { withAgentCallContext } from '../state/runContext.js';
@@ -1478,10 +1478,30 @@ export async function reviewSinglePr(params: {
 
   // 2. Per-PR worktree (when the repo is cloned locally). Repos without a local
   //    clone are reviewed from the diff alone — no checkout, tmp cwd (#10).
+  //    No worktree, no review: never check the PR out in the shared clone.
   const hasLocalRepo = Boolean(baseRepoPath);
-  const repoPath = hasLocalRepo
-    ? await deps.resolveWorkspaceFn(baseRepoPath as string, `${task.event.threadTs}--pr-${prContext.number}`)
-    : os.tmpdir();
+  let repoPath = os.tmpdir();
+  if (hasLocalRepo) {
+    try {
+      repoPath = await deps.resolveWorkspaceFn(
+        baseRepoPath as string,
+        `${task.event.threadTs}--pr-${prContext.number}`,
+      );
+    } catch (error) {
+      const failureMessage =
+        error instanceof WorkspaceSetupError
+          ? error.message
+          : `I couldn't set up my own copy of ${prContext.repo} for this review, so I didn't run anything. Ask me again in a few minutes.`;
+      logStep?.({
+        stage: 'agentic.pr_review.workspace_failed',
+        level: 'ERROR',
+        message: `Could not create the review worktree: ${String(error)}`,
+        data: { prUrl: prContext.url },
+      });
+      await postToThread(failureMessage);
+      return failedOutcome(prContext, failureMessage, currentPrHeadSha);
+    }
+  }
 
   // 3. Diff fetch (TS-side: the same bytes feed the agent prompt AND the
   //    submitPrReview hunk validator, eliminating agent/validator drift).

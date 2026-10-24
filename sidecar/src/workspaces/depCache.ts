@@ -21,6 +21,13 @@ const execFileAsync = promisify(execFile);
  * gets its own copy-on-write clone of that install (APFS `cp -c`: seconds, and
  * no extra disk until something writes), so an agent's own install or build
  * cache never reaches the cache or another run.
+ *
+ * Installs run outside the agents' sandbox and are shared between runs, so no
+ * package code runs during them (`--ignore-scripts`) and they get none of the
+ * sidecar's environment beyond what the package manager needs. The gates the
+ * agents run don't need install scripts: esbuild, Next's SWC and sharp load
+ * their prebuilt binaries from optional platform packages (checked on the
+ * marketing site: tsc, eslint and `next build` all pass).
  */
 
 export type PackageManager = 'npm' | 'pnpm' | 'yarn';
@@ -32,9 +39,9 @@ const LOCKFILES: Array<{ file: string; manager: PackageManager }> = [
 ];
 
 const COMMANDS: Record<PackageManager, string[]> = {
-  npm: ['npm', 'ci', '--no-audit', '--no-fund', '--loglevel=error'],
-  pnpm: ['pnpm', 'install', '--frozen-lockfile'],
-  yarn: ['yarn', 'install', '--frozen-lockfile', '--non-interactive'],
+  npm: ['npm', 'ci', '--ignore-scripts', '--no-audit', '--no-fund', '--loglevel=error'],
+  pnpm: ['pnpm', 'install', '--frozen-lockfile', '--ignore-scripts'],
+  yarn: ['yarn', 'install', '--frozen-lockfile', '--ignore-scripts', '--non-interactive'],
 };
 
 /** Config files beside the lockfile that change what an install produces. */
@@ -45,40 +52,54 @@ const MARKER = '.watchtower-deps.json';
 /** Touched in a cache entry on every use; the least recently used entries are pruned. */
 const LAST_USED = '.last-used';
 
+/**
+ * The environment an install gets: what a package manager needs and nothing
+ * else of the sidecar's (no tokens, no paths to miniOG's own data).
+ * SSH_AUTH_SOCK stays: newton-web has a `git+ssh` dependency, and with
+ * scripts off nothing but git uses it.
+ */
+const INSTALL_ENV_KEYS = [
+  'HOME',
+  'USER',
+  'LOGNAME',
+  'SHELL',
+  'TMPDIR',
+  'LANG',
+  'LC_ALL',
+  'LC_CTYPE',
+  'SSH_AUTH_SOCK',
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'NO_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'no_proxy',
+  'NODE_EXTRA_CA_CERTS',
+];
+
+export function installEnv(env: NodeJS.ProcessEnv = toolchainEnv()): NodeJS.ProcessEnv {
+  const clean: NodeJS.ProcessEnv = { PATH: env.PATH, CI: '1' };
+  for (const key of INSTALL_ENV_KEYS) {
+    if (env[key] !== undefined) clean[key] = env[key];
+  }
+  return clean;
+}
+
 async function runInstall(dir: string, command: string[], timeoutMs: number): Promise<void> {
   const [bin, ...args] = command;
-  await execFileAsync(bin, args, {
-    cwd: dir,
-    timeout: timeoutMs,
-    maxBuffer: 64 * 1024 * 1024,
-    // CI quiets progress output; HUSKY=0 stops a `prepare` hook installer
-    // looking for a .git the cache directory doesn't have.
-    env: { ...toolchainEnv(), CI: '1', HUSKY: '0', DISABLE_OPENCOLLECTIVE: '1', ADBLOCK: '1' },
-  });
+  await execFileAsync(bin, args, { cwd: dir, timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024, env: installEnv() });
 }
 
 /**
- * Gives the worktree its own copy-on-write clone of an install. Where that
- * can't be done (not APFS), a symlink to the cache instead: shared, so a
- * sandboxed agent can read it but not write through it.
+ * Gives the worktree its own copy of an install: a copy-on-write clone on
+ * APFS, a plain copy elsewhere. Never a link to the cache, which can be pruned.
  */
-async function copyTree(
-  source: string,
-  target: string,
-  timeoutMs: number,
-  signal?: AbortSignal,
-): Promise<'clone' | 'symlink'> {
+async function copyTree(source: string, target: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
   if (process.platform === 'darwin') {
-    try {
-      await execFileAsync('/bin/cp', ['-Rc', source, target], { timeout: timeoutMs, signal });
-      return 'clone';
-    } catch (error) {
-      logger.warn({ source, target, error: String(error) }, 'could not clone the dependency cache; linking it instead');
-      discard(target);
-    }
+    await execFileAsync('/bin/cp', ['-Rc', source, target], { timeout: timeoutMs, signal });
+    return;
   }
-  fs.symlinkSync(source, target, 'junction');
-  return 'symlink';
+  await fs.promises.cp(source, target, { recursive: true, verbatimSymlinks: true });
 }
 
 /** Settings; tests point them at temp dirs and stub the install and the copy. */
@@ -105,9 +126,9 @@ export type DepsPlan =
   | { kind: 'install'; manager: PackageManager; lockfile: string; key: string; inputs: string[]; command: string[] };
 
 /**
- * What an install for this checkout would be, and its cache key: the
- * lockfile and the config beside it, the package manager, the Node major
- * version and the platform (native modules are built for both).
+ * What an install for this checkout would be, and its cache key: package.json,
+ * the lockfile and the config beside it, the package manager, the Node major
+ * version and the platform (native packages are built for both).
  */
 export function planDeps(dir: string, nodeVersion: string = process.versions.node): DepsPlan {
   const packageJson = path.join(dir, 'package.json');
@@ -126,10 +147,10 @@ export function planDeps(dir: string, nodeVersion: string = process.versions.nod
   if (found.manager === 'yarn' && fs.existsSync(path.join(dir, '.yarnrc.yml'))) {
     return { kind: 'unsupported', reason: 'it uses Yarn 2 or later' };
   }
-  const keyed = [found.file, ...CONFIG_FILES.filter(file => fs.existsSync(path.join(dir, file)))];
+  const inputs = ['package.json', found.file, ...CONFIG_FILES.filter(file => fs.existsSync(path.join(dir, file)))];
   const hash = crypto.createHash('sha256');
   hash.update(`${found.manager}\0node${nodeVersion.split('.')[0]}\0${process.platform}-${process.arch}\0`);
-  for (const file of keyed) {
+  for (const file of inputs) {
     hash.update(`${file}\0`);
     hash.update(fs.readFileSync(path.join(dir, file)));
     hash.update('\0');
@@ -139,7 +160,7 @@ export function planDeps(dir: string, nodeVersion: string = process.versions.nod
     manager: found.manager,
     lockfile: found.file,
     key: hash.digest('hex').slice(0, 16),
-    inputs: ['package.json', ...keyed],
+    inputs,
     command: COMMANDS[found.manager],
   };
 }
@@ -157,17 +178,27 @@ export type WorktreeDeps =
       command: string;
       /** This call ran the install (a cache miss). */
       installed: boolean;
-      /** How the worktree has it: its own clone, or a link to the shared cache. */
-      linked: 'clone' | 'symlink';
       ms: number;
     }
   | { status: 'unavailable'; reason: string; command: string };
 
 const inflight = new Map<string, Promise<void>>();
+/** Cache entries being copied from, and how many times: prune leaves them alone. */
+const inUse = new Map<string, number>();
 const failures = new Map<string, { at: number; reason: string }>();
 const states = new Map<string, WorktreeDeps>();
 const MAX_STATES = 500;
 let swept = false;
+
+function acquire(entry: string): void {
+  inUse.set(entry, (inUse.get(entry) ?? 0) + 1);
+}
+
+function release(entry: string): void {
+  const left = (inUse.get(entry) ?? 1) - 1;
+  if (left > 0) inUse.set(entry, left);
+  else inUse.delete(entry);
+}
 
 function remember(wsPath: string, state: WorktreeDeps): WorktreeDeps {
   const key = path.resolve(wsPath);
@@ -196,68 +227,67 @@ function readMarkerKey(nodeModules: string): string | undefined {
   }
 }
 
-function linkKind(nodeModules: string): 'clone' | 'symlink' {
-  try {
-    return fs.lstatSync(nodeModules).isSymbolicLink() ? 'symlink' : 'clone';
-  } catch {
-    return 'clone';
-  }
-}
-
 /**
- * Removes a path without waiting on a big tree: a symlink is unlinked (never
- * its target), a directory is moved into the cache's trash and deleted in the
- * background.
+ * Removes a path without blocking on a big tree: a symlink is unlinked (never
+ * its target); a directory is moved into the cache's trash, on the same
+ * volume, and deleted in the background. When it can't be moved, it is
+ * deleted in place, still without blocking the sidecar. Never throws.
  */
-function discard(target: string): void {
+export async function discardInBackground(target: string): Promise<void> {
   let stat: fs.Stats;
   try {
     stat = fs.lstatSync(target);
   } catch {
     return;
   }
-  if (!stat.isDirectory()) {
-    fs.rmSync(target, { force: true });
-    return;
-  }
-  const trash = path.join(__depCache.root, '.trash', `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`);
   try {
-    fs.mkdirSync(path.dirname(trash), { recursive: true });
-    fs.renameSync(target, trash);
-  } catch {
-    fs.rmSync(target, { recursive: true, force: true });
-    return;
+    if (!stat.isDirectory()) {
+      await fs.promises.rm(target, { force: true });
+      return;
+    }
+    const trash = path.join(__depCache.root, '.trash', `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`);
+    try {
+      fs.mkdirSync(path.dirname(trash), { recursive: true });
+      fs.renameSync(target, trash);
+    } catch {
+      await fs.promises.rm(target, { recursive: true, force: true });
+      return;
+    }
+    void fs.promises
+      .rm(trash, { recursive: true, force: true })
+      .catch(error => logger.warn({ trash, error: String(error) }, 'could not delete an old dependency install'));
+  } catch (error) {
+    logger.warn({ target, error: String(error) }, 'could not delete a dependency install');
   }
-  fs.rm(trash, { recursive: true, force: true }, error => {
-    if (error) logger.warn({ trash, error: String(error) }, 'could not delete an old dependency install');
-  });
 }
 
 /** Leftovers of a run that stopped mid-install, once per process. */
-function sweepOnce(): void {
+async function sweepOnce(): Promise<void> {
   if (swept) return;
   swept = true;
+  let repos: string[];
   try {
-    for (const repo of fs.readdirSync(__depCache.root)) {
-      const repoDir = path.join(__depCache.root, repo);
+    repos = fs.readdirSync(__depCache.root);
+  } catch {
+    return; // no cache yet
+  }
+  for (const repo of repos) {
+    const repoDir = path.join(__depCache.root, repo);
+    try {
       if (repo.startsWith('.trash')) {
         // Out of the way first, so a discard made meanwhile gets a fresh trash.
         const old = path.join(__depCache.root, `.trash-old-${crypto.randomBytes(4).toString('hex')}`);
-        try {
-          fs.renameSync(repoDir, old);
-          fs.rm(old, { recursive: true, force: true }, () => undefined);
-        } catch {
-          // gone already
-        }
+        fs.renameSync(repoDir, old);
+        void fs.promises.rm(old, { recursive: true, force: true }).catch(() => undefined);
         continue;
       }
       if (repo.startsWith('.') || !fs.statSync(repoDir).isDirectory()) continue;
       for (const entry of fs.readdirSync(repoDir)) {
-        if (entry.includes('.tmp-')) discard(path.join(repoDir, entry));
+        if (entry.includes('.tmp-')) await discardInBackground(path.join(repoDir, entry));
       }
+    } catch {
+      // gone already
     }
-  } catch {
-    // no cache yet
   }
 }
 
@@ -287,8 +317,11 @@ function lastUsed(entry: string): number {
   return 0;
 }
 
-/** Keeps the most recently used installs of a repo; the rest go to the trash. */
-function prune(repoDir: string): void {
+/**
+ * Keeps the most recently used installs of a repo; the rest go to the trash.
+ * Never one being installed or copied from.
+ */
+async function prune(repoDir: string): Promise<void> {
   try {
     const entries = fs
       .readdirSync(repoDir)
@@ -297,9 +330,9 @@ function prune(repoDir: string): void {
       .filter(isComplete)
       .sort((a, b) => lastUsed(b) - lastUsed(a));
     for (const old of entries.slice(__depCache.keepPerRepo)) {
-      if (inflight.has(old)) continue;
+      if (inflight.has(old) || inUse.has(old)) continue;
       logger.info({ entry: old }, 'pruning an old dependency install');
-      discard(old);
+      await discardInBackground(old);
     }
   } catch (error) {
     logger.warn({ repoDir, error: String(error) }, 'could not prune old dependency installs');
@@ -329,7 +362,7 @@ function untilAborted<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
 
 /** Installs into a temp directory beside the entry, then renames it into place. */
 async function install(entry: string, source: string, plan: Extract<DepsPlan, { kind: 'install' }>): Promise<void> {
-  sweepOnce();
+  await sweepOnce();
   fs.mkdirSync(path.dirname(entry), { recursive: true });
   const free = freeBytes(path.dirname(entry));
   if (free !== undefined && free < __depCache.minFreeBytes) {
@@ -351,20 +384,24 @@ async function install(entry: string, source: string, plan: Extract<DepsPlan, { 
     } catch (error) {
       // Another install of the same lockfile finished first: use that one.
       if (!isComplete(entry)) throw error;
-      discard(tmp);
+      await discardInBackground(tmp);
     }
   } catch (error) {
-    discard(tmp);
+    await discardInBackground(tmp);
     throw error;
   }
   touch(entry);
-  prune(path.dirname(entry));
+  await prune(path.dirname(entry));
 }
 
-function describeFailure(error: unknown): string {
-  const err = error as { killed?: boolean; signal?: string; name?: string; stderr?: unknown; message?: string };
-  if (err?.name === 'AbortError') return 'the run was stopped during the install';
-  if (err?.killed) return `the install took longer than ${Math.round(__depCache.installTimeoutMs / 60_000)} min`;
+function describeFailure(error: unknown, what: 'install' | 'copy' = 'install'): string {
+  const err = error as { killed?: boolean; name?: string; code?: unknown; stderr?: unknown; message?: string };
+  if (err?.name === 'AbortError') return `the run was stopped during the ${what}`;
+  if (err?.code === 'ENOSPC') return `the disk filled up during the ${what}`;
+  if (err?.killed) {
+    const limit = what === 'install' ? __depCache.installTimeoutMs : __depCache.copyTimeoutMs;
+    return `the ${what} took longer than ${Math.round(limit / 60_000)} min`;
+  }
   const stderr = typeof err?.stderr === 'string' ? err.stderr.trim() : '';
   const text = (stderr || err?.message || String(error)).replace(/\s+/g, ' ').trim();
   return text.length > 240 ? `…${text.slice(-240)}` : text;
@@ -373,9 +410,10 @@ function describeFailure(error: unknown): string {
 /**
  * Gives a worktree the dependencies its lockfile asks for, from the cache
  * (installing them there first on a miss). Concurrent calls for the same
- * lockfile share one install. Never throws: when it cannot, the worktree is
- * left as it was (a link to the shared clone's install, if it had one) and
- * the result says why, for the agents' prompts (`depsPromptLine`).
+ * lockfile share one install. Never throws: when the install fails, the
+ * worktree is left as it was (a link to the shared clone's install, if it had
+ * one); when the copy fails, the partial copy is removed. Either way the
+ * result says why, for the agents' prompts (`depsPromptLine`).
  */
 export async function prepareWorktreeDeps(
   wsPath: string,
@@ -396,76 +434,89 @@ export async function prepareWorktreeDeps(
 
   const command = plan.command.join(' ');
   const target = path.join(wsPath, 'node_modules');
-  if (readMarkerKey(target) === plan.key) {
-    return remember(wsPath, {
-      status: 'ready',
-      manager: plan.manager,
-      lockfile: plan.lockfile,
-      key: plan.key,
-      command,
-      installed: false,
-      linked: linkKind(target),
-      ms: 0,
-    });
-  }
-
-  const repoName = path.basename(path.dirname(path.resolve(wsPath)));
-  const entry = path.join(__depCache.root, repoName, plan.key);
-  const started = Date.now();
-  try {
-    let installed = false;
-    if (!isComplete(entry)) {
-      const failed = failures.get(entry);
-      if (failed && Date.now() - failed.at < __depCache.failureHoldMs) throw new Error(failed.reason);
-      let pending = inflight.get(entry);
-      if (!pending) {
-        installed = true;
-        logStep?.({
-          stage,
-          message: `Installing ${repoName}'s dependencies for this ${plan.lockfile} (\`${command}\`), once; later runs reuse it.`,
-          data: { key: plan.key, entry },
-        });
-        // Not tied to this run's signal: other runs may be waiting on the same install.
-        pending = install(entry, wsPath, plan)
-          .catch(error => {
-            failures.set(entry, { at: Date.now(), reason: describeFailure(error) });
-            throw error;
-          })
-          .finally(() => inflight.delete(entry));
-        inflight.set(entry, pending);
-      }
-      await untilAborted(pending, signal);
-      failures.delete(entry);
-    }
-    touch(entry);
-    discard(target);
-    const linked = await __depCache.copy(path.join(entry, 'node_modules'), target, __depCache.copyTimeoutMs, signal);
-    const ms = Date.now() - started;
-    logStep?.({
-      stage,
-      message: `The worktree has ${repoName}'s dependencies for its ${plan.lockfile} (${installed ? 'installed' : 'from the cache'}, ${linked === 'clone' ? 'its own copy' : 'linked'}, ${Math.round(ms / 1000)}s).`,
-      data: { key: plan.key, installed, linked, ms },
-    });
-    return remember(wsPath, {
+  const ready = (installed: boolean, ms: number): WorktreeDeps =>
+    remember(wsPath, {
       status: 'ready',
       manager: plan.manager,
       lockfile: plan.lockfile,
       key: plan.key,
       command,
       installed,
-      linked,
       ms,
     });
-  } catch (error) {
-    const reason = failures.get(entry)?.reason ?? describeFailure(error);
-    logStep?.({
-      stage,
-      level: 'WARN',
-      message: `Could not give the worktree its dependencies: ${reason}`,
-      data: { key: plan.key, entry },
-    });
-    return remember(wsPath, { status: 'unavailable', reason, command });
+  if (readMarkerKey(target) === plan.key) return ready(false, 0);
+
+  const repoName = path.basename(path.dirname(path.resolve(wsPath)));
+  const entry = path.join(__depCache.root, repoName, plan.key);
+  const started = Date.now();
+  let installed = false;
+  // From here until the copy is done, prune leaves this entry alone.
+  acquire(entry);
+  try {
+    try {
+      if (!isComplete(entry)) {
+        const failed = failures.get(entry);
+        if (failed && Date.now() - failed.at < __depCache.failureHoldMs) throw new Error(failed.reason);
+        let pending = inflight.get(entry);
+        if (!pending) {
+          installed = true;
+          logStep?.({
+            stage,
+            message: `Installing ${repoName}'s dependencies for this ${plan.lockfile} (\`${command}\`), once; later runs reuse it.`,
+            data: { key: plan.key, entry },
+          });
+          // Not tied to this run's signal: other runs may be waiting on the same install.
+          pending = install(entry, wsPath, plan)
+            .catch(error => {
+              failures.set(entry, { at: Date.now(), reason: describeFailure(error) });
+              throw error;
+            })
+            .finally(() => inflight.delete(entry));
+          inflight.set(entry, pending);
+        }
+        await untilAborted(pending, signal);
+        failures.delete(entry);
+      }
+    } catch (error) {
+      const reason = failures.get(entry)?.reason ?? describeFailure(error);
+      logStep?.({
+        stage,
+        level: 'WARN',
+        message: `Could not install the worktree's dependencies: ${reason}`,
+        data: { key: plan.key, entry },
+      });
+      return remember(wsPath, { status: 'unavailable', reason, command });
+    }
+
+    touch(entry);
+    await discardInBackground(target);
+    try {
+      await __depCache.copy(path.join(entry, 'node_modules'), target, __depCache.copyTimeoutMs, signal);
+      if (readMarkerKey(target) !== plan.key) throw new Error('the copy is incomplete');
+    } catch (error) {
+      // A partial copy (a timeout, a full disk, an install pruned meanwhile)
+      // must not pass for an install.
+      await discardInBackground(target);
+      const reason = describeFailure(error, 'copy');
+      logStep?.({
+        stage,
+        level: 'WARN',
+        message: `Could not copy the dependencies into the worktree: ${reason}`,
+        data: { key: plan.key, entry },
+      });
+      return remember(wsPath, { status: 'unavailable', reason, command });
+    }
+  } finally {
+    release(entry);
   }
+
+  const ms = Date.now() - started;
+  logStep?.({
+    stage,
+    message: `The worktree has ${repoName}'s dependencies for its ${plan.lockfile} (${installed ? 'installed' : 'from the cache'}, ${Math.round(ms / 1000)}s).`,
+    data: { key: plan.key, installed, ms },
+  });
+  return ready(installed, ms);
 }
 
 /**
@@ -475,11 +526,7 @@ export async function prepareWorktreeDeps(
 export function depsPromptLine(wsPath: string, state: WorktreeDeps | undefined = worktreeDepsFor(wsPath)): string {
   if (!state) return '';
   if (state.status === 'ready') {
-    const reinstall =
-      state.linked === 'clone'
-        ? 'reinstall only if you change package.json or the lockfile.'
-        : `node_modules is shared with other runs: never install into it; if you change dependencies, \`rm node_modules\` and run \`${state.command}\` first.`;
-    return `Dependencies: installed in node_modules for this checkout's ${state.lockfile} (with \`${state.command}\`, before you started). Run the repo's own typecheck, lint, test and build scripts directly; ${reinstall}`;
+    return `Dependencies: installed in node_modules for this checkout's ${state.lockfile} (with \`${state.command}\`, before you started: packages' install scripts did not run). Run the repo's own typecheck, lint, test and build scripts directly; reinstall only if you change package.json or the lockfile.`;
   }
   if (state.status === 'unavailable') {
     let linked = false;
@@ -495,9 +542,10 @@ export function depsPromptLine(wsPath: string, state: WorktreeDeps | undefined =
   return '';
 }
 
-/** For tests: forget installs in flight, held failures and per-worktree results. */
+/** For tests: forget installs in flight, entries in use, held failures and per-worktree results. */
 export function __resetDepCacheState(): void {
   inflight.clear();
+  inUse.clear();
   failures.clear();
   states.clear();
   swept = false;
