@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   buildCoderFollowUpQuestion,
   buildCoderNoDiffQuestion,
+  formatExecutedPlanEdit,
   formatPlanDetail,
   formatPlanMessage,
   planNeedsRequesterConfirmation,
@@ -16,6 +17,7 @@ import { __infraRetry } from '../src/codex/infraRetry.js';
 import { activeClock } from '../src/runtime/activeClock.js';
 import { currentConnectors, withConnectors } from '../src/backends/connectors.js';
 import { fetchThreadContext } from '../src/slack/threadContext.js';
+import { splitSlackText } from '../src/slack/replyParts.js';
 import { __resetButtonRepliesForTests, recordButtonReply, rememberPrompt } from '../src/slack/buttonReplies.js';
 import { checkCoderProducedChanges } from '../src/workspaces/gitState.js';
 import { agentCallContext } from '../src/state/runContext.js';
@@ -1241,6 +1243,29 @@ describe("the pipeline's agents see the thread's attachments (issue #595)", () =
     });
 
     expect(vi.mocked(runCodex).mock.calls[0][0].imagePaths).toBeUndefined();
+  });
+});
+
+describe('formatExecutedPlanEdit: the plan message once the coder is done (issue #623)', () => {
+  const FILES = ['/ws/newton-web/1-1/src/a.ts'];
+  const REPO = '/ws/newton-web/1-1';
+
+  it('is the whole plan with the marker when the plan went out as one message', () => {
+    const plan = '# Fix the label\n\n1. Change the label.';
+    expect(formatExecutedPlanEdit(plan, FILES, 'small', REPO)).toBe(
+      formatPlanMessage(plan, FILES, 'small', REPO, true),
+    );
+  });
+
+  it('rewrites only the first part of a plan that went out in parts, and keeps the marker', () => {
+    const steps = Array.from({ length: 80 }, (_, i) => `${i + 1}. Update the copy on page ${i} to the new wording.`);
+    const plan = `# Update the copy\n\n${steps.join('\n')}`;
+    const posted = splitSlackText(formatPlanMessage(plan, FILES, 'small', REPO, false));
+    expect(posted.length).toBeGreaterThan(1);
+
+    const edit = formatExecutedPlanEdit(plan, FILES, 'small', REPO);
+    expect(edit).toBe(`${posted[0]}\n\n_✅ Plan executed._`);
+    expect(edit.length).toBeLessThan(4_000);
   });
 });
 

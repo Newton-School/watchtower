@@ -32,7 +32,7 @@ import {
 } from '../slack/buttonReplies.js';
 import { isGateStop, normalizeControlText, slackMentionIds, stripSlackMentions } from '../router/stopIntent.js';
 import { createProgressMessage, formatElapsed, type ProgressMessage } from '../slack/progressMessage.js';
-import { clipText } from '../slack/replyParts.js';
+import { clipText, splitSlackText } from '../slack/replyParts.js';
 import { currentHead, checkCoderProducedChanges, getDiffVsBase } from '../workspaces/gitState.js';
 import { prepareWorktreeDeps } from '../workspaces/depCache.js';
 
@@ -164,6 +164,8 @@ const PLAN_MESSAGE_MAX_FILES = 8;
  * The header counts files the change edits. It used to count every
  * path-shaped token in the plan.
  */
+const PLAN_EXECUTED_SUFFIX = '\n\n_✅ Plan executed._';
+
 export function formatPlanMessage(
   planMarkdown: string,
   affectedFiles: string[],
@@ -183,7 +185,7 @@ export function formatPlanMessage(
   const shownFiles = displayFiles.slice(0, PLAN_MESSAGE_MAX_FILES).map(f => `• \`${f}\``);
   if (count > PLAN_MESSAGE_MAX_FILES) shownFiles.push(`• … and ${count - PLAN_MESSAGE_MAX_FILES} more`);
   const filesSection = count > 0 ? `*Files to change:*\n${shownFiles.join('\n')}` : '';
-  const completedSuffix = completed ? '\n\n_✅ Plan executed._' : '';
+  const completedSuffix = completed ? PLAN_EXECUTED_SUFFIX : '';
 
   if (!summary) {
     const body = planMarkdown.trim();
@@ -223,6 +225,23 @@ export function formatPlanMessage(
     );
   }
   return [block.join('\n'), ...(filesSection ? [filesSection] : [])].join('\n\n').concat(completedSuffix);
+}
+
+/**
+ * The plan message once the coder is done: the plan with "✅ Plan executed."
+ * after it. A plan too long for one message went out in parts and its ts is
+ * the first part's, so only that part is rewritten, with the marker after it
+ * (issue #623); the whole plan in one edit would be cut or refused.
+ */
+export function formatExecutedPlanEdit(
+  planMarkdown: string,
+  affectedFiles: string[],
+  scope: string,
+  repoPath?: string,
+): string {
+  const posted = splitSlackText(formatPlanMessage(planMarkdown, affectedFiles, scope, repoPath, false));
+  if (posted.length <= 1) return formatPlanMessage(planMarkdown, affectedFiles, scope, repoPath, true);
+  return `${posted[0]}${PLAN_EXECUTED_SUFFIX}`;
 }
 
 const CHANGED_HEADING_RE = /^#{1,6}\s*changed since the last plan\b/i;
@@ -2068,12 +2087,11 @@ async function runAgentPipelineBody(
         slack,
         ctx,
         ts: planMessageTs,
-        text: formatPlanMessage(
+        text: formatExecutedPlanEdit(
           plannerNormalized.planMarkdown,
           plannerNormalized.affectedFiles,
           plannerNormalized.scope,
           ctx.repoPath,
-          true,
         ),
       });
     }

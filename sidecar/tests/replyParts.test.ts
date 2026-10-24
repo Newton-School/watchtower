@@ -1,6 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 import { chunkForSlack } from '../src/slack/attachmentFollowUp.js';
-import { clipText, postInParts, slackLength, SLACK_PART_CHARS, splitSlackText } from '../src/slack/replyParts.js';
+import {
+  clipText,
+  MAX_REPLY_PARTS,
+  postInParts,
+  REST_NOT_SHOWN,
+  slackLength,
+  SLACK_PART_CHARS,
+  splitSlackText,
+} from '../src/slack/replyParts.js';
 
 function words(count: number, word = 'word'): string {
   return Array.from({ length: count }, () => word).join(' ');
@@ -135,6 +143,63 @@ describe('splitSlackText', () => {
     expect(parts.length).toBe(2);
     for (const part of parts) expect(part.endsWith('.')).toBe(true);
   });
+
+  it('turns a link too long for any part into its label', () => {
+    const link = `<https://example.com/${'a'.repeat(300)}|the design doc>`;
+    const parts = splitSlackText(`${words(5, 'see')} ${link} ${words(30, 'more')}`, 100);
+    expect(parts.join(' ')).toContain('the design doc');
+    expect(parts.join(' ')).not.toContain('<https://');
+  });
+});
+
+/** Fences in `text`, counted the way Slack reads them: every ``` counts. */
+function fenceCount(text: string): number {
+  return text.split('```').length - 1;
+}
+
+describe('splitSlackText: code blocks as Slack reads them', () => {
+  const prose = Array.from({ length: 12 }, (_, i) => `${words(40, `prose${i}`)}.`).join('\n\n');
+
+  it('sees a block opened in the middle of a line, and leaves the prose after it plain', () => {
+    const text = `Run this: \`\`\`\nnpm ci\n\`\`\`\n\n${prose}`;
+    const parts = splitSlackText(text, 800);
+    expect(parts[0].startsWith('Run this: ```\nnpm ci\n```')).toBe(true);
+    for (const part of parts.slice(1)) expect(part).not.toContain('```');
+    expectWhole(text, parts, 800);
+  });
+
+  it('treats a last fence with nothing to close it as plain text, and adds none', () => {
+    const text = `Type \`\`\` to start a code block.\n\n${prose}`;
+    const parts = splitSlackText(text, 800);
+    expect(fenceCount(parts.join('\n'))).toBe(1);
+    expectWhole(text, parts, 800);
+  });
+
+  it('closes a block where Slack does, at a fence inside a line of code', () => {
+    // Slack ends the first block at the ``` inside the echo line; the last
+    // fence then has nothing to close it.
+    const code = Array.from({ length: 20 }, (_, i) => `echo line${i}`).join('\n');
+    const text = `\`\`\`sh\n${code}\necho "\`\`\`" done\n\`\`\`\n\n${prose}`;
+    const parts = splitSlackText(text, 200);
+    // The block is cut and reopened; each cut adds one closing and one opening fence.
+    const reopened = parts.filter(part => part.startsWith('```sh\n')).length - 1;
+    expect(reopened).toBeGreaterThan(0);
+    expect(fenceCount(parts.join('\n')) - fenceCount(text)).toBe(2 * reopened);
+    // The stray fence is still followed by the prose, with no fence added for it.
+    expect(parts.join('\n')).toContain('" done\n```\n\nprose0');
+    for (const part of parts) if (!part.includes('" done')) expect(fenceCount(part) % 2).toBe(0);
+  });
+
+  it('cuts a block whose closing fence ends a line of code', () => {
+    const code = Array.from({ length: 15 }, (_, i) => `select ${i} from t;`).join('\n');
+    const text = `\`\`\`sql\n${code}\`\`\` and that is the query.`;
+    const parts = splitSlackText(text, 120);
+    for (const part of parts) {
+      expect(slackLength(part)).toBeLessThanOrEqual(120);
+      expect(fenceCount(part) % 2).toBe(0);
+    }
+    expect(parts[parts.length - 1].endsWith('and that is the query.')).toBe(true);
+  });
 });
 
 describe('clipText', () => {
@@ -167,6 +232,18 @@ describe('clipText', () => {
     const clipped = clipText('Before:\n```\nconst a = 1;\nconst b = 2;\nconst c = 3;\n```', 30);
     expect((clipped.split('```').length - 1) % 2).toBe(0);
   });
+
+  it('adds no fence after a stray one that opens nothing', () => {
+    expect(clipText('Type ``` to start a block, then your code, then three more', 30)).toBe(
+      'Type ``` to start a block…',
+    );
+  });
+
+  it('turns a leading link too long to keep into its label, or drops it', () => {
+    const url = `https://example.com/${'a'.repeat(300)}`;
+    expect(clipText(`<${url}|the design doc> is where the plan lives now`, 30)).toBe('the design doc is where the…');
+    expect(clipText(`<${url}> is where the plan lives, with the notes`, 30)).toBe('is where the plan lives, with…');
+  });
 });
 
 describe('postInParts', () => {
@@ -182,7 +259,11 @@ describe('postInParts', () => {
     let n = 0;
     const post = vi.fn(async () => ({ ok: true, ts: String(++n) }));
     const text = `${words(15, 'alpha')}\n\n${words(15, 'beta')}\n\n${words(15, 'gamma')}`;
-    const result = await postInParts(post, { channel: 'C1', thread_ts: '9', text, reply_broadcast: true }, 100);
+    const result = await postInParts(
+      post,
+      { channel: 'C1', thread_ts: '9', text, reply_broadcast: true },
+      { limit: 100 },
+    );
     expect(result).toEqual({ ok: true, ts: '1' });
     const calls = post.mock.calls.map(call => (call as unknown[])[0] as Record<string, unknown>);
     expect(calls.length).toBe(3);
@@ -195,7 +276,7 @@ describe('postInParts', () => {
   it('stops when the first part is refused, and swallows a later failure', async () => {
     const text = `${words(15, 'alpha')}\n\n${words(15, 'beta')}\n\n${words(15, 'gamma')}`;
     const refused = vi.fn().mockResolvedValue({ ok: false });
-    await expect(postInParts(refused, { text }, 100)).resolves.toEqual({ ok: false });
+    await expect(postInParts(refused, { text }, { limit: 100 })).resolves.toEqual({ ok: false });
     expect(refused).toHaveBeenCalledTimes(1);
 
     const flaky = vi
@@ -203,15 +284,58 @@ describe('postInParts', () => {
       .mockResolvedValueOnce({ ok: true, ts: '1' })
       .mockRejectedValueOnce(new Error('ratelimited'))
       .mockResolvedValue({ ok: true, ts: '3' });
-    await expect(postInParts(flaky, { text }, 100)).resolves.toEqual({ ok: true, ts: '1' });
+    await expect(postInParts(flaky, { text }, { limit: 100 })).resolves.toEqual({ ok: true, ts: '1' });
     expect(flaky).toHaveBeenCalledTimes(2);
   });
 
   it('posts text that only backs blocks as it is', async () => {
     const post = vi.fn().mockResolvedValue({ ok: true });
     const args = { text: words(100), blocks: [{ type: 'section' }] };
-    await postInParts(post, args, 100);
+    await postInParts(post, args, { limit: 100 });
     expect(post).toHaveBeenCalledTimes(1);
     expect(post).toHaveBeenCalledWith(args);
+  });
+
+  const five = Array.from({ length: 5 }, (_, i) => words(15, `part${i}`)).join('\n\n');
+  const textOf = (post: ReturnType<typeof vi.fn>) =>
+    post.mock.calls.map(call => String(((call as unknown[])[0] as { text: string }).text));
+
+  it('joins the other parts into one message when the first went a way that allows few posts', async () => {
+    const post = vi.fn().mockResolvedValue({ ok: true, ts: '1', via: 'response_url' });
+    await postInParts(post, { text: five }, { limit: 100, joinRest: first => first.via === 'response_url' });
+    const texts = textOf(post);
+    expect(texts.length).toBe(2);
+    expect(texts[1].split('\n\n').map(text => text.split(' ')[0])).toEqual(['part1', 'part2', 'part3', 'part4']);
+  });
+
+  it('posts at most maxParts messages and puts the rest in a file', async () => {
+    const post = vi.fn().mockResolvedValue({ ok: true, ts: '1' });
+    const fileRest = vi.fn().mockResolvedValue(true);
+    const args = { channel: 'C1', thread_ts: '9', text: five };
+    await postInParts(post, args, { limit: 100, maxParts: 2, fileRest });
+    expect(textOf(post).map(text => text.split(' ')[0])).toEqual(['part0', 'part1']);
+    expect(fileRest).toHaveBeenCalledTimes(1);
+    const [rest, passed] = fileRest.mock.calls[0] as [string, unknown];
+    expect(rest.split('\n\n').map(text => text.split(' ')[0])).toEqual(['part2', 'part3', 'part4']);
+    expect(passed).toBe(args);
+  });
+
+  it('says so when the rest could not be attached', async () => {
+    for (const fileRest of [undefined, vi.fn().mockResolvedValue(false), vi.fn().mockRejectedValue(new Error('x'))]) {
+      const post = vi.fn().mockResolvedValue({ ok: true, ts: '1' });
+      await postInParts(post, { text: five }, { limit: 100, maxParts: 2, fileRest });
+      const texts = textOf(post);
+      expect(texts.length).toBe(3);
+      expect(texts[2]).toBe(REST_NOT_SHOWN);
+    }
+  });
+
+  it('caps a reply at MAX_REPLY_PARTS messages by default', async () => {
+    const post = vi.fn().mockResolvedValue({ ok: true, ts: '1' });
+    const fileRest = vi.fn().mockResolvedValue(true);
+    const many = Array.from({ length: MAX_REPLY_PARTS + 3 }, (_, i) => words(15, `part${i}`)).join('\n\n');
+    await postInParts(post, { text: many }, { limit: 100, fileRest });
+    expect(post).toHaveBeenCalledTimes(MAX_REPLY_PARTS);
+    expect(fileRest).toHaveBeenCalledTimes(1);
   });
 });
