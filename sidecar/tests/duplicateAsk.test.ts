@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   askFeatures,
   askTextOf,
@@ -6,6 +6,7 @@ import {
   findDuplicateAsk,
   isSameAsk,
   mayCheckForDuplicate,
+  resolveDuplicateAsk,
 } from '../src/router/duplicateAsk.js';
 import { registerActiveJob, unregisterActiveJob, getActiveJobIds } from '../src/state/activeJobs.js';
 import {
@@ -18,20 +19,17 @@ import {
 } from '../src/state/workLedger.js';
 import type { NormalizedTask } from '../src/types/contracts.js';
 
-// Shaped on the two requests in issue #602: the same graduation-year change
-// sent to miniOG in one channel and, 13 minutes later, to the owner in another
-// with more pages listed.
-const FORM_ASK =
-  "<@UBOT> <https://www.example.com/courses/data-science|example.com/courses/data-science> On this page: For ds_placement_form = existing; This is a question inside the form: Select your bachelor's graduation year (not masters) Option-1. Before 2013 Option-2: 2013 - 2025 Option-3. 2026 Option-4. After 2026 Option-5. Haven't joined college yet\n\nCan you change the Options: Option-2 should be 2013 - 2026; Option-3. 2027 and Option-4. After 2027";
-const FORM_ASK_TO_OWNER =
-  '<@UOWNER> Hey, there\'s an *urgent requirement* to update the graduation year options in the form.\n*Question:* Select your bachelor\'s graduation year (not master\'s)\n*Required changes:*\n• 2013–2025 → *2013–2026*\n• 2026 → *2027*\n• After 2026 → *After 2027*\n• Keep "Before 2013" and "Haven\'t joined college yet" unchanged.\n*Pages impacted:*\n1. <https://www.example.com/courses/full-stack|example.com/courses/full-stack>\n2. <https://www.example.com/|example.com>\n3. <https://www.example.com/courses/data-science|example.com/courses/data-science>\n*Important:* On page 3 there\'s another form variant live for *90% of traffic*. For that form, update: • "2027 or later" → *"2027"*';
+const PAGE = '<https://www.example.com/placement|example.com/placement>';
+const ASK = `<@UBOT> on ${PAGE} change "Average Earned" to "Average Stipend" in the 1st batch pune campus section`;
+const ASK_WITH_MORE = `<@UOWNER> hey, urgent: on ${PAGE} change "Average Earned" to "Average Stipend" in the 1st batch pune campus section, and keep the heading bold`;
 
 const HEADER_ASK = (page: string, node: string) =>
   `<@UBOT> update the header section of <https://www.example.com/campus/${page}|example.com/campus/${page}> refer to attached ss to understand which section im referring to design: Desktop - <https://www.figma.com/design/abc/Site?node-id=${node}&amp;t=xyz|figma.com/design/abc>`;
 
 describe('isSameAsk', () => {
-  it('matches the same change re-sent with more detail', () => {
-    expect(isSameAsk('change', FORM_ASK, `${FORM_ASK_TO_OWNER}\nyes`)).toBe(true);
+  it('matches a copy re-posted elsewhere, with or without more added', () => {
+    expect(isSameAsk('change', ASK, ASK.replace('<@UBOT>', '<@UOWNER>'))).toBe(true);
+    expect(isSameAsk('change', ASK, ASK_WITH_MORE)).toBe(true);
   });
 
   it('matches a request re-posted with the links the first one was missing', () => {
@@ -40,28 +38,58 @@ describe('isSameAsk', () => {
     expect(isSameAsk('change', cut, HEADER_ASK('north', '1-2'))).toBe(true);
   });
 
+  it('does not catch a rephrased request: text, not meaning', () => {
+    expect(
+      isSameAsk(
+        'change',
+        `<@UBOT> on ${PAGE} please change the graduation year options: 2013 - 2025 becomes 2013 - 2026, 2026 becomes 2027`,
+        `<@UOWNER> urgent requirement to update the graduation year options on ${PAGE}: 2013 - 2025 → 2013 - 2026, 2026 → 2027`,
+      ),
+    ).toBe(false);
+  });
+
   it('tells the same request template for another page apart', () => {
     expect(isSameAsk('change', HEADER_ASK('north', '1-2'), HEADER_ASK('south', '3-4'))).toBe(false);
   });
 
   it('tells two edits to the same page apart', () => {
-    const page = '<https://www.example.com/placement|example.com/placement>';
     expect(
       isSameAsk(
         'change',
-        `<@UBOT> change "Average Earned" to "Average Stipend" and "23,364" to "23,149" in 1st batch pune campus section ${page}`,
-        `<@UBOT> update Students placed in AI firms section, change 30% to 31% ${page}`,
+        `<@UBOT> change "Average Earned" to "Average Stipend" and "23,364" to "23,149" in 1st batch pune campus section ${PAGE}`,
+        `<@UBOT> update Students placed in AI firms section, change 30% to 31% ${PAGE}`,
       ),
     ).toBe(false);
   });
 
-  it('needs every word when the two are about the same length', () => {
-    const page = '<https://www.example.com/placement|example.com/placement>';
+  it('tells asks one word apart: pune and delhi, add and remove, red and blue, show and not show', () => {
+    const pairs: Array<[string, string]> = [
+      [
+        `<@UBOT> change Average Earned to Average Stipend in the first batch pune campus section ${PAGE}`,
+        `<@UBOT> change Average Earned to Average Stipend in the first batch delhi campus section ${PAGE}`,
+      ],
+      [
+        `<@UBOT> add the scholarship banner above the hero section on ${PAGE}`,
+        `<@UBOT> remove the scholarship banner above the hero section on ${PAGE}`,
+      ],
+      [
+        `<@UBOT> make the apply now button in the hero section red on ${PAGE}`,
+        `<@UBOT> make the apply now button in the hero section blue on ${PAGE}`,
+      ],
+      [
+        `<@UBOT> show the scholarship banner in the hero section on ${PAGE}`,
+        `<@UBOT> do not show the scholarship banner in the hero section on ${PAGE}`,
+      ],
+    ];
+    for (const [a, b] of pairs) expect(isSameAsk('change', a, b), `${a} / ${b}`).toBe(false);
+  });
+
+  it('tells a swap apart: the same quotes in the other order', () => {
     expect(
       isSameAsk(
         'change',
-        `<@UBOT> change Average Earned to Average Stipend in the first batch pune campus section ${page}`,
-        `<@UBOT> change Average Earned to Average Stipend in the first batch delhi campus section ${page}`,
+        `<@UBOT> on ${PAGE} change the hero button label "Apply now" to "Enroll today" please`,
+        `<@UBOT> on ${PAGE} change the hero button label "Enroll today" to "Apply now" please`,
       ),
     ).toBe(false);
   });
@@ -84,6 +112,9 @@ describe('isSameAsk', () => {
   it('matches a lookup only when it is nearly word for word', () => {
     const asked = '<@UBOT> how is the monthly leaderboard rank computed for learners in a cohort';
     expect(isSameAsk('lookup', asked, `${asked}?`)).toBe(true);
+    expect(isSameAsk('lookup', asked, `${asked}, and who decides the tie breaks when two learners score equal`)).toBe(
+      false,
+    );
     expect(
       isSameAsk(
         'lookup',
@@ -96,24 +127,25 @@ describe('isSameAsk', () => {
 
 describe('askFeatures', () => {
   it('reads a link the same with or without www, a trailing slash or a Slack label', () => {
-    expect([...askFeatures('<https://www.example.com/a/b/|label>').specifics]).toEqual(['link:example.com/a/b']);
-    expect([...askFeatures('see https://example.com/a/b').specifics]).toEqual(['link:example.com/a/b']);
+    expect(askFeatures('<https://www.example.com/a/b/|label>').specifics).toEqual(['link:example.com/a/b']);
+    expect(askFeatures('see https://example.com/a/b').specifics).toEqual(['link:example.com/a/b']);
   });
 
-  it('reads 23,364 and 23364 as one number and skips list markers', () => {
-    expect([...askFeatures('1. change 23,364').specifics]).toEqual(['num:23364']);
-    expect([...askFeatures('change 23364').specifics]).toEqual(['num:23364']);
+  it('reads 23,364 and 23364 as one number, skips list markers, and keeps the order written', () => {
+    expect(askFeatures('1. change 23,364 to "x"').specifics).toEqual(['num:23364', 'quote:x']);
+    expect(askFeatures('change "x" to 23364').specifics).toEqual(['quote:x', 'num:23364']);
   });
 
-  it('leaves out mentions and the "Sent using" footer', () => {
-    const { words } = askFeatures('<@UBOT> update hero banner copy *Sent using* <@UCLAUDE>');
-    expect([...words].sort()).toEqual(['banner', 'copy', 'hero', 'update']);
+  it('leaves out mentions and the "Sent using" footer, and keeps negations', () => {
+    const { words } = askFeatures('<@UBOT> do not update hero banner copy *Sent using* <@UCLAUDE>');
+    expect([...words].sort()).toEqual(['banner', 'copy', 'hero', 'not', 'update']);
   });
 });
 
 function makeTask(overrides: {
   userId?: string;
   channelId?: string;
+  channelType?: string;
   threadTs?: string;
   text?: string;
   isOwnerAuthor?: boolean;
@@ -129,10 +161,11 @@ function makeTask(overrides: {
     event: {
       eventId: overrides.eventId ?? 'Ev2',
       channelId: overrides.channelId ?? 'C-OTHER',
+      channelType: overrides.channelType ?? 'channel',
       threadTs,
       eventTs: threadTs,
       userId: overrides.userId ?? 'UPM',
-      text: overrides.text ?? FORM_ASK_TO_OWNER,
+      text: overrides.text ?? ASK_WITH_MORE,
       ingestSource: overrides.ingestSource,
       requestedForUserId: overrides.requestedForUserId,
       rawEvent: overrides.rawEvent ?? {},
@@ -154,9 +187,10 @@ function entry(overrides: Partial<WorkEntry> = {}): WorkEntry {
     jobId: 'job-first',
     requesterId: 'UPM',
     channelId: 'C-FIRST',
+    channelType: 'channel',
     threadTs: '100.1',
     kind: 'change',
-    text: FORM_ASK,
+    text: ASK,
     startedAtMs: NOW - 13 * 60_000,
     ...overrides,
   };
@@ -199,6 +233,19 @@ describe('findDuplicateAsk', () => {
     ).toBeUndefined();
   });
 
+  it('never matches a DM with a channel, either way, so no DM link lands in a channel', () => {
+    const inDm = entry({ channelId: 'D-PM', channelType: 'im' });
+    expect(
+      findDuplicateAsk({ task: makeTask({}), kind: 'change', jobId: 'job-new', work: [inDm], nowMs: NOW }),
+    ).toBeUndefined();
+    const fromDm = makeTask({ channelId: 'D-PM', channelType: 'im' });
+    expect(
+      findDuplicateAsk({ task: fromDm, kind: 'change', jobId: 'job-new', work: [entry()], nowMs: NOW }),
+    ).toBeUndefined();
+    // Two threads of the same DM are fine.
+    expect(findDuplicateAsk({ task: fromDm, kind: 'change', jobId: 'job-new', work: [inDm], nowMs: NOW })).toBe(inDm);
+  });
+
   it('points at the PR of a run that ended in the last 15 minutes', () => {
     const done = entry({
       startedAtMs: NOW - 60 * 60_000,
@@ -221,10 +268,32 @@ describe('findDuplicateAsk', () => {
   it('reads a "yes" to miniOG\'s question with the message it asked about', () => {
     const task = makeTask({
       text: 'yes',
-      clarification: { question: 'Want me to pick this up?', askedText: FORM_ASK_TO_OWNER },
+      clarification: { question: 'Want me to pick this up?', askedText: ASK_WITH_MORE },
     });
-    expect(askTextOf(task)).toContain('graduation year');
+    expect(askTextOf(task)).toContain('Average Stipend');
     expect(findDuplicateAsk({ task, kind: 'change', jobId: 'job-new', work: [entry()], nowMs: NOW })).toBeDefined();
+  });
+});
+
+describe('resolveDuplicateAsk', () => {
+  beforeEach(() => resetWorkLedgerForTests());
+
+  it('lets a request run when the earlier PR was merged or closed since, and forgets that run', async () => {
+    const done = entry({ endedAtMs: Date.now() - 60_000, prUrl: 'https://github.com/o/r/pull/9' });
+    const prOpen = vi.fn().mockResolvedValue(false);
+    expect(await resolveDuplicateAsk({ task: makeTask({}), kind: 'change', work: [done], prOpen })).toBeUndefined();
+    expect(prOpen).toHaveBeenCalledWith('https://github.com/o/r/pull/9');
+  });
+
+  it('points at a PR that is still open, and asks GitHub nothing about a run still in flight', async () => {
+    const done = entry({ endedAtMs: Date.now() - 60_000, prUrl: 'https://github.com/o/r/pull/9' });
+    expect(
+      await resolveDuplicateAsk({ task: makeTask({}), kind: 'change', work: [done], prOpen: async () => true }),
+    ).toBe(done);
+    const prOpen = vi.fn();
+    const running = entry({ startedAtMs: Date.now() - 60_000 });
+    expect(await resolveDuplicateAsk({ task: makeTask({}), kind: 'change', work: [running], prOpen })).toBe(running);
+    expect(prOpen).not.toHaveBeenCalled();
   });
 });
 
@@ -279,11 +348,11 @@ describe('workLedger', () => {
     expect(currentWork(NOW)).toEqual([]);
   });
 
-  it('keeps a run that opened a PR for 15 minutes after it ends', () => {
+  it('keeps a run that succeeded with an open PR for 15 minutes after it ends', () => {
     registerActiveJob('job-a', new AbortController());
     note('job-a');
     notePlannedFiles('job-a', 'repo', ['a.ts'], NOW);
-    finishWork('job-a', { prUrl: 'https://github.com/o/r/pull/1' }, NOW);
+    finishWork('job-a', { status: 'SUCCESS', prUrl: 'https://github.com/o/r/pull/1' }, NOW);
     unregisterActiveJob('job-a');
     const [kept] = currentWork(NOW + 10 * 60_000);
     expect(kept.prUrl).toBe('https://github.com/o/r/pull/1');
@@ -291,11 +360,18 @@ describe('workLedger', () => {
     expect(currentWork(NOW + 16 * 60_000)).toEqual([]);
   });
 
-  it('forgets a run that ended without a PR', () => {
-    registerActiveJob('job-a', new AbortController());
-    note('job-a');
-    finishWork('job-a', {}, NOW);
-    expect(currentWork(NOW)).toEqual([]);
+  it("forgets a run that ended without a PR, a failed run's leftover PR, and a PR that is no longer open", () => {
+    for (const outcome of [
+      { status: 'SUCCESS' },
+      { status: 'FAILED', prUrl: 'https://github.com/o/r/pull/2', prState: 'OPEN' },
+      { status: 'SUCCESS', prUrl: 'https://github.com/o/r/pull/3', prState: 'MERGED' },
+    ]) {
+      registerActiveJob('job-a', new AbortController());
+      note('job-a');
+      finishWork('job-a', outcome, NOW);
+      unregisterActiveJob('job-a');
+      expect(currentWork(NOW), JSON.stringify(outcome)).toEqual([]);
+    }
   });
 
   it("keeps a run's first place in line across a retry", () => {

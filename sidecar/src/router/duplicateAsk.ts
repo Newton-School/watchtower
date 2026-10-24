@@ -1,58 +1,58 @@
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import type { NormalizedTask, WorkflowIntent } from '../types/contracts.js';
 import { requesterOf } from '../workflows/shared/requester.js';
 import { RESTART_EVENT_PREFIX } from '../runtime/restartRecovery.js';
-import type { AskKind, WorkEntry } from '../state/workLedger.js';
+import { toolchainEnv } from '../backends/codexBackend.js';
+import { forgetWork, type AskKind, type WorkEntry } from '../state/workLedger.js';
+
+const execFileAsync = promisify(execFile);
 
 /**
  * The same ask sent twice (issue #602).
  *
  * A requester who posts a request in one channel and, a few minutes later,
- * the same request in another (or tags the owner with it) got two jobs: two
- * plans, two approvals, two PRs. A new request from the same person that
- * matches one of their runs still in flight, or one that opened a PR in the
- * last 15 minutes, is pointed at that thread instead.
+ * the same request in another got two jobs: two plans, two approvals, two
+ * PRs. A new request from the same person that matches one of their runs
+ * still in flight, or one that succeeded with a PR still open in the last 15
+ * minutes, is pointed at that thread instead.
  *
  * Text is matched, not meaning, so the match is deliberately narrow: two asks
- * are the same only when nearly every word of the shorter one is in the
- * longer one AND every link, number and quoted phrase of the shorter one is
- * in the longer one too. Requests to the same page that change different
- * numbers, or the same request template for a different page, are different
- * asks. The longer one may add detail (more pages, another variant): that is
- * still the same piece of work, and the details belong in its thread.
+ * are the same only when EVERY word of the shorter one is in the longer one,
+ * and every link, number and quoted phrase of the shorter one is in the
+ * longer one too, in the same order. One word apart is a different ask
+ * ("pune" and "delhi", "add" and "remove", "red" and "blue"), and so is a
+ * swap ('"Apply" to "Enroll"' and back). A rephrased request is not caught;
+ * a copy re-posted, or re-posted with more added, is.
  */
 
 /** How long after the first ask a matching one counts as the same ask sent again. */
 export const DUPLICATE_ASK_WINDOW_MS = 15 * 60_000;
 
-/**
- * A change ask is the same when this share of the shorter one's words is in
- * the longer one, and the longer one is at least LONGER_BY times as long: it
- * restates the shorter one with more detail. Two asks of about the same
- * length must share every word of the shorter one ("the pune campus section"
- * and "the delhi campus section" are different asks).
- */
-const CHANGE_CONTAINMENT = 0.75;
-const LONGER_BY = 1.5;
-/** A lookup is cheap to run twice and easy to rephrase into a different question: near-identical only. */
+/** Words that turn a request around when added to it: "show the banner" and "do not show the banner". */
+const TURNS_AROUND = new Set(['not', 'no', 'never', "don't", 'dont', 'without', 'except', 'instead', 'undo', 'revert']);
+
+/** A lookup may not add much to the question either: it would be a different question. */
 const LOOKUP_JACCARD = 0.85;
 /** Fewer words than this carry too little to match on ("check now", "yes"). */
 const MIN_WORDS = 5;
 
+// Only words that carry no meaning in a request. Negations, directions and
+// quantities ("not", "off", "below", "more", "only") are kept: they change it.
 const STOPWORDS = new Set(
   (
-    'a an the and or but if then else of to in on at by for from with without into onto over under as is are was ' +
-    'were be been being am do does did done have has had having it its this that these those there here i me my ' +
-    'we our you your he she they them their his her can could would should will shall may might must please pls ' +
-    'kindly also just so very too not no yes ok okay hi hey hello thanks thank miniog what which who whom when ' +
-    'where why how all any some each every both few more most other such only own same than up down out off ' +
-    'again further once about above below between through during before after while because until against'
+    'a an the and or but if then else of to in at by for from with as is are was were be been being am do does ' +
+    'did done have has had having it its this that these those there here i me my we our you your he she they ' +
+    'them their his her can could would should will shall may might must please pls kindly also just so very ' +
+    'too yes ok okay hi hey hello thanks thank miniog what which who whom when where why how some each every ' +
+    'both such own than about through during while because until'
   ).split(' '),
 );
 
 export interface AskFeatures {
   words: Set<string>;
-  /** Links (host and path), numbers of two digits or more, and double-quoted phrases. */
-  specifics: Set<string>;
+  /** Links (host and path), numbers of two digits or more, and double-quoted phrases, in the order written. */
+  specifics: string[];
 }
 
 /** The request without mentions, Slack's "Sent using" footer, or HTML entities. */
@@ -85,28 +85,25 @@ function stem(word: string): string {
 }
 
 export function askFeatures(text: string): AskFeatures {
-  const specifics = new Set<string>();
-  let rest = cleanAskText(text);
-
-  // Slack links arrive as <url|label> or <url>; take them out before reading words.
-  rest = rest.replace(/<(https?:\/\/[^>|\s]+)(?:\|[^>]*)?>/g, (_match, url: string) => {
-    const normalized = normalizeUrl(url);
-    if (normalized) specifics.add(`link:${normalized}`);
-    return ' ';
-  });
-  rest = rest.replace(/https?:\/\/[^\s<>]+/g, url => {
-    const normalized = normalizeUrl(url);
-    if (normalized) specifics.add(`link:${normalized}`);
-    return ' ';
-  });
+  const found: Array<{ at: number; value: string }> = [];
+  const rest = cleanAskText(text)
+    // Slack links arrive as <url|label> or <url>; take them out before reading words.
+    .replace(
+      /<(https?:\/\/[^>|\s]+)(?:\|[^>]*)?>|https?:\/\/[^\s<>]+/g,
+      (match, slackUrl: string | undefined, at: number) => {
+        const normalized = normalizeUrl(slackUrl ?? match);
+        if (normalized) found.push({ at, value: `link:${normalized}` });
+        return ' '.repeat(match.length);
+      },
+    );
   for (const match of rest.matchAll(/["“”]([^"“”]{1,120})["“”]/g)) {
     const phrase = match[1].toLowerCase().replace(/\s+/g, ' ').trim();
-    if (phrase) specifics.add(`quote:${phrase}`);
+    if (phrase) found.push({ at: match.index ?? 0, value: `quote:${phrase}` });
   }
   // "23,364" and "23364" are one number; a single digit is usually a list marker.
   for (const match of rest.matchAll(/\d+(?:[.,]\d+)*/g)) {
     const value = match[0].replace(/,/g, '');
-    if (value.replace(/\D/g, '').length >= 2) specifics.add(`num:${value}`);
+    if (value.replace(/\D/g, '').length >= 2) found.push({ at: match.index ?? 0, value: `num:${value}` });
   }
 
   const words = new Set<string>();
@@ -115,18 +112,19 @@ export function askFeatures(text: string): AskFeatures {
     if (word.length < 2 || /\d/.test(word) || STOPWORDS.has(word)) continue;
     words.add(word);
   }
-  return { words, specifics };
-}
-
-function overlap(a: Set<string>, b: Set<string>): number {
-  let shared = 0;
-  for (const item of a) if (b.has(item)) shared += 1;
-  return shared;
+  return { words, specifics: found.sort((a, b) => a.at - b.at).map(item => item.value) };
 }
 
 function isSubset(a: Set<string>, b: Set<string>): boolean {
   for (const item of a) if (!b.has(item)) return false;
   return true;
+}
+
+/** Whether `inner` appears in `outer` in order, with anything in between. */
+function isSubsequence(inner: string[], outer: string[]): boolean {
+  let at = 0;
+  for (const item of outer) if (item === inner[at]) at += 1;
+  return at === inner.length;
 }
 
 /** Whether two asks of the same kind, from the same person, are the same request. */
@@ -135,19 +133,15 @@ export function isSameAsk(kind: AskKind, a: string, b: string): boolean {
   const second = askFeatures(b);
   const [shorter, longer] = first.words.size <= second.words.size ? [first, second] : [second, first];
   if (shorter.words.size < MIN_WORDS) return false;
+  if (!isSubset(shorter.words, longer.words)) return false;
+  for (const word of longer.words) if (TURNS_AROUND.has(word) && !shorter.words.has(word)) return false;
   if (kind === 'lookup') {
-    const shared = overlap(first.words, second.words);
-    const union = first.words.size + second.words.size - shared;
     return (
-      shared / union >= LOOKUP_JACCARD &&
-      isSubset(first.specifics, second.specifics) &&
-      isSubset(second.specifics, first.specifics)
+      shorter.words.size / longer.words.size >= LOOKUP_JACCARD &&
+      first.specifics.join('\n') === second.specifics.join('\n')
     );
   }
-  const needed = longer.words.size >= shorter.words.size * LONGER_BY ? CHANGE_CONTAINMENT : 1;
-  return (
-    overlap(shorter.words, longer.words) / shorter.words.size >= needed && isSubset(shorter.specifics, longer.specifics)
-  );
+  return isSubsequence(shorter.specifics, longer.specifics);
 }
 
 /** The kind of work a routed intent is, for the intents a duplicate is checked for. */
@@ -186,10 +180,13 @@ export function mayCheckForDuplicate(task: NormalizedTask): boolean {
   return !thread.some(message => message.text.includes(DIFFERENT_REQUEST_HINT));
 }
 
+const isDm = (channelType: string | undefined): boolean => channelType === 'im' || channelType === 'mpim';
+
 /**
  * The earlier run this request repeats, if any: the same requester and kind,
  * another thread, still in flight and asked in the last 15 minutes, or ended
- * with a PR in the last 15 minutes.
+ * with an open PR in the last 15 minutes. A DM and a channel are never
+ * matched with each other: the reply would link one from the other.
  */
 export function findDuplicateAsk(params: {
   task: NormalizedTask;
@@ -202,6 +199,7 @@ export function findDuplicateAsk(params: {
   const nowMs = params.nowMs ?? Date.now();
   const requesterId = requesterOf(task);
   const text = askTextOf(task);
+  const fromDm = isDm(task.event.channelType);
   return work
     .filter(
       entry =>
@@ -209,12 +207,47 @@ export function findDuplicateAsk(params: {
         entry.requesterId === requesterId &&
         entry.kind === kind &&
         !(entry.channelId === task.event.channelId && entry.threadTs === task.event.threadTs) &&
+        ((!fromDm && !isDm(entry.channelType)) || entry.channelId === task.event.channelId) &&
         (entry.endedAtMs === undefined
           ? nowMs - entry.startedAtMs <= DUPLICATE_ASK_WINDOW_MS
           : nowMs - entry.endedAtMs <= DUPLICATE_ASK_WINDOW_MS),
     )
     .sort((a, b) => a.startedAtMs - b.startedAtMs)
     .find(entry => isSameAsk(kind, entry.text, text));
+}
+
+/** Whether a PR is still open. Unknown counts as not: the request then runs. */
+export async function isPrOpen(prUrl: string): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync('gh', ['pr', 'view', prUrl, '--json', 'state', '-q', '.state'], {
+      timeout: 15_000,
+      env: toolchainEnv(),
+    });
+    return stdout.trim() === 'OPEN';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * `findDuplicateAsk`, with a run that ended checked against GitHub: one
+ * whose PR was merged or closed since no longer counts, and is forgotten.
+ */
+export async function resolveDuplicateAsk(params: {
+  task: NormalizedTask;
+  kind: AskKind;
+  jobId?: string;
+  work: WorkEntry[];
+  prOpen?: (prUrl: string) => Promise<boolean>;
+}): Promise<WorkEntry | undefined> {
+  const prOpen = params.prOpen ?? isPrOpen;
+  let work = params.work;
+  for (;;) {
+    const first = findDuplicateAsk({ ...params, work });
+    if (!first?.prUrl || (await prOpen(first.prUrl))) return first;
+    forgetWork(first.jobId);
+    work = work.filter(entry => entry !== first);
+  }
 }
 
 /** The one line posted instead of starting a second run. */

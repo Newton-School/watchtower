@@ -7,8 +7,8 @@ import { getActiveJobIds } from './activeJobs.js';
  *
  * In memory, like the active-jobs registry it leans on: only this process
  * runs jobs, and an entry whose job is no longer active is dropped. A run
- * that opened a PR stays for a short while after it ends, so "the same ask
- * again, a few minutes after the PR" points at that PR.
+ * that succeeded with an open PR stays for a short while after it ends, so
+ * "the same ask again, a few minutes after the PR" points at that PR.
  */
 
 export type AskKind = 'change' | 'lookup';
@@ -18,6 +18,8 @@ export interface WorkEntry {
   /** Who the run is for (`requesterOf`), not who typed the trigger. */
   requesterId: string;
   channelId: string;
+  /** Slack's channel type: `im` and `mpim` are DMs. */
+  channelType?: string;
   threadTs: string;
   kind: AskKind;
   /** The request as asked, mentions removed (a reply to a question carries the question's message too). */
@@ -25,7 +27,7 @@ export interface WorkEntry {
   startedAtMs: number;
   /** A change run's approved plan: the repo and the files it will edit. */
   plan?: { repo: string; files: string[]; notedAtMs: number };
-  /** Set when the run ended having opened a PR. */
+  /** Set when the run succeeded and left an open PR. */
   prUrl?: string;
   endedAtMs?: number;
 }
@@ -54,18 +56,30 @@ export function notePlannedFiles(jobId: string, repo: string, files: string[], n
   return entry.plan.notedAtMs;
 }
 
-/** Called when a job ends. A run that opened a PR is kept for a while; anything else is dropped. */
-export function finishWork(jobId: string, outcome: { prUrl?: string }, nowMs = Date.now()): void {
+/**
+ * Called when a job ends. A run that succeeded and left an open PR is kept
+ * for a while; anything else (a failed run's leftover PR included) is dropped.
+ */
+export function finishWork(
+  jobId: string,
+  outcome: { status: string; prUrl?: string; prState?: string },
+  nowMs = Date.now(),
+): void {
   const entry = entries.get(jobId);
   if (!entry) return;
-  if (outcome.prUrl) {
+  if (outcome.status === 'SUCCESS' && outcome.prUrl && (outcome.prState ?? 'OPEN') === 'OPEN') {
     entry.prUrl = outcome.prUrl;
     entry.endedAtMs = nowMs;
-    // The PR's files are on GitHub now: nothing waits on this run's plan.
+    // The PR's files are on GitHub now.
     delete entry.plan;
   } else {
     entries.delete(jobId);
   }
+}
+
+/** Drops a run that no longer counts, e.g. one whose PR was merged or closed since. */
+export function forgetWork(jobId: string): void {
+  entries.delete(jobId);
 }
 
 /** The runs a new request is checked against: in flight, or ended with a PR in the last 15 minutes. */

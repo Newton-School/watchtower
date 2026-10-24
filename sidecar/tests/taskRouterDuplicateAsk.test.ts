@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { toResolvedAccessControlConfig } from '../src/access/control.js';
 import type { AppConfig, NormalizedTask } from '../src/types/contracts.js';
 import { getActiveJobIds, registerActiveJob, unregisterActiveJob } from '../src/state/activeJobs.js';
-import { currentWork, resetWorkLedgerForTests } from '../src/state/workLedger.js';
+import { currentWork, finishWork, resetWorkLedgerForTests } from '../src/state/workLedger.js';
 
 const runImplementationWorkflow = vi.fn();
 const runAgenticEntry = vi.fn();
@@ -54,7 +54,7 @@ const config = {
       groups: {
         viewer: { manualUserIds: '', allowedChannelIds: '', allowIm: false, allowMpim: false },
         reviewer: { manualUserIds: '', allowedChannelIds: '', allowIm: false, allowMpim: false },
-        builder: { manualUserIds: 'UPM,UPM2', allowedChannelIds: 'C-ONE,C-TWO', allowIm: false, allowMpim: false },
+        builder: { manualUserIds: 'UPM,UPM2', allowedChannelIds: 'C-ONE,C-TWO', allowIm: true, allowMpim: false },
         admin: { manualUserIds: '', allowedChannelIds: '', allowIm: false, allowMpim: false },
         owner: { manualUserIds: '', allowedChannelIds: '', allowIm: false, allowMpim: false },
       },
@@ -71,7 +71,7 @@ function makeTask(userId: string, channelId: string, threadTs: string, text = AS
     event: {
       eventId: `Ev-${threadTs}`,
       channelId,
-      channelType: 'channel',
+      channelType: channelId.startsWith('D') ? 'im' : 'channel',
       threadTs,
       eventTs: threadTs,
       userId,
@@ -90,16 +90,34 @@ function makeSlack() {
   return { chat: { postMessage: vi.fn().mockResolvedValue({ ok: true, ts: '9.9' }) } };
 }
 
-async function route(task: NormalizedTask, jobId: string, slack = makeSlack()) {
+async function route(task: NormalizedTask, jobId: string, prOpen?: (prUrl: string) => Promise<boolean>) {
+  const slack = makeSlack();
   registerActiveJob(jobId, new AbortController(), {
     channelId: task.event.channelId,
     threadTs: task.event.threadTs,
     requestedBy: task.event.userId,
   });
   const logStep = vi.fn();
-  const result = await routeTask({ task, config, slack: slack as never, store: {} as never, jobId, logStep });
+  const result = await routeTask({
+    task,
+    config,
+    slack: slack as never,
+    store: {} as never,
+    jobId,
+    logStep,
+    deps: { prOpen },
+  });
   return { result, slack, logStep };
 }
+
+/** What intake does when the first run ends. */
+function endRun(jobId: string, outcome: { status: string; prUrl?: string }) {
+  finishWork(jobId, outcome);
+  unregisterActiveJob(jobId);
+}
+
+const posted = (slack: ReturnType<typeof makeSlack>) =>
+  slack.chat.postMessage.mock.calls.map(call => (call[0] as { text: string }).text);
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -130,8 +148,7 @@ describe('routeTask: the same ask twice (issue #602)', () => {
 
     expect(result.status).toBe('SKIPPED');
     expect(runImplementationWorkflow).toHaveBeenCalledTimes(1);
-    const posted = slack.chat.postMessage.mock.calls.map(call => (call[0] as { text: string }).text);
-    expect(posted).toEqual([
+    expect(posted(slack)).toEqual([
       expect.stringMatching(
         /^I'm already working on this in <https:\/\/[^|]+\/archives\/C-ONE\/p1001\|this thread>\. /,
       ),
@@ -151,11 +168,35 @@ describe('routeTask: the same ask twice (issue #602)', () => {
     expect(runImplementationWorkflow).toHaveBeenCalledTimes(2);
   });
 
-  it('runs it again once the first run is over without a PR', async () => {
+  it('runs it again once the first run is over without a PR, or failed leaving one', async () => {
     await route(makeTask('UPM', 'C-ONE', '100.1'), 'job-1');
-    unregisterActiveJob('job-1');
-    const { result } = await route(makeTask('UPM', 'C-TWO', '200.1'), 'job-2');
-    expect(result.status).toBe('SUCCESS');
+    endRun('job-1', { status: 'SUCCESS' });
+    expect((await route(makeTask('UPM', 'C-TWO', '200.1'), 'job-2')).result.status).toBe('SUCCESS');
+    endRun('job-2', { status: 'FAILED', prUrl: 'https://github.com/o/r/pull/8' });
+    expect((await route(makeTask('UPM', 'C-ONE', '300.1'), 'job-3')).result.status).toBe('SUCCESS');
+  });
+
+  it("points at the first run's PR while it is open, and runs once it is merged", async () => {
+    await route(makeTask('UPM', 'C-ONE', '100.1'), 'job-1');
+    endRun('job-1', { status: 'SUCCESS', prUrl: 'https://github.com/o/r/pull/9' });
+
+    const open = await route(makeTask('UPM', 'C-TWO', '200.1'), 'job-2', async () => true);
+    expect(open.result.status).toBe('SKIPPED');
+    expect(posted(open.slack)[0]).toMatch(/^I opened <https:\/\/github.com\/o\/r\/pull\/9\|a PR> for this/);
+
+    const merged = await route(makeTask('UPM', 'C-TWO', '300.1'), 'job-3', async () => false);
+    expect(merged.result.status).toBe('SUCCESS');
+  });
+
+  it('never points a channel at a DM, or a DM at a channel', async () => {
+    await route(makeTask('UPM', 'D-PM', '100.1'), 'job-1');
+    expect((await route(makeTask('UPM', 'C-TWO', '200.1'), 'job-2')).result.status).toBe('SUCCESS');
+    expect((await route(makeTask('UPM', 'D-PM', '300.1'), 'job-3')).result.status).toBe('SKIPPED');
+  });
+
+  it('runs an owner repeating a request', async () => {
+    await route(makeTask('UOWNER1', 'C-ONE', '100.1'), 'job-1');
+    expect((await route(makeTask('UOWNER1', 'C-TWO', '200.1'), 'job-2')).result.status).toBe('SUCCESS');
   });
 
   it('notes each run it starts, so later asks are checked against it', async () => {

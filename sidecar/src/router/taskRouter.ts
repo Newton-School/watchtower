@@ -51,7 +51,7 @@ import { marketingStagingReply } from '../repos/registry.js';
 import { acknowledgementText, pickupDelayMs } from './acknowledgement.js';
 import { RESTART_EVENT_PREFIX } from '../runtime/restartRecovery.js';
 import { looksLikeFixAffirmation } from './resumeIntentParser.js';
-import { askKindOf, askTextOf, duplicateAskReply, findDuplicateAsk, mayCheckForDuplicate } from './duplicateAsk.js';
+import { askKindOf, askTextOf, duplicateAskReply, mayCheckForDuplicate, resolveDuplicateAsk } from './duplicateAsk.js';
 import { currentWork, noteAsk } from '../state/workLedger.js';
 import { requesterOf } from '../workflows/shared/requester.js';
 
@@ -158,7 +158,10 @@ export async function routeTask(params: {
    */
   onEngage?: () => Promise<void> | void;
   /** Test seam. */
-  deps?: { resolveMembership?: (userId: string) => Promise<WorkspaceMembership> };
+  deps?: {
+    resolveMembership?: (userId: string) => Promise<WorkspaceMembership>;
+    prOpen?: (prUrl: string) => Promise<boolean>;
+  };
 }): Promise<WorkflowResult> {
   const { task, config, slack, store, jobId, logStep, signal, onEngage, deps } = params;
   let resolvedIntent: WorkflowIntent = task.intent;
@@ -789,8 +792,14 @@ export async function routeTask(params: {
     // instead of becoming a second plan and PR (issue #602).
     const askKind = askKindOf(resolvedIntent);
     if (askKind && !signal?.aborted && mayCheckForDuplicate(routedTask)) {
-      const first = findDuplicateAsk({ task: routedTask, kind: askKind, jobId, work: currentWork() });
-      if (first) {
+      const first = await resolveDuplicateAsk({
+        task: routedTask,
+        kind: askKind,
+        jobId,
+        work: currentWork(),
+        prOpen: deps?.prOpen,
+      });
+      if (first && !signal?.aborted) {
         const text = duplicateAskReply(first, buildSlackThreadLink(first.channelId, first.threadTs));
         logStep?.({
           stage: 'router.duplicate_ask',
@@ -818,6 +827,7 @@ export async function routeTask(params: {
         jobId,
         requesterId: requesterOf(routedTask),
         channelId: task.event.channelId,
+        channelType: task.event.channelType,
         threadTs: task.event.threadTs,
         kind: askKind,
         text: askTextOf(routedTask),

@@ -35,7 +35,7 @@ import {
   coderDeclaredBlocked,
   formatExternalChanges,
 } from '../agents/pipeline.js';
-import { normalizePlannerOutput } from '../agents/normalizePlannerOutput.js';
+import { normalizePlannerOutput, planListsFiles } from '../agents/normalizePlannerOutput.js';
 import { inferRepoFromAffectedFiles, readRepoAffinity, repoPathFor, resolveRepoOrAsk } from './shared/repoResolver.js';
 import { enabledRepoKeys, getRepo, repoKeyForWorkspacePath } from '../repos/registry.js';
 import type { RepoAffinity } from '../router/repoClassifier.js';
@@ -50,7 +50,7 @@ import { buildUnfinishedRunMessage, coderReportedPrUrl } from '../agents/unfinis
 import { fetchMergeState, fetchUnresolvedReviewThreadCount, type MergeState } from '../github/prReviewComments.js';
 import { waitForExactConfirmation } from './shared/confirmationGate.js';
 import { cancelledResult } from './shared/cancelState.js';
-import { waitForSameFileTurn } from './shared/sameFileGuard.js';
+import { headsUpOnSameFiles, type OpenPr } from './shared/sameFileGuard.js';
 import type { PipelineStore } from '../agents/pipeline.js';
 import type { AgentStepResult, PipelineConfig } from '../agents/types.js';
 import type { InvestigationStore } from '../state/investigationStore.js';
@@ -1263,6 +1263,52 @@ export function plannerFailureReply(
 }
 
 /**
+ * The last step before the coder (issue #602). A heads-up when another run
+ * or an open miniOG PR is changing the same files, then the worktree moved to
+ * the latest base: the plan may have waited hours for approval, and anything
+ * merged since belongs under this change. Nothing in the worktree is lost:
+ * the planner only reads (plan mode, or a read-only run), the plan itself is
+ * in memory, and attachments are downloaded outside it. Returns the worktree.
+ */
+export async function prepareForCoder(params: {
+  jobId?: string;
+  task: NormalizedTask;
+  config: AppConfig;
+  pipelineCwd: string;
+  planMarkdown: string;
+  planAffectedFiles: string[];
+  threadTexts: string[];
+  slack: WebClient;
+  logStep?: WorkflowStepLogger;
+  /** Test seams. */
+  deps?: { listOpenPrs?: (cwd: string) => Promise<OpenPr[]>; refresh?: typeof resolveWorkspace };
+}): Promise<string> {
+  const { jobId, task, config, pipelineCwd, planMarkdown, slack, logStep } = params;
+  const repoKey = repoKeyForWorkspacePath(pipelineCwd, config);
+  await headsUpOnSameFiles({
+    jobId,
+    channelId: task.event.channelId,
+    threadTs: task.event.threadTs,
+    repo: repoKey ?? path.dirname(pipelineCwd),
+    cwd: pipelineCwd,
+    // Files the plan lists, never a guess from every path in it.
+    files: planListsFiles(planMarkdown) ? params.planAffectedFiles : [],
+    context: [task.event.text ?? '', ...params.threadTexts, planMarkdown],
+    slack,
+    logStep,
+    listOpenPrs: params.deps?.listOpenPrs,
+  });
+  if (!repoKey) return pipelineCwd;
+  const refreshed = await (params.deps?.refresh ?? resolveWorkspace)(repoPathFor(repoKey, config), task.event.threadTs);
+  logStep?.({
+    stage: 'implementation.workspace.refreshed',
+    message: 'Moved the worktree to the latest base before the coder starts.',
+    data: { pipelineCwd: refreshed },
+  });
+  return refreshed;
+}
+
+/**
  * A code change keeps Figma, to read the design it implements, and for an
  * admin-tier requester the Newton admin upload tools. Every agent the workflow
  * starts gets that list instead of the host user's connectors (issue #443);
@@ -1996,31 +2042,19 @@ async function runImplementationWorkflowBody(params: {
     // initial repo classification.
     pipelineCwd = loopOutcome.pipelineCwd;
 
-    // Another run, or a fresh miniOG PR, changing the same files would make a
-    // second PR that conflicts with the first (issue #602): wait for it, then
-    // start from the latest base so a merged first PR is in this one.
-    const repoKey = repoKeyForWorkspacePath(pipelineCwd, config);
-    const turn = await waitForSameFileTurn({
+    pipelineCwd = await prepareForCoder({
       jobId,
-      channelId: task.event.channelId,
-      threadTs: task.event.threadTs,
-      repo: repoKey ?? path.dirname(pipelineCwd),
-      cwd: pipelineCwd,
-      files: planAffectedFiles,
+      task,
+      config,
+      pipelineCwd,
+      planMarkdown,
+      planAffectedFiles,
+      threadTexts: (ctx.threadMessages ?? []).map(message => message.text),
       slack,
       logStep,
-      signal,
     });
-    if (turn.outcome === 'cancelled' || signal?.aborted) {
+    if (signal?.aborted) {
       return cancelledResult('IMPLEMENTATION');
-    }
-    if (turn.waited && repoKey) {
-      pipelineCwd = await resolveWorkspace(repoPathFor(repoKey, config), task.event.threadTs);
-      logStep?.({
-        stage: 'implementation.workspace.refreshed',
-        message: 'Moved the worktree to the latest base after waiting for the same files.',
-        data: { pipelineCwd },
-      });
     }
 
     // Build the plannerStep for downstream consumption

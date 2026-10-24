@@ -169,7 +169,6 @@ const STAGE_TEXT: Record<string, StageRule> = {
   'pipeline.clarification.waiting': { text: 'is waiting for your answer', suspend: true },
   'pipeline.repo_choice.waiting': { text: 'is waiting for you to pick a repo', suspend: true },
   'implementation.approval.revising': { text: 'is revising the plan…' },
-  'implementation.same_file.waiting': { text: 'is waiting for another change to the same files', suspend: true },
   'pipeline.agent.coder.start': { text: 'is writing the code…' },
   'pipeline.agent.reviewer.start': { text: 'is reviewing the changes…' },
   'pipeline.agent.security.start': { text: 'is checking for security issues…' },
