@@ -207,6 +207,37 @@ export async function resolveWorkspace(repoPath: string, threadTs: string): Prom
   }
 }
 
+export type WorktreeRefresh =
+  | { ok: true; base: string; head: string }
+  /** Left as it was. `skipped`: not one of miniOG's worktrees, so never reset. */
+  | { ok: false; reason: string; skipped?: true };
+
+/**
+ * Moves an existing worktree to origin's latest default branch: fetch, then
+ * `reset --hard` to the fetched base and `clean -fd`, which leaves ignored
+ * paths (node_modules and the deps marker inside it) alone. Unlike
+ * `resolveWorkspace` it never removes or recreates anything: when a step
+ * fails (a fetch that can't reach origin, usually, before anything moved),
+ * the worktree stays where it was and the reason comes back, so a caller with
+ * approved work can carry on. Only a worktree under the workspaces root
+ * is touched; a shared clone is never reset.
+ */
+export async function refreshWorktreeToBase(wsPath: string): Promise<WorktreeRefresh> {
+  if (!path.resolve(wsPath).startsWith(`${WORKSPACES_ROOT}${path.sep}`)) {
+    return { ok: false, reason: 'not a miniOG worktree', skipped: true };
+  }
+  try {
+    await git(['fetch', 'origin', '--quiet'], { cwd: wsPath, timeoutMs: 30_000 });
+    const base = await resolveDefaultRemoteBranch(wsPath);
+    await git(['reset', '--hard', base], { cwd: wsPath, timeoutMs: 15_000 });
+    await git(['clean', '-fd'], { cwd: wsPath, timeoutMs: 15_000 });
+    const head = await git(['rev-parse', 'HEAD'], { cwd: wsPath, timeoutMs: 10_000 });
+    return { ok: true, base, head };
+  } catch (error) {
+    return { ok: false, reason: String(error) };
+  }
+}
+
 /** Why a shared clone could not be brought up to date with origin. */
 export type SharedRepoStaleReason =
   /** `git fetch` failed: everything below is as of the last successful fetch. */

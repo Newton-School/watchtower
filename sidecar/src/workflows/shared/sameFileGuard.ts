@@ -31,7 +31,7 @@ export interface OpenPr {
 }
 
 export type SameFileOverlap =
-  | { kind: 'run'; jobId: string; channelId: string; threadTs: string; files: string[] }
+  | { kind: 'run'; jobId: string; channelId: string; channelType?: string; threadTs: string; files: string[] }
   | { kind: 'pr'; number: number; url: string; files: string[] };
 
 /** A repo-relative path as planners and GitHub write it: no `./`, no leading `/`, no `:line`. */
@@ -106,6 +106,7 @@ export function findSameFileOverlaps(params: {
         kind: 'run',
         jobId: entry.jobId,
         channelId: entry.channelId,
+        ...(entry.channelType ? { channelType: entry.channelType } : {}),
         threadTs: entry.threadTs,
         files: shared,
       });
@@ -144,11 +145,22 @@ function describeFiles(files: string[]): string {
   return names.length > 2 ? `${shown} and ${names.length - 2} more` : shown;
 }
 
-export function sameFileHeadsUpText(overlap: SameFileOverlap): string {
+/**
+ * The line for this run's thread, in `channelId`. A PR is linked (it is on
+ * GitHub either way); another run's Slack thread only when it is in this
+ * same channel and not a DM, so no one is pointed into a conversation they
+ * may not be in.
+ */
+export function sameFileHeadsUpText(overlap: SameFileOverlap, channelId: string): string {
   const files = describeFiles(overlap.files);
-  return overlap.kind === 'pr'
-    ? `Heads-up: <${overlap.url}|PR #${overlap.number}> is also changing ${files}. If it merges first, I'll need \`@miniOG sync it\` here.`
-    : `Heads-up: <${buildSlackThreadLink(overlap.channelId, overlap.threadTs)}|another request> is also changing ${files}. If its PR merges first, I'll need \`@miniOG sync it\` here.`;
+  if (overlap.kind === 'pr') {
+    return `Heads-up: <${overlap.url}|PR #${overlap.number}> is also changing ${files}. If it merges first, I'll need \`@miniOG sync it\` here.`;
+  }
+  const linkable = overlap.channelId === channelId && overlap.channelType !== 'im' && overlap.channelType !== 'mpim';
+  const other = linkable
+    ? `<${buildSlackThreadLink(overlap.channelId, overlap.threadTs)}|another request>`
+    : 'another request';
+  return `Heads-up: ${other} is also changing ${files}. If its PR merges first, I'll need \`@miniOG sync it\` here.`;
 }
 
 /**
@@ -203,7 +215,7 @@ export async function headsUpOnSameFiles(params: {
     namedPrs: namedPrNumbers(context),
   });
   if (!overlap) return undefined;
-  const text = sameFileHeadsUpText(overlap);
+  const text = sameFileHeadsUpText(overlap, channelId);
   logStep?.({
     stage: 'implementation.same_file.heads_up',
     message: text,

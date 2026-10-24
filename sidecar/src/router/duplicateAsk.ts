@@ -18,12 +18,16 @@ const execFileAsync = promisify(execFile);
  * minutes, is pointed at that thread instead.
  *
  * Text is matched, not meaning, so the match is deliberately narrow: two asks
- * are the same only when EVERY word of the shorter one is in the longer one,
- * and every link, number and quoted phrase of the shorter one is in the
- * longer one too, in the same order. One word apart is a different ask
- * ("pune" and "delhi", "add" and "remove", "red" and "blue"), and so is a
- * swap ('"Apply" to "Enroll"' and back). A rephrased request is not caught;
- * a copy re-posted, or re-posted with more added, is.
+ * are the same only when every word of the shorter one appears in the longer
+ * one in the same order, and so does every link, number and quoted phrase.
+ * One word apart is a different ask ("pune" and "delhi", "add" and "remove",
+ * "3" and "5"), and so is the same words in another order ("move FAQ above
+ * testimonials" and "move testimonials above FAQ"). A rephrased request is
+ * not caught; a copy re-posted, or re-posted with more added, is.
+ *
+ * Only a message that starts its thread is checked: a reply ("please go
+ * ahead and raise a PR with this fix") means something different in every
+ * thread it is sent in.
  */
 
 /** How long after the first ask a matching one counts as the same ask sent again. */
@@ -50,8 +54,10 @@ const STOPWORDS = new Set(
 );
 
 export interface AskFeatures {
+  /** The words that carry meaning, in the order written. */
+  sequence: string[];
   words: Set<string>;
-  /** Links (host and path), numbers of two digits or more, and double-quoted phrases, in the order written. */
+  /** Links (host and path), numbers and double-quoted phrases, in the order written. */
   specifics: string[];
 }
 
@@ -86,6 +92,8 @@ function stem(word: string): string {
 
 export function askFeatures(text: string): AskFeatures {
   const found: Array<{ at: number; value: string }> = [];
+  // Blanked rather than removed, so positions still order what is found.
+  const blank = (match: string) => ' '.repeat(match.length);
   const rest = cleanAskText(text)
     // Slack links arrive as <url|label> or <url>; take them out before reading words.
     .replace(
@@ -93,31 +101,33 @@ export function askFeatures(text: string): AskFeatures {
       (match, slackUrl: string | undefined, at: number) => {
         const normalized = normalizeUrl(slackUrl ?? match);
         if (normalized) found.push({ at, value: `link:${normalized}` });
-        return ' '.repeat(match.length);
+        return blank(match);
       },
-    );
+    )
+    // A list marker opening a line ("1." or "2)") numbers the list, not the request.
+    .replace(/(^|\n)([ \t>*•-]*)(\d{1,2}[.)])(?=\s)/g, (_match, start: string, lead: string, marker: string) => {
+      return `${start}${lead}${blank(marker)}`;
+    });
   for (const match of rest.matchAll(/["“”]([^"“”]{1,120})["“”]/g)) {
     const phrase = match[1].toLowerCase().replace(/\s+/g, ' ').trim();
     if (phrase) found.push({ at: match.index ?? 0, value: `quote:${phrase}` });
   }
-  // "23,364" and "23364" are one number; a single digit is usually a list marker.
+  // "23,364" and "23364" are one number.
   for (const match of rest.matchAll(/\d+(?:[.,]\d+)*/g)) {
-    const value = match[0].replace(/,/g, '');
-    if (value.replace(/\D/g, '').length >= 2) found.push({ at: match.index ?? 0, value: `num:${value}` });
+    found.push({ at: match.index ?? 0, value: `num:${match[0].replace(/,/g, '')}` });
   }
 
-  const words = new Set<string>();
+  const sequence: string[] = [];
   for (const token of rest.toLowerCase().split(/[^a-z0-9_'’-]+/)) {
     const word = stem(token.replace(/^['’-]+|['’-]+$/g, ''));
     if (word.length < 2 || /\d/.test(word) || STOPWORDS.has(word)) continue;
-    words.add(word);
+    sequence.push(word);
   }
-  return { words, specifics: found.sort((a, b) => a.at - b.at).map(item => item.value) };
-}
-
-function isSubset(a: Set<string>, b: Set<string>): boolean {
-  for (const item of a) if (!b.has(item)) return false;
-  return true;
+  return {
+    sequence,
+    words: new Set(sequence),
+    specifics: found.sort((a, b) => a.at - b.at).map(item => item.value),
+  };
 }
 
 /** Whether `inner` appears in `outer` in order, with anything in between. */
@@ -133,7 +143,7 @@ export function isSameAsk(kind: AskKind, a: string, b: string): boolean {
   const second = askFeatures(b);
   const [shorter, longer] = first.words.size <= second.words.size ? [first, second] : [second, first];
   if (shorter.words.size < MIN_WORDS) return false;
-  if (!isSubset(shorter.words, longer.words)) return false;
+  if (!isSubsequence(shorter.sequence, longer.sequence)) return false;
   for (const word of longer.words) if (TURNS_AROUND.has(word) && !shorter.words.has(word)) return false;
   if (kind === 'lookup') {
     return (
@@ -152,32 +162,37 @@ export function askKindOf(intent: WorkflowIntent): AskKind | undefined {
 }
 
 /**
- * What the message asks for. A reply to a question miniOG asked ("yes") is
- * read with the message the question was about, as the router reads it.
+ * What the message asks for, as the run it starts is noted. A reply to a
+ * question miniOG asked ("yes") is read with the message the question was
+ * about, as the router reads it.
  */
 export function askTextOf(task: NormalizedTask): string {
   const own = cleanAskText(task.event.text ?? '');
   return task.clarification ? `${cleanAskText(task.clarification.askedText)}\n${own}` : own;
 }
 
-/** Ends the line posted for a duplicate. Seen in a thread, it means the requester was already told once. */
-const DIFFERENT_REQUEST_HINT = 'mention me here if this is a different request';
-
 /**
- * Whether a message may be checked at all. A deliberate re-run (a retrigger
- * from the app, a restart replay) is never a duplicate, an owner repeating a
- * request means it, and a message with files can't be compared by its text.
- * Nor is a thread checked twice: once told, a requester who mentions miniOG
- * there again is saying it is a different request.
+ * Whether a message may be checked at all. Only a message that starts its
+ * thread is: a reply means something different in every thread, and a
+ * requester who was pointed elsewhere and mentions miniOG again in the same
+ * thread is saying it is a different request. A deliberate re-run (a
+ * retrigger from the app, a restart replay) is never a duplicate, an owner
+ * repeating a request means it, and a message with files can't be compared by
+ * its text.
  */
 export function mayCheckForDuplicate(task: NormalizedTask): boolean {
   if (task.isOwnerAuthor) return false;
   if (task.event.ingestSource === 'launchpad' || task.event.eventId.startsWith(RESTART_EVENT_PREFIX)) return false;
-  const rawFiles = (task.event.rawEvent as { files?: unknown } | undefined)?.files;
-  if (Array.isArray(rawFiles) && rawFiles.length > 0) return false;
+  const raw = task.event.rawEvent as { files?: unknown; message?: { ts?: unknown; files?: unknown } } | undefined;
+  // A message shortcut's event is the click; the message it was used on is in `message`.
+  const shortcut = task.event.eventId.startsWith('shortcut:');
+  const messageTs = shortcut ? String(raw?.message?.ts ?? '') : task.event.eventTs;
+  if (messageTs !== task.event.threadTs) return false;
+  for (const files of [raw?.files, raw?.message?.files]) {
+    if (Array.isArray(files) && files.length > 0) return false;
+  }
   const thread = task.threadMessages ?? [];
-  if (thread.some(message => message.ts === task.event.eventTs && (message.files?.length ?? 0) > 0)) return false;
-  return !thread.some(message => message.text.includes(DIFFERENT_REQUEST_HINT));
+  return !thread.some(message => message.ts === messageTs && (message.files?.length ?? 0) > 0);
 }
 
 const isDm = (channelType: string | undefined): boolean => channelType === 'im' || channelType === 'mpim';
@@ -255,5 +270,5 @@ export function duplicateAskReply(first: WorkEntry, threadLink: string): string 
   const elsewhere = first.prUrl
     ? `I opened <${first.prUrl}|a PR> for this a few minutes ago, in <${threadLink}|this thread>.`
     : `I'm already working on this in <${threadLink}|this thread>.`;
-  return `${elsewhere} Add anything new there, or ${DIFFERENT_REQUEST_HINT}.`;
+  return `${elsewhere} Add anything new there, or mention me here if this is a different request.`;
 }

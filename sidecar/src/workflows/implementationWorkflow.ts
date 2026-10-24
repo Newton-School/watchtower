@@ -44,7 +44,7 @@ import { requesterOf } from './shared/requester.js';
 import type { ClarificationRound } from './shared/clarificationGuards.js';
 import { profileForAgentRole } from '../codex/modelProfiles.js';
 import { buildPlannerPrompt, buildPlannerPlanModePrompt } from '../agents/prompts.js';
-import { resolveWorkspace } from '../workspaces/workspaceManager.js';
+import { refreshWorktreeToBase, resolveWorkspace } from '../workspaces/workspaceManager.js';
 import { createPrFromWorkspace, findRunPr } from '../github/postPipelinePr.js';
 import { buildUnfinishedRunMessage, coderReportedPrUrl } from '../agents/unfinishedRun.js';
 import { fetchMergeState, fetchUnresolvedReviewThreadCount, type MergeState } from '../github/prReviewComments.js';
@@ -1268,7 +1268,8 @@ export function plannerFailureReply(
  * the latest base: the plan may have waited hours for approval, and anything
  * merged since belongs under this change. Nothing in the worktree is lost:
  * the planner only reads (plan mode, or a read-only run), the plan itself is
- * in memory, and attachments are downloaded outside it. Returns the worktree.
+ * in memory, and attachments are downloaded outside it. A refresh that fails
+ * leaves the worktree as it was and the approved run carries on.
  */
 export async function prepareForCoder(params: {
   jobId?: string;
@@ -1281,8 +1282,8 @@ export async function prepareForCoder(params: {
   slack: WebClient;
   logStep?: WorkflowStepLogger;
   /** Test seams. */
-  deps?: { listOpenPrs?: (cwd: string) => Promise<OpenPr[]>; refresh?: typeof resolveWorkspace };
-}): Promise<string> {
+  deps?: { listOpenPrs?: (cwd: string) => Promise<OpenPr[]>; refresh?: typeof refreshWorktreeToBase };
+}): Promise<void> {
   const { jobId, task, config, pipelineCwd, planMarkdown, slack, logStep } = params;
   const repoKey = repoKeyForWorkspacePath(pipelineCwd, config);
   await headsUpOnSameFiles({
@@ -1298,14 +1299,21 @@ export async function prepareForCoder(params: {
     logStep,
     listOpenPrs: params.deps?.listOpenPrs,
   });
-  if (!repoKey) return pipelineCwd;
-  const refreshed = await (params.deps?.refresh ?? resolveWorkspace)(repoPathFor(repoKey, config), task.event.threadTs);
-  logStep?.({
-    stage: 'implementation.workspace.refreshed',
-    message: 'Moved the worktree to the latest base before the coder starts.',
-    data: { pipelineCwd: refreshed },
-  });
-  return refreshed;
+  const refresh = await (params.deps?.refresh ?? refreshWorktreeToBase)(pipelineCwd);
+  if (refresh.ok) {
+    logStep?.({
+      stage: 'implementation.workspace.refreshed',
+      message: `Moved the worktree to the latest ${refresh.base} before the coder starts.`,
+      data: { pipelineCwd, base: refresh.base, head: refresh.head },
+    });
+  } else if (!refresh.skipped) {
+    logStep?.({
+      stage: 'implementation.refresh.failed',
+      message: "Couldn't move the worktree to the latest base; the coder starts from where the plan was made.",
+      level: 'WARN',
+      data: { pipelineCwd, reason: refresh.reason },
+    });
+  }
 }
 
 /**
@@ -2042,7 +2050,7 @@ async function runImplementationWorkflowBody(params: {
     // initial repo classification.
     pipelineCwd = loopOutcome.pipelineCwd;
 
-    pipelineCwd = await prepareForCoder({
+    await prepareForCoder({
       jobId,
       task,
       config,

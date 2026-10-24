@@ -84,6 +84,28 @@ describe('isSameAsk', () => {
     for (const [a, b] of pairs) expect(isSameAsk('change', a, b), `${a} / ${b}`).toBe(false);
   });
 
+  it('tells 3 and 5 apart, but not a list numbered or not', () => {
+    expect(
+      isSameAsk(
+        'change',
+        `<@UBOT> show 3 scholarship cards in the hero section on ${PAGE}`,
+        `<@UBOT> show 5 scholarship cards in the hero section on ${PAGE}`,
+      ),
+    ).toBe(false);
+    const list = `<@UBOT> on ${PAGE} please change these:\n1. the hero heading to "Apply today"\n2. the footer link colour to grey`;
+    expect(isSameAsk('change', list, list.replace('1. ', '- ').replace('2. ', '- '))).toBe(true);
+  });
+
+  it('tells the same words in another order apart', () => {
+    expect(
+      isSameAsk(
+        'change',
+        `<@UBOT> move the FAQ section above the testimonials section on ${PAGE}`,
+        `<@UBOT> move the testimonials section above the FAQ section on ${PAGE}`,
+      ),
+    ).toBe(false);
+  });
+
   it('tells a swap apart: the same quotes in the other order', () => {
     expect(
       isSameAsk(
@@ -132,7 +154,11 @@ describe('askFeatures', () => {
   });
 
   it('reads 23,364 and 23364 as one number, skips list markers, and keeps the order written', () => {
-    expect(askFeatures('1. change 23,364 to "x"').specifics).toEqual(['num:23364', 'quote:x']);
+    expect(askFeatures('1. change 23,364 to "x"\n 2) show 3 cards').specifics).toEqual([
+      'num:23364',
+      'quote:x',
+      'num:3',
+    ]);
     expect(askFeatures('change "x" to 23364').specifics).toEqual(['quote:x', 'num:23364']);
   });
 
@@ -147,6 +173,7 @@ function makeTask(overrides: {
   channelId?: string;
   channelType?: string;
   threadTs?: string;
+  eventTs?: string;
   text?: string;
   isOwnerAuthor?: boolean;
   eventId?: string;
@@ -163,7 +190,7 @@ function makeTask(overrides: {
       channelId: overrides.channelId ?? 'C-OTHER',
       channelType: overrides.channelType ?? 'channel',
       threadTs,
-      eventTs: threadTs,
+      eventTs: overrides.eventTs ?? threadTs,
       userId: overrides.userId ?? 'UPM',
       text: overrides.text ?? ASK_WITH_MORE,
       ingestSource: overrides.ingestSource,
@@ -312,10 +339,24 @@ describe('mayCheckForDuplicate', () => {
     expect(mayCheckForDuplicate(makeTask({ rawEvent: { files: [{ id: 'F1' }] } }))).toBe(false);
   });
 
-  it('checks a thread once: a second mention there says it is a different request', () => {
-    const told = duplicateAskReply(entry(), 'https://slack.test/x');
-    const task = makeTask({ threadMessages: [{ text: told, user: 'UBOT', ts: '200.2' }] });
-    expect(mayCheckForDuplicate(task)).toBe(false);
+  it('checks only a message that starts its thread: a reply means something else in every thread', () => {
+    // "please go ahead and raise a PR with this fix" in two different bug threads.
+    const reply = makeTask({
+      threadTs: '200.1',
+      eventTs: '200.9',
+      text: '<@UBOT> please go ahead and raise a PR with this fix',
+    });
+    expect(mayCheckForDuplicate(reply)).toBe(false);
+    // Nor the mention that follows being pointed elsewhere: that says it is a different request.
+    expect(mayCheckForDuplicate(makeTask({ eventTs: '200.3' }))).toBe(false);
+  });
+
+  it('reads a message shortcut by the message it was used on', () => {
+    const shortcut = (message: Record<string, unknown>) =>
+      makeTask({ eventId: 'shortcut:C-OTHER:200.1:999.9', threadTs: '200.1', eventTs: '999.9', rawEvent: { message } });
+    expect(mayCheckForDuplicate(shortcut({ ts: '200.1' }))).toBe(true);
+    expect(mayCheckForDuplicate(shortcut({ ts: '200.5', thread_ts: '200.1' }))).toBe(false);
+    expect(mayCheckForDuplicate(shortcut({ ts: '200.1', files: [{ id: 'F1' }] }))).toBe(false);
   });
 });
 

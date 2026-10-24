@@ -4,6 +4,7 @@ import {
   headsUpOnSameFiles,
   namedPrNumbers,
   normalizeRepoPath,
+  sameFileHeadsUpText,
   sharedFiles,
   type OpenPr,
 } from '../src/workflows/shared/sameFileGuard.js';
@@ -115,9 +116,18 @@ describe('headsUpOnSameFiles', () => {
   const texts = (slack: ReturnType<typeof makeSlack>) =>
     slack.chat.postMessage.mock.calls.map(call => (call[0] as { text: string }).text);
 
-  const startRun = (jobId: string, threadTs: string) => {
+  const startRun = (jobId: string, threadTs: string, channelId = 'C1', channelType = 'channel') => {
     registerActiveJob(jobId, new AbortController());
-    noteAsk({ jobId, requesterId: 'UPM', channelId: 'C1', threadTs, kind: 'change', text: 'x', startedAtMs: NOW });
+    noteAsk({
+      jobId,
+      requesterId: 'UPM',
+      channelId,
+      channelType,
+      threadTs,
+      kind: 'change',
+      text: 'x',
+      startedAtMs: NOW,
+    });
   };
 
   beforeEach(() => {
@@ -162,17 +172,40 @@ describe('headsUpOnSameFiles', () => {
     expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'implementation.same_file.heads_up' }));
   });
 
-  it('names the thread of a run that has no PR yet', async () => {
-    startRun('job-1', '111.1');
+  it('links the thread of a run that has no PR yet when it is in this same channel', async () => {
+    startRun('job-1', '111.1', 'C2');
     notePlannedFiles('job-1', 'marketing', [FILE], NOW - 60_000);
-    startRun('job-2', '222.2');
+    startRun('job-2', '222.2', 'C2');
     const slack = makeSlack();
     await headsUpOnSameFiles(params(slack));
     expect(texts(slack)).toEqual([
       expect.stringMatching(
-        /^Heads-up: <https:\/\/[^|]+\/archives\/C1\/p1111\|another request> is also changing `batch-momentum.tsx`\. If its PR merges first, I'll need `@miniOG sync it` here\.$/,
+        /^Heads-up: <https:\/\/[^|]+\/archives\/C2\/p1111\|another request> is also changing `batch-momentum.tsx`\. If its PR merges first, I'll need `@miniOG sync it` here\.$/,
       ),
     ]);
+  });
+
+  it('names a run in another channel or a DM without linking its thread', async () => {
+    startRun('job-1', '111.1', 'C-PRIVATE');
+    notePlannedFiles('job-1', 'marketing', [FILE], NOW - 60_000);
+    startRun('job-2', '222.2', 'C2');
+    const slack = makeSlack();
+    await headsUpOnSameFiles(params(slack));
+    expect(texts(slack)).toEqual([
+      "Heads-up: another request is also changing `batch-momentum.tsx`. If its PR merges first, I'll need `@miniOG sync it` here.",
+    ]);
+
+    const inDm = {
+      kind: 'run' as const,
+      jobId: 'j',
+      channelId: 'D1',
+      channelType: 'im',
+      threadTs: '1.1',
+      files: [FILE],
+    };
+    expect(sameFileHeadsUpText(inDm, 'D1')).toMatch(/^Heads-up: another request is also changing/);
+    const pr = { kind: 'pr' as const, number: 7, url: 'https://github.com/o/r/pull/7', files: [FILE] };
+    expect(sameFileHeadsUpText(pr, 'C-ANY')).toMatch(/^Heads-up: <https:\/\/github.com\/o\/r\/pull\/7\|PR #7>/);
   });
 
   it('does not warn about a PR the ask names', async () => {

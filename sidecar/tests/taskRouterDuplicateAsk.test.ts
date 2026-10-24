@@ -66,14 +66,14 @@ const config = {
 const ASK =
   '<@UBOT1> on <https://www.example.com/placement|example.com/placement> change "Average Earned" to "Average Stipend" in the pune campus section';
 
-function makeTask(userId: string, channelId: string, threadTs: string, text = ASK): NormalizedTask {
+function makeTask(userId: string, channelId: string, threadTs: string, text = ASK, eventTs = threadTs): NormalizedTask {
   return {
     event: {
-      eventId: `Ev-${threadTs}`,
+      eventId: `Ev-${eventTs}`,
       channelId,
       channelType: channelId.startsWith('D') ? 'im' : 'channel',
       threadTs,
-      eventTs: threadTs,
+      eventTs,
       userId,
       text,
       rawEvent: {},
@@ -192,6 +192,14 @@ describe('routeTask: the same ask twice (issue #602)', () => {
     await route(makeTask('UPM', 'D-PM', '100.1'), 'job-1');
     expect((await route(makeTask('UPM', 'C-TWO', '200.1'), 'job-2')).result.status).toBe('SUCCESS');
     expect((await route(makeTask('UPM', 'D-PM', '300.1'), 'job-3')).result.status).toBe('SKIPPED');
+  });
+
+  it('runs the same follow-up in two threads: only a message that starts its thread is checked', async () => {
+    const followUp = '<@UBOT1> please go ahead and raise a PR with this fix for the checkout page bug';
+    await route(makeTask('UPM', 'C-ONE', '100.1', followUp, '100.5'), 'job-1');
+    const second = await route(makeTask('UPM', 'C-TWO', '200.1', followUp, '200.5'), 'job-2');
+    expect(second.result.status).toBe('SUCCESS');
+    expect(runImplementationWorkflow).toHaveBeenCalledTimes(2);
   });
 
   it('runs an owner repeating a request', async () => {
