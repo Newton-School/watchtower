@@ -16,6 +16,8 @@ import { runAgenticEntry } from '../src/agentic/agenticEntry.js';
 import { refreshSharedRepoToDefaultBranch } from '../src/workspaces/workspaceManager.js';
 import { __connectors, currentConnectors } from '../src/backends/connectors.js';
 import { collectThreadAttachments } from '../src/slack/threadAttachments.js';
+import { resolveGithubTokenForCodex } from '../src/github/githubAuth.js';
+import { fetchMergeState, fetchUnresolvedReviewThreadCount } from '../src/github/prReviewComments.js';
 
 // Regression coverage for #348 RC2: when the planner concludes no code changes
 // are needed AND the request is not an operational action, the implementation
@@ -39,6 +41,12 @@ vi.mock('../src/slack/threadContext.js', () => ({
 vi.mock('../src/github/githubAuth.js', () => ({
   resolveGithubTokenForCodex: vi.fn().mockResolvedValue(undefined),
   githubAuthModeHint: vi.fn().mockReturnValue('none'),
+}));
+
+// What GitHub says about a merge: nothing in the way, unless a test says otherwise.
+vi.mock('../src/github/prReviewComments.js', () => ({
+  fetchUnresolvedReviewThreadCount: vi.fn(async () => ({ unresolvedCount: 0, totalThreads: 0 })),
+  fetchMergeState: vi.fn(async () => ({ mergeStateStatus: 'CLEAN', isDraft: false })),
 }));
 
 vi.mock('../src/notify/desktopNotifier.js', () => ({
@@ -421,8 +429,8 @@ describe('implementationWorkflow — quick-action merge needs the owner (#429)',
         stagePrefix: 'implementation.quick_action.confirm',
       }),
     );
-    // Confirmed: the quick action runs, and the run is auditable.
-    expect(runCodex).toHaveBeenCalledTimes(2);
+    // Confirmed: the quick action runs, with no planner before it (issue #605), and the run is auditable.
+    expect(runCodex).toHaveBeenCalledTimes(1);
     const audit = logs.find(entry => entry.stage === 'implementation.quick_action.pr_action');
     expect(audit?.data).toEqual({ action: 'merge', prUrls: [PR_URL], requestedBy: 'UBUILDER', confirmedBy: 'UOWNER1' });
   });
@@ -444,7 +452,7 @@ describe('implementationWorkflow — quick-action merge needs the owner (#429)',
     outcome(value);
     const { result } = await run(`<@UBOT1> merge ${PR_URL}`, { withPr: true });
 
-    expect(runCodex).toHaveBeenCalledTimes(1); // the planner only
+    expect(runCodex).not.toHaveBeenCalled(); // not even a planner (issue #605)
     expect(result.status).toBe(status);
     expect(result.message).toContain(message);
   });
@@ -461,7 +469,7 @@ describe('implementationWorkflow — quick-action merge needs the owner (#429)',
     const { logs } = await run(`<@UBOT1> merge ${PR_URL}`, { byOwner: true, withPr: true });
 
     expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
-    expect(runCodex).toHaveBeenCalledTimes(2);
+    expect(runCodex).toHaveBeenCalledTimes(1);
     const audit = logs.find(entry => entry.stage === 'implementation.quick_action.pr_action');
     expect(audit?.data).toMatchObject({ requestedBy: 'UOWNER1', confirmedBy: 'UOWNER1' });
   });
@@ -470,7 +478,7 @@ describe('implementationWorkflow — quick-action merge needs the owner (#429)',
     const { result } = await run(`<@UBOT1> merge ${PR_URL}`, { withPr: true }, { ownerSlackUserIds: [] });
 
     expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
-    expect(runCodex).toHaveBeenCalledTimes(1);
+    expect(runCodex).not.toHaveBeenCalled();
     expect(result.status).toBe('SKIPPED');
     expect(result.message).toContain('no owner configured');
   });
@@ -538,7 +546,8 @@ describe('implementationWorkflow — cancelled runs post no failure copy (#438)'
     const slack = makeSlack();
 
     const result = await runImplementationWorkflow({
-      task: makeTask(`<@UBOT1> merge ${PR_URL}`, { withPr: true }),
+      // A condition on the merge is the planner's to read (issue #605).
+      task: makeTask(`<@UBOT1> merge ${PR_URL} once CI is green`, { withPr: true }),
       config,
       slack: slack as unknown as import('@slack/web-api').WebClient,
       signal: controller.signal,
@@ -666,5 +675,225 @@ describe('implementationWorkflow — a planner run that failed is not a plan (#4
     expect(plannerFailureReply({ errorKind: 'EXTERNAL_KILL', timedOut: false })).toContain(
       'My planning run was killed from outside',
     );
+  });
+});
+
+// Issue #605: "merge the pr" ran a 3.5-minute planner to learn no code was
+// needed, then asked for the confirmation. A message that is only an
+// operation on one known PR now goes straight to the quick action.
+describe('implementationWorkflow — a PR operation needs no planner (#605)', () => {
+  const OTHER_PR = 'https://github.com/Newton-School/newton-web/pull/9301';
+  const target = (url: string, source: 'trigger' | 'thread') => ({
+    url,
+    owner: 'Newton-School',
+    repo: 'newton-web',
+    number: Number(url.split('/').pop()),
+    source,
+  });
+
+  beforeEach(() => {
+    vi.mocked(runCodex).mockReset().mockResolvedValue(plannerNoCodeResult());
+    vi.mocked(runAgenticEntry).mockReset();
+    vi.mocked(fetchUnresolvedReviewThreadCount).mockClear();
+  });
+  afterEach(() => {
+    vi.mocked(resolveGithubTokenForCodex).mockResolvedValue(undefined);
+    vi.mocked(fetchUnresolvedReviewThreadCount).mockResolvedValue({ unresolvedCount: 0, totalThreads: 0 });
+    vi.mocked(fetchMergeState).mockResolvedValue({ mergeStateStatus: 'CLEAN', isDraft: false });
+  });
+
+  /** GitHub's answers for the PR; the token makes the run read them. */
+  function github(threads: { unresolvedCount: number }, state: Awaited<ReturnType<typeof fetchMergeState>>) {
+    vi.mocked(resolveGithubTokenForCodex).mockResolvedValue('ghs_test');
+    vi.mocked(fetchUnresolvedReviewThreadCount).mockResolvedValue({ ...threads, totalThreads: 2 });
+    vi.mocked(fetchMergeState).mockResolvedValue(state);
+  }
+  const confirmPrompt = (posted: string[]) => posted.find(text => text.includes('confirm merge'));
+
+  async function run(text: string, prContexts: ReturnType<typeof target>[], options: { byOwner?: boolean } = {}) {
+    const slack = makeSlack();
+    const logs: { stage: string; data?: Record<string, unknown> }[] = [];
+    const task = { ...makeTask(text, options), prContexts, prContext: prContexts[0] };
+    const result = await runImplementationWorkflow({
+      task,
+      config,
+      slack: slack as unknown as import('@slack/web-api').WebClient,
+      logStep: entry => logs.push(entry),
+    });
+    const posted = slack.chat.postMessage.mock.calls.map(call => call[0].text as string);
+    return { result, posted, logs };
+  }
+
+  it("merges the thread's only PR after the owner's confirmation, with one agent call and no plan", async () => {
+    const { result, posted, logs } = await run('<@UBOT1> merge it', [target(PR_URL, 'thread')]);
+
+    expect(runCodex).toHaveBeenCalledTimes(1);
+    const quickPrompt = vi.mocked(runCodex).mock.calls[0][0].prompt;
+    expect(quickPrompt).toContain('quick operational action');
+    expect(quickPrompt).toContain(`Pull requests you may act on: ${PR_URL}.`);
+    expect(vi.mocked(__quickActionConfirm.wait).mock.calls[0][0].phrase).toBe('confirm merge');
+    expect(posted.find(text => text.includes('confirm merge'))).toContain(`<@UBUILDER> asked me to merge ${PR_URL}.`);
+    expect(logs.map(entry => entry.stage)).toContain('implementation.quick_action.no_planner');
+    expect(logs.map(entry => entry.stage)).not.toContain('pipeline.agent.planner.start');
+    expect(result).toMatchObject({ workflow: 'IMPLEMENTATION', status: 'SUCCESS' });
+  });
+
+  it('limits the agent to the PR the message names, not every PR in the thread', async () => {
+    await run('<@UBOT1> merge #9301', [target(PR_URL, 'thread'), target(OTHER_PR, 'thread')]);
+
+    expect(runCodex).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(runCodex).mock.calls[0][0].prompt).toContain(`Pull requests you may act on: ${OTHER_PR}.`);
+  });
+
+  it('syncs on "sync it", the daily follow-up\'s offer, with its own phrase', async () => {
+    await run('<@UBOT1> sync it', [target(PR_URL, 'thread')]);
+
+    expect(runCodex).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(__quickActionConfirm.wait).mock.calls[0][0].phrase).toBe('confirm sync');
+  });
+
+  it('takes the action from the ask, not from a word inside a link', async () => {
+    const syncTool = {
+      url: 'https://github.com/Newton-School/sync-tool/pull/3',
+      owner: 'Newton-School',
+      repo: 'sync-tool',
+      number: 3,
+      source: 'trigger' as const,
+    };
+    await run(`<@UBOT1> merge <${syncTool.url}|sync-tool#3>`, [syncTool]);
+
+    expect(vi.mocked(__quickActionConfirm.wait).mock.calls[0][0].phrase).toBe('confirm merge');
+  });
+
+  it.each([
+    ['a merge with a change', '<@UBOT1> merge it and fix the typo in the title first', [target(PR_URL, 'thread')]],
+    ['a merge with a condition', '<@UBOT1> merge it once CI is green', [target(PR_URL, 'thread')]],
+    ['two PRs and no way to tell', '<@UBOT1> merge it', [target(PR_URL, 'thread'), target(OTHER_PR, 'thread')]],
+    ['no PR at all', '<@UBOT1> merge it', []],
+  ])('still plans first for %s', async (_case, text, prs) => {
+    const { logs } = await run(text, prs);
+
+    expect(logs.map(entry => entry.stage)).toContain('pipeline.agent.planner.start');
+    expect(logs.map(entry => entry.stage)).not.toContain('implementation.quick_action.no_planner');
+    // The planner says no code is needed here, so the quick action follows it.
+    expect(runCodex).toHaveBeenCalledTimes(2);
+  });
+
+  it('says in the confirmation when the merge would go past a required review', async () => {
+    github({ unresolvedCount: 1 }, { reviewDecision: 'REVIEW_REQUIRED', mergeStateStatus: 'BLOCKED', isDraft: false });
+
+    const { posted } = await run('<@UBOT1> merge it', [target(PR_URL, 'thread')]);
+
+    const asked = expect.objectContaining({ owner: 'Newton-School', repo: 'newton-web', pullNumber: 9300 });
+    expect(fetchUnresolvedReviewThreadCount).toHaveBeenCalledWith(asked);
+    expect(fetchMergeState).toHaveBeenCalledWith(asked);
+    // Read once per run: the owner's own check and the confirmation share it.
+    expect(fetchMergeState).toHaveBeenCalledTimes(1);
+    expect(confirmPrompt(posted)).toContain(
+      'It has 1 unresolved review comment. It still needs an approving review, so merging now uses admin rights. <@UOWNER1>, reply `confirm merge`',
+    );
+  });
+
+  it.each([
+    [
+      'behind the base branch',
+      { mergeStateStatus: 'BEHIND' },
+      "It's behind the base branch, so merging now skips the up-to-date rule.",
+    ],
+    ['a draft', { mergeStateStatus: 'DRAFT', isDraft: true }, "It's still a draft."],
+    ['still being worked out by GitHub', { mergeStateStatus: 'UNKNOWN' }, "I couldn't check branch protection."],
+    ['unreadable', undefined, "I couldn't check branch protection."],
+  ])('says so in the confirmation when the PR is %s', async (_case, state, note) => {
+    github({ unresolvedCount: 0 }, state);
+
+    const { posted } = await run('<@UBOT1> merge it', [target(PR_URL, 'thread')]);
+
+    expect(confirmPrompt(posted)).toBe(
+      `<@UBUILDER> asked me to merge ${PR_URL}. ${note} <@UOWNER1>, reply \`confirm merge\` within 10 minutes and I'll do it. Without that, nothing changes.`,
+    );
+  });
+
+  it('still counts unresolved comments when the merge state cannot be read', async () => {
+    github({ unresolvedCount: 2 }, undefined);
+    vi.mocked(fetchMergeState).mockRejectedValue(new Error('Resource not accessible'));
+
+    const { posted } = await run('<@UBOT1> merge it', [target(PR_URL, 'thread')]);
+
+    expect(confirmPrompt(posted)).toContain(
+      "It has 2 unresolved review comments. I couldn't check branch protection. <@UOWNER1>, reply `confirm merge`",
+    );
+  });
+
+  it.each([
+    ['for someone else', {}],
+    ['for the owner', { byOwner: true }],
+  ])('does not offer to merge a PR with conflicts %s, and runs no agent', async (_case, options) => {
+    github({ unresolvedCount: 1 }, { mergeStateStatus: 'DIRTY', isDraft: false });
+
+    const { result, posted } = await run('<@UBOT1> merge it', [target(PR_URL, 'thread')], options);
+
+    expect(posted).toEqual([
+      `${PR_URL} has conflicts with its base branch, so it can't be merged yet. Nothing was changed.`,
+    ]);
+    expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
+    expect(runCodex).not.toHaveBeenCalled();
+    expect(result.status).toBe('SKIPPED');
+  });
+
+  it('says a PR has conflicts in the confirmation when a planner read the ask, since it may be more than the merge', async () => {
+    github({ unresolvedCount: 0 }, { mergeStateStatus: 'DIRTY', isDraft: false });
+
+    const { posted, logs } = await run('<@UBOT1> merge it once CI is green', [target(PR_URL, 'thread')]);
+
+    expect(logs.map(entry => entry.stage)).toContain('pipeline.agent.planner.start');
+    expect(confirmPrompt(posted)).toContain(
+      "It has conflicts, so it can't be merged yet. <@UOWNER1>, reply `confirm merge`",
+    );
+  });
+
+  it("says it in the owner's own unresolved-comments prompt too", async () => {
+    github(
+      { unresolvedCount: 2 },
+      { reviewDecision: 'CHANGES_REQUESTED', mergeStateStatus: 'BLOCKED', isDraft: false },
+    );
+
+    // Stop the job once the prompt is up: the wait for a yes is not what this checks.
+    const controller = new AbortController();
+    const slack = makeSlack();
+    slack.chat.postMessage.mockImplementation(async (message: { text: string }) => {
+      if (message.text.startsWith('This PR has')) controller.abort();
+      return { ok: true, ts: '123.45' };
+    });
+    const result = await runImplementationWorkflow({
+      task: { ...makeTask('<@UBOT1> merge it', { byOwner: true }), prContexts: [target(PR_URL, 'thread')] },
+      config,
+      slack: slack as unknown as import('@slack/web-api').WebClient,
+      signal: controller.signal,
+    });
+
+    expect(slack.chat.postMessage.mock.calls[0][0].text).toBe(
+      'This PR has 2 unresolved review comments. A reviewer asked for changes, so merging now uses admin rights. Should I still merge? Reply *yes* to proceed or *no* to cancel.',
+    );
+    expect(result.status).toBe('CANCELLED');
+    expect(runCodex).not.toHaveBeenCalled();
+  });
+
+  it('adds nothing to the confirmation when the branch lets the merge through', async () => {
+    github({ unresolvedCount: 0 }, { mergeStateStatus: 'CLEAN', isDraft: false });
+
+    const { posted } = await run('<@UBOT1> merge it', [target(PR_URL, 'thread')]);
+
+    expect(confirmPrompt(posted)).toBe(
+      `<@UBUILDER> asked me to merge ${PR_URL}. <@UOWNER1>, reply \`confirm merge\` within 10 minutes and I'll do it. Without that, nothing changes.`,
+    );
+  });
+
+  it('stops before the confirmation when the job is cancelled while waiting', async () => {
+    __quickActionConfirm.wait = vi.fn().mockResolvedValue({ outcome: 'cancelled' });
+
+    const { result } = await run('<@UBOT1> merge it', [target(PR_URL, 'thread')]);
+
+    expect(runCodex).not.toHaveBeenCalled();
+    expect(result.status).toBe('CANCELLED');
   });
 });

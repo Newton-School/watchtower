@@ -28,6 +28,10 @@ export interface RouterDecision {
   reason: string;
   /** For `ask_user`: the one question to put to the requester. */
   question?: string;
+  /** For `unsupported`: what miniOG can't do, in a few words starting with a verb. */
+  cannot?: string;
+  /** For `unsupported`: who or what can do it, when the message makes that plain. */
+  whoCan?: string;
 }
 
 export interface RouterFacts {
@@ -79,7 +83,8 @@ const PROMPT_TOOLS: ReadonlyArray<{ id: RouterTool; description: string }> = [
   },
   {
     id: 'unsupported',
-    description: 'A clear request for something none of these tools do (file a ticket, schedule a meeting).',
+    description:
+      'A clear request for an action in a system none of these tools reach (grant access, file a ticket, schedule a meeting). Say what you cannot do in "cannot", and who or what can in "who_can".',
   },
 ];
 
@@ -98,7 +103,10 @@ const RULES = `Rules:
 - deploy only when this message itself tells you to deploy to production now. Words like "deploy", "release" or "ship" in a description, a plan, a question or a link are not that.
 - A message addressed to you that asks only for a staging deploy is answer, not deploy or change_code: miniOG does not run staging deploys, and the answer says how to do one. A staging deploy asked for together with a change, a fix or a merge is that change. Asked of the owner instead of you, a staging deploy is for the owner to do: stay_silent.
 - qa_webapp only when the person asks you to test or QA a running app or a pull request in a browser.
-- unsupported is only for an action in a system these tools do not reach (file a ticket, schedule a meeting, send an email). A question is never unsupported.
+- unsupported is only for an action in a system these tools do not reach: grant access or permissions, enrol or move someone, change records or accounts in a live system, file a ticket, schedule a meeting, set a reminder, send an email. change_code changes code and content in a repository, not live data. A bug in that code is change_code or investigate even when it is about access or enrolment. A message is unsupported only when nothing in it is something these tools can do; when part of it is, route that part.
+- A question is never unsupported, and a message that asks for an action these tools do not reach and also asks a question is answer.
+- Asking for data or a report as a spreadsheet or a Google Sheet is answer; the data can be attached as a file.
+- For unsupported, "cannot" says what you can't do in a few words, starting with a verb ("create a Jira ticket"). "who_can" says who or what can do it, only when that is plain ("an admin of that system", "Slack's /remind"); never a person's name. Leave it empty otherwise.
 - A message with nothing to act on ("no", "check now", "cc", a bare "yes" with no pending question) is ask_user, not a guess.
 - When a message is addressed to the owner instead of you, you act for the owner: a request in it that one of these tools can do is yours to route. A pull request posted for review is review_pr, and so is a request to merge one (the owner decides the merge; your review is what helps).
 - When you are tagged only in passing, route the message if it asks you for something. If it talks about you, or copies you in, without asking anything of you, choose stay_silent.
@@ -123,7 +131,7 @@ export function buildRouterPrompt(facts: RouterFacts): string {
     RULES,
     '',
     'Return strict JSON and nothing else:',
-    '{ "tool": one of the tool names above, "confidence": number between 0 and 1, "reason": "one sentence", "question": "only for ask_user" }',
+    '{ "tool": one of the tool names above, "confidence": number between 0 and 1, "reason": "one sentence", "question": "only for ask_user", "cannot": "only for unsupported", "who_can": "only for unsupported" }',
   ];
   if (facts.userDossierSummary) {
     lines.push('', 'About the requester (from past activity; weigh this message above it):', facts.userDossierSummary);
@@ -163,12 +171,17 @@ export function parseRouterDecision(raw: unknown): RouterDecision | undefined {
     typeof record.confidence === 'number' && Number.isFinite(record.confidence)
       ? Math.min(1, Math.max(0, record.confidence))
       : 0.5;
-  const question = typeof record.question === 'string' && record.question.trim() ? record.question.trim() : undefined;
+  const text = (value: unknown) => (typeof value === 'string' && value.trim() ? value.trim() : undefined);
+  const question = text(record.question);
+  const cannot = text(record.cannot);
+  const whoCan = text(record.who_can);
   return {
     tool: record.tool as RouterTool,
     confidence,
     reason: typeof record.reason === 'string' ? record.reason : '',
     ...(record.tool === 'ask_user' && question ? { question } : {}),
+    ...(record.tool === 'unsupported' && cannot ? { cannot } : {}),
+    ...(record.tool === 'unsupported' && whoCan ? { whoCan } : {}),
   };
 }
 
