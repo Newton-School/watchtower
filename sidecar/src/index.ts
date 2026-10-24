@@ -31,8 +31,9 @@ import { keepAwake } from './runtime/keepAwake.js';
 import { decidePausedResume } from './router/pausedResume.js';
 import { classifyProduct } from './router/productClassifier.js';
 import { routeTask } from './router/taskRouter.js';
-import { startMentionCatchup } from './slack/mentionCatchup.js';
+import { startMentionCatchup, type MentionCatchup } from './slack/mentionCatchup.js';
 import { SocketSlackClient } from './slack/socketClient.js';
+import { SocketWatchdog, type SocketAlert } from './slack/socketWatchdog.js';
 import { captureLiveMessage, captureThreadFromMessages, isSyntheticEnvelope } from './conversation/threadCapture.js';
 import { startThreadSweeper, stopThreadSweeper } from './conversation/threadSweeper.js';
 import { startThreadSynthesizerScheduler, stopThreadSynthesizerScheduler } from './conversation/threadSynthesizer.js';
@@ -1929,14 +1930,37 @@ async function main(): Promise<void> {
     );
   }
 
+  // The Slack socket stays dead for hours after a sleep unless something
+  // restarts it (issue #587); after a gap, catch-up sweeps thread replies too.
+  const catchup: { current?: MentionCatchup } = {};
+  const socketAlertText = (alert: SocketAlert): string =>
+    alert.reason === 'missed_event'
+      ? `My Slack connection had gone quiet: a mention in <#${alert.channelId}> only reached me through catch-up. I've reconnected and I'm looking through recent threads for anything else I missed.`
+      : "I've lost my Slack connection and can't get it back yet. I'll keep trying; anything sent to me meanwhile waits until then.";
+  const socketWatchdog = new SocketWatchdog({
+    reconnect: () => client.restart(),
+    onGap: since => catchup.current?.sweepThreadsSince(since),
+    alert: async alert => {
+      const text = socketAlertText(alert);
+      notifyDesktop('Slack connection', text);
+      for (const ownerId of config.ownerSlackUserIds) {
+        await client.webClient.chat
+          .postMessage({ channel: ownerId, text })
+          .catch(err => logger.warn({ err: String(err) }, 'could not DM the owner about the Slack connection'));
+      }
+    },
+  });
+
   const client = new SocketSlackClient(
     config,
     async (event, webClient) => {
+      socketWatchdog.noteDelivered(event.channelId, event.eventTs);
       await enqueueSlackEvent(event, webClient as WebClient, 'socket');
     },
     async (event, webClient) => {
       await processReactionFeedback(event, webClient as WebClient);
     },
+    state => (state === 'connected' ? socketWatchdog.markConnected() : socketWatchdog.markDisconnected()),
   );
   for (const request of expiredLaunchpad) void takeBackPostedAsk(client.webClient, request);
 
@@ -1998,6 +2022,7 @@ async function main(): Promise<void> {
     },
   });
   await client.start();
+  socketWatchdog.start();
   logger.info('autonomous feed/digest/incident posting disabled; mention-triggered replies only');
 
   // Bundles list people directly now; copy in the people of the Slack user
@@ -2194,11 +2219,20 @@ async function main(): Promise<void> {
   runRetentionSweep();
   setInterval(runRetentionSweep, 60 * 60 * 1000);
 
-  startMentionCatchup({
+  catchup.current = startMentionCatchup({
     webClient: client.webClient,
     config,
     store,
-    enqueue: enqueueSlackEvent,
+    deliveredLive: (channelId, ts) => socketWatchdog.wasDelivered(channelId, ts),
+    enqueue: async (event, webClient, source) => {
+      // A bot mention only catch-up found is evidence the socket is dead.
+      socketWatchdog.noteCatchupRecovery({
+        channelId: event.channelId,
+        eventTs: event.eventTs,
+        mentionType: detectMention(event.text, config).type,
+      });
+      await enqueueSlackEvent(event, webClient, source);
+    },
   });
 
   // Conversation reconciliation sweeper: re-fetches recently-active tracked

@@ -1258,6 +1258,26 @@ export class JobStore {
     return rows.map(row => row.channel_id).filter(Boolean);
   }
 
+  /**
+   * Threads with a running or paused job, or one updated since `sinceIso`:
+   * the mention catch-up reads their replies every scan (issue #587).
+   * `active` when a job there is still running or paused.
+   */
+  threadsWithRecentJobs(sinceIso: string, limit = 25): Array<{ channelId: string; threadTs: string; active: boolean }> {
+    const rows = this.db
+      .prepare(
+        `SELECT channel_id, thread_ts, MAX(status IN ('RUNNING', 'PAUSED')) AS active
+         FROM jobs
+         WHERE (status IN ('RUNNING', 'PAUSED') OR updated_at >= ?)
+           AND channel_id != '' AND thread_ts != ''
+         GROUP BY channel_id, thread_ts
+         ORDER BY MAX(updated_at) DESC
+         LIMIT ?`,
+      )
+      .all(sinceIso, limit) as Array<{ channel_id: string; thread_ts: string; active: number }>;
+    return rows.map(row => ({ channelId: row.channel_id, threadTs: row.thread_ts, active: row.active === 1 }));
+  }
+
   getState(key: string): string | undefined {
     const row = this.getStateStmt.get(key) as { value?: string } | undefined;
     return row?.value;

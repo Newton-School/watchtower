@@ -1,4 +1,4 @@
-import { App, LogLevel } from '@slack/bolt';
+import { App, LogLevel, SocketModeReceiver } from '@slack/bolt';
 import type { WebClient } from '@slack/web-api';
 import type { AppConfig, SlackEventEnvelope, SlackReactionEvent } from '../types/contracts.js';
 import { logger } from '../logging/logger.js';
@@ -6,6 +6,61 @@ import { BUTTON_ACTION_RE, handleButtonClick, readButtonClick } from './buttonRe
 
 type SlackEventHandler = (event: SlackEventEnvelope, client: WebClient) => Promise<void>;
 type SlackReactionHandler = (event: SlackReactionEvent, client: WebClient) => Promise<void>;
+/** `connected` when Slack says hello; `closed` when the websocket drops (Bolt may still reconnect). */
+type SocketStateHandler = (state: 'connected' | 'closed') => void;
+
+/** The parts of @slack/socket-mode's client a restart needs. */
+type SocketModeConnection = {
+  on(event: 'connected' | 'close', listener: () => void): unknown;
+  removeListener(event: 'connected' | 'close', listener: () => void): unknown;
+  disconnect(): Promise<void>;
+};
+
+/** How long a retired connection gets to close before it is dropped. */
+const RETIRE_GRACE_MS = 5000;
+/**
+ * A restart step that takes longer than this has failed. Slack's clients keep
+ * retrying by themselves (the Web API for up to half an hour), which would
+ * hold the restart, and with it the watchdog's next try, that long.
+ */
+const RESTART_STEP_TIMEOUT_MS = 60 * 1000;
+
+function withinTimeout<T>(work: Promise<T>, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${what} took over ${RESTART_STEP_TIMEOUT_MS / 1000}s`)),
+      RESTART_STEP_TIMEOUT_MS,
+    );
+  });
+  return Promise.race([work, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Close a Socket Mode connection for good. A dead connection never answers
+ * the close frame (ws waits 30s and more), so after a few seconds the
+ * websocket is dropped outright. The client is never started again: its own
+ * reconnect timers see it shutting down and stand still, and if a reconnect
+ * that was already under way connects anyway, it is closed too.
+ */
+export async function retireSocketConnection(socket: SocketModeConnection, graceMs = RETIRE_GRACE_MS): Promise<void> {
+  const closeAgain = () => void socket.disconnect().catch(() => {});
+  socket.on('connected', closeAgain);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const dropped = new Promise<void>(resolve => {
+    timer = setTimeout(() => {
+      const websocket = (socket as { websocket?: { terminate?: () => void } | null }).websocket;
+      try {
+        websocket?.terminate?.();
+      } catch {
+        // already gone
+      }
+      resolve();
+    }, graceMs);
+  });
+  await Promise.race([socket.disconnect().catch(() => {}), dropped]);
+  if (timer) clearTimeout(timer);
+}
 
 /**
  * Translate a raw Slack `message` (or `app_mention`) event payload into the
@@ -71,17 +126,40 @@ export function normalizeMessageEnvelope(
 
 export class SocketSlackClient {
   private app: App;
+  private receiver: SocketModeReceiver;
+  private readonly stableWebClient: WebClient;
   private readonly config: AppConfig;
   private readonly onEvent: SlackEventHandler;
   private readonly onReaction?: SlackReactionHandler;
+  private readonly onSocketState?: SocketStateHandler;
+  /** Who the bot is, so an App built for a restart need not ask Slack (see restart). */
+  private botIdentity: { botId: string; botUserId: string } | undefined;
+  private readonly socketListeners = {
+    connected: () => this.onSocketState?.('connected'),
+    close: () => this.onSocketState?.('closed'),
+  };
 
-  constructor(config: AppConfig, onEvent: SlackEventHandler, onReaction?: SlackReactionHandler) {
+  constructor(
+    config: AppConfig,
+    onEvent: SlackEventHandler,
+    onReaction?: SlackReactionHandler,
+    onSocketState?: SocketStateHandler,
+  ) {
     this.config = config;
     this.onEvent = onEvent;
     this.onReaction = onReaction;
-    this.app = new App({
-      token: config.slackBotToken,
-      appToken: config.slackAppToken,
+    this.onSocketState = onSocketState;
+    ({ app: this.app, receiver: this.receiver } = this.buildApp());
+    // Callers keep this client for Web API calls; it outlives socket restarts.
+    this.stableWebClient = this.app.client;
+  }
+
+  private buildApp(): { app: App; receiver: SocketModeReceiver } {
+    const receiver = new SocketModeReceiver({ appToken: this.config.slackAppToken, logLevel: LogLevel.INFO });
+    const app = new App({
+      token: this.config.slackBotToken,
+      ...this.botIdentity,
+      receiver,
       socketMode: true,
       logLevel: LogLevel.INFO,
       // Bolt's default ignoreSelf middleware drops every event the bot itself
@@ -92,12 +170,14 @@ export class SocketSlackClient {
       // bot-authored reactions explicitly.
       ignoreSelf: false,
     });
-
-    this.registerHandlers();
+    receiver.client.on('connected', this.socketListeners.connected);
+    receiver.client.on('close', this.socketListeners.close);
+    this.registerHandlers(app);
+    return { app, receiver };
   }
 
-  private registerHandlers(): void {
-    this.app.event('app_mention', async ({ event, body, client }) => {
+  private registerHandlers(app: App): void {
+    app.event('app_mention', async ({ event, body, client }) => {
       const normalized = this.normalizeEnvelope(
         event as unknown as Record<string, unknown>,
         body as unknown as Record<string, unknown>,
@@ -115,7 +195,7 @@ export class SocketSlackClient {
       await this.onEvent(normalized, client);
     });
 
-    this.app.event('message', async ({ event, body, client }) => {
+    app.event('message', async ({ event, body, client }) => {
       const normalized = this.normalizeEnvelope(
         event as unknown as Record<string, unknown>,
         body as unknown as Record<string, unknown>,
@@ -134,7 +214,7 @@ export class SocketSlackClient {
       await this.onEvent(normalized, client);
     });
 
-    this.app.event('reaction_added', async ({ event, body, client }) => {
+    app.event('reaction_added', async ({ event, body, client }) => {
       if (!this.onReaction) {
         return;
       }
@@ -162,7 +242,7 @@ export class SocketSlackClient {
     // person would have typed, for the gate that is polling; a Stop goes to
     // the stop lane. The gate decides who may act and retires the buttons
     // when it ends, so nothing is rewritten here.
-    this.app.action(BUTTON_ACTION_RE, async ({ ack, body }) => {
+    app.action(BUTTON_ACTION_RE, async ({ ack, body }) => {
       await ack();
       const click = readButtonClick(body as unknown as Record<string, unknown>);
       if (!click) return;
@@ -179,7 +259,7 @@ export class SocketSlackClient {
       await handleButtonClick(click);
     });
 
-    this.app.command('/miniog', async ({ command, ack, client }) => {
+    app.command('/miniog', async ({ command, ack, client }) => {
       await ack();
       const normalized = this.normalizeCommandEnvelope(command as unknown as Record<string, unknown>);
       logger.info(
@@ -196,7 +276,7 @@ export class SocketSlackClient {
       await this.onEvent(normalized, client);
     });
 
-    this.app.command('/wt', async ({ command, ack, client }) => {
+    app.command('/wt', async ({ command, ack, client }) => {
       await ack();
       // Preserve the `wt` namespace so devAssistParser.stripPrefix() (which
       // requires it) still routes prefix-dependent operator commands like
@@ -217,7 +297,7 @@ export class SocketSlackClient {
       await this.onEvent(normalized, client);
     });
 
-    this.app.command('/watchtower', async ({ command, ack, client }) => {
+    app.command('/watchtower', async ({ command, ack, client }) => {
       await ack();
       const normalized = this.normalizeCommandEnvelope(command as unknown as Record<string, unknown>, 'wt');
       logger.info(
@@ -234,7 +314,7 @@ export class SocketSlackClient {
       await this.onEvent(normalized, client);
     });
 
-    this.app.shortcut(/.*/, async ({ shortcut, ack, client }) => {
+    app.shortcut(/.*/, async ({ shortcut, ack, client }) => {
       await ack();
       const normalized = this.normalizeShortcutEnvelope(shortcut as unknown as Record<string, unknown>);
       if (!normalized) {
@@ -350,8 +430,35 @@ export class SocketSlackClient {
     logger.info({ component: 'slack' }, 'socket mode started');
   }
 
+  /**
+   * Drop the Socket Mode connection and open a new one (issue #587). The old
+   * connection is closed first so the two never both deliver, and it gets a
+   * fresh client because @slack/socket-mode's own reconnect timers would
+   * otherwise race a restart of the same one.
+   */
+  async restart(): Promise<void> {
+    logger.warn({ component: 'slack' }, 'restarting socket mode');
+    // A new App checks the token once, when built, and keeps a failed check
+    // for good: built while the network is still coming back after a sleep,
+    // it would drop every event. Asking first also fails a restart before it
+    // has closed the old connection.
+    if (!this.botIdentity) {
+      const auth = await withinTimeout(this.stableWebClient.auth.test(), 'auth.test');
+      if (!auth.bot_id || !auth.user_id) throw new Error('auth.test did not say who the bot is');
+      this.botIdentity = { botId: auth.bot_id, botUserId: auth.user_id };
+    }
+    const old = this.receiver.client;
+    old.removeListener('connected', this.socketListeners.connected);
+    old.removeListener('close', this.socketListeners.close);
+    await retireSocketConnection(old as unknown as SocketModeConnection);
+    ({ app: this.app, receiver: this.receiver } = this.buildApp());
+    // On a timeout the next restart retires this client, which stops its retries.
+    await withinTimeout(this.app.start(), 'opening the Slack socket');
+    logger.info({ component: 'slack' }, 'socket mode restarted');
+  }
+
   get webClient() {
-    return this.app.client;
+    return this.stableWebClient;
   }
 }
 
