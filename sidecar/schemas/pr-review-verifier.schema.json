@@ -10,6 +10,10 @@
       "type": "string",
       "enum": ["critical", "high", "medium", "low", "info"]
     },
+    "severityBasis": {
+      "type": "string",
+      "enum": ["no-behaviour-change", "not-shipped", "smaller-impact"]
+    },
     "reason": { "type": "string" }
   },
   "additionalProperties": false
