@@ -119,6 +119,9 @@ export interface RouterClassification {
   tool?: RouterTool;
   /** The question it wants put to the requester, for `ask_user`. */
   question?: string;
+  /** For `unsupported`: what miniOG can't do, and who or what can, as the router put it. */
+  cannot?: string;
+  whoCan?: string;
   /** For `deploy`: whether code agrees a deploy may start (`mayDeploy`). */
   deployAllowed?: boolean;
 }
@@ -201,6 +204,8 @@ export function startRouterShadow(params: {
         failed: false,
         tool: outcome.decision.tool,
         question: outcome.decision.question,
+        ...(outcome.decision.cannot ? { cannot: outcome.decision.cannot } : {}),
+        ...(outcome.decision.whoCan ? { whoCan: outcome.decision.whoCan } : {}),
         deployAllowed,
       };
     },
@@ -233,6 +238,8 @@ export function startRouterShadow(params: {
                     confidence: outcome.decision.confidence,
                     reason: outcome.decision.reason,
                     question: outcome.decision.question,
+                    cannot: outcome.decision.cannot,
+                    whoCan: outcome.decision.whoCan,
                   }
                 : { error: outcome.error }),
               durationMs: outcome.durationMs,
