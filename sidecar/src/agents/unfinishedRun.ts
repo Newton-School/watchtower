@@ -1,3 +1,4 @@
+import { clipText } from '../slack/replyParts.js';
 import type { AgentFinding, AgentStepResult, PipelineResult } from './types.js';
 
 /**
@@ -95,8 +96,7 @@ export function prLine(pr: RunPr | undefined): string {
 
 function findingLine(finding: AgentFinding): string {
   const where = finding.file ? ` \`${finding.file}${finding.line ? `:${finding.line}` : ''}\`` : '';
-  const message =
-    finding.message.length > FINDING_CHARS ? `${finding.message.slice(0, FINDING_CHARS).trim()}…` : finding.message;
+  const message = clipText(finding.message, FINDING_CHARS);
   return `• *${finding.severity}*${where} — ${message}`;
 }
 

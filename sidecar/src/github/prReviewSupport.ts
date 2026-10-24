@@ -3,6 +3,7 @@ import { promisify } from 'node:util';
 import type { AppConfig, CodexRunResult, PrContext, WorkflowStepLogger } from '../types/contracts.js';
 import { REPO_KEYS, repoKeyFromGithubRepoName, repoPathOrNull } from '../repos/registry.js';
 import type { AgentFinding } from '../agents/types.js';
+import { clipText } from '../slack/replyParts.js';
 import type { ReviewEvent, SubmitPrReviewResult } from './submitPrReview.js';
 
 const execFileAsync = promisify(execFile);
@@ -790,7 +791,7 @@ export function formatUnpostedFindings(findings: AgentFinding[]): string {
   const ordered = [...findings].sort((a, b) => (SEVERITY_ORDER[a.severity] ?? 9) - (SEVERITY_ORDER[b.severity] ?? 9));
   const lines = ordered.slice(0, UNPOSTED_FINDINGS_IN_SLACK).map(f => {
     const where = f.file ? `${f.file}${typeof f.line === 'number' ? `:${f.line}` : ''} — ` : '';
-    const message = f.message.length > 240 ? `${f.message.slice(0, 240).trim()}…` : f.message;
+    const message = clipText(f.message, 240);
     return `• [${f.severity.toUpperCase()}] ${where}${message}`;
   });
   if (ordered.length > UNPOSTED_FINDINGS_IN_SLACK) {
