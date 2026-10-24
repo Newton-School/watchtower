@@ -36,22 +36,34 @@ function withinTimeout<T>(work: Promise<T>, what: string): Promise<T> {
   return Promise.race([work, timeout]).finally(() => clearTimeout(timer));
 }
 
+/** socket-mode internals a retired client is stopped through; private in its types. */
+type SocketModeInternals = {
+  autoReconnectEnabled?: boolean;
+  webClient?: { axios?: { interceptors?: { request?: { use(onRequest: () => unknown): unknown } } } };
+  websocket?: { terminate?: () => void } | null;
+};
+
 /**
  * Close a Socket Mode connection for good. A dead connection never answers
  * the close frame (ws waits 30s and more), so after a few seconds the
- * websocket is dropped outright. The client is never started again: its own
- * reconnect timers see it shutting down and stand still, and if a reconnect
- * that was already under way connects anyway, it is closed too.
+ * websocket is dropped outright. The client is never started again, and it
+ * stops trying by itself: auto-reconnect goes off, and the
+ * apps.connections.open retries it may still have running (up to 100 of
+ * them) are parked on a request that never settles. Not failed: socket-mode's
+ * reconnect chain has no catch, so a rejection there would be unhandled and
+ * take the sidecar down. If a reconnect connects anyway, it is closed too.
  */
 export async function retireSocketConnection(socket: SocketModeConnection, graceMs = RETIRE_GRACE_MS): Promise<void> {
+  const internals = socket as SocketModeInternals;
+  internals.autoReconnectEnabled = false;
+  internals.webClient?.axios?.interceptors?.request?.use(() => new Promise(() => {}));
   const closeAgain = () => void socket.disconnect().catch(() => {});
   socket.on('connected', closeAgain);
   let timer: ReturnType<typeof setTimeout> | undefined;
   const dropped = new Promise<void>(resolve => {
     timer = setTimeout(() => {
-      const websocket = (socket as { websocket?: { terminate?: () => void } | null }).websocket;
       try {
-        websocket?.terminate?.();
+        internals.websocket?.terminate?.();
       } catch {
         // already gone
       }

@@ -2230,6 +2230,7 @@ async function main(): Promise<void> {
         channelId: event.channelId,
         eventTs: event.eventTs,
         mentionType: detectMention(event.text, config).type,
+        edited: Boolean((event.rawEvent as { edited?: unknown } | undefined)?.edited),
       });
       await enqueueSlackEvent(event, webClient, source);
     },

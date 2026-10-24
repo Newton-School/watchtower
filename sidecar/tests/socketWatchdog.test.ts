@@ -1,32 +1,43 @@
-import { describe, expect, it, vi } from 'vitest';
-import { SocketWatchdog, type SocketAlert } from '../src/slack/socketWatchdog.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ActiveClock } from '../src/runtime/activeClock.js';
+import { SocketWatchdog, type SocketAlert, type SocketRestartReason } from '../src/slack/socketWatchdog.js';
 
 // Issue #587: after the host sleeps the Slack socket can stay dead for hours.
-// The watchdog restarts it when the host wakes, when it stays closed, and when
-// catch-up recovers a bot mention the socket should have delivered. Tags of
-// the owner reach miniOG through catch-up by design and prove nothing.
+// The watchdog restarts it when the host wakes (activeClock, the process's one
+// sleep detector, says so), when it stays closed for two awake minutes, and
+// when catch-up recovers a bot mention the socket should have delivered. Tags
+// of the owner and edits reach miniOG through catch-up by design and prove
+// nothing.
+
+const stops: Array<() => void> = [];
+afterEach(() => {
+  for (const stop of stops.splice(0)) stop();
+});
 
 function makeWatchdog(opts: { reconnect?: () => Promise<void> } = {}) {
   let nowMs = 1_800_000_000_000;
-  const reconnects: number[] = [];
+  const clock = new ActiveClock(() => nowMs);
+  const reconnects: SocketRestartReason[] = [];
   const alerts: SocketAlert[] = [];
   const gaps: number[] = [];
   const watchdog = new SocketWatchdog({
-    reconnect:
-      opts.reconnect ??
-      (async () => {
-        reconnects.push(nowMs);
-      }),
+    reconnect: async reason => {
+      reconnects.push(reason);
+      await opts.reconnect?.();
+    },
     alert: alert => {
       alerts.push(alert);
     },
     onGap: since => gaps.push(since),
     now: () => nowMs,
+    clock,
   });
-  const advance = (ms: number) => {
-    nowMs += ms;
-  };
-  // Time passing with the host awake: the watchdog's timer ticks every 15s.
+  watchdog.start();
+  stops.push(() => {
+    watchdog.stop();
+    clock.stop();
+  });
+  // Time passing with the host awake: the watchdog's checks run every 15s.
   const awake = (ms: number) => {
     watchdog.tick();
     for (let left = ms; left > 0; left -= 15_000) {
@@ -34,9 +45,13 @@ function makeWatchdog(opts: { reconnect?: () => Promise<void> } = {}) {
       watchdog.tick();
     }
   };
+  // The lid shut: nothing runs until it opens.
+  const sleep = (ms: number) => {
+    nowMs += ms;
+  };
   // A message posted `agoMs` before now, as a Slack ts.
   const ts = (agoMs: number) => ((nowMs - agoMs) / 1000).toFixed(6);
-  return { watchdog, reconnects, alerts, gaps, advance, awake, ts, now: () => nowMs };
+  return { watchdog, reconnects, alerts, gaps, awake, sleep, ts, now: () => nowMs };
 }
 
 const settle = () => new Promise(resolve => setTimeout(resolve, 0));
@@ -48,7 +63,8 @@ describe('SocketWatchdog: missed mentions', () => {
     awake(10 * 60 * 1000);
 
     watchdog.noteCatchupRecovery({ channelId: 'C1', eventTs: ts(90_000), mentionType: 'bot' });
-    await vi.waitFor(() => expect(reconnects.length).toBe(1));
+    await vi.waitFor(() => expect(reconnects).toEqual(['missed_event']));
+    await settle(); // the restart finishes
     expect(alerts).toEqual([{ reason: 'missed_event', channelId: 'C1' }]);
 
     // More evidence a minute later: inside the cooldown, and already alerted.
@@ -65,6 +81,16 @@ describe('SocketWatchdog: missed mentions', () => {
     awake(10 * 60 * 1000);
     watchdog.noteCatchupRecovery({ channelId: 'C1', eventTs: ts(90_000), mentionType: 'owner' });
     watchdog.noteCatchupRecovery({ channelId: 'C1', eventTs: ts(90_000), mentionType: 'none' });
+    await settle();
+    expect(reconnects).toEqual([]);
+    expect(alerts).toEqual([]);
+  });
+
+  it('never counts an edit that added the mention: Slack sends no app_mention for an edit', async () => {
+    const { watchdog, reconnects, alerts, awake, ts } = makeWatchdog();
+    watchdog.markConnected();
+    awake(10 * 60 * 1000);
+    watchdog.noteCatchupRecovery({ channelId: 'C1', eventTs: ts(90_000), mentionType: 'bot', edited: true });
     await settle();
     expect(reconnects).toEqual([]);
     expect(alerts).toEqual([]);
@@ -101,11 +127,13 @@ describe('SocketWatchdog: missed mentions', () => {
     awake(10 * 60 * 1000);
     watchdog.noteCatchupRecovery({ channelId: 'C1', eventTs: ts(90_000), mentionType: 'bot' });
     await vi.waitFor(() => expect(reconnects.length).toBe(1));
+    await settle(); // the restart finishes
 
     // Still broken after the restart: restart again, no second alert.
     awake(5 * 60 * 1000);
     watchdog.noteCatchupRecovery({ channelId: 'C1', eventTs: ts(90_000), mentionType: 'bot' });
     await vi.waitFor(() => expect(reconnects.length).toBe(2));
+    await settle(); // the restart finishes
     expect(alerts.length).toBe(1);
 
     // The socket delivers again: the outage is over. A later one is news.
@@ -113,6 +141,7 @@ describe('SocketWatchdog: missed mentions', () => {
     awake(60 * 60 * 1000);
     watchdog.noteCatchupRecovery({ channelId: 'C3', eventTs: ts(90_000), mentionType: 'bot' });
     await vi.waitFor(() => expect(reconnects.length).toBe(3));
+    await settle(); // the restart finishes
     expect(alerts).toEqual([
       { reason: 'missed_event', channelId: 'C1' },
       { reason: 'missed_event', channelId: 'C3' },
@@ -132,70 +161,91 @@ describe('SocketWatchdog: missed mentions', () => {
 });
 
 describe('SocketWatchdog: wake and a closed socket', () => {
-  it('restarts the socket when the host wakes, sweeps from when it fell asleep, and does not alert', async () => {
-    const { watchdog, reconnects, alerts, gaps, advance, now } = makeWatchdog();
+  it('restarts a socket that closed before the lid shut, sweeps from the sleep, and does not alert', async () => {
+    const { watchdog, reconnects, alerts, gaps, awake, sleep, now } = makeWatchdog();
     watchdog.markConnected();
-    watchdog.tick();
-    advance(15 * 1000);
-    watchdog.tick();
+    awake(60 * 1000);
+    watchdog.markDisconnected(); // Wi-Fi dropped, then the lid shut
     const asleepAt = Math.floor(now() / 1000);
 
-    advance(45 * 60 * 1000); // lid closed: no ticks
-    watchdog.tick();
-    await vi.waitFor(() => expect(reconnects.length).toBe(1));
-    expect(gaps).toEqual([asleepAt]);
+    sleep(45 * 60 * 1000);
+    awake(15 * 1000);
+    await vi.waitFor(() => expect(reconnects).toEqual(['wake']));
+    await settle(); // the restart finishes
+    expect(gaps.length).toBe(1);
+    expect(gaps[0]).toBeLessThanOrEqual(asleepAt);
     expect(alerts).toEqual([]);
   });
 
   it('does not take mentions sent while the host slept as a dead socket, even if catch-up runs first on waking', async () => {
-    const { watchdog, reconnects, alerts, advance, ts } = makeWatchdog();
+    const { watchdog, reconnects, alerts, awake, sleep, ts } = makeWatchdog();
     watchdog.markConnected();
-    watchdog.tick();
-    advance(45 * 60 * 1000);
-    // Catch-up's timer fires before the watchdog's on waking.
+    awake(60 * 1000);
+    sleep(45 * 60 * 1000);
+    // Catch-up's timer fires before the clock's tick on waking.
     watchdog.noteCatchupRecovery({ channelId: 'C1', eventTs: ts(20 * 60 * 1000), mentionType: 'bot' });
-    await vi.waitFor(() => expect(reconnects.length).toBe(1)); // the wake restart
+    await vi.waitFor(() => expect(reconnects).toEqual(['wake']));
+    await settle(); // the restart finishes
     expect(alerts).toEqual([]);
   });
 
-  it('restarts a socket that stays closed, retries a failed restart with backoff, and alerts once after 10 minutes', async () => {
-    let attempts = 0;
-    const { watchdog, alerts, advance } = makeWatchdog({
+  it('does not count slept time as downtime, nor alert before a restart has failed', async () => {
+    let fail = true;
+    const { watchdog, reconnects, alerts, awake, sleep } = makeWatchdog({
       reconnect: async () => {
-        attempts += 1;
+        if (fail) throw new Error('getaddrinfo ENOTFOUND slack.com');
+      },
+    });
+    watchdog.markConnected();
+    awake(60 * 1000);
+    watchdog.markDisconnected();
+    sleep(45 * 60 * 1000);
+    awake(15 * 1000);
+    await vi.waitFor(() => expect(reconnects).toEqual(['wake']));
+    await settle(); // the restart finishes
+    await settle();
+    // One failed restart, but the socket has been down for seconds of awake time.
+    expect(alerts).toEqual([]);
+    fail = false;
+    awake(30 * 1000);
+    await vi.waitFor(() => expect(reconnects).toEqual(['wake', 'wake']));
+    await settle(); // the restart finishes
+    expect(alerts).toEqual([]);
+  });
+
+  it('restarts a socket that stays closed for two awake minutes, retries with backoff, and alerts once after 10', async () => {
+    const { watchdog, reconnects, alerts, awake } = makeWatchdog({
+      reconnect: async () => {
         throw new Error('getaddrinfo ENOTFOUND slack.com');
       },
     });
     watchdog.markConnected();
-    watchdog.tick();
+    awake(60 * 1000);
     watchdog.markDisconnected();
 
-    advance(60 * 1000);
-    watchdog.tick();
+    awake(105 * 1000);
     await settle();
-    expect(attempts).toBe(0); // Bolt gets two minutes to reconnect by itself
+    expect(reconnects).toEqual([]); // Bolt gets two minutes to reconnect by itself
 
-    advance(75 * 1000);
-    watchdog.tick();
-    await vi.waitFor(() => expect(attempts).toBe(1));
+    awake(15 * 1000);
+    await vi.waitFor(() => expect(reconnects).toEqual(['disconnected']));
+    await settle(); // the restart finishes
 
-    advance(15 * 1000);
-    watchdog.tick();
+    awake(15 * 1000);
     await settle();
-    expect(attempts).toBe(1); // first retry waits 30s
+    expect(reconnects.length).toBe(1); // the first retry waits 30s
 
-    advance(15 * 1000);
-    watchdog.tick();
-    await vi.waitFor(() => expect(attempts).toBe(2));
+    awake(15 * 1000);
+    await vi.waitFor(() => expect(reconnects).toEqual(['disconnected', 'disconnected']));
+    await settle(); // the restart finishes
     expect(alerts).toEqual([]);
 
     for (let i = 0; i < 40; i += 1) {
-      advance(15 * 1000);
-      watchdog.tick();
+      awake(15 * 1000);
       await settle();
     }
     expect(alerts).toEqual([{ reason: 'disconnected' }]);
-    expect(attempts).toBeGreaterThan(2);
+    expect(reconnects.length).toBeGreaterThan(2);
   });
 
   it('leaves a socket alone when Bolt reconnects it in time', async () => {

@@ -28,9 +28,11 @@ const RECENT_JOB_THREAD_HOURS = 6;
 // Replay ids queued in this process, so a reply the intake drops without a
 // record (no job, no event row) is not queued again on every scan.
 const REPLAYED_MEMORY = 2000;
-// Threads read in one scan, sweep included: a sweep after a long sleep must
-// not turn into hundreds of conversations.replies calls at once.
-const CATCHUP_MAX_THREADS_PER_SCAN = 150;
+// A sweep after a gap opens at most this many threads, newest activity first.
+const SWEEP_MAX_THREADS = 40;
+// ...one Slack call this far apart: about 40 a minute, under the roughly 50 a
+// minute conversations.history and conversations.replies allow.
+const SWEEP_PACE_MS = 1500;
 // Catchup is a recovery scanner — it walks `conversations.history` and replays
 // mentions whose live socket delivery we may have missed. Deletions only flow
 // through the live socket path (where processMessageDeleted reacts); a
@@ -74,11 +76,13 @@ type CatchupDeps = {
   /** Messages the live socket delivered in this process: already handled, never replayed. */
   deliveredLive?: (channelId: string, ts: string) => boolean;
   nowMs?: () => number;
+  /** Gap between a sweep's Slack calls; tests set 0. */
+  paceMs?: number;
 };
 
-/** What a scan carries over to the next. */
+/** What one scan or sweep carries over to the next. */
 export type CatchupState = {
-  /** Read every thread with replies since then (epoch seconds), on the next scan only. */
+  /** Sweep every thread with replies since then (epoch seconds); taken by the next sweep. */
   sweepSince: number | null;
   replayed: Set<string>;
 };
@@ -90,43 +94,150 @@ export function newCatchupState(): CatchupState {
 export interface MentionCatchup {
   /**
    * The socket may have missed messages since then (the host slept, or the
-   * socket was dead): the next scan reads every recent thread with replies
-   * since that time, not just the threads miniOG has jobs in.
+   * socket was dead): sweep every recent thread with replies since that
+   * time, not just the threads miniOG has jobs in.
    */
   sweepThreadsSince(epochSeconds: number): void;
 }
 
-export function startMentionCatchup(deps: CatchupDeps): MentionCatchup {
-  const state = newCatchupState();
-  // While the sidecar was down nothing at all was delivered, thread replies
-  // included: the first scan sweeps threads from the last scan before it.
-  const storedCursor = Number(deps.store.getState(CATCHUP_STATE_KEY) ?? 0);
-  state.sweepSince = effectiveOldestTs(storedCursor, Math.floor(now(deps) / 1000), CATCHUP_LOOKBACK_SECONDS);
-  // A sweep can outlast the interval; two scans at once would queue the same
-  // reply twice, so a tick that finds one running skips.
+/**
+ * Runs `work` unless the last run is still going. A scan that outlasts its
+ * interval, or a sweep asked for again mid-sweep, would otherwise run twice at
+ * once and queue the same reply twice.
+ */
+export function skipWhileRunning(work: () => Promise<void>, what: string): () => Promise<void> {
   let running = false;
-  const scan = async () => {
+  return async () => {
     if (running) return;
     running = true;
     try {
-      await runMentionCatchup(deps, state);
+      await work();
     } catch (error) {
-      logger.warn({ component: 'slack-catchup', error: String(error) }, 'missed mention catch-up scan failed');
+      logger.warn({ component: 'slack-catchup', error: String(error) }, `${what} failed`);
     } finally {
       running = false;
     }
   };
+}
+
+export function startMentionCatchup(deps: CatchupDeps): MentionCatchup {
+  const state = newCatchupState();
+  // The intake runs a queued job to its end before it returns, so a scan that
+  // waited on it would stop for the whole job.
+  const detached: CatchupDeps = {
+    ...deps,
+    enqueue: async (event, client, source) => {
+      void deps.enqueue(event, client, source).catch(error => {
+        logger.warn({ component: 'slack-catchup', eventId: event.eventId, error: String(error) }, 'replay failed');
+      });
+    },
+  };
+  const scan = skipWhileRunning(() => runMentionCatchup(detached, state), 'missed mention catch-up scan');
+  // Off the scan's path: a sweep is paced and can take minutes.
+  const sweep = skipWhileRunning(async () => {
+    while (state.sweepSince !== null) {
+      const since = state.sweepSince;
+      state.sweepSince = null;
+      await runThreadSweep(detached, state, since);
+    }
+  }, 'thread sweep');
+
+  // While the sidecar was down nothing at all was delivered, thread replies
+  // included: sweep threads from the last scan before it.
+  const storedCursor = Number(deps.store.getState(CATCHUP_STATE_KEY) ?? 0);
+  state.sweepSince = effectiveOldestTs(storedCursor, Math.floor(now(deps) / 1000), CATCHUP_LOOKBACK_SECONDS);
   void scan();
+  void sweep();
   setInterval(() => void scan(), CATCHUP_INTERVAL_MS);
   return {
     sweepThreadsSince(epochSeconds) {
       state.sweepSince = state.sweepSince === null ? epochSeconds : Math.min(state.sweepSince, epochSeconds);
+      void sweep();
     },
   };
 }
 
 function now(deps: Pick<CatchupDeps, 'nowMs'>): number {
   return deps.nowMs ? deps.nowMs() : Date.now();
+}
+
+function replayIdFor(channelId: string, ts: string): string {
+  return `replay:${channelId}:${ts}`;
+}
+
+/** Handled already: queued by catch-up, delivered by the socket, recorded, or a job's own message. */
+function alreadySeen(deps: CatchupDeps, state: CatchupState, channelId: string, ts: string): boolean {
+  const replayEventId = replayIdFor(channelId, ts);
+  return (
+    state.replayed.has(replayEventId) ||
+    Boolean(deps.deliveredLive?.(channelId, ts)) ||
+    deps.store.hasEvent(replayEventId) ||
+    deps.store.hasJobForEventTs(channelId, ts)
+  );
+}
+
+function remember(state: CatchupState, replayEventId: string): void {
+  state.replayed.add(replayEventId);
+  if (state.replayed.size > REPLAYED_MEMORY) {
+    state.replayed.delete(state.replayed.values().next().value as string);
+  }
+}
+
+/**
+ * Queue the bot mentions among a thread's replies that nothing has handled.
+ * Only mentions of miniOG: an owner tag in a thread reply never reached the
+ * intake live either. A reply miniOG answered later is recorded instead,
+ * except a stop while the thread's job still runs: its later posts are
+ * progress, not an answer to the stop.
+ */
+async function recoverThreadMentions(
+  deps: CatchupDeps,
+  state: CatchupState,
+  thread: { channelId: string; parentTs: string; active: boolean },
+  replies: Array<Record<string, unknown>>,
+): Promise<number> {
+  const { config, store, webClient } = deps;
+  const { channelId, parentTs } = thread;
+  let queued = 0;
+  for (const reply of replies) {
+    const replyTs = String(reply.ts ?? '');
+    if (!replyTs || replyTs === parentTs) continue;
+    const candidate = actionableMention(reply, config);
+    if (!candidate || candidate.type !== 'bot') continue;
+    if (alreadySeen(deps, state, channelId, replyTs)) continue;
+    const replayEventId = replayIdFor(channelId, replyTs);
+
+    const replyEpoch = toEpochSeconds(replyTs);
+    const answeredLater = replies.some(
+      other => String(other.user ?? '') === config.botUserId && toEpochSeconds(String(other.ts ?? '')) > replyEpoch,
+    );
+    if (answeredLater && !(thread.active && isStopCommand(candidate.text))) {
+      store.recordEvent(replayEventId, channelId, parentTs);
+      continue;
+    }
+
+    remember(state, replayEventId);
+    await deps.enqueue(
+      {
+        eventId: replayEventId,
+        channelId,
+        threadTs: parentTs,
+        eventTs: replyTs,
+        userId: candidate.userId,
+        text: candidate.text,
+        messageSubtype: candidate.subtype || undefined,
+        rawEvent: reply,
+      },
+      webClient,
+      'catchup',
+    );
+    queued += 1;
+  }
+  return queued;
+}
+
+function recentJobThreadsSince(deps: CatchupDeps): string {
+  return new Date(now(deps) - RECENT_JOB_THREAD_HOURS * 60 * 60 * 1000).toISOString();
 }
 
 // Exported for unit tests; production runs it through startMentionCatchup.
@@ -136,73 +247,6 @@ export async function runMentionCatchup(deps: CatchupDeps, state: CatchupState =
   const storedCursorRaw = store.getState(CATCHUP_STATE_KEY);
   const storedCursor = storedCursorRaw ? Number(storedCursorRaw) : 0;
   const oldestTs = effectiveOldestTs(storedCursor, nowTs, CATCHUP_LOOKBACK_SECONDS);
-  // A sweep reaches back to the gap, never past the lookback window.
-  const sweepSince =
-    state.sweepSince === null ? null : Math.max(nowTs - CATCHUP_LOOKBACK_SECONDS, Math.min(state.sweepSince, oldestTs));
-  state.sweepSince = null;
-  const replyBoundary = sweepSince ?? oldestTs;
-  const seen = (channelId: string, ts: string, replayEventId: string) =>
-    state.replayed.has(replayEventId) ||
-    Boolean(deps.deliveredLive?.(channelId, ts)) ||
-    store.hasEvent(replayEventId) ||
-    store.hasJobForEventTs(channelId, ts);
-  const remember = (replayEventId: string) => {
-    state.replayed.add(replayEventId);
-    if (state.replayed.size > REPLAYED_MEMORY) {
-      state.replayed.delete(state.replayed.values().next().value as string);
-    }
-  };
-
-  /**
-   * Queue the bot mentions among a thread's replies that nothing has handled.
-   * Only mentions of miniOG: an owner tag in a thread reply never reached the
-   * intake live either. A reply miniOG answered later is recorded instead,
-   * except a stop while the thread's job still runs: its later posts are
-   * progress, not an answer to the stop.
-   */
-  const recoverThreadMentions = async (
-    channelId: string,
-    parentTs: string,
-    replies: Array<Record<string, unknown>>,
-    threadActive: boolean,
-  ): Promise<number> => {
-    let queued = 0;
-    for (const reply of replies) {
-      const replyTs = String(reply.ts ?? '');
-      if (!replyTs || replyTs === parentTs) continue;
-      const candidate = actionableMention(reply, config);
-      if (!candidate || candidate.type !== 'bot') continue;
-      const replayEventId = `replay:${channelId}:${replyTs}`;
-      if (seen(channelId, replyTs, replayEventId)) continue;
-
-      const replyEpoch = toEpochSeconds(replyTs);
-      const answeredLater = replies.some(
-        other => String(other.user ?? '') === config.botUserId && toEpochSeconds(String(other.ts ?? '')) > replyEpoch,
-      );
-      if (answeredLater && !(threadActive && isStopCommand(candidate.text))) {
-        store.recordEvent(replayEventId, channelId, parentTs);
-        continue;
-      }
-
-      await enqueue(
-        {
-          eventId: replayEventId,
-          channelId,
-          threadTs: parentTs,
-          eventTs: replyTs,
-          userId: candidate.userId,
-          text: candidate.text,
-          messageSubtype: candidate.subtype || undefined,
-          rawEvent: reply,
-        },
-        webClient,
-        'catchup',
-      );
-      remember(replayEventId);
-      queued += 1;
-    }
-    return queued;
-  };
   if (storedCursor > nowTs) {
     logger.warn(
       { component: 'slack-catchup', storedCursor, nowTs },
@@ -215,7 +259,6 @@ export async function runMentionCatchup(deps: CatchupDeps, state: CatchupState =
       component: 'slack-catchup',
       oldestTs,
       cursorTs: storedCursor || null,
-      sweepSince,
     },
     'starting missed mention catch-up scan',
   );
@@ -231,28 +274,24 @@ export async function runMentionCatchup(deps: CatchupDeps, state: CatchupState =
 
   let recovered = 0;
   let scannedMessages = 0;
-  const threadsRead = new Set<string>();
 
   // Thread replies never appear in conversations.history, so an @mention
   // posted inside a thread was invisible here whenever the socket was down:
   // a "stop", a follow-up, a review ask (RCA 2026-07-29, issue #587). Every
   // scan reads the threads miniOG has a running, paused or recent job in.
-  const recentSince = new Date(now(deps) - RECENT_JOB_THREAD_HOURS * 60 * 60 * 1000).toISOString();
-  for (const thread of store.threadsWithRecentJobs(recentSince)) {
-    threadsRead.add(`${thread.channelId}:${thread.threadTs}`);
-    const replies = await fetchThreadReplies(webClient, thread.channelId, thread.threadTs, replyBoundary);
+  for (const thread of store.threadsWithRecentJobs(recentJobThreadsSince(deps))) {
+    const replies = await fetchThreadReplies(webClient, thread.channelId, thread.threadTs, oldestTs);
     scannedMessages += replies.length;
-    recovered += await recoverThreadMentions(thread.channelId, thread.threadTs, replies, thread.active);
+    recovered += await recoverThreadMentions(
+      deps,
+      state,
+      { channelId: thread.channelId, parentTs: thread.threadTs, active: thread.active },
+      replies,
+    );
   }
 
   for (const channelId of channelIds) {
-    // A sweep needs parents up to the lookback old: a fresh reply shows only
-    // as its parent's reply metadata.
-    const historyMessages = await fetchChannelHistory(
-      webClient,
-      channelId,
-      sweepSince === null ? oldestTs : nowTs - CATCHUP_LOOKBACK_SECONDS,
-    );
+    const historyMessages = await fetchChannelHistory(webClient, channelId, oldestTs);
     if (historyMessages.length === 0) {
       continue;
     }
@@ -263,7 +302,7 @@ export async function runMentionCatchup(deps: CatchupDeps, state: CatchupState =
 
     for (const message of ordered) {
       const eventTs = String(message.ts ?? '');
-      if (!eventTs || toEpochSeconds(eventTs) <= oldestTs) {
+      if (!eventTs) {
         continue;
       }
 
@@ -275,10 +314,10 @@ export async function runMentionCatchup(deps: CatchupDeps, state: CatchupState =
       }
       const { text, userId, subtype } = candidate;
 
-      const replayEventId = `replay:${channelId}:${eventTs}`;
-      if (seen(channelId, eventTs, replayEventId)) {
+      if (alreadySeen(deps, state, channelId, eventTs)) {
         continue;
       }
+      const replayEventId = replayIdFor(channelId, eventTs);
 
       const threadTs = String(message.thread_ts ?? message.ts ?? '');
       const alreadyResponded = await hasBotResponseAfterMention(
@@ -304,32 +343,9 @@ export async function runMentionCatchup(deps: CatchupDeps, state: CatchupState =
         rawEvent: message as Record<string, unknown>,
       };
 
+      remember(state, replayEventId);
       await enqueue(envelope, webClient, 'catchup');
-      remember(replayEventId);
       recovered += 1;
-    }
-
-    if (sweepSince === null) continue;
-    // Sweep: every other thread with replies since the gap, latest first.
-    const active = ordered
-      .filter(parent => Number(parent.reply_count ?? 0) > 0)
-      .filter(parent => toEpochSeconds(String(parent.latest_reply ?? '')) > sweepSince)
-      .sort((a, b) => toEpochSeconds(String(b.latest_reply)) - toEpochSeconds(String(a.latest_reply)));
-    for (const parent of active) {
-      const parentTs = String(parent.ts ?? '');
-      const key = `${channelId}:${parentTs}`;
-      if (threadsRead.has(key)) continue;
-      if (threadsRead.size >= CATCHUP_MAX_THREADS_PER_SCAN) {
-        logger.warn(
-          { component: 'slack-catchup', channelId, cap: CATCHUP_MAX_THREADS_PER_SCAN },
-          'thread sweep hit its per-scan cap; older threads are left out',
-        );
-        break;
-      }
-      threadsRead.add(key);
-      const replies = await fetchThreadReplies(webClient, channelId, parentTs, sweepSince);
-      scannedMessages += replies.length;
-      recovered += await recoverThreadMentions(channelId, parentTs, replies, false);
     }
   }
 
@@ -358,6 +374,60 @@ export async function runMentionCatchup(deps: CatchupDeps, state: CatchupState =
       nextCursor,
     },
     'completed missed mention catch-up scan',
+  );
+}
+
+/**
+ * After a gap, read the replies of every thread with replies since then: the
+ * one place a thread-reply mention in a thread miniOG has no job in can be
+ * found. Parents up to the lookback old are read for their reply metadata,
+ * only threads with a reply after the gap are opened, the newest first and at
+ * most SWEEP_MAX_THREADS of them, and the Slack calls are spaced out: every
+ * wake and every start sweeps, and a burst would hit conversations.replies'
+ * rate limit, whose Retry-After pause holds every other call of the client,
+ * run posts included.
+ */
+export async function runThreadSweep(deps: CatchupDeps, state: CatchupState, sinceEpochSeconds: number): Promise<void> {
+  const { webClient, config, store } = deps;
+  const nowTs = Math.floor(now(deps) / 1000);
+  const since = Math.max(nowTs - CATCHUP_LOOKBACK_SECONDS, sinceEpochSeconds);
+  const paceMs = deps.paceMs ?? SWEEP_PACE_MS;
+  const pace = () => (paceMs > 0 ? new Promise(resolve => setTimeout(resolve, paceMs)) : Promise.resolve());
+  const jobThreads = new Map(
+    store
+      .threadsWithRecentJobs(recentJobThreadsSince(deps))
+      .map(thread => [`${thread.channelId}:${thread.threadTs}`, thread.active]),
+  );
+
+  const threads: Array<{ channelId: string; parentTs: string; latestReply: number }> = [];
+  for (const channelId of await discoverChannels(webClient, store, config)) {
+    const parents = await fetchChannelHistory(webClient, channelId, nowTs - CATCHUP_LOOKBACK_SECONDS);
+    for (const parent of parents) {
+      const latestReply = toEpochSeconds(String(parent.latest_reply ?? ''));
+      if (Number(parent.reply_count ?? 0) > 0 && latestReply > since) {
+        threads.push({ channelId, parentTs: String(parent.ts ?? ''), latestReply });
+      }
+    }
+    await pace();
+  }
+  threads.sort((a, b) => b.latestReply - a.latestReply);
+  if (threads.length > SWEEP_MAX_THREADS) {
+    logger.warn(
+      { component: 'slack-catchup', threads: threads.length, cap: SWEEP_MAX_THREADS },
+      'thread sweep found more threads than it reads; the oldest are left out',
+    );
+  }
+
+  let recovered = 0;
+  for (const thread of threads.slice(0, SWEEP_MAX_THREADS)) {
+    const replies = await fetchThreadReplies(webClient, thread.channelId, thread.parentTs, since);
+    const active = jobThreads.get(`${thread.channelId}:${thread.parentTs}`) ?? false;
+    recovered += await recoverThreadMentions(deps, state, { ...thread, active }, replies);
+    await pace();
+  }
+  logger.info(
+    { component: 'slack-catchup', since, threads: Math.min(threads.length, SWEEP_MAX_THREADS), recovered },
+    'completed thread sweep',
   );
 }
 

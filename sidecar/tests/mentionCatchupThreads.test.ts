@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import type { WebClient } from '@slack/web-api';
-import { newCatchupState, runMentionCatchup, type CatchupState } from '../src/slack/mentionCatchup.js';
+import {
+  newCatchupState,
+  runMentionCatchup,
+  runThreadSweep,
+  skipWhileRunning,
+  type CatchupState,
+} from '../src/slack/mentionCatchup.js';
 import type { AppConfig, SlackEventEnvelope } from '../src/types/contracts.js';
 
 // Issue #587 (RCA 2026-07-29): conversations.history never returns plain
@@ -92,6 +98,30 @@ async function scan(
       nowMs: () => NOW_MS,
     },
     opts.state ?? newCatchupState(),
+  );
+  return queued;
+}
+
+async function sweep(
+  slack: WebClient,
+  store: ReturnType<typeof makeStore>['store'],
+  since: number,
+  state: CatchupState = newCatchupState(),
+) {
+  const queued: SlackEventEnvelope[] = [];
+  await runThreadSweep(
+    {
+      webClient: slack,
+      config: makeConfig(),
+      store: store as never,
+      enqueue: async event => {
+        queued.push(event);
+      },
+      nowMs: () => NOW_MS,
+      paceMs: 0,
+    },
+    state,
+    since,
   );
   return queued;
 }
@@ -193,7 +223,7 @@ describe('mention catch-up: sweep after a gap', () => {
     ],
   };
 
-  it('finds a mention in a thread miniOG has no job in, once a sweep is asked for', async () => {
+  it('finds a mention in a thread miniOG has no job in; the regular scan does not open such threads', async () => {
     const { store } = makeStore();
     const { client, repliesAsked } = makeSlack(history, thread);
     const state = newCatchupState();
@@ -201,19 +231,48 @@ describe('mention catch-up: sweep after a gap', () => {
     expect(await scan(client, store, { state })).toEqual([]);
     expect(repliesAsked).toEqual([]);
 
-    state.sweepSince = NOW - 3600;
-    const queued = await scan(client, store, { state });
+    const queued = await sweep(client, store, NOW - 3600, state);
     expect(queued.map(e => [e.eventId, e.threadTs])).toEqual([[`replay:C1:${reply}`, parent]]);
-    expect(state.sweepSince).toBeNull();
   });
 
   it('skips threads with no replies since the gap', async () => {
     const { store } = makeStore();
     const { client, repliesAsked } = makeSlack(history, thread);
-    const state = newCatchupState();
-    state.sweepSince = NOW - 600; // the reply is from before the gap
-    expect(await scan(client, store, { state })).toEqual([]);
+    expect(await sweep(client, store, NOW - 600)).toEqual([]); // the reply is from before the gap
     expect(repliesAsked).toEqual([]);
+  });
+
+  it('opens at most 40 threads, the most recently active first', async () => {
+    const parents = Array.from({ length: 45 }, (_unused, i) => ({
+      ts: at(7200 + i, i),
+      user: 'U1',
+      text: `thread ${i}`,
+      reply_count: 1,
+      latest_reply: at(100 + i * 10, i),
+    }));
+    const { store } = makeStore();
+    const { client, repliesAsked } = makeSlack(parents, {});
+    await sweep(client, store, NOW - 3600);
+    expect(repliesAsked.length).toBe(40);
+    expect(repliesAsked[0]).toBe(parents[0].ts);
+    expect(repliesAsked).not.toContain(parents[44].ts);
+  });
+
+  it("treats a stop in a running job's thread as a stop", async () => {
+    const stop = at(300);
+    const jobParent = at(3000);
+    const { store } = makeStore({ jobThreads: [{ channelId: 'C1', threadTs: jobParent, active: true }] });
+    const { client } = makeSlack(
+      [{ ts: jobParent, user: 'U1', text: `<@${BOT}> fix it`, reply_count: 2, latest_reply: at(200) }],
+      {
+        [jobParent]: [
+          { ts: stop, user: 'U1', text: `<@${BOT}> stop` },
+          { ts: at(200), user: BOT, text: 'Still working…' },
+        ],
+      },
+    );
+    const queued = await sweep(client, store, NOW - 3600);
+    expect(queued.map(e => e.eventTs)).toEqual([stop]);
   });
 
   it('still recovers unanswered top-level mentions after the cursor', async () => {
@@ -224,5 +283,40 @@ describe('mention catch-up: sweep after a gap', () => {
     });
     const queued = await scan(client, store);
     expect(queued.map(e => [e.eventId, e.threadTs])).toEqual([[`replay:C1:${top}`, top]]);
+  });
+});
+
+describe('skipWhileRunning', () => {
+  it('skips a call while the last one runs, and runs again once it is done', async () => {
+    let release: () => void = () => {};
+    let runs = 0;
+    const run = skipWhileRunning(async () => {
+      runs += 1;
+      await new Promise<void>(resolve => {
+        release = resolve;
+      });
+    }, 'test');
+
+    const first = run();
+    await run();
+    expect(runs).toBe(1);
+    release();
+    await first;
+
+    const second = run();
+    expect(runs).toBe(2);
+    release();
+    await second;
+  });
+
+  it('keeps going after a run throws', async () => {
+    let runs = 0;
+    const run = skipWhileRunning(async () => {
+      runs += 1;
+      throw new Error('slack down');
+    }, 'test');
+    await run();
+    await run();
+    expect(runs).toBe(2);
   });
 });
