@@ -927,20 +927,121 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
     expect(runner).toHaveBeenCalledOnce();
   });
 
-  it.each(['unsupported', 'qa_webapp'])(
-    'cannot start anything new: %s on a direct mention is a lookup, as an invalid classification was',
-    async tool => {
-      routerSays(tool, 0.95);
+  it('cannot start anything new: qa_webapp on a direct mention is a lookup, as an invalid classification was', async () => {
+    routerSays('qa_webapp', 0.95);
 
-      const { result, logStep } = await route('<@UBOT1> ship it to production now');
+    const { result, logStep } = await route('<@UBOT1> ship it to production now');
 
-      expect(result.workflow).toBe('INFORMATIONAL');
-      expect(runDeployWorkflow).not.toHaveBeenCalled();
+    expect(result.workflow).toBe('INFORMATIONAL');
+    expect(runDeployWorkflow).not.toHaveBeenCalled();
+    expect(runImplementationWorkflow).not.toHaveBeenCalled();
+    // The row says what the router wanted, so the difference stays visible.
+    expect(stageLog(logStep, 'router.decision').data).toMatchObject({ tool: 'qa_webapp', agree: false });
+  });
+
+  describe('an action none of the tools reach (issue #606)', () => {
+    const builder = { userId: 'UBUILDER', channelId: 'C-BUILD', intent: 'IMPLEMENTATION' as const };
+    const enforce = () => ({ config: makeConfig('enforce') });
+    const permissions = '<@UBOT1> please give two TAs permission to view proctor reports and extend time';
+    const nothingRan = () => {
       expect(runImplementationWorkflow).not.toHaveBeenCalled();
-      // The row says what the router wanted, so the difference stays visible.
-      expect(stageLog(logStep, 'router.decision').data).toMatchObject({ tool, agree: false });
-    },
-  );
+      expect(runAgenticEntry).not.toHaveBeenCalled();
+      expect(runInvestigationWorkflow).not.toHaveBeenCalled();
+      expect(runDeployWorkflow).not.toHaveBeenCalled();
+    };
+
+    it('says at once what miniOG cannot do and who can, and runs no agent', async () => {
+      routerSays('unsupported', 0.85, {
+        cannot: 'grant access to proctor reports',
+        whoCan: 'someone with admin access to the proctoring system',
+      });
+
+      const { result, logStep, slack } = await route(permissions, builder, enforce());
+
+      nothingRan();
+      // One line, and no "On it. A lookup like this…" opener first.
+      expect(slack.chat.postMessage).toHaveBeenCalledExactlyOnceWith({
+        channel: 'C-BUILD',
+        thread_ts: '111.22',
+        text:
+          "I can't grant access to proctor reports: none of my tools reach that. " +
+          'Someone with admin access to the proctoring system can help with that. ' +
+          'Mention me with "help" to see what I can do here.',
+      });
+      expect(result).toMatchObject({ workflow: 'UNKNOWN', status: 'SKIPPED', slackPosted: true });
+      expect(stageLog(logStep, 'router.unsupported').data).toMatchObject({
+        cannot: 'grant access to proctor reports',
+        whoCan: 'someone with admin access to the proctoring system',
+      });
+      expect(stageLog(logStep, 'router.decision')).toMatchObject({
+        message: 'Router chose unsupported; saying it cannot do this.',
+        data: { tool: 'unsupported', routerWouldRun: 'UNSUPPORTED', agree: true },
+      });
+    });
+
+    it('still says so when the router named no action', async () => {
+      routerSays('unsupported', 0.85);
+
+      const { result, slack } = await route('<@UBOT1> remind me to drink water in 10 mins', builder, enforce());
+
+      nothingRan();
+      expect(repliesOf(slack)).toEqual([
+        'That\'s not something I can do: none of my tools reach it. Mention me with "help" to see what I can do here.',
+      ]);
+      expect(result.status).toBe('SKIPPED');
+    });
+
+    it('answers a reply to its own question the same way', async () => {
+      routerSays('unsupported', 0.85, { cannot: 'send emails' });
+      const clarification = { question: 'What do you need?', askedText: 'can you help' };
+
+      const { slack } = await route('email the batch about the new date', { ...builder, clarification }, enforce());
+
+      nothingRan();
+      expect(repliesOf(slack)[0]).toMatch(/^I can't send emails: /);
+    });
+
+    it('stays silent on an owner mention and on a mention in passing', async () => {
+      routerSays('unsupported', 0.9, { cannot: 'grant access' });
+
+      const owner = await route('<@UOWNER1> please give them access', {
+        mentionType: 'owner' as const,
+        userId: 'UVIEWER',
+      });
+      expect(owner.result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
+      expectNoReply(owner.slack);
+
+      const inPassing = await route(
+        '<@U999> can you give them access? cc <@UBOT1>',
+        { ...builder, mentionReference: true },
+        enforce(),
+      );
+      expect(inPassing.result).toMatchObject({ workflow: 'NONE', status: 'SKIPPED' });
+      expectNoReply(inPassing.slack);
+      nothingRan();
+    });
+
+    it('gives a requester who would be denied the denial, and nothing else', async () => {
+      routerSays('unsupported', 0.9, { cannot: 'grant access' });
+
+      const { result, slack } = await route(permissions, { userId: 'USTRANGER', channelId: 'C-VIEW' }, enforce());
+
+      expect(result.status).toBe('SKIPPED');
+      expect(slack.chat.postMessage).toHaveBeenCalledOnce();
+      expect(slack.chat.postMessage.mock.calls[0][0].text).not.toContain("I can't grant access");
+    });
+
+    it('says nothing once the job is cancelled', async () => {
+      routerSays('unsupported', 0.9, { cannot: 'grant access' });
+      const controller = new AbortController();
+      controller.abort();
+
+      const { result, slack } = await route(permissions, builder, { ...enforce(), signal: controller.signal });
+
+      expect(result.status).toBe('CANCELLED');
+      expectNoReply(slack);
+    });
+  });
 
   const routerFails = { ok: false, error: 'router call failed (exit 1)', durationMs: 3 };
 

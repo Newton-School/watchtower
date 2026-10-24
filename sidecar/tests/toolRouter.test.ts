@@ -74,6 +74,12 @@ describe('buildRouterPrompt', () => {
       'Asked of the owner instead of you, a staging deploy is for the owner to do: stay_silent.',
     );
     expect(prompt).toContain('is ask_user, not a guess');
+    // Issue #606: a permissions ask ran a full lookup; a Sheet ask is still worth one (it attaches CSVs).
+    expect(prompt).toContain('grant access or permissions, enrol or move someone');
+    expect(prompt).toContain('change_code changes code and content in a repository, not live data');
+    expect(prompt).toContain('neither is a message that asks a question beside the action: that is answer');
+    expect(prompt).toContain('Asking for data or a report as a spreadsheet or a Google Sheet is answer too');
+    expect(prompt).toContain('"cannot": "only for unsupported", "who_can": "only for unsupported"');
     expect(prompt).toContain('A message addressed to you directly is never stay_silent');
   });
 
@@ -147,6 +153,32 @@ describe('parseRouterDecision', () => {
     expect(
       parseRouterDecision({ tool: 'answer', confidence: 0.8, reason: 'r', question: 'x' })?.question,
     ).toBeUndefined();
+  });
+
+  it('keeps what miniOG cannot do, and who can, only for unsupported (issue #606)', () => {
+    expect(
+      parseRouterDecision({
+        tool: 'unsupported',
+        confidence: 0.85,
+        reason: 'r',
+        cannot: ' grant access to proctor reports ',
+        who_can: 'an admin of that system',
+      }),
+    ).toEqual({
+      tool: 'unsupported',
+      confidence: 0.85,
+      reason: 'r',
+      cannot: 'grant access to proctor reports',
+      whoCan: 'an admin of that system',
+    });
+    expect(parseRouterDecision({ tool: 'unsupported', confidence: 0.85, reason: 'r', who_can: '' })).toEqual({
+      tool: 'unsupported',
+      confidence: 0.85,
+      reason: 'r',
+    });
+    const answer = parseRouterDecision({ tool: 'answer', confidence: 0.8, reason: 'r', cannot: 'x', who_can: 'y' });
+    expect(answer?.cannot).toBeUndefined();
+    expect(answer?.whoCan).toBeUndefined();
   });
 
   it.each([null, 'answer', {}, { tool: 'PR_REVIEW' }, { tool: 'dev_assist' }, { tool: 'merge_pr', confidence: 1 }])(
