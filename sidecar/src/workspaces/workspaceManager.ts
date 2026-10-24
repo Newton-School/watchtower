@@ -66,6 +66,14 @@ async function excludeNodeModulesFromGit(wsPath: string): Promise<void> {
   }
 }
 
+function hasEntries(dir: string): boolean {
+  try {
+    return fs.readdirSync(dir).length > 0;
+  } catch {
+    return false;
+  }
+}
+
 function sanitizeThreadTs(threadTs: string): string {
   return threadTs.replace(/[^a-zA-Z0-9.-]/g, '_');
 }
@@ -149,10 +157,13 @@ export async function resolveWorkspace(repoPath: string, threadTs: string): Prom
     const defaultBranch = await resolveDefaultRemoteBranch(repoPath);
     await git(['worktree', 'add', '--detach', wsPath, defaultBranch], { cwd: repoPath, timeoutMs: 30_000 });
 
-    // Symlink parent node_modules so tools (Jest, ESLint, etc.) are available in the worktree
+    // Symlink parent node_modules so tools (Jest, ESLint, etc.) are available in the worktree.
+    // Runs that execute the repo's gates replace it with an install for the
+    // worktree's own lockfile (depCache.ts, issue #611). Not an empty one: a link
+    // to an empty directory only told agents the deps were "installed".
     const parentNodeModules = path.join(repoPath, 'node_modules');
     const worktreeNodeModules = path.join(wsPath, 'node_modules');
-    if (fs.existsSync(parentNodeModules) && !fs.existsSync(worktreeNodeModules)) {
+    if (hasEntries(parentNodeModules) && !fs.existsSync(worktreeNodeModules)) {
       try {
         fs.symlinkSync(parentNodeModules, worktreeNodeModules, 'junction');
         logger.info({ wsPath }, 'symlinked node_modules into worktree');

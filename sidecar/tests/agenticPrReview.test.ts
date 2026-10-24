@@ -181,6 +181,7 @@ function makeDeps(overrides: Record<string, unknown> = {}) {
     runBuildGate: vi
       .fn()
       .mockResolvedValue({ ok: true, nodeVersion: 'v20.0.0', usedNvmrc: false, buildScript: 'build', outputTail: '' }),
+    prepareDeps: vi.fn().mockResolvedValue({ status: 'skipped' }),
     ...overrides,
   };
 }
@@ -842,6 +843,72 @@ describe('agenticPrReview', () => {
     expect(orchPrompt).toContain('FAILED at the install stage');
     const texts = slack.chat.postMessage.mock.calls.map((c: any) => c[0].text as string);
     expect(texts.some(t => t.includes('npm ci/build FAILED'))).toBe(true);
+  });
+
+  it('gives the review installed deps for the PR head, after the checkout, and says so in the prompts (issue #611)', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const runAgent = routedRunAgent({ orchestrator: agentOk([]) });
+    const order: string[] = [];
+    const deps = makeDeps({
+      runAgent,
+      checkoutPr: vi.fn(async () => {
+        order.push('checkout');
+        return true;
+      }),
+      prepareDeps: vi.fn(async () => {
+        order.push('deps');
+        return {
+          status: 'ready',
+          manager: 'npm',
+          lockfile: 'package-lock.json',
+          key: 'k',
+          command: 'npm ci',
+          installed: false,
+          linked: 'clone',
+          ms: 10,
+        };
+      }),
+    });
+
+    await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+    });
+
+    expect(order).toEqual(['checkout', 'deps']);
+    expect(deps.prepareDeps).toHaveBeenCalledWith(
+      '/repos/newton-web',
+      expect.objectContaining({ stage: 'agentic.pr_review.deps' }),
+    );
+    const orchPrompt = runAgent.mock.calls
+      .map((c: any[]) => c[0].prompt as string)
+      .find(p => p.includes(ORCHESTRATOR_PROMPT_MARKER)) as string;
+    expect(orchPrompt).toContain("Dependencies: installed in node_modules for this checkout's package-lock.json");
+  });
+
+  it('does not install deps a second time when the build gate already ran', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const deps = makeDeps({
+      fetchDiff: vi.fn().mockResolvedValue({
+        diff: 'diff --git a/package.json b/package.json\n--- a/package.json\n+++ b/package.json\n@@ -1,1 +1,2 @@\n line\n+added',
+        truncated: false,
+        reason: 'ok',
+      }),
+    });
+
+    await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+    });
+
+    expect(deps.runBuildGate).toHaveBeenCalledTimes(1);
+    expect(deps.prepareDeps).not.toHaveBeenCalled();
   });
 
   it('skips the build gate for app-code-only PRs', async () => {

@@ -47,6 +47,7 @@ import type {
 } from '../github/prReviewSupport.js';
 import { isAnchorInDiff, parseDiffHunks } from '../github/diffHunks.js';
 import { resolveWorkspace } from '../workspaces/workspaceManager.js';
+import { depsPromptLine, prepareWorktreeDeps } from '../workspaces/depCache.js';
 import { applyFollowUpScope, formatFollowUpLine, type FollowUpStats } from './reReview.js';
 import { withAgentCallContext } from '../state/runContext.js';
 import { STE_REVIEW_TEXT_RULE } from '../codex/replyStyle.js';
@@ -96,6 +97,8 @@ export interface PrReviewDeps {
   runAgent: typeof runCodex;
   discoverSkills: typeof discoverReviewSkills;
   runBuildGate: typeof runPrBuildGate;
+  /** Installed dependencies for the PR's lockfile, so the review can run its gates (issue #611). */
+  prepareDeps: typeof prepareWorktreeDeps;
 }
 
 export const defaultPrReviewDeps: PrReviewDeps = {
@@ -112,6 +115,7 @@ export const defaultPrReviewDeps: PrReviewDeps = {
   runAgent: request => runWithInfraRetry(request, { label: 'the review', logStep: request.onLog }),
   discoverSkills: discoverReviewSkills,
   runBuildGate: runPrBuildGate,
+  prepareDeps: prepareWorktreeDeps,
 };
 
 /** Rollout switch for the orchestrator-led review. Default ON; set
@@ -1471,6 +1475,15 @@ export async function reviewSinglePr(params: {
     }
   }
 
+  // 4c. Installed dependencies for the PR head's lockfile (issue #611), so the
+  //     review can run typecheck, lint and tests. Not when the build gate ran:
+  //     it installed the PR's own and its verdict already says so.
+  let depsBlock: string | undefined;
+  if (hasLocalRepo && !buildStatusBlock && !signal?.aborted) {
+    const prepared = await deps.prepareDeps(repoPath, { logStep, stage: 'agentic.pr_review.deps', signal });
+    depsBlock = depsPromptLine(repoPath, prepared) || undefined;
+  }
+
   // 5. Orchestrated review (tier 1): a skills-led lead orchestrator + the
   //    security/performance safety-net lenses run in parallel; blocking
   //    findings are adversarially verified, and the survivors are synthesized
@@ -1502,7 +1515,8 @@ export async function reviewSinglePr(params: {
     diff: diffResult.diff,
     userFocusBlock,
     checkoutDegraded,
-    buildStatusBlock,
+    // The prompts carry one block about what is installed and built.
+    buildStatusBlock: buildStatusBlock ?? depsBlock,
     priorReviewBlock,
     priorReviewLensBlock,
   };

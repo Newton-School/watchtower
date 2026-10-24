@@ -141,8 +141,8 @@ describe('resolveWorkspace refresh-on-reuse', () => {
     await git(repo, ['add', '.gitignore']);
     await git(repo, ['commit', '-qm', 'add gitignore']);
     await git(repo, ['push', '-q', 'origin', 'main']);
-    // Parent clone needs a node_modules for the worktree symlink to be created.
-    fs.mkdirSync(path.join(repo, 'node_modules'), { recursive: true });
+    // Parent clone needs a populated node_modules for the worktree symlink to be created.
+    fs.mkdirSync(path.join(repo, 'node_modules', 'left-pad'), { recursive: true });
 
     const ws = await resolveWorkspace(repo, thread);
 
@@ -157,7 +157,7 @@ describe('resolveWorkspace refresh-on-reuse', () => {
     await git(repo, ['add', '.gitignore']);
     await git(repo, ['commit', '-qm', 'add gitignore']);
     await git(repo, ['push', '-q', 'origin', 'main']);
-    fs.mkdirSync(path.join(repo, 'node_modules'), { recursive: true });
+    fs.mkdirSync(path.join(repo, 'node_modules', 'left-pad'), { recursive: true });
 
     const ws1 = await resolveWorkspace(repo, thread);
     expect(fs.existsSync(path.join(ws1, 'node_modules'))).toBe(true);
@@ -171,6 +171,14 @@ describe('resolveWorkspace refresh-on-reuse', () => {
     expect(ws2).toBe(ws1);
     expect(fs.lstatSync(path.join(ws2, 'node_modules')).isSymbolicLink()).toBe(true);
     expect(await git(ws2, ['status', '--porcelain'])).toBe('');
+  });
+
+  it('does not link an empty node_modules: agents read it as "installed" (#611)', async () => {
+    fs.mkdirSync(path.join(repo, 'node_modules'), { recursive: true });
+
+    const ws = await resolveWorkspace(repo, thread);
+
+    expect(fs.existsSync(path.join(ws, 'node_modules'))).toBe(false);
   });
 
   it('reuse discards stale tracked + untracked leftovers from a prior run', async () => {
