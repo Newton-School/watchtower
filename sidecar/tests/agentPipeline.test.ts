@@ -13,6 +13,7 @@ import {
 } from '../src/agents/pipeline.js';
 import { runCodex } from '../src/codex/runCodex.js';
 import { __infraRetry } from '../src/codex/infraRetry.js';
+import { activeClock } from '../src/runtime/activeClock.js';
 import { currentConnectors, withConnectors } from '../src/backends/connectors.js';
 import { fetchThreadContext } from '../src/slack/threadContext.js';
 import { __resetButtonRepliesForTests, recordButtonReply, rememberPrompt } from '../src/slack/buttonReplies.js';
@@ -1670,6 +1671,85 @@ describe('agentPipeline and a dropped connection (issue #439)', () => {
     expect(result.finalStatus).toBe('passed');
     expect(result.steps.map(step => step.role)).toEqual(['planner', 'reviewer']);
     expect(logStep).not.toHaveBeenCalledWith(expect.objectContaining({ stage: 'pipeline.timeout' }));
+  });
+});
+
+describe('the pipeline budget and a sleeping host (issue #586)', () => {
+  const MIN = 60_000;
+  const step = (parsedJson: Record<string, unknown>) =>
+    ({
+      ok: true,
+      exitCode: 0,
+      timedOut: false,
+      stdout: '',
+      stderr: '',
+      lastMessage: '',
+      durationMs: 10,
+      parsedJson,
+    }) as any;
+  const planned = step({ plan: ['x'], risks: [], affectedFiles: [], scope: 'small', requiresCodeChanges: false });
+  const reviewed = step({ approved: true, findings: [], blockers: [] });
+  const tenMinuteRun = () =>
+    makeContext({ pipelineConfig: makePipelineConfig({ agents: ['planner', 'reviewer'], totalTimeoutMs: 10 * MIN }) });
+  const logged = (stage: string) => logStep.mock.calls.map(([entry]) => entry).find(entry => entry.stage === stage);
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    // The clock's tick starts again, under the fake timers.
+    activeClock.stop();
+    vi.mocked(runCodex).mockReset();
+    logStep.mockClear();
+  });
+  afterEach(() => {
+    activeClock.stop();
+    vi.useRealTimers();
+  });
+
+  it('does not charge an hour asleep to a ten-minute budget, and logs that the host slept', async () => {
+    vi.mocked(runCodex)
+      .mockImplementationOnce(async () => {
+        // The lid is closed for an hour while the planner runs: no timer runs
+        // until the machine wakes.
+        vi.setSystemTime(Date.now() + 60 * MIN);
+        return planned;
+      })
+      .mockResolvedValueOnce(reviewed);
+
+    const result = await runAgentPipeline({ ctx: tenMinuteRun(), slack: slack as any, logStep });
+
+    expect(result.finalStatus).toBe('passed');
+    expect(result.steps.map(s => s.role)).toEqual(['planner', 'reviewer']);
+    expect(logged('pipeline.timeout')).toBeUndefined();
+    expect(logged('pipeline.host_slept')).toMatchObject({
+      message: "The host was asleep for 1 h; that time does not count against the run's budget.",
+      data: { sleptMs: 60 * MIN - 5_000 },
+    });
+    expect(logged('pipeline.finish')?.data.hostSleptMs).toBe(60 * MIN - 5_000);
+  });
+
+  it('still stops a run whose agents really worked past the budget', async () => {
+    vi.mocked(runCodex)
+      .mockImplementationOnce(async () => {
+        await vi.advanceTimersByTimeAsync(15 * MIN);
+        return planned;
+      })
+      .mockResolvedValueOnce(reviewed);
+
+    const result = await runAgentPipeline({ ctx: tenMinuteRun(), slack: slack as any, logStep });
+
+    expect(result.finalStatus).toBe('aborted');
+    expect(result.steps.map(s => s.role)).toEqual(['planner']);
+    expect(logged('pipeline.timeout')?.data).toMatchObject({ elapsed: 15 * MIN, hostSleptMs: 0 });
+    expect(logged('pipeline.host_slept')).toBeUndefined();
+  });
+
+  it('stops logging host sleep once the run is over', async () => {
+    vi.mocked(runCodex).mockResolvedValueOnce(planned).mockResolvedValueOnce(reviewed);
+    await runAgentPipeline({ ctx: tenMinuteRun(), slack: slack as any, logStep });
+
+    vi.setSystemTime(Date.now() + 60 * MIN);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(logged('pipeline.host_slept')).toBeUndefined();
   });
 });
 

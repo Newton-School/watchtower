@@ -17,6 +17,7 @@ import { computeCostUsd } from '../pricing/modelPrices.js';
 import { agentCallContext } from '../state/runContext.js';
 import { createStreamDecoder } from './streamEvents.js';
 import { reportConnectorStatuses } from '../runtime/connectorAlerts.js';
+import { activeClock } from '../runtime/activeClock.js';
 import type { DossierStore } from '../state/dossierStore.js';
 
 /**
@@ -85,20 +86,22 @@ export function selectBackendForUser(opts: {
   return fallback;
 }
 
+// Only awake time counts: a plain timer fires the moment the host wakes, so
+// it killed agents for time the machine spent asleep (issue #586).
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, onTimeout: () => void): Promise<T> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
+    const cancel = activeClock.setTimeout(() => {
       onTimeout();
       reject(new Error('CODex_TIMEOUT'));
     }, timeoutMs);
 
     promise
       .then(value => {
-        clearTimeout(timer);
+        cancel();
         resolve(value);
       })
       .catch(error => {
-        clearTimeout(timer);
+        cancel();
         reject(error);
       });
   });
@@ -474,8 +477,8 @@ export async function runAgent(rawRequest: CodexRunRequest, backend: AgentBacken
             level: 'ERROR',
             data: {
               timeoutMs: request.timeoutMs,
-              // Wall-clock time since spawn. A timer cannot fire while the host
-              // sleeps, so this can be far past timeoutMs (issue #440).
+              // Wall-clock time since spawn: past timeoutMs by any time the
+              // host slept, which the timeout does not count (issues #440, #586).
               elapsedMs: Date.now() - spawnedAt,
             },
           });
