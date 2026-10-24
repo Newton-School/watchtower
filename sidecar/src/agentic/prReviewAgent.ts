@@ -125,14 +125,18 @@ function orchestratedReviewEnabled(): boolean {
   return (process.env.WATCHTOWER_PR_REVIEW_ORCHESTRATED ?? '1') !== '0';
 }
 
-/** Shared severity rubric — byte-identical across the one-shot, lens, and
- * orchestrator prompts so calibration (and the pinned prompt tests) never drift. */
+/** Shared severity rubric — byte-identical across the one-shot, lens,
+ * orchestrator and verifier prompts so calibration (and the pinned prompt
+ * tests) never drift. The "Medium or low" line came with the 5.5 models: they
+ * rated real but narrow bugs and missing tests as low, and lows are not posted
+ * inline, so 30 of 40 reviews in the first week posted no inline comment. */
 export const SEVERITY_RUBRIC = `- Severity — calibrate against this rubric (web/api review); only report issues actually present in the diff, never pre-existing code:
   - critical: exploitable or data-destroying in production — auth bypass, SQL/command injection, secret/PII leak, an unguarded destructive query (e.g. user input concatenated into a raw SQL string).
   - high: a likely runtime break or security/perf regression on a real path — unhandled rejection on the happy path, missing authz on a new mutating endpoint, an N+1 added inside a request handler.
   - medium: a real bug behind a narrower condition or a meaningful gap — edge case mishandled, missing validation on a non-critical field, absent error handling, missing test for new branching logic.
-  - low: localized correctness/maintainability nits with little blast radius — a narrow off-by-one in a bounded loop, minor readability/naming, a redundant re-render.
-  - info: non-actionable observations or style notes that don't require a change.`;
+  - low: maintainability nits with little blast radius — minor readability/naming, duplication, a redundant re-render, an inconsistency no user or caller would notice.
+  - info: non-actionable observations or style notes that don't require a change.
+  - Medium or low: code that does the wrong thing for some input, state or timing a user or caller can reach is medium or above, however narrow or uncommon the condition — narrowness keeps it below high, it does not make it low. Low is for what changes nothing a user or caller can notice. A missing test for new branching logic is medium even when the rest of the module has no tests. A security weakness on input someone outside can send (SSRF, path traversal, missing authorization, data or secret exposure) is never low.`;
 
 /** Pinned invariant: the agent never posts — submitPrReview is the sole GitHub write path. */
 export const NEVER_POST_RULE =
@@ -445,9 +449,29 @@ ${diff}
 \`\`\``.trim();
 }
 
+/** What a verifier may give as the reason for lowering a finding. */
+export const SEVERITY_BASES = ['no-behaviour-change', 'not-shipped', 'smaller-impact'] as const;
+type SeverityBasis = (typeof SEVERITY_BASES)[number];
+
+/** The only reasons that take a finding below medium, out of the inline
+ * comments. With "smaller-impact" (or none) such a downgrade stops at medium:
+ * Sonnet 5.5 lowered 48 of 61 mediums to low as "real but narrow", "an
+ * uncommon setup" or "a coverage gap", which the rubric calls medium. */
+const BELOW_MEDIUM_BASES: ReadonlySet<string> = new Set<SeverityBasis>(['no-behaviour-change', 'not-shipped']);
+
+/** A verifier's change to a finding's severity, as proposed and as applied. */
+export interface SeverityChange {
+  from: AgentFinding['severity'];
+  proposed: AgentFinding['severity'];
+  /** What the finding got: `proposed`, or medium when a downgrade below medium had no accepted basis. */
+  applied: AgentFinding['severity'];
+  basis?: SeverityBasis;
+  reason?: string;
+}
+
 /** Adversarial skeptic prompt for one finding — default to refuting. The
  * adjudicator tier gets the same contract with a senior, independent framing. */
-function buildVerifierPrompt(params: {
+export function buildPrReviewVerifierPrompt(params: {
   finding: AgentFinding & { lens: PrReviewRole };
   diff: string;
   oneShot: boolean;
@@ -478,12 +502,23 @@ ${evidence}
 Confirm ALL of the following, or REFUTE:
 1. The issue is real in the actual code (not a misreading of the diff).
 2. It lives in code THIS PR changed (anchored in the diff below).
-3. The stated severity is justified by the rubric — if it is overstated, return verdict "confirmed" with a corrected, lower "severity".
+3. The stated severity matches the rubric below. If it is overstated, return verdict "confirmed" with the corrected, lower "severity" and a "severityBasis".
+
+${SEVERITY_RUBRIC}
+
+Lowering severity:
+- Rate the issue by the rubric, not by how likely you think it is to happen. "Real but narrow", "an uncommon setup", "nice to have" and "the module has no other tests" describe a medium; they are not reasons to go lower.
+- A finding goes below medium (to low or info) only with one of these "severityBasis" values:
+  - "no-behaviour-change": nothing a user or caller can notice changes (naming, duplication, readability, style, a redundant re-render).
+  - "not-shipped": the code never runs for real users (a scratch file marked not for merging, a test fixture, a path nothing calls).
+  Any other lowering of a medium-or-above finding stops at medium.
+- For any other lowering (e.g. high to medium), use "severityBasis": "smaller-impact".
+- In "reason", name the rubric line you applied.
 
 You must NOT post anything to GitHub or Slack. Do not run \`gh\`, \`git push\`, \`curl\`, or any network command.
 
 Your final message must be ONLY this JSON object (no prose, no code fences):
-{ "verdict": "confirmed" | "refuted", "severity"?: "critical"|"high"|"medium"|"low"|"info", "reason"?: string }
+{ "verdict": "confirmed" | "refuted", "severity"?: "critical"|"high"|"medium"|"low"|"info", "severityBasis"?: "no-behaviour-change"|"not-shipped"|"smaller-impact", "reason"?: string }
 
 PR Diff:
 \`\`\`diff
@@ -577,6 +612,15 @@ async function runReviewLens(params: {
   return { lens, result: ok ? result : undefined, ok };
 }
 
+type VerifierVerdict = {
+  verdict: 'confirmed' | 'refuted';
+  /** The severity the finding now has, when the verifier lowered it. */
+  severityOverride?: AgentFinding['severity'];
+  /** The verifier's proposed downgrade, for the log (also when it was refused). */
+  severityChange?: SeverityChange;
+  inconclusive: boolean;
+};
+
 /** One verifier run. FAILS OPEN — a crashed/timed-out skeptic keeps the finding
  * (verdict 'confirmed', inconclusive true); only an explicit refute drops it. */
 async function runVerifier(params: {
@@ -591,7 +635,7 @@ async function runVerifier(params: {
   verifierSchemaPath: string;
   logStep?: WorkflowStepLogger;
   signal?: AbortSignal;
-}): Promise<{ verdict: 'confirmed' | 'refuted'; severityOverride?: AgentFinding['severity']; inconclusive: boolean }> {
+}): Promise<VerifierVerdict> {
   const { deps, cwd, finding, diff, oneShot, githubToken, timeoutMs, verifierSchemaPath, logStep, signal } = params;
   const tier = params.tier ?? 'primary';
   const profile = verifierProfile(tier);
@@ -601,7 +645,7 @@ async function runVerifier(params: {
     result = await withAgentCallContext({ role: 'verifier' }, () =>
       deps.runAgent({
         cwd,
-        prompt: buildVerifierPrompt({ finding, diff, oneShot, tier }),
+        prompt: buildPrReviewVerifierPrompt({ finding, diff, oneShot, tier }),
         outputSchemaPath: verifierSchemaPath,
         githubToken,
         ...profile,
@@ -631,17 +675,37 @@ async function runVerifier(params: {
   }
 
   const verdict = result.parsedJson.verdict === 'refuted' ? 'refuted' : 'confirmed';
-  // Only honor a DOWNGRADE (the prompt asks the verifier to lower an overstated
-  // severity). Ignore an escalation — it would otherwise promote a single-vote
-  // 'high' to 'critical' behind the best-of-3 gate that real criticals get.
-  const rawSeverity = result.parsedJson.severity;
+  if (verdict === 'refuted') return { verdict, inconclusive: false };
+  const severityChange = readSeverityChange(finding.severity, result.parsedJson);
   const severityOverride =
-    typeof rawSeverity === 'string' &&
-    rawSeverity in SEVERITY_RANK &&
-    SEVERITY_RANK[rawSeverity as AgentFinding['severity']] < SEVERITY_RANK[finding.severity]
-      ? (rawSeverity as AgentFinding['severity'])
-      : undefined;
-  return { verdict, severityOverride, inconclusive: false };
+    severityChange && severityChange.applied !== finding.severity ? severityChange.applied : undefined;
+  return { verdict, severityOverride, severityChange, inconclusive: false };
+}
+
+/**
+ * The verifier's downgrade, if any. Only a DOWNGRADE is honored (the prompt
+ * asks the verifier to lower an overstated severity); an escalation would
+ * otherwise promote a single-vote 'high' to 'critical' behind the best-of-3
+ * gate that real criticals get. A downgrade from medium or above to below
+ * medium needs a basis in BELOW_MEDIUM_BASES, or it stops at medium.
+ */
+export function readSeverityChange(
+  from: AgentFinding['severity'],
+  verdictJson: Record<string, unknown>,
+): SeverityChange | undefined {
+  const raw = verdictJson.severity;
+  // hasOwn, not `in`: "constructor" or "valueOf" from a vote would otherwise
+  // pass as a severity and get the finding dropped as invalid.
+  if (typeof raw !== 'string' || !Object.hasOwn(SEVERITY_RANK, raw)) return undefined;
+  const proposed = raw as AgentFinding['severity'];
+  if (SEVERITY_RANK[proposed] >= SEVERITY_RANK[from]) return undefined;
+  const basis = (SEVERITY_BASES as readonly string[]).includes(String(verdictJson.severityBasis))
+    ? (verdictJson.severityBasis as SeverityBasis)
+    : undefined;
+  const leavesInline = SEVERITY_RANK[from] >= SEVERITY_RANK.medium && SEVERITY_RANK[proposed] < SEVERITY_RANK.medium;
+  const applied = leavesInline && !BELOW_MEDIUM_BASES.has(basis ?? '') ? 'medium' : proposed;
+  const reason = typeof verdictJson.reason === 'string' ? verdictJson.reason : undefined;
+  return { from, proposed, applied, ...(basis ? { basis } : {}), ...(reason ? { reason } : {}) };
 }
 
 /** Verify one finding. high → one primary vote, with a primary refute
@@ -659,7 +723,7 @@ async function verifyOneFinding(params: {
   verifierSchemaPath: string;
   logStep?: WorkflowStepLogger;
   signal?: AbortSignal;
-}): Promise<{ verdict: 'confirmed' | 'refuted'; severityOverride?: AgentFinding['severity']; inconclusive: boolean }> {
+}): Promise<VerifierVerdict> {
   const { finding, logStep } = params;
   // A medium does not drive the blocking warning, so one light-tier vote
   // decides it: cheap enough to run on every medium, and a wrong refute costs
@@ -688,8 +752,14 @@ async function verifyOneFinding(params: {
   if (refutes >= 2) {
     return { verdict: 'refuted', inconclusive };
   }
-  const severityOverride = votes.find(v => v.verdict === 'confirmed' && v.severityOverride)?.severityOverride;
-  return { verdict: 'confirmed', severityOverride, inconclusive };
+  const lowered = votes.find(v => v.verdict === 'confirmed' && v.severityOverride);
+  const proposed = lowered ?? votes.find(v => v.verdict === 'confirmed' && v.severityChange);
+  return {
+    verdict: 'confirmed',
+    severityOverride: lowered?.severityOverride,
+    severityChange: proposed?.severityChange,
+    inconclusive,
+  };
 }
 
 /**
@@ -741,6 +811,7 @@ async function verifyFindings(params: {
   const survivors: Array<AgentFinding & { lens: PrReviewRole }> = [...overflow];
   let refuted = 0;
   let inconclusive = 0;
+  const severityChanges: Array<SeverityChange & { lens: PrReviewRole; file?: string; line?: number }> = [];
 
   for (let i = 0; i < toVerify.length; i += VERIFY_CONCURRENCY) {
     if (signal?.aborted) {
@@ -757,14 +828,25 @@ async function verifyFindings(params: {
         refuted += 1;
         return;
       }
+      if (v.severityChange) {
+        severityChanges.push({
+          ...v.severityChange,
+          reason: v.severityChange.reason?.slice(0, 300),
+          lens: finding.lens,
+          file: finding.file,
+          line: finding.line,
+        });
+      }
       survivors.push(v.severityOverride ? { ...finding, severity: v.severityOverride } : finding);
     });
   }
 
   const confirmed = toVerify.length - refuted;
+  const lowered = severityChanges.filter(change => change.applied !== change.from).length;
+  const keptAtMedium = severityChanges.filter(change => change.applied !== change.proposed).length;
   logStep?.({
     stage: 'agentic.pr_review.verify.done',
-    message: `Verify: ${survivors.length} kept (${confirmed} confirmed + ${overflow.length} unverified), ${refuted} refuted, ${inconclusive} inconclusive of ${toVerify.length} checked.`,
+    message: `Verify: ${survivors.length} kept (${confirmed} confirmed + ${overflow.length} unverified), ${refuted} refuted, ${inconclusive} inconclusive of ${toVerify.length} checked; ${lowered} lowered, ${keptAtMedium} kept at medium.`,
     data: {
       candidates: candidates.length,
       checked: toVerify.length,
@@ -773,6 +855,9 @@ async function verifyFindings(params: {
       inconclusive,
       unverifiedKept: overflow.length,
       kept: survivors.length,
+      lowered,
+      keptAtMedium,
+      severityChanges,
     },
   });
   return survivors;

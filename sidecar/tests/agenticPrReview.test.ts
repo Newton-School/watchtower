@@ -100,7 +100,7 @@ function agentDead() {
   };
 }
 
-function agentVerify(verdict: 'confirmed' | 'refuted', severity?: string) {
+function agentVerify(verdict: 'confirmed' | 'refuted', severity?: string, extra: Record<string, unknown> = {}) {
   return {
     ok: true,
     exitCode: 0,
@@ -108,7 +108,7 @@ function agentVerify(verdict: 'confirmed' | 'refuted', severity?: string) {
     stdout: '{}',
     stderr: '',
     lastMessage: '',
-    parsedJson: { verdict, ...(severity ? { severity } : {}) },
+    parsedJson: { verdict, ...(severity ? { severity } : {}), ...extra },
     durationMs: 5,
     backend: 'codex',
   };
@@ -1358,6 +1358,101 @@ describe('agenticPrReview', () => {
     expect(outcomes[0].severityCounts).toEqual({ medium: 1 });
     const texts = slack.chat.postMessage.mock.calls.map((c: any) => c[0].text as string);
     expect(texts.some(t => t.includes('blocking-severity finding'))).toBe(false);
+  });
+
+  describe('a verifier that lowers a finding below medium (the 5.5 models)', () => {
+    const lowered = async (extra: Record<string, unknown>) => {
+      const slack = makeSlack([`review ${WEB_PR}`]);
+      const runAgent = routedRunAgent({
+        reviewer: agentOk([
+          {
+            role: 'reviewer',
+            severity: 'medium',
+            category: 'edge-case',
+            message: 'NaN on 0',
+            file: 'src/a.ts',
+            line: 2,
+          },
+        ]),
+        verifier: () => agentVerify('confirmed', 'low', extra),
+      });
+      const deps = makeDeps({ runAgent });
+      const logStep = vi.fn();
+      const result = await runAgenticPrReview({
+        task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+        config,
+        slack: slack as any,
+        store: emptyStore,
+        deps: deps as any,
+        logStep,
+      });
+      const done = logStep.mock.calls.map(c => c[0]).find(entry => entry.stage === 'agentic.pr_review.verify.done');
+      const inline = deps.submitReview.mock.calls[0][0].findingsByRole.flatMap((r: any) => r.findings);
+      return { outcome: (result.result as any).outcomes[0], done, inline };
+    };
+
+    it('keeps a real but narrow bug at medium, posts it inline, and logs the refused downgrade', async () => {
+      const reason = 'Real, but only when total is 0, an uncommon setup.';
+      const { outcome, done, inline } = await lowered({ severityBasis: 'smaller-impact', reason });
+
+      expect(outcome.severityCounts).toEqual({ medium: 1 });
+      expect(inline).toHaveLength(1);
+      expect(done.message).toContain('0 lowered, 1 kept at medium');
+      expect(done.data).toMatchObject({
+        lowered: 0,
+        keptAtMedium: 1,
+        severityChanges: [
+          {
+            from: 'medium',
+            proposed: 'low',
+            applied: 'medium',
+            basis: 'smaller-impact',
+            reason,
+            lens: 'reviewer',
+            file: 'src/a.ts',
+            line: 2,
+          },
+        ],
+      });
+    });
+
+    it('also keeps it at medium when the verifier gives no basis', async () => {
+      const { outcome, done } = await lowered({});
+
+      expect(outcome.severityCounts).toEqual({ medium: 1 });
+      expect(done.data.severityChanges[0]).toMatchObject({ proposed: 'low', applied: 'medium' });
+      expect(done.data.severityChanges[0].basis).toBeUndefined();
+    });
+
+    it.each(['no-behaviour-change', 'not-shipped'])('lowers it to low with the basis "%s"', async basis => {
+      const { outcome, done, inline } = await lowered({ severityBasis: basis });
+
+      expect(outcome.severityCounts).toEqual({ low: 1 });
+      expect(inline).toEqual([]);
+      expect(done.data).toMatchObject({ lowered: 1, keptAtMedium: 0 });
+      expect(done.data.severityChanges[0]).toMatchObject({ from: 'medium', applied: 'low', basis });
+    });
+  });
+
+  it('a high lowered to low without an accepted basis stops at medium', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const runAgent = routedRunAgent({
+      security: agentOk([
+        { role: 'security', severity: 'high', category: 'ssrf', message: 'unchecked URL', file: 'src/a.ts', line: 2 },
+      ]),
+      verifier: () => agentVerify('confirmed', 'low', { severityBasis: 'smaller-impact' }),
+    });
+    const deps = makeDeps({ runAgent });
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+    });
+
+    expect((result.result as any).outcomes[0].severityCounts).toEqual({ medium: 1 });
   });
 
   it('verifier severity escalation is ignored (no high → critical promotion)', async () => {
