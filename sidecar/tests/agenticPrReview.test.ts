@@ -892,7 +892,7 @@ describe('agenticPrReview', () => {
   it('fails plainly when it cannot make its own worktree, and never checks the PR out in the shared clone', async () => {
     const slack = makeSlack([`review ${WEB_PR}`]);
     const message =
-      "I couldn't set up my own copy of newton-web for this, so I didn't run anything. Ask me again in a few minutes.";
+      "I couldn't set up my own copy of newton-web to work in, so I stopped here. Ask me again in a few minutes.";
     const deps = makeDeps({ resolveWorkspaceFn: vi.fn().mockRejectedValue(new WorkspaceSetupError(message)) });
 
     const result = await runAgenticPrReview({

@@ -202,7 +202,7 @@ export async function resolveWorkspace(repoPath: string, threadTs: string): Prom
     // The cause (git's own words, with local paths) goes to the log, not Slack.
     logger.error({ repoPath, threadTs, wsPath, error: String(error) }, 'failed to create workspace');
     throw new WorkspaceSetupError(
-      `I couldn't set up my own copy of ${repoNameFromPath(repoPath)} for this, so I didn't run anything. Ask me again in a few minutes.`,
+      `I couldn't set up my own copy of ${repoNameFromPath(repoPath)} to work in, so I stopped here. Ask me again in a few minutes.`,
     );
   }
 }

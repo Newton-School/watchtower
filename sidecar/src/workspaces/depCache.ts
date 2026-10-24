@@ -25,9 +25,11 @@ const execFileAsync = promisify(execFile);
  * Installs run outside the agents' sandbox and are shared between runs, so no
  * package code runs during them (`--ignore-scripts`) and they get none of the
  * sidecar's environment beyond what the package manager needs. The gates the
- * agents run don't need install scripts: esbuild, Next's SWC and sharp load
- * their prebuilt binaries from optional platform packages (checked on the
- * marketing site: tsc, eslint and `next build` all pass).
+ * agents run don't need install scripts: esbuild and Next's SWC load their
+ * prebuilt binaries from optional platform packages (checked on the marketing
+ * site: tsc, eslint and `next build` all pass). sharp does too from 0.33 on;
+ * an older one (newton-web pins 0.31.3) is left without its binary, which
+ * `next build` doesn't need.
  */
 
 export type PackageManager = 'npm' | 'pnpm' | 'yarn';
@@ -188,7 +190,7 @@ const inUse = new Map<string, number>();
 const failures = new Map<string, { at: number; reason: string }>();
 const states = new Map<string, WorktreeDeps>();
 const MAX_STATES = 500;
-let swept = false;
+let sweeping: Promise<void> | undefined;
 
 function acquire(entry: string): void {
   inUse.set(entry, (inUse.get(entry) ?? 0) + 1);
@@ -261,16 +263,25 @@ export async function discardInBackground(target: string): Promise<void> {
   }
 }
 
-/** Leftovers of a run that stopped mid-install, once per process. */
-async function sweepOnce(): Promise<void> {
-  if (swept) return;
-  swept = true;
+/**
+ * Deletes what a restart left behind: the trash being deleted and installs
+ * stopped halfway, gigabytes either way. Once per process: called at startup
+ * without waiting, and awaited before the first install, so its free-space
+ * check counts what this frees. Never throws.
+ */
+export function sweepDepCache(): Promise<void> {
+  sweeping ??= sweep();
+  return sweeping;
+}
+
+async function sweep(): Promise<void> {
   let repos: string[];
   try {
     repos = fs.readdirSync(__depCache.root);
   } catch {
     return; // no cache yet
   }
+  const doomed: string[] = [];
   for (const repo of repos) {
     const repoDir = path.join(__depCache.root, repo);
     try {
@@ -278,17 +289,26 @@ async function sweepOnce(): Promise<void> {
         // Out of the way first, so a discard made meanwhile gets a fresh trash.
         const old = path.join(__depCache.root, `.trash-old-${crypto.randomBytes(4).toString('hex')}`);
         fs.renameSync(repoDir, old);
-        void fs.promises.rm(old, { recursive: true, force: true }).catch(() => undefined);
+        doomed.push(old);
         continue;
       }
       if (repo.startsWith('.') || !fs.statSync(repoDir).isDirectory()) continue;
       for (const entry of fs.readdirSync(repoDir)) {
-        if (entry.includes('.tmp-')) await discardInBackground(path.join(repoDir, entry));
+        // No install is under way yet: each one waits for this sweep first.
+        if (entry.includes('.tmp-')) doomed.push(path.join(repoDir, entry));
       }
     } catch {
       // gone already
     }
   }
+  await Promise.all(
+    doomed.map(dir =>
+      fs.promises
+        .rm(dir, { recursive: true, force: true })
+        .catch(error => logger.warn({ dir, error: String(error) }, 'could not delete a leftover dependency install')),
+    ),
+  );
+  if (doomed.length > 0) logger.info({ removed: doomed.length }, 'deleted dependency installs a restart left behind');
 }
 
 function isComplete(entry: string): boolean {
@@ -362,7 +382,7 @@ function untilAborted<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
 
 /** Installs into a temp directory beside the entry, then renames it into place. */
 async function install(entry: string, source: string, plan: Extract<DepsPlan, { kind: 'install' }>): Promise<void> {
-  await sweepOnce();
+  await sweepDepCache();
   fs.mkdirSync(path.dirname(entry), { recursive: true });
   const free = freeBytes(path.dirname(entry));
   if (free !== undefined && free < __depCache.minFreeBytes) {
@@ -397,12 +417,15 @@ async function install(entry: string, source: string, plan: Extract<DepsPlan, { 
 function describeFailure(error: unknown, what: 'install' | 'copy' = 'install'): string {
   const err = error as { killed?: boolean; name?: string; code?: unknown; stderr?: unknown; message?: string };
   if (err?.name === 'AbortError') return `the run was stopped during the ${what}`;
-  if (err?.code === 'ENOSPC') return `the disk filled up during the ${what}`;
+  const stderr = typeof err?.stderr === 'string' ? err.stderr.trim() : '';
+  // fs errors carry ENOSPC; `cp` and `npm` exit with a status and say it in stderr.
+  if (err?.code === 'ENOSPC' || /No space left on device|ENOSPC/.test(stderr)) {
+    return `the disk filled up during the ${what}`;
+  }
   if (err?.killed) {
     const limit = what === 'install' ? __depCache.installTimeoutMs : __depCache.copyTimeoutMs;
     return `the ${what} took longer than ${Math.round(limit / 60_000)} min`;
   }
-  const stderr = typeof err?.stderr === 'string' ? err.stderr.trim() : '';
   const text = (stderr || err?.message || String(error)).replace(/\s+/g, ' ').trim();
   return text.length > 240 ? `…${text.slice(-240)}` : text;
 }
@@ -548,5 +571,5 @@ export function __resetDepCacheState(): void {
   inUse.clear();
   failures.clear();
   states.clear();
-  swept = false;
+  sweeping = undefined;
 }

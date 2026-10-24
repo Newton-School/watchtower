@@ -1491,7 +1491,7 @@ export async function reviewSinglePr(params: {
       const failureMessage =
         error instanceof WorkspaceSetupError
           ? error.message
-          : `I couldn't set up my own copy of ${prContext.repo} for this review, so I didn't run anything. Ask me again in a few minutes.`;
+          : `I couldn't set up my own copy of ${prContext.repo} to review in, so I stopped here. Ask me again in a few minutes.`;
       logStep?.({
         stage: 'agentic.pr_review.workspace_failed',
         level: 'ERROR',

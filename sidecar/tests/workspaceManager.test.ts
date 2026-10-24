@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
@@ -183,8 +183,40 @@ describe('resolveWorkspace refresh-on-reuse', () => {
     // A worktree's own install (depCache.ts): newton-web's is 200k files, more than git deletes in its timeout.
     fs.mkdirSync(path.join(ws, 'node_modules', 'next'), { recursive: true });
     fs.writeFileSync(path.join(ws, 'node_modules', 'next', 'index.js'), 'x');
+    const rename = vi.spyOn(fs, 'renameSync');
 
-    expect(await removeWorktreeByPath(ws)).toBe(true);
+    try {
+      expect(await removeWorktreeByPath(ws)).toBe(true);
+      expect(rename).toHaveBeenCalledWith(
+        path.join(ws, 'node_modules'),
+        expect.stringContaining(path.join(TEST_HOME, '.watchtower', 'dep-cache', '.trash') + path.sep),
+      );
+    } finally {
+      rename.mockRestore();
+    }
+    expect(fs.existsSync(ws)).toBe(false);
+    expect(await git(repo, ['worktree', 'list', '--porcelain'])).not.toContain(ws);
+  });
+
+  it('when git cannot remove a worktree, deletes the directory and prunes its registration (#611)', async () => {
+    const ws = await resolveWorkspace(repo, thread);
+    // A `git` first on PATH that fails `worktree remove`, as a timed-out one did.
+    const realGit = (await execFileAsync('which', ['git'])).stdout.trim();
+    const fakeBin = await mkdtemp(path.join(os.tmpdir(), 'wt-fakegit-'));
+    const script = [
+      '#!/bin/sh',
+      'if [ "$1" = worktree ] && [ "$2" = remove ]; then echo "fatal: killed" >&2; exit 1; fi',
+      `exec "${realGit}" "$@"`,
+    ].join('\n');
+    fs.writeFileSync(path.join(fakeBin, 'git'), `${script}\n`, { mode: 0o755 });
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${fakeBin}${path.delimiter}${originalPath}`;
+    try {
+      expect(await removeWorktreeByPath(ws)).toBe(true);
+    } finally {
+      process.env.PATH = originalPath;
+      await rm(fakeBin, { recursive: true, force: true });
+    }
 
     expect(fs.existsSync(ws)).toBe(false);
     expect(await git(repo, ['worktree', 'list', '--porcelain'])).not.toContain(ws);
@@ -207,7 +239,7 @@ describe('resolveWorkspace refresh-on-reuse', () => {
     try {
       await expect(resolveWorkspace(notARepo, thread)).rejects.toBeInstanceOf(WorkspaceSetupError);
       await expect(resolveWorkspace(notARepo, thread)).rejects.toThrow(
-        /couldn't set up my own copy of wt-plain-\w+ for this, so I didn't run anything/,
+        /couldn't set up my own copy of wt-plain-\w+ to work in, so I stopped here/,
       );
     } finally {
       await rm(notARepo, { recursive: true, force: true });

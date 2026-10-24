@@ -9,6 +9,7 @@ import {
   installEnv,
   planDeps,
   prepareWorktreeDeps,
+  sweepDepCache,
 } from '../src/workspaces/depCache.js';
 import { buildCoderPrompt, buildReviewerPrompt, buildVerifierPrompt } from '../src/agents/prompts.js';
 import type { AgentContext } from '../src/agents/types.js';
@@ -19,6 +20,8 @@ import type { AgentContext } from '../src/agents/types.js';
 
 const original = { ...__depCache };
 const NPM_CI = 'npm ci --ignore-scripts --no-audit --no-fund --loglevel=error';
+/** What marks a finished install in the cache. */
+const MARKER_FILE = '.watchtower-deps.json';
 let tmp: string;
 let installs: string[];
 
@@ -111,6 +114,47 @@ describe('the cache key', () => {
     const unlocked = path.join(tmp, 'unlocked');
     write(unlocked, { 'package.json': '{}' });
     expect(planDeps(unlocked)).toEqual({ kind: 'unsupported', reason: 'the repo has no lockfile' });
+  });
+});
+
+describe('what a restart left behind', () => {
+  function leftovers(): { trash: string; tmp: string } {
+    const trash = path.join(__depCache.root, '.trash', '1-abcd', 'next');
+    const tmp = path.join(repoDir(), 'deadbeef.tmp-123-ab', 'node_modules');
+    write(trash, { 'index.js': 'x' });
+    write(tmp, { 'index.js': 'x' });
+    return { trash, tmp };
+  }
+
+  it('is deleted by the sweep the sidecar starts with, including a half-finished install', async () => {
+    leftovers();
+    write(path.join(repoDir(), 'cafe0000', 'node_modules'), { [MARKER_FILE]: '{"key":"cafe0000"}' });
+
+    await sweepDepCache();
+
+    expect(fs.readdirSync(__depCache.root)).toEqual(['newton-marketing-web']);
+    // A finished install stays.
+    expect(fs.readdirSync(repoDir())).toEqual(['cafe0000']);
+  });
+
+  it('is gone before the first install checks for free disk', async () => {
+    const { trash, tmp } = leftovers();
+    const statfs = vi.spyOn(fs, 'statfsSync');
+    let leftAtCheck: boolean | undefined;
+    statfs.mockImplementation(((_dir: fs.PathLike) => {
+      leftAtCheck =
+        fs.existsSync(trash) ||
+        fs.existsSync(tmp) ||
+        fs.readdirSync(__depCache.root).some(name => name.startsWith('.trash-old'));
+      return { bavail: 1, bsize: 1 } as fs.StatsFs;
+    }) as typeof fs.statfsSync);
+    try {
+      await prepareWorktreeDeps(worktree('14.1'));
+    } finally {
+      statfs.mockRestore();
+    }
+
+    expect(leftAtCheck).toBe(false);
   });
 });
 
@@ -252,9 +296,13 @@ describe('prepareWorktreeDeps', () => {
   });
 
   it('removes a partial copy and reports the deps missing when the copy fails', async () => {
+    // What execFile rejects with when `/bin/cp` runs out of disk: an exit status, the reason in stderr.
     __depCache.copy = vi.fn(async (source: string, target: string) => {
       fs.mkdirSync(path.join(target, 'next'), { recursive: true });
-      throw Object.assign(new Error('cp: write error: No space left on device'), { code: 'ENOSPC' });
+      throw Object.assign(new Error(`Command failed: /bin/cp -Rc ${source} ${target}`), {
+        code: 1,
+        stderr: `cp: ${target}/next/index.js: No space left on device\n`,
+      });
     });
     const dir = worktree('12.1');
 
