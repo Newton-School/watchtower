@@ -7,6 +7,7 @@ import type {
   CodexRunResult,
   ImplementationApprovalResume,
   NormalizedTask,
+  PrContext,
   ResumeContext,
   WorkflowResult,
   WorkflowStepLogger,
@@ -46,7 +47,7 @@ import { buildPlannerPrompt, buildPlannerPlanModePrompt } from '../agents/prompt
 import { resolveWorkspace } from '../workspaces/workspaceManager.js';
 import { createPrFromWorkspace, findRunPr } from '../github/postPipelinePr.js';
 import { buildUnfinishedRunMessage, coderReportedPrUrl } from '../agents/unfinishedRun.js';
-import { fetchUnresolvedReviewThreadCount } from '../github/prReviewComments.js';
+import { fetchMergeState, fetchUnresolvedReviewThreadCount, type MergeState } from '../github/prReviewComments.js';
 import { waitForExactConfirmation } from './shared/confirmationGate.js';
 import { cancelledResult } from './shared/cancelState.js';
 import type { PipelineStore } from '../agents/pipeline.js';
@@ -57,7 +58,9 @@ import {
   resolveCombinedWorkspaceRoot,
   sanitizeOwnerSummary,
   extractReplyFromCodexResult,
+  type WorkflowContext,
 } from './shared/workflowUtils.js';
+import { readPrActionAsk } from '../router/prActionAsk.js';
 import { refreshSharedClones } from '../workspaces/staleCheckout.js';
 import { assertThreadParentExists } from '../slack/threadContext.js';
 import { runAgenticEntry } from '../agentic/agenticEntry.js';
@@ -230,6 +233,51 @@ export const QUICK_ACTION_APPROVE_REFUSAL =
 export const __quickActionConfirm = { wait: waitForExactConfirmation };
 
 /**
+ * What branch protection means for merging now (issue #605). A merge past a
+ * required review goes through on admin rights; whoever says yes should know
+ * that before they do, not learn it afterwards. Whether such a merge is
+ * allowed is unchanged: this only says it. Empty when nothing stands in the
+ * way.
+ */
+export function mergeProtectionNote(state: MergeState | undefined): string {
+  if (!state) return "I couldn't check branch protection.";
+  if (state.mergeStateStatus === 'DIRTY') return "It has conflicts, so it can't be merged yet.";
+  if (state.isDraft || state.mergeStateStatus === 'DRAFT') return "It's still a draft.";
+  // The review decision is known even while GitHub is still working out the rest.
+  if (state.reviewDecision === 'REVIEW_REQUIRED') {
+    return 'It still needs an approving review, so merging now uses admin rights.';
+  }
+  if (state.reviewDecision === 'CHANGES_REQUESTED') {
+    return 'A reviewer asked for changes, so merging now uses admin rights.';
+  }
+  if (!state.mergeStateStatus || state.mergeStateStatus === 'UNKNOWN') return "I couldn't check branch protection.";
+  if (state.mergeStateStatus === 'BLOCKED') {
+    return 'Branch protection still blocks it, so merging now uses admin rights.';
+  }
+  if (state.mergeStateStatus === 'BEHIND') {
+    return "It's behind the base branch, so merging now skips the up-to-date rule.";
+  }
+  return '';
+}
+
+/**
+ * What a merge checks on GitHub, read once: the unresolved review threads and
+ * the merge state come from separate queries, so a failure reading the state
+ * leaves the count, which gates the owner's own merges, intact.
+ */
+async function readMergeChecks(
+  pr: PrContext,
+  githubToken: string,
+): Promise<{ unresolvedCount: number; state: MergeState | undefined }> {
+  const target = { owner: pr.owner, repo: pr.repo, pullNumber: pr.number, githubToken };
+  const [threads, state] = await Promise.all([
+    fetchUnresolvedReviewThreadCount(target).catch(() => ({ unresolvedCount: 0, totalThreads: 0 })),
+    fetchMergeState(target).catch(() => undefined),
+  ]);
+  return { unresolvedCount: threads.unresolvedCount, state };
+}
+
+/**
  * Merge, close and revert run under the owner's GitHub identity, so when
  * someone else asks, the owner confirms first (issue #429). Returns the
  * confirming user, or the result to return with nothing changed.
@@ -241,10 +289,12 @@ async function confirmQuickPrAction(params: {
   action: QuickPrAction;
   prUrls: string[];
   unresolvedCount?: number;
+  /** What branch protection means for a merge now (`mergeProtectionNote`). */
+  protectionNote?: string;
   logStep?: WorkflowStepLogger;
   signal?: AbortSignal;
 }): Promise<{ confirmedBy: string } | { result: WorkflowResult }> {
-  const { task, config, slack, action, prUrls, unresolvedCount, logStep, signal } = params;
+  const { task, config, slack, action, prUrls, unresolvedCount, protectionNote, logStep, signal } = params;
   const { channelId, threadTs } = task.event;
   const userId = requesterOf(task);
   const phrase = `confirm ${action}`;
@@ -277,7 +327,7 @@ async function confirmQuickPrAction(params: {
       : '';
   let promptTs: string | undefined;
   try {
-    const confirmText = `<@${userId}> asked me to ${action} ${target}.${unresolvedNote} ${ownerMentions}, reply \`${phrase}\` within 10 minutes and I'll do it. Without that, nothing changes.`;
+    const confirmText = `<@${userId}> asked me to ${action} ${target}.${unresolvedNote}${protectionNote ? ` ${protectionNote}` : ''} ${ownerMentions}, reply \`${phrase}\` within 10 minutes and I'll do it. Without that, nothing changes.`;
     promptTs = await postGatePrompt(slack, {
       channel: channelId,
       thread_ts: threadTs,
@@ -319,6 +369,338 @@ async function confirmQuickPrAction(params: {
       ? 'Okay, leaving it as it is.'
       : `No \`${phrase}\` from ${ownerMentions} in 10 minutes, so nothing was changed. Ask again when they're around.`;
   return stop('SKIPPED', msg, await say(msg));
+}
+type ImplementationStore = PipelineStore & {
+  dossierStore?: () => import('../state/dossierStore.js').DossierStore;
+  readVaultSettings?: () => { vaultPath: string; vaultEnabled: boolean };
+  recentSignalsForUser?: (
+    userId: string,
+    limit?: number,
+  ) => Array<{
+    intent: string | null;
+    workflow: string | null;
+    status: string | null;
+    repo: string | null;
+    errorKind: string | null;
+    createdAt: string;
+  }>;
+};
+
+/**
+ * A request that needs no code change, run as one agent call (merge, close,
+ * sync, re-run tests…). Reached when the planner finds no code change is
+ * needed, or straight away for a message that is only an operation on one
+ * pull request (issue #605). Every gate lives here, so both ways in keep the
+ * same confirmations.
+ */
+async function runQuickAction(params: {
+  task: NormalizedTask;
+  config: AppConfig;
+  slack: WebClient;
+  ctx: WorkflowContext;
+  store?: ImplementationStore;
+  jobId?: string;
+  logStep?: WorkflowStepLogger;
+  signal?: AbortSignal;
+  /** The planner's plan, for the logs; none when the planner was skipped. */
+  plan?: unknown;
+  /** The pull requests the agent may act on. */
+  prs: PrContext[];
+  /** The pull request whose review threads and branch protection a merge checks. */
+  checkPr?: PrContext;
+  /** The operation, when the message was read as only that; otherwise it is read from the text. */
+  action?: QuickPrAction;
+}): Promise<WorkflowResult> {
+  const { task, config, slack, ctx, store, jobId, logStep, signal, plan, prs, checkPr } = params;
+  const prAction =
+    params.action ?? (QUICK_ACTION_PR_ACTION_RE.exec(task.event.text)?.[1].toLowerCase() as QuickPrAction | undefined);
+  const mergeIntent = params.action ? params.action === 'merge' : /\bmerge\b/i.test(task.event.text);
+  const mergeChecks =
+    (mergeIntent || prAction === 'merge') && checkPr && ctx.githubToken
+      ? await readMergeChecks(checkPr, ctx.githubToken)
+      : undefined;
+
+  // Nobody can merge a PR with conflicts, admin rights or not: a message that
+  // is only that merge gets no confirmation to answer and no agent (issue
+  // #605). After a planner the ask may be more than the merge, so its prompt
+  // says it instead.
+  if (params.action === 'merge' && checkPr && mergeChecks?.state?.mergeStateStatus === 'DIRTY') {
+    const reply = `${checkPr.url} has conflicts with its base branch, so it can't be merged yet. Nothing was changed.`;
+    logStep?.({
+      stage: 'implementation.quick_action.merge_conflicts',
+      message: 'The PR has conflicts — not asking to merge it.',
+      data: { prUrl: checkPr.url },
+    });
+    const posted = await slack.chat
+      .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: reply })
+      .then(() => true)
+      .catch(() => false);
+    return { workflow: 'IMPLEMENTATION', status: 'SKIPPED', message: reply, notifyDesktop: false, slackPosted: posted };
+  }
+
+  // For merge requests: check for unresolved review comments before proceeding
+  // Asked by someone else, the owner confirmation further down covers it
+  // (and shows the same count), so this check is for the owner's own asks.
+  if (mergeIntent && task.isOwnerAuthor && mergeChecks) {
+    const adminUserIds = getAdminUserIds(config);
+    const { unresolvedCount } = mergeChecks;
+    if (unresolvedCount > 0) {
+      const protection = mergeProtectionNote(mergeChecks.state);
+      const confirmMsg = `This PR has ${unresolvedCount} unresolved review comment${unresolvedCount > 1 ? 's' : ''}.${protection ? ` ${protection}` : ''} Should I still merge? Reply *yes* to proceed or *no* to cancel.`;
+      // Yes or No: a No turns the merge down, it does not stop the job.
+      const confirmTs = await postGatePrompt(slack, {
+        channel: task.event.channelId,
+        thread_ts: task.event.threadTs,
+        text: confirmMsg,
+        blocks: () => yesNoBlocks(confirmMsg),
+      });
+      const confirmResult = { ts: confirmTs };
+      if (confirmResult.ts) {
+        const approval = await waitForApproval({
+          slack,
+          channelId: task.event.channelId,
+          threadTs: task.event.threadTs,
+          approverUserIds: adminUserIds,
+          triggerUserId: requesterOf(task),
+          approvalPromptTs: confirmResult.ts,
+          logStep: logStep ?? (() => {}),
+          botUserId: config.botUserId,
+          signal,
+        });
+
+        // The job's abort: nothing to say. A "stop" or "cancel" by reply skips the merge like a "no",
+        // and so does a change of instructions: a merge with new conditions is a new ask.
+        if (approval.outcome === 'cancelled' && !approval.approverId) {
+          return cancelledResult('IMPLEMENTATION');
+        }
+
+        if (approval.outcome === 'rejected' || approval.outcome === 'cancelled' || approval.outcome === 'feedback') {
+          await slack.chat
+            .postMessage({
+              channel: task.event.channelId,
+              thread_ts: task.event.threadTs,
+              text: 'Got it, skipping the merge.',
+            })
+            .catch(() => {});
+
+          return {
+            workflow: 'IMPLEMENTATION',
+            status: 'SKIPPED',
+            message: 'Merge cancelled — unresolved review comments.',
+            notifyDesktop: false,
+            slackPosted: true,
+          };
+        }
+
+        if (approval.outcome === 'paused') {
+          // The merge-confirm gate doesn't have plan state to resume; treat
+          // pause as a cancellation here. The user can re-issue the merge
+          // request when they're ready (it's a quick-action, not an
+          // expensive pipeline).
+          await slack.chat
+            .postMessage({
+              channel: task.event.channelId,
+              thread_ts: task.event.threadTs,
+              text: `Pausing the merge — re-mention <@${config.botUserId}> when you'd like to retry.`,
+            })
+            .catch(() => {});
+          return {
+            workflow: 'IMPLEMENTATION',
+            status: 'SKIPPED',
+            message: 'Merge paused by user — re-issue when ready.',
+            notifyDesktop: false,
+            slackPosted: true,
+          };
+        }
+      }
+    }
+  }
+
+  // Distinguish a genuine operational action (merge/close/deploy/run/etc.)
+  // from an informational ask the planner also flags as no-code (explain /
+  // summarize / "what changed"). The quick-action prompt below frames the
+  // task as an operation; routing a question through it produced the
+  // bug-fix dead-end in #348. Hand questions to the tuned read-only
+  // INFORMATIONAL path instead. Default to informational — both misroute
+  // directions are non-destructive (a misrouted op just gets explained).
+  const operationalAction =
+    /\b(merge|close|reopen|revert|sync|restart|rerun|re-run|run (?:the )?tests?|approve|assign)\b/i.test(
+      task.event.text,
+    );
+
+  // Deploys never run from here (issue #407). This path has no deploy
+  // capability check and no confirmation, and its agent runs with
+  // permissions bypassed — "release the X fix" must not become an
+  // ungated production deploy. A deploy-only ask is redirected to the
+  // deploy command; a mixed ask ("merge and deploy") keeps its other
+  // operation and the prompt below forbids the deploy half.
+  if (QUICK_ACTION_DEPLOY_RE.test(task.event.text) && !operationalAction) {
+    logStep?.({
+      stage: 'implementation.quick_action.deploy_redirect',
+      message: 'Deploy-shaped ask reached the quick-action path — redirecting to the deploy command.',
+      level: 'WARN',
+      data: { plan },
+    });
+    await slack.chat
+      .postMessage({
+        channel: task.event.channelId,
+        thread_ts: task.event.threadTs,
+        text: QUICK_ACTION_DEPLOY_REDIRECT,
+      })
+      .catch(() => {});
+    return {
+      workflow: 'IMPLEMENTATION',
+      status: 'SKIPPED',
+      message: QUICK_ACTION_DEPLOY_REDIRECT,
+      notifyDesktop: false,
+      slackPosted: true,
+    };
+  }
+
+  if (!operationalAction) {
+    logStep?.({
+      stage: 'implementation.no_code_needed.informational',
+      message: 'Planner says no code changes and this is not an operational action — answering as informational.',
+      data: { plan },
+    });
+    return runAgenticEntry({
+      mode: 'informational',
+      task,
+      config,
+      slack,
+      store: store as unknown as JobStore,
+      jobId,
+      logStep,
+      signal,
+    });
+  }
+
+  const prUrls = [...new Set(prs.map(pr => pr.url))];
+
+  // An approval from this agent would be submitted under the owner's
+  // GitHub identity (issue #429). An approve-only ask is declined; in a
+  // mixed ask the prompt below forbids the approving review.
+  if (!prAction && /\bapprove\b/i.test(task.event.text)) {
+    logStep?.({
+      stage: 'implementation.quick_action.approve_refused',
+      message: 'Approve-only ask reached the quick-action path — declined.',
+      level: 'WARN',
+    });
+    await slack.chat
+      .postMessage({
+        channel: task.event.channelId,
+        thread_ts: task.event.threadTs,
+        text: QUICK_ACTION_APPROVE_REFUSAL,
+      })
+      .catch(() => {});
+    return {
+      workflow: 'IMPLEMENTATION',
+      status: 'SKIPPED',
+      message: QUICK_ACTION_APPROVE_REFUSAL,
+      notifyDesktop: false,
+      slackPosted: true,
+    };
+  }
+
+  if (prAction) {
+    let confirmedBy = task.event.userId;
+    // A run the owner started or picked up for someone else still needs
+    // the phrase: answering their question isn't saying yes to a merge.
+    const forSomeoneElse = requesterOf(task) !== task.event.userId;
+    if (!task.isOwnerAuthor || forSomeoneElse) {
+      const checks = prAction === 'merge' ? mergeChecks : undefined;
+      const confirmation = await confirmQuickPrAction({
+        task,
+        config,
+        slack,
+        action: prAction,
+        prUrls,
+        unresolvedCount: checks?.unresolvedCount,
+        protectionNote: checks ? mergeProtectionNote(checks.state) : undefined,
+        logStep,
+        signal,
+      });
+      if ('result' in confirmation) return confirmation.result;
+      confirmedBy = confirmation.confirmedBy;
+    }
+    logStep?.({
+      stage: 'implementation.quick_action.pr_action',
+      message: `Running quick action "${prAction}" requested by <@${requesterOf(task)}>, confirmed by <@${confirmedBy}>.`,
+      data: { action: prAction, prUrls, requestedBy: requesterOf(task), confirmedBy },
+    });
+  }
+
+  const quickPrompt = `
+${buildMentionSystemPrompt({ task, workflow: 'IMPLEMENTATION', toneMode: task.toneMode })}
+
+Context:
+- You are miniOG, a developer assistant bot in a Slack workspace.
+- Your response will be posted DIRECTLY into a Slack thread as-is.
+- Working directory: ${ctx.cwd}
+- GitHub auth mode: ${githubAuthModeHint(Boolean(ctx.githubToken))}
+
+Task:
+Execute this request directly. No code changes are needed — this is a quick operational action (merge PR, close PR, run a command, etc.).
+
+"sync" means: bring the pull request's branch up to date with its base branch by merging the base branch into it. Do it in a fresh, isolated checkout under the OS temp directory (\`gh pr checkout <number>\` inside a new \`git worktree\` or clone there), never in the working directory you were started in, which other runs read. Then \`git fetch origin && git merge origin/<base>\`; resolve nothing by guesswork: if the merge conflicts, abort it, remove the checkout and report the conflicting files. Push with a plain \`git push\`, remove the checkout, and say what the branch now contains. Never rebase and never force-push a branch that has an open pull request.
+
+Never deploy, release, ship or roll back anything, and never run a deploy command, script or skill, even if the request asks for it. If the request includes that, do the rest and say that deploys go through "@miniOG deploy <target> to prod", which asks for confirmation first.
+
+Never submit an approving review or request changes on a pull request (no \`gh pr review --approve\`, no \`--request-changes\`), even if the request asks for it. Say that approval is a person's call.${
+    prUrls.length > 0
+      ? `\n\nPull requests you may act on: ${prUrls.join(', ')}. Do not merge, close, revert or sync any other pull request.`
+      : ''
+  }
+
+Slack thread context:
+${ctx.threadContext}${ctx.imageContext}
+
+Write your response as a ready-to-post Slack message describing what you did.
+`.trim();
+
+  const quickBackend = store?.dossierStore
+    ? selectBackendForUser({
+        userId: task.event.userId,
+        workflow: 'IMPLEMENTATION',
+        dossierStore: store.dossierStore(),
+        onSelect: info =>
+          logStep?.({
+            stage: 'pipeline.backend.select',
+            message: `Selected backend ${info.backend} (${info.reason}).`,
+            data: info,
+          }),
+      })
+    : getActiveBackendId();
+  const quickResult = await runCodex({
+    cwd: ctx.cwd,
+    prompt: quickPrompt,
+    githubToken: ctx.githubToken,
+    ...highReasoningProfile(quickBackend),
+    // timeoutMs: Math.floor(workflowTimeoutMs * 0.5),
+    onLog: logStep,
+    signal,
+  });
+
+  // Cancelled mid-action: "Quick action completed." would be false (#438).
+  if (signal?.aborted && !quickResult.ok) {
+    return cancelledResult('IMPLEMENTATION');
+  }
+
+  const reply = extractReplyFromCodexResult(quickResult) || 'Quick action completed.';
+
+  await slack.chat.postMessage({
+    channel: task.event.channelId,
+    thread_ts: task.event.threadTs,
+    text: reply,
+  });
+
+  return {
+    workflow: 'IMPLEMENTATION',
+    status: quickResult.ok ? 'SUCCESS' : 'FAILED',
+    message: reply,
+    notifyDesktop: false,
+    slackPosted: true,
+  };
 }
 const MAX_PAUSE_CYCLES = 10;
 
@@ -907,21 +1289,7 @@ async function runImplementationWorkflowBody(params: {
   task: NormalizedTask;
   config: AppConfig;
   slack: WebClient;
-  store?: PipelineStore & {
-    dossierStore?: () => import('../state/dossierStore.js').DossierStore;
-    readVaultSettings?: () => { vaultPath: string; vaultEnabled: boolean };
-    recentSignalsForUser?: (
-      userId: string,
-      limit?: number,
-    ) => Array<{
-      intent: string | null;
-      workflow: string | null;
-      status: string | null;
-      repo: string | null;
-      errorKind: string | null;
-      createdAt: string;
-    }>;
-  };
+  store?: ImplementationStore;
   investigationStore?: InvestigationStore;
   jobId?: string;
   logStep?: WorkflowStepLogger;
@@ -1004,6 +1372,53 @@ async function runImplementationWorkflowBody(params: {
       data: { isOwnerAuthor: ctx.isOwnerAuthor },
     });
 
+    // Cheap pre-flight: if the user has already deleted the source mention,
+    // skip the 5-minute planner call and any quick action. Slack would
+    // silently promote any post we make into an orphan channel-root message
+    // (see processMessageDeleted doc-comment in index.ts for the RCA). One
+    // ~50ms API call to save minutes of compute and a confusing channel artifact.
+    const parentAlive = await assertThreadParentExists(slack, task.event.channelId, task.event.threadTs);
+    if (!parentAlive) {
+      logStep?.({
+        stage: 'implementation.source_deleted',
+        level: 'WARN',
+        message: 'Source mention no longer exists — aborting before planner spawn.',
+        data: { channelId: task.event.channelId, threadTs: task.event.threadTs },
+      });
+      return {
+        workflow: 'IMPLEMENTATION',
+        status: 'CANCELLED',
+        message: 'Source message deleted before planner ran.',
+        notifyDesktop: false,
+        slackPosted: false,
+      };
+    }
+
+    // "merge the PR" and nothing else needs no plan (issue #605): it goes
+    // straight to the quick action, whose confirmations are the same ones a
+    // planner verdict of "no code needed" reaches.
+    const prActionAsk = readPrActionAsk(task, { botUserId: config.botUserId, ownerUserIds: config.ownerSlackUserIds });
+    if (prActionAsk) {
+      logStep?.({
+        stage: 'implementation.quick_action.no_planner',
+        message: `The message only asks to ${prActionAsk.action} ${prActionAsk.pr.url} — running it as a quick action without a planner.`,
+        data: { action: prActionAsk.action, prUrl: prActionAsk.pr.url },
+      });
+      return runQuickAction({
+        task,
+        config,
+        slack,
+        ctx,
+        store,
+        jobId,
+        logStep,
+        signal,
+        prs: [prActionAsk.pr],
+        checkPr: prActionAsk.pr,
+        action: prActionAsk.action,
+      });
+    }
+
     // Planner runs directly via runCodex to capture sessionId for iterative feedback
     const workflowTimeoutMs = config.bugFixTimeoutMs;
     const plannerPipelineConfig: PipelineConfig = {
@@ -1084,28 +1499,6 @@ async function runImplementationWorkflowBody(params: {
       }
     }
     const plannerSchemaPath = path.resolve(process.cwd(), 'schemas/agent-planner-result.schema.json');
-
-    // Cheap pre-flight: if the user has already deleted the source mention,
-    // skip the 5-minute planner call. Slack would silently promote any post
-    // we make into an orphan channel-root message (see processMessageDeleted
-    // doc-comment in index.ts for the RCA). One ~50ms API call to save
-    // minutes of compute and a confusing channel artifact.
-    const parentAlive = await assertThreadParentExists(slack, task.event.channelId, task.event.threadTs);
-    if (!parentAlive) {
-      logStep?.({
-        stage: 'implementation.source_deleted',
-        level: 'WARN',
-        message: 'Source mention no longer exists — aborting before planner spawn.',
-        data: { channelId: task.event.channelId, threadTs: task.event.threadTs },
-      });
-      return {
-        workflow: 'IMPLEMENTATION',
-        status: 'CANCELLED',
-        message: 'Source message deleted before planner ran.',
-        notifyDesktop: false,
-        slackPosted: false,
-      };
-    }
 
     logStep?.({ stage: 'pipeline.agent.planner.start', message: 'Starting planner agent.' });
 
@@ -1331,290 +1724,19 @@ async function runImplementationWorkflowBody(params: {
         message: 'Planner says no code changes needed — executing as quick action (no approval, no pipeline).',
         data: { plan: plannerOutput.plan },
       });
-
-      // For merge requests: check for unresolved review comments before proceeding
-      // Asked by someone else, the owner confirmation further down covers it
-      // (and shows the same count), so this check is for the owner's own asks.
-      const mergeIntent = /\bmerge\b/i.test(task.event.text);
-      if (mergeIntent && task.isOwnerAuthor && task.prContext && ctx.githubToken) {
-        const adminUserIds = getAdminUserIds(config);
-        const { unresolvedCount } = await fetchUnresolvedReviewThreadCount({
-          owner: task.prContext.owner,
-          repo: task.prContext.repo,
-          pullNumber: task.prContext.number,
-          githubToken: ctx.githubToken,
-        });
-
-        if (unresolvedCount > 0) {
-          const confirmMsg = `This PR has ${unresolvedCount} unresolved review comment${unresolvedCount > 1 ? 's' : ''}. Should I still merge? Reply *yes* to proceed or *no* to cancel.`;
-          // Yes or No: a No turns the merge down, it does not stop the job.
-          const confirmTs = await postGatePrompt(slack, {
-            channel: task.event.channelId,
-            thread_ts: task.event.threadTs,
-            text: confirmMsg,
-            blocks: () => yesNoBlocks(confirmMsg),
-          });
-          const confirmResult = { ts: confirmTs };
-          if (confirmResult.ts) {
-            const approval = await waitForApproval({
-              slack,
-              channelId: task.event.channelId,
-              threadTs: task.event.threadTs,
-              approverUserIds: adminUserIds,
-              triggerUserId: requesterOf(task),
-              approvalPromptTs: confirmResult.ts,
-              logStep: logStep ?? (() => {}),
-              botUserId: config.botUserId,
-              signal,
-            });
-
-            // The job's abort: nothing to say. A "stop" or "cancel" by reply skips the merge like a "no",
-            // and so does a change of instructions: a merge with new conditions is a new ask.
-            if (approval.outcome === 'cancelled' && !approval.approverId) {
-              return cancelledResult('IMPLEMENTATION');
-            }
-
-            if (
-              approval.outcome === 'rejected' ||
-              approval.outcome === 'cancelled' ||
-              approval.outcome === 'feedback'
-            ) {
-              await slack.chat
-                .postMessage({
-                  channel: task.event.channelId,
-                  thread_ts: task.event.threadTs,
-                  text: 'Got it, skipping the merge.',
-                })
-                .catch(() => {});
-
-              return {
-                workflow: 'IMPLEMENTATION',
-                status: 'SKIPPED',
-                message: 'Merge cancelled — unresolved review comments.',
-                notifyDesktop: false,
-                slackPosted: true,
-              };
-            }
-
-            if (approval.outcome === 'paused') {
-              // The merge-confirm gate doesn't have plan state to resume; treat
-              // pause as a cancellation here. The user can re-issue the merge
-              // request when they're ready (it's a quick-action, not an
-              // expensive pipeline).
-              await slack.chat
-                .postMessage({
-                  channel: task.event.channelId,
-                  thread_ts: task.event.threadTs,
-                  text: `Pausing the merge — re-mention <@${config.botUserId}> when you'd like to retry.`,
-                })
-                .catch(() => {});
-              return {
-                workflow: 'IMPLEMENTATION',
-                status: 'SKIPPED',
-                message: 'Merge paused by user — re-issue when ready.',
-                notifyDesktop: false,
-                slackPosted: true,
-              };
-            }
-          }
-        }
-      }
-
-      // Distinguish a genuine operational action (merge/close/deploy/run/etc.)
-      // from an informational ask the planner also flags as no-code (explain /
-      // summarize / "what changed"). The quick-action prompt below frames the
-      // task as an operation; routing a question through it produced the
-      // bug-fix dead-end in #348. Hand questions to the tuned read-only
-      // INFORMATIONAL path instead. Default to informational — both misroute
-      // directions are non-destructive (a misrouted op just gets explained).
-      const operationalAction =
-        /\b(merge|close|reopen|revert|sync|restart|rerun|re-run|run (?:the )?tests?|approve|assign)\b/i.test(
-          task.event.text,
-        );
-
-      // Deploys never run from here (issue #407). This path has no deploy
-      // capability check and no confirmation, and its agent runs with
-      // permissions bypassed — "release the X fix" must not become an
-      // ungated production deploy. A deploy-only ask is redirected to the
-      // deploy command; a mixed ask ("merge and deploy") keeps its other
-      // operation and the prompt below forbids the deploy half.
-      if (QUICK_ACTION_DEPLOY_RE.test(task.event.text) && !operationalAction) {
-        logStep?.({
-          stage: 'implementation.quick_action.deploy_redirect',
-          message: 'Deploy-shaped ask reached the quick-action path — redirecting to the deploy command.',
-          level: 'WARN',
-          data: { plan: plannerOutput.plan },
-        });
-        await slack.chat
-          .postMessage({
-            channel: task.event.channelId,
-            thread_ts: task.event.threadTs,
-            text: QUICK_ACTION_DEPLOY_REDIRECT,
-          })
-          .catch(() => {});
-        return {
-          workflow: 'IMPLEMENTATION',
-          status: 'SKIPPED',
-          message: QUICK_ACTION_DEPLOY_REDIRECT,
-          notifyDesktop: false,
-          slackPosted: true,
-        };
-      }
-
-      if (!operationalAction) {
-        logStep?.({
-          stage: 'implementation.no_code_needed.informational',
-          message: 'Planner says no code changes and this is not an operational action — answering as informational.',
-          data: { plan: plannerOutput.plan },
-        });
-        return runAgenticEntry({
-          mode: 'informational',
-          task,
-          config,
-          slack,
-          store: store as unknown as JobStore,
-          jobId,
-          logStep,
-          signal,
-        });
-      }
-
-      const prAction = QUICK_ACTION_PR_ACTION_RE.exec(task.event.text)?.[1].toLowerCase() as QuickPrAction | undefined;
-      const prUrls = [...new Set((task.prContexts ?? (task.prContext ? [task.prContext] : [])).map(pr => pr.url))];
-
-      // An approval from this agent would be submitted under the owner's
-      // GitHub identity (issue #429). An approve-only ask is declined; in a
-      // mixed ask the prompt below forbids the approving review.
-      if (!prAction && /\bapprove\b/i.test(task.event.text)) {
-        logStep?.({
-          stage: 'implementation.quick_action.approve_refused',
-          message: 'Approve-only ask reached the quick-action path — declined.',
-          level: 'WARN',
-        });
-        await slack.chat
-          .postMessage({
-            channel: task.event.channelId,
-            thread_ts: task.event.threadTs,
-            text: QUICK_ACTION_APPROVE_REFUSAL,
-          })
-          .catch(() => {});
-        return {
-          workflow: 'IMPLEMENTATION',
-          status: 'SKIPPED',
-          message: QUICK_ACTION_APPROVE_REFUSAL,
-          notifyDesktop: false,
-          slackPosted: true,
-        };
-      }
-
-      if (prAction) {
-        let confirmedBy = task.event.userId;
-        // A run the owner started or picked up for someone else still needs
-        // the phrase: answering their question isn't saying yes to a merge.
-        const forSomeoneElse = requesterOf(task) !== task.event.userId;
-        if (!task.isOwnerAuthor || forSomeoneElse) {
-          let unresolvedCount: number | undefined;
-          if (prAction === 'merge' && task.prContext && ctx.githubToken) {
-            unresolvedCount = await fetchUnresolvedReviewThreadCount({
-              owner: task.prContext.owner,
-              repo: task.prContext.repo,
-              pullNumber: task.prContext.number,
-              githubToken: ctx.githubToken,
-            })
-              .then(r => r.unresolvedCount)
-              .catch(() => undefined);
-          }
-          const confirmation = await confirmQuickPrAction({
-            task,
-            config,
-            slack,
-            action: prAction,
-            prUrls,
-            unresolvedCount,
-            logStep,
-            signal,
-          });
-          if ('result' in confirmation) return confirmation.result;
-          confirmedBy = confirmation.confirmedBy;
-        }
-        logStep?.({
-          stage: 'implementation.quick_action.pr_action',
-          message: `Running quick action "${prAction}" requested by <@${requesterOf(task)}>, confirmed by <@${confirmedBy}>.`,
-          data: { action: prAction, prUrls, requestedBy: requesterOf(task), confirmedBy },
-        });
-      }
-
-      const quickPrompt = `
-${buildMentionSystemPrompt({ task, workflow: 'IMPLEMENTATION', toneMode: task.toneMode })}
-
-Context:
-- You are miniOG, a developer assistant bot in a Slack workspace.
-- Your response will be posted DIRECTLY into a Slack thread as-is.
-- Working directory: ${ctx.cwd}
-- GitHub auth mode: ${githubAuthModeHint(Boolean(ctx.githubToken))}
-
-Task:
-Execute this request directly. No code changes are needed — this is a quick operational action (merge PR, close PR, run a command, etc.).
-
-"sync" means: bring the pull request's branch up to date with its base branch by merging the base branch into it. Do it in a fresh, isolated checkout under the OS temp directory (\`gh pr checkout <number>\` inside a new \`git worktree\` or clone there), never in the working directory you were started in, which other runs read. Then \`git fetch origin && git merge origin/<base>\`; resolve nothing by guesswork: if the merge conflicts, abort it, remove the checkout and report the conflicting files. Push with a plain \`git push\`, remove the checkout, and say what the branch now contains. Never rebase and never force-push a branch that has an open pull request.
-
-Never deploy, release, ship or roll back anything, and never run a deploy command, script or skill, even if the request asks for it. If the request includes that, do the rest and say that deploys go through "@miniOG deploy <target> to prod", which asks for confirmation first.
-
-Never submit an approving review or request changes on a pull request (no \`gh pr review --approve\`, no \`--request-changes\`), even if the request asks for it. Say that approval is a person's call.${
-        prUrls.length > 0
-          ? `\n\nPull requests you may act on: ${prUrls.join(', ')}. Do not merge, close, revert or sync any other pull request.`
-          : ''
-      }
-
-Slack thread context:
-${ctx.threadContext}${ctx.imageContext}
-
-Write your response as a ready-to-post Slack message describing what you did.
-`.trim();
-
-      const quickBackend = store?.dossierStore
-        ? selectBackendForUser({
-            userId: task.event.userId,
-            workflow: 'IMPLEMENTATION',
-            dossierStore: store.dossierStore(),
-            onSelect: info =>
-              logStep?.({
-                stage: 'pipeline.backend.select',
-                message: `Selected backend ${info.backend} (${info.reason}).`,
-                data: info,
-              }),
-          })
-        : getActiveBackendId();
-      const quickResult = await runCodex({
-        cwd: ctx.cwd,
-        prompt: quickPrompt,
-        githubToken: ctx.githubToken,
-        ...highReasoningProfile(quickBackend),
-        // timeoutMs: Math.floor(workflowTimeoutMs * 0.5),
-        onLog: logStep,
+      return runQuickAction({
+        task,
+        config,
+        slack,
+        ctx,
+        store,
+        jobId,
+        logStep,
         signal,
+        plan: plannerOutput.plan,
+        prs: task.prContexts ?? (task.prContext ? [task.prContext] : []),
+        checkPr: task.prContext,
       });
-
-      // Cancelled mid-action: "Quick action completed." would be false (#438).
-      if (signal?.aborted && !quickResult.ok) {
-        return cancelledResult('IMPLEMENTATION');
-      }
-
-      const reply = extractReplyFromCodexResult(quickResult) || 'Quick action completed.';
-
-      await slack.chat.postMessage({
-        channel: task.event.channelId,
-        thread_ts: task.event.threadTs,
-        text: reply,
-      });
-
-      return {
-        workflow: 'IMPLEMENTATION',
-        status: quickResult.ok ? 'SUCCESS' : 'FAILED',
-        message: reply,
-        notifyDesktop: false,
-        slackPosted: true,
-      };
     }
 
     // Full pipeline path: code changes are needed. Normalize the planner

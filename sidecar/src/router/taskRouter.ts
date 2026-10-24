@@ -28,6 +28,7 @@ import { runDevAssistWorkflow } from '../workflows/devAssistWorkflow.js';
 import { runMiniogDossierWorkflow } from '../workflows/miniogDossierWorkflow.js';
 import { runDeployWorkflow } from '../workflows/deployWorkflow.js';
 import { runImplementationWorkflow } from '../workflows/implementationWorkflow.js';
+import { readPrActionAsk } from './prActionAsk.js';
 import { runInvestigationWorkflow } from '../workflows/investigationWorkflow.js';
 import { runAgenticEntry } from '../agentic/agenticEntry.js';
 import { runAgenticPrReview } from '../agentic/agenticPrReview.js';
@@ -787,10 +788,13 @@ export async function routeTask(params: {
       intent: resolvedIntent,
       pickupDelayMs: pickupDelay,
       // Only a PR named in the message itself: one from earlier in the thread
-      // does not make a new request a quick action.
-      aboutExistingPr: routedTask.prContexts
-        ? routedTask.prContexts.some(pr => pr.source === 'trigger')
-        : Boolean(routedTask.prContext),
+      // does not make a new request a quick action, unless the message is
+      // only an operation on it ("merge it", issue #605).
+      aboutExistingPr:
+        (routedTask.prContexts
+          ? routedTask.prContexts.some(pr => pr.source === 'trigger')
+          : Boolean(routedTask.prContext)) ||
+        Boolean(readPrActionAsk(routedTask, { botUserId: config.botUserId, ownerUserIds: config.ownerSlackUserIds })),
       replayed: task.event.ingestSource === 'launchpad' || task.event.eventId.startsWith(RESTART_EVENT_PREFIX),
     });
     if (ack && !signal?.aborted) {
