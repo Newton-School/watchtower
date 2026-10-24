@@ -1500,8 +1500,16 @@ describe('what the thread is told when the coder leaves no diff (issue #432)', (
   it('keeps a long report to a readable length', () => {
     const question = buildCoderNoDiffQuestion('', [], 'x'.repeat(5000));
 
-    expect(question).toContain(`> ${'x'.repeat(900)}…`);
+    expect(question).toContain(`> ${'x'.repeat(899)}…`);
     expect(question.length).toBeLessThan(1500);
+  });
+
+  it('cuts a long report at a word, not in the middle of one (issue #623)', () => {
+    const question = buildCoderNoDiffQuestion('', [], 'updated the dashboard card '.repeat(60));
+    const quoted = question.split('\n').find(line => line.startsWith('> ')) ?? '';
+
+    expect(quoted).toMatch(/ (updated|the|dashboard|card)…$/);
+    expect(quoted.length).toBeLessThanOrEqual(2 + 900);
   });
 
   it('still shows the plan and the planned files, and how to go on', () => {

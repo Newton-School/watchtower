@@ -32,6 +32,7 @@ import {
 } from '../slack/buttonReplies.js';
 import { isGateStop, normalizeControlText, slackMentionIds, stripSlackMentions } from '../router/stopIntent.js';
 import { createProgressMessage, formatElapsed, type ProgressMessage } from '../slack/progressMessage.js';
+import { clipText } from '../slack/replyParts.js';
 import { currentHead, checkCoderProducedChanges, getDiffVsBase } from '../workspaces/gitState.js';
 import { prepareWorktreeDeps } from '../workspaces/depCache.js';
 
@@ -1490,7 +1491,7 @@ export function buildCoderFollowUpQuestion(
   planAffectedFiles: string[],
 ): string {
   const trimmed = planMarkdown.trim();
-  const preview = trimmed.length > 200 ? `${trimmed.slice(0, 200).trim()}…` : trimmed;
+  const preview = clipText(trimmed, 200);
   const filePreview = planAffectedFiles.slice(0, 3).join(', ');
 
   // Says what is known and no more. This used to add "so I haven't touched
@@ -1534,14 +1535,12 @@ export function buildCoderNoDiffQuestion(
   coderSummary: string,
 ): string {
   const report = coderSummary.trim();
-  const quoted = (
-    report.length > CODER_REPORT_QUOTE_CHARS ? `${report.slice(0, CODER_REPORT_QUOTE_CHARS).trim()}…` : report
-  )
+  const quoted = clipText(report, CODER_REPORT_QUOTE_CHARS)
     .split('\n')
     .map(line => `> ${line}`)
     .join('\n');
   const plan = planMarkdown.trim();
-  const planPreview = plan.length > 200 ? `${plan.slice(0, 200).trim()}…` : plan;
+  const planPreview = clipText(plan, 200);
   const filePreview = planAffectedFiles.slice(0, 3).join(', ');
 
   const lines = ['The coder finished, but nothing changed in the repository: no commit and no edited file.'];

@@ -32,6 +32,7 @@ import { decidePausedResume } from './router/pausedResume.js';
 import { classifyProduct } from './router/productClassifier.js';
 import { routeTask } from './router/taskRouter.js';
 import { startMentionCatchup, type MentionCatchup } from './slack/mentionCatchup.js';
+import { postInParts } from './slack/replyParts.js';
 import { SocketSlackClient } from './slack/socketClient.js';
 import { SocketWatchdog, type SocketAlert } from './slack/socketWatchdog.js';
 import { captureLiveMessage, captureThreadFromMessages, isSyntheticEnvelope } from './conversation/threadCapture.js';
@@ -260,15 +261,15 @@ function buildEventAwareClient(client: WebClient, event: SlackEventEnvelope): We
   const originalDelete = client.chat.delete.bind(client.chat);
   const wrappedChat = Object.create(client.chat) as typeof client.chat;
 
-  wrappedChat.postMessage = async (...args: Parameters<typeof client.chat.postMessage>) => {
-    const payload = (args[0] ?? {}) as {
+  const postOne = async (args: Parameters<typeof client.chat.postMessage>[0]) => {
+    const payload = (args ?? {}) as {
       channel?: string;
       thread_ts?: string;
       text?: string;
     };
     let response: Awaited<ReturnType<typeof client.chat.postMessage>>;
     try {
-      response = await originalPostMessage(...args);
+      response = await originalPostMessage(args);
     } catch (error) {
       const errorCode = extractSlackErrorCode(error);
       const sameChannel = payload.channel === event.channelId;
@@ -360,6 +361,12 @@ function buildEventAwareClient(client: WebClient, event: SlackEventEnvelope): We
 
     return response;
   };
+
+  // Slack cuts text over 4,000 characters wherever the limit falls, mid-word
+  // or mid-code-block; a long reply goes out in parts cut where they read
+  // whole (issue #623). Each part gets the handling above.
+  wrappedChat.postMessage = async (...args: Parameters<typeof client.chat.postMessage>) =>
+    postInParts(postOne, args[0]);
 
   (wrappedClient as unknown as { chat: typeof client.chat }).chat = wrappedChat;
   return wrappedClient;
