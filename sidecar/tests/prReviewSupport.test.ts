@@ -378,6 +378,13 @@ describe('what the thread is told when a review is not on the PR (issue #449)', 
     expect(lines[1].length).toBeLessThan(290);
     expect(formatUnpostedFindings([])).toBe('');
   });
+
+  it('shortens a long finding at a word, not in the middle of one (issue #623)', () => {
+    const message = `The sibling parameter on the same page passes through ${'getValidCampaign before it is sent, '.repeat(10)}`;
+    const [, line] = formatUnpostedFindings([finding('medium', message, 'a.ts', 1)]).split('\n');
+
+    expect(line).toMatch(/ (getValidCampaign|before|it|is|sent)…$/);
+  });
 });
 
 describe('planReviewPosting: what goes on the diff and what goes in the body (issue #441)', () => {

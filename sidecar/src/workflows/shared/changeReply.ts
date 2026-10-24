@@ -1,4 +1,5 @@
 import { getAdminUserIds } from '../../access/control.js';
+import { clipText } from '../../slack/replyParts.js';
 import type { AppConfig, DossierRole } from '../../types/contracts.js';
 
 /**
@@ -32,7 +33,7 @@ export function sanitizeRequesterSummary(raw: string): string {
     .filter((line, index, lines) => line.trim() !== '' || (index > 0 && lines[index - 1].trim() !== ''))
     .join('\n')
     .trim();
-  return text.length > 700 ? `${text.slice(0, 699).trimEnd()}…` : text;
+  return clipText(text, 700);
 }
 
 /**

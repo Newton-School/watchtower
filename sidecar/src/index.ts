@@ -20,6 +20,7 @@ import { runPrFollowUp } from './workflows/prFollowUp.js';
 import { resolveGithubTokenForCodex } from './github/githubAuth.js';
 import { notifyDesktop } from './notify/desktopNotifier.js';
 import { botScopes, missingScopesNotice, NOTIFIED_MISSING_SCOPES_KEY } from './slack/botScopes.js';
+import { buildEventAwareClient, type OrphanPromotion } from './slack/eventAwareClient.js';
 import { assertMacOS } from './platform.js';
 import { evaluatePolicy, loadPolicies } from './policies/evaluator.js';
 import { agentCallContext } from './state/runContext.js';
@@ -218,151 +219,28 @@ function isTransientError(message: string): boolean {
   return /ETIMEDOUT|ECONNRESET|429|SlackApiError|timeout/i.test(message);
 }
 
-function extractSlackErrorCode(error: unknown): string | undefined {
-  if (!error || typeof error !== 'object') {
-    return undefined;
-  }
-  const maybeData = (error as { data?: { error?: unknown } }).data;
-  if (maybeData && typeof maybeData.error === 'string') {
-    return maybeData.error;
-  }
-  return undefined;
-}
-
-async function postViaResponseUrl(params: { responseUrl: string; text: string; threadTs?: string }): Promise<void> {
-  const { responseUrl, text, threadTs } = params;
-  const payload: Record<string, unknown> = {
-    response_type: 'in_channel',
-    replace_original: false,
-    text,
-  };
-  if (threadTs) {
-    payload.thread_ts = threadTs;
-  }
-
-  const response = await fetch(responseUrl, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json; charset=utf-8',
-    },
-    body: JSON.stringify(payload),
+/**
+ * Find and cancel the active job tied to this Slack event after one of its
+ * replies was orphan-promoted (see `buildEventAwareClient`). If no active job
+ * is found (post was made outside a workflow), the orphan was just deleted.
+ */
+function cancelForOrphanedReply(event: SlackEventEnvelope, orphan: OrphanPromotion): void {
+  const active = store.activeJobForEventTs(event.channelId, event.eventTs);
+  if (!active) return;
+  cancelJob(active.id, {
+    source: 'source_deleted',
+    message: 'Source message deleted during post (orphan-promoted reply).',
   });
-
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    throw new Error(`response_url post failed (${response.status}): ${body}`);
-  }
-}
-
-function buildEventAwareClient(client: WebClient, event: SlackEventEnvelope): WebClient {
-  const wrappedClient = Object.create(client) as WebClient;
-  const originalPostMessage = client.chat.postMessage.bind(client.chat);
-  const originalDelete = client.chat.delete.bind(client.chat);
-  const wrappedChat = Object.create(client.chat) as typeof client.chat;
-
-  wrappedChat.postMessage = async (...args: Parameters<typeof client.chat.postMessage>) => {
-    const payload = (args[0] ?? {}) as {
-      channel?: string;
-      thread_ts?: string;
-      text?: string;
-    };
-    let response: Awaited<ReturnType<typeof client.chat.postMessage>>;
-    try {
-      response = await originalPostMessage(...args);
-    } catch (error) {
-      const errorCode = extractSlackErrorCode(error);
-      const sameChannel = payload.channel === event.channelId;
-      const sameThread = !payload.thread_ts || payload.thread_ts === event.threadTs;
-
-      if (errorCode === 'not_in_channel' && sameChannel && sameThread && event.responseUrl) {
-        await postViaResponseUrl({
-          responseUrl: event.responseUrl,
-          text: String(payload.text ?? ''),
-          threadTs: payload.thread_ts ?? event.threadTs,
-        });
-        return {
-          ok: true,
-          ts: payload.thread_ts ?? event.threadTs,
-          channel: event.channelId,
-        } as Awaited<ReturnType<typeof client.chat.postMessage>>;
-      }
-      throw error;
-    }
-
-    // Detect Slack's silent orphan-promotion. When we ask to post into a
-    // thread whose parent was just deleted, Slack accepts the call but
-    // strips `thread_ts` and lands the message at channel root — confusing
-    // junk that no human asked for. Compare the requested thread_ts to the
-    // one Slack actually stamped on the response and undo the post if they
-    // diverged. RCA: Slack thread 1779174569.451259 (2026-05-19).
-    const requestedThreadTs = payload.thread_ts;
-    if (requestedThreadTs && response?.ok && response?.ts && payload.channel) {
-      const responseMessage = (response as { message?: { thread_ts?: string } }).message;
-      const actualThreadTs = responseMessage?.thread_ts;
-      if (actualThreadTs !== requestedThreadTs) {
-        const orphanTs = response.ts;
-        // Best-effort delete of the orphan. If this itself fails (e.g. token
-        // can't delete its own bot post), we still log+cancel so observers
-        // can see what happened.
-        try {
-          await originalDelete({ channel: payload.channel, ts: orphanTs });
-        } catch (deleteError) {
-          logger.warn(
-            { channel: payload.channel, orphanTs, error: String(deleteError) },
-            'failed to delete orphan-promoted post (non-fatal)',
-          );
-        }
-        logger.warn(
-          {
-            channel: payload.channel,
-            requestedThreadTs,
-            actualThreadTs: actualThreadTs ?? null,
-            orphanTs,
-            eventTs: event.eventTs,
-          },
-          'slack.post.orphan_promoted: parent deleted mid-flight; deleted the orphan and cancelling job',
-        );
-        // Find and cancel the active job tied to this Slack event. If no
-        // active job is found (post was made outside a workflow), we just
-        // delete the orphan and continue without cancellation.
-        const active = store.activeJobForEventTs(event.channelId, event.eventTs);
-        if (active) {
-          cancelJob(active.id, {
-            source: 'source_deleted',
-            message: 'Source message deleted during post (orphan-promoted reply).',
-          });
-          store.markJob(active.id, 'CANCELLED', {
-            errorMessage: 'Source message deleted during post (orphan-promoted reply).',
-          });
-          store.appendJobLog({
-            jobId: active.id,
-            stage: 'job.source_deleted',
-            level: 'WARN',
-            message: 'Slack promoted our thread reply to a channel-root orphan; cancelling.',
-            data: {
-              channelId: payload.channel,
-              requestedThreadTs,
-              actualThreadTs: actualThreadTs ?? null,
-              orphanTs,
-              eventTs: event.eventTs,
-            },
-          });
-        }
-        // Synthesize an "ok: false" return so callers see the post as a
-        // no-op rather than a successful publish. Workflows already wrap
-        // postMessage in .catch(() => {}); throwing here would surprise.
-        return {
-          ok: false,
-          error: 'thread_parent_deleted',
-        } as unknown as Awaited<ReturnType<typeof client.chat.postMessage>>;
-      }
-    }
-
-    return response;
-  };
-
-  (wrappedClient as unknown as { chat: typeof client.chat }).chat = wrappedChat;
-  return wrappedClient;
+  store.markJob(active.id, 'CANCELLED', {
+    errorMessage: 'Source message deleted during post (orphan-promoted reply).',
+  });
+  store.appendJobLog({
+    jobId: active.id,
+    stage: 'job.source_deleted',
+    level: 'WARN',
+    message: 'Slack promoted our thread reply to a channel-root orphan; cancelling.',
+    data: { ...orphan },
+  });
 }
 
 function reactionToSentiment(reaction: string): -1 | 0 | 1 {
@@ -1048,7 +926,9 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     answeredFromApp: Boolean(event.answersJobId),
   });
 
-  const eventClient = buildEventAwareClient(client, event);
+  const eventClient = buildEventAwareClient(client, event, {
+    onOrphanPromoted: orphan => cancelForOrphanedReply(event, orphan),
+  });
 
   // A message that only tags an owner is written to a person. Until the
   // router decides miniOG has something to say or do, it leaves no reaction

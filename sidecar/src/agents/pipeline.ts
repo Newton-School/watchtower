@@ -32,6 +32,7 @@ import {
 } from '../slack/buttonReplies.js';
 import { isGateStop, normalizeControlText, slackMentionIds, stripSlackMentions } from '../router/stopIntent.js';
 import { createProgressMessage, formatElapsed, type ProgressMessage } from '../slack/progressMessage.js';
+import { clipText, splitSlackText } from '../slack/replyParts.js';
 import { currentHead, checkCoderProducedChanges, getDiffVsBase } from '../workspaces/gitState.js';
 import { prepareWorktreeDeps } from '../workspaces/depCache.js';
 
@@ -148,6 +149,9 @@ function stripRepoPrefix(filePath: string, repoPath: string): string {
 /** How many files the plan message lists before it says "and N more". */
 const PLAN_MESSAGE_MAX_FILES = 8;
 
+/** Added to the plan message once the coder is done. */
+const PLAN_EXECUTED_SUFFIX = '\n\n_✅ Plan executed._';
+
 /**
  * The plan as posted for approval (issue #437).
  *
@@ -182,7 +186,7 @@ export function formatPlanMessage(
   const shownFiles = displayFiles.slice(0, PLAN_MESSAGE_MAX_FILES).map(f => `• \`${f}\``);
   if (count > PLAN_MESSAGE_MAX_FILES) shownFiles.push(`• … and ${count - PLAN_MESSAGE_MAX_FILES} more`);
   const filesSection = count > 0 ? `*Files to change:*\n${shownFiles.join('\n')}` : '';
-  const completedSuffix = completed ? '\n\n_✅ Plan executed._' : '';
+  const completedSuffix = completed ? PLAN_EXECUTED_SUFFIX : '';
 
   if (!summary) {
     const body = planMarkdown.trim();
@@ -222,6 +226,24 @@ export function formatPlanMessage(
     );
   }
   return [block.join('\n'), ...(filesSection ? [filesSection] : [])].join('\n\n').concat(completedSuffix);
+}
+
+/**
+ * The plan message once the coder is done: the plan with "✅ Plan executed."
+ * after it. A plan too long for one message went out in parts and its ts is
+ * the first part's, so only that part is rewritten, saying the plan goes on
+ * below so the marker is not read as its end (issue #623); the whole plan in
+ * one edit would be cut or refused.
+ */
+export function formatExecutedPlanEdit(
+  planMarkdown: string,
+  affectedFiles: string[],
+  scope: string,
+  repoPath?: string,
+): string {
+  const posted = splitSlackText(formatPlanMessage(planMarkdown, affectedFiles, scope, repoPath, false));
+  if (posted.length <= 1) return formatPlanMessage(planMarkdown, affectedFiles, scope, repoPath, true);
+  return `${posted[0]}\n_(continued below)_${PLAN_EXECUTED_SUFFIX}`;
 }
 
 const CHANGED_HEADING_RE = /^#{1,6}\s*changed since the last plan\b/i;
@@ -1490,7 +1512,7 @@ export function buildCoderFollowUpQuestion(
   planAffectedFiles: string[],
 ): string {
   const trimmed = planMarkdown.trim();
-  const preview = trimmed.length > 200 ? `${trimmed.slice(0, 200).trim()}…` : trimmed;
+  const preview = clipText(trimmed, 200);
   const filePreview = planAffectedFiles.slice(0, 3).join(', ');
 
   // Says what is known and no more. This used to add "so I haven't touched
@@ -1534,14 +1556,12 @@ export function buildCoderNoDiffQuestion(
   coderSummary: string,
 ): string {
   const report = coderSummary.trim();
-  const quoted = (
-    report.length > CODER_REPORT_QUOTE_CHARS ? `${report.slice(0, CODER_REPORT_QUOTE_CHARS).trim()}…` : report
-  )
+  const quoted = clipText(report, CODER_REPORT_QUOTE_CHARS)
     .split('\n')
     .map(line => `> ${line}`)
     .join('\n');
   const plan = planMarkdown.trim();
-  const planPreview = plan.length > 200 ? `${plan.slice(0, 200).trim()}…` : plan;
+  const planPreview = clipText(plan, 200);
   const filePreview = planAffectedFiles.slice(0, 3).join(', ');
 
   const lines = ['The coder finished, but nothing changed in the repository: no commit and no edited file.'];
@@ -2069,12 +2089,11 @@ async function runAgentPipelineBody(
         slack,
         ctx,
         ts: planMessageTs,
-        text: formatPlanMessage(
+        text: formatExecutedPlanEdit(
           plannerNormalized.planMarkdown,
           plannerNormalized.affectedFiles,
           plannerNormalized.scope,
           ctx.repoPath,
-          true,
         ),
       });
     }
