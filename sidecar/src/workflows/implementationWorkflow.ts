@@ -49,6 +49,7 @@ import { buildUnfinishedRunMessage, coderReportedPrUrl } from '../agents/unfinis
 import { fetchUnresolvedReviewThreadCount } from '../github/prReviewComments.js';
 import { waitForExactConfirmation } from './shared/confirmationGate.js';
 import { cancelledResult } from './shared/cancelState.js';
+import { waitForSameFileTurn } from './shared/sameFileGuard.js';
 import type { PipelineStore } from '../agents/pipeline.js';
 import type { AgentStepResult, PipelineConfig } from '../agents/types.js';
 import type { InvestigationStore } from '../state/investigationStore.js';
@@ -1872,6 +1873,33 @@ Write your response as a ready-to-post Slack message describing what you did.
     // pipeline below must run against that worktree, not the one chosen at
     // initial repo classification.
     pipelineCwd = loopOutcome.pipelineCwd;
+
+    // Another run, or a fresh miniOG PR, changing the same files would make a
+    // second PR that conflicts with the first (issue #602): wait for it, then
+    // start from the latest base so a merged first PR is in this one.
+    const repoKey = repoKeyForWorkspacePath(pipelineCwd, config);
+    const turn = await waitForSameFileTurn({
+      jobId,
+      channelId: task.event.channelId,
+      threadTs: task.event.threadTs,
+      repo: repoKey ?? path.dirname(pipelineCwd),
+      cwd: pipelineCwd,
+      files: planAffectedFiles,
+      slack,
+      logStep,
+      signal,
+    });
+    if (turn.outcome === 'cancelled' || signal?.aborted) {
+      return cancelledResult('IMPLEMENTATION');
+    }
+    if (turn.waited && repoKey) {
+      pipelineCwd = await resolveWorkspace(repoPathFor(repoKey, config), task.event.threadTs);
+      logStep?.({
+        stage: 'implementation.workspace.refreshed',
+        message: 'Moved the worktree to the latest base after waiting for the same files.',
+        data: { pipelineCwd },
+      });
+    }
 
     // Build the plannerStep for downstream consumption
     const plannerStep: AgentStepResult = {

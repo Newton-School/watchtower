@@ -62,6 +62,7 @@ import {
   activeJobIdForThread,
   activeJobForThread,
 } from './state/activeJobs.js';
+import { finishWork } from './state/workLedger.js';
 import { decideStop } from './router/stopIntent.js';
 import { JobStore } from './state/jobStore.js';
 import { settleAbortedResult } from './workflows/shared/cancelState.js';
@@ -1549,6 +1550,9 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
           await cleanupThreadWorkspaces(event.threadTs);
         }
 
+        // A run that opened a PR is still matched against the same ask sent
+        // again for a few minutes (issue #602); anything else is forgotten.
+        finishWork(jobId, { prUrl: hasPrInResult ? String(result.result?.prUrl) : undefined });
         unregisterActiveJob(jobId);
 
         // Swap :eyes: for outcome reaction. PAUSED gets a distinct emoji so a
