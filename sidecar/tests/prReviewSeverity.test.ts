@@ -106,6 +106,9 @@ describe('readSeverityChange', () => {
     expect(readSeverityChange('high', { severity: 'critical' })).toBeUndefined();
     expect(readSeverityChange('medium', { severity: 'medium' })).toBeUndefined();
     expect(readSeverityChange('medium', { severity: 'blocker' })).toBeUndefined();
+    for (const inherited of ['constructor', 'valueOf', '__proto__', 'toString']) {
+      expect(readSeverityChange('high', { severity: inherited, severityBasis: 'not-shipped' })).toBeUndefined();
+    }
     expect(readSeverityChange('medium', {})).toBeUndefined();
   });
 });

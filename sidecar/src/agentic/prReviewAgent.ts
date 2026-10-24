@@ -690,7 +690,9 @@ export function readSeverityChange(
   verdictJson: Record<string, unknown>,
 ): SeverityChange | undefined {
   const raw = verdictJson.severity;
-  if (typeof raw !== 'string' || !(raw in SEVERITY_RANK)) return undefined;
+  // hasOwn, not `in`: "constructor" or "valueOf" from a vote would otherwise
+  // pass as a severity and get the finding dropped as invalid.
+  if (typeof raw !== 'string' || !Object.hasOwn(SEVERITY_RANK, raw)) return undefined;
   const proposed = raw as AgentFinding['severity'];
   if (SEVERITY_RANK[proposed] >= SEVERITY_RANK[from]) return undefined;
   const basis = (SEVERITY_BASES as readonly string[]).includes(String(verdictJson.severityBasis))
