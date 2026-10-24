@@ -77,8 +77,18 @@ describe('buildRouterPrompt', () => {
     // Issue #606: a permissions ask ran a full lookup; a Sheet ask is still worth one (it attaches CSVs).
     expect(prompt).toContain('grant access or permissions, enrol or move someone');
     expect(prompt).toContain('change_code changes code and content in a repository, not live data');
-    expect(prompt).toContain('neither is a message that asks a question beside the action: that is answer');
-    expect(prompt).toContain('Asking for data or a report as a spreadsheet or a Google Sheet is answer too');
+    expect(prompt).toContain(
+      'A message is unsupported only when nothing in it is something these tools can do; when part of it is, route that part.',
+    );
+    // Naming enrolment as unsupported once cut "the enrol button 500s, fix it" to 0.6, below the floor.
+    expect(prompt).toContain(
+      'A bug in that code is change_code or investigate even when it is about access or enrolment.',
+    );
+    // Scoped to actions the tools do not reach: "fix it and tell me why" stays change_code.
+    expect(prompt).toContain(
+      'a message that asks for an action these tools do not reach and also asks a question is answer',
+    );
+    expect(prompt).toContain('Asking for data or a report as a spreadsheet or a Google Sheet is answer;');
     expect(prompt).toContain('"cannot": "only for unsupported", "who_can": "only for unsupported"');
     expect(prompt).toContain('A message addressed to you directly is never stay_silent');
   });

@@ -420,15 +420,22 @@ export async function routeTask(params: {
             : clarify.kind === 'ask' && clarify.reason === 'owner_mention_change'
               ? classification.intent
               : 'INFORMATIONAL';
-      } else if (classification.tool === 'unsupported' && addressingOf(task) === 'direct') {
+      } else if (
+        classification.tool === 'unsupported' &&
+        addressingOf(task) === 'direct' &&
+        classification.confidence >= CLASSIFIER_CONFIDENCE_FLOOR
+      ) {
         // An action none of the tools reach (grant access, set a reminder):
         // said at once, instead of a lookup that takes minutes to say the same
         // (issue #606). Nothing runs, so access is checked at the lowest tier.
-        // An owner mention or a mention in passing keeps its silence.
+        // An owner mention or a mention in passing keeps its silence. Below the
+        // floor the router may have missed something it could do: the lookup
+        // runs as before, and reads the message itself.
         unsupportedText = unsupportedReply({ cannot: classification.cannot, whoCan: classification.whoCan });
         logStep?.({
           stage: 'router.unsupported',
-          message: 'The router says none of the tools can do this — replying at once, with no agent run.',
+          message:
+            "Router chose unsupported — will say miniOG can't do this, with no agent run, if the requester may be answered.",
           data: {
             cannot: classification.cannot ?? null,
             whoCan: classification.whoCan ?? null,
@@ -496,7 +503,7 @@ export async function routeTask(params: {
       : clarify.kind === 'give_up'
         ? { did: 'not asking a second time', ran: 'GAVE_UP' }
         : unsupportedText
-          ? { did: 'saying it cannot do this', ran: 'UNSUPPORTED' }
+          ? { did: "will say it can't do this, if allowed", ran: 'UNSUPPORTED' }
           : {}),
   });
 
@@ -748,6 +755,7 @@ export async function routeTask(params: {
       thread_ts: task.event.threadTs,
       text: unsupportedText,
     });
+    logStep?.({ stage: 'router.unsupported.replied', message: unsupportedText });
     return {
       workflow: 'UNKNOWN',
       status: 'SKIPPED',

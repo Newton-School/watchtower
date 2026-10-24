@@ -974,9 +974,23 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
         whoCan: 'someone with admin access to the proctoring system',
       });
       expect(stageLog(logStep, 'router.decision')).toMatchObject({
-        message: 'Router chose unsupported; saying it cannot do this.',
+        message: "Router chose unsupported; will say it can't do this, if allowed.",
         data: { tool: 'unsupported', routerWouldRun: 'UNSUPPORTED', agree: true },
       });
+      expect(stageLog(logStep, 'router.unsupported.replied').message).toMatch(/^I can't grant access/);
+    });
+
+    it('runs the lookup as before when the router is unsure nothing here is doable', async () => {
+      routerSays('unsupported', 0.6, { cannot: 'grant access to proctor reports' });
+
+      const { result, logStep, slack } = await route(permissions, builder, enforce());
+
+      expect(result.workflow).toBe('INFORMATIONAL');
+      expect(runAgenticEntry).toHaveBeenCalledWith(expect.objectContaining({ mode: 'informational' }));
+      expect(repliesOf(slack)).toEqual([]);
+      expect(stageLog(logStep, 'router.unsupported')).toBeUndefined();
+      // The row still says what the router wanted.
+      expect(stageLog(logStep, 'router.decision').data).toMatchObject({ tool: 'unsupported', agree: false });
     });
 
     it('still says so when the router named no action', async () => {
@@ -1024,11 +1038,16 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
     it('gives a requester who would be denied the denial, and nothing else', async () => {
       routerSays('unsupported', 0.9, { cannot: 'grant access' });
 
-      const { result, slack } = await route(permissions, { userId: 'USTRANGER', channelId: 'C-VIEW' }, enforce());
+      const { result, slack, logStep } = await route(
+        permissions,
+        { userId: 'USTRANGER', channelId: 'C-VIEW' },
+        enforce(),
+      );
 
       expect(result.status).toBe('SKIPPED');
       expect(slack.chat.postMessage).toHaveBeenCalledOnce();
       expect(slack.chat.postMessage.mock.calls[0][0].text).not.toContain("I can't grant access");
+      expect(stageLog(logStep, 'router.unsupported.replied')).toBeUndefined();
     });
 
     it('says nothing once the job is cancelled', async () => {
@@ -1036,10 +1055,14 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
       const controller = new AbortController();
       controller.abort();
 
-      const { result, slack } = await route(permissions, builder, { ...enforce(), signal: controller.signal });
+      const { result, slack, logStep } = await route(permissions, builder, {
+        ...enforce(),
+        signal: controller.signal,
+      });
 
       expect(result.status).toBe('CANCELLED');
       expectNoReply(slack);
+      expect(stageLog(logStep, 'router.unsupported.replied')).toBeUndefined();
     });
   });
 
