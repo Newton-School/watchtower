@@ -10,6 +10,7 @@ import { lightweightProfile, profileForAgentRole } from '../codex/modelProfiles.
 import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
 import { isInterruption, runWithInfraRetry, type InterruptionKind } from '../codex/infraRetry.js';
 import { jobSlots } from '../runtime/jobSlots.js';
+import { activeClock } from '../runtime/activeClock.js';
 import { whileWaitingForAnswer } from '../runtime/humanWaits.js';
 import {
   isNone,
@@ -1616,9 +1617,19 @@ export async function runAgentPipeline(params: RunAgentPipelineParams): Promise<
         logStep: params.logStep,
       })
     : undefined;
+  // The budget leaves out time the host slept (issue #586); the run's log says when it did.
+  const stopSleepLog = activeClock.onSlept(sleptMs =>
+    params.logStep({
+      stage: 'pipeline.host_slept',
+      message: `The host was asleep for ${formatElapsed(sleptMs)}; that time does not count against the run's budget.`,
+      level: 'WARN',
+      data: { sleptMs },
+    }),
+  );
   try {
     return await runAgentPipelineBody(params, progress);
   } finally {
+    stopSleepLog();
     // A body that threw must not leave a live-looking "writing the code · 12 min" behind.
     if (progress && !progress.finished) await progress.finish('Stopped before it finished. Details below.');
     progress?.dispose();
@@ -1639,6 +1650,8 @@ async function runAgentPipelineBody(
   } = ctx.pipelineConfig;
 
   const pipelineStart = Date.now();
+  // The budget runs on awake time: a laptop asleep mid-run is not the run's time (issue #586).
+  const budgetClock = activeClock.stopwatch();
   // Steps produced by THIS run. Kept separate from `ctx.previousSteps` so the
   // persisted steps_json and the returned `result.steps` stay scoped to this
   // pipeline — but every prompt is built from BOTH via promptSteps() below.
@@ -1736,7 +1749,8 @@ async function runAgentPipelineBody(
     if (totalTimeoutMs) {
       // Time lost to a dead connection is not the pipeline's: a run that sat
       // offline for an hour has not used an hour of its budget (issue #439).
-      const elapsed = Date.now() - pipelineStart - infraWaitMs;
+      // Nor is time the host slept (issue #586).
+      const elapsed = budgetClock.elapsedMs() - infraWaitMs;
       if (elapsed >= totalTimeoutMs) {
         // The budget is checked between steps, so it often runs out just
         // after a coder pass: that pass's changes were never reviewed (issue #333).
@@ -1745,7 +1759,7 @@ async function runAgentPipelineBody(
           stage: 'pipeline.timeout',
           message: 'Pipeline total timeout exceeded.',
           level: 'ERROR',
-          data: { elapsed, totalTimeoutMs, lastCoderPassUnreviewed },
+          data: { elapsed, totalTimeoutMs, lastCoderPassUnreviewed, hostSleptMs: budgetClock.sleptMs() },
         });
         budgetExhausted = { elapsedMs: elapsed, limitMs: totalTimeoutMs, lastCoderPassUnreviewed };
         aborted = true;
@@ -2265,7 +2279,13 @@ async function runAgentPipelineBody(
     stage: 'pipeline.finish',
     message: `Pipeline finished: ${finalStatus} (${totalDurationMs}ms, ${retryLoops} retry loops, ${aggregatedFindings.length} total findings).`,
     level: finalStatus === 'passed' ? 'INFO' : 'WARN',
-    data: { finalStatus, totalDurationMs, retryLoops, totalFindings: aggregatedFindings.length },
+    data: {
+      finalStatus,
+      totalDurationMs,
+      retryLoops,
+      totalFindings: aggregatedFindings.length,
+      hostSleptMs: budgetClock.sleptMs(),
+    },
   });
 
   const took = formatElapsed(totalDurationMs);

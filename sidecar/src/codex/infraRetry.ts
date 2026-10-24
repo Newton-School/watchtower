@@ -1,5 +1,6 @@
 import { runCodex } from './runCodex.js';
 import type { CodexRunRequest, CodexRunResult, WorkflowStepLogger } from '../types/contracts.js';
+import { activeClock } from '../runtime/activeClock.js';
 
 /**
  * One place that knows what to do when an agent run dies of something that is
@@ -103,6 +104,11 @@ export async function runWithInfraRetry(
     EXTERNAL_KILL: __infraRetry.killDelaysMs,
   };
   const used: Record<InterruptionKind, number> = { API_ERROR: 0, EXTERNAL_KILL: 0 };
+  // Time the host slept is already off the pipeline's clock (issue #586), and
+  // a sleep is often what drops the connection: lost time here leaves it out,
+  // or the run would get that time back twice.
+  let watch = activeClock.stopwatch();
+  const lostTime = (wallMs: number): number => Math.max(0, wallMs - watch.sleptMs());
   let result = await __infraRetry.run(request);
   let infraWaitMs = 0;
   let infraRetries = 0;
@@ -113,7 +119,7 @@ export async function runWithInfraRetry(
     if (used[kind] >= delays.length) break;
     const delayMs = delays[used[kind]];
     used[kind] += 1;
-    infraWaitMs += result.durationMs ?? 0;
+    infraWaitMs += lostTime(result.durationMs ?? 0);
     infraRetries += 1;
     logStep?.({
       stage: RETRY_COPY[kind].stage,
@@ -128,11 +134,15 @@ export async function runWithInfraRetry(
       },
     });
 
+    watch = activeClock.stopwatch();
     const waited = await __infraRetry.sleep(delayMs, request.signal);
-    infraWaitMs += delayMs;
+    // A sleep can run past the end of the wait, so count the awake part of
+    // it, not the planned delay minus the sleep.
+    infraWaitMs += watch.sleptMs() > 0 ? watch.elapsedMs() : delayMs;
     if (!waited) break;
 
     const sessionId = options.resume ? result.sessionId : undefined;
+    watch = activeClock.stopwatch();
     let next = await __infraRetry.run(
       sessionId ? { ...request, resumeSessionId: sessionId, prompt: RESUME_AFTER_DROP_PROMPT } : request,
     );
@@ -143,13 +153,14 @@ export async function runWithInfraRetry(
         level: 'WARN',
         data: { label, sessionId },
       });
+      watch = activeClock.stopwatch();
       next = await __infraRetry.run(request);
     }
     result = next;
   }
 
   // Still interrupted after the last retry: that attempt was lost time too.
-  if (isInterruption(result.errorKind)) infraWaitMs += result.durationMs ?? 0;
+  if (isInterruption(result.errorKind)) infraWaitMs += lostTime(result.durationMs ?? 0);
   return { ...result, infraWaitMs, infraRetries };
 }
 
