@@ -44,6 +44,7 @@ import { cancelledResult } from '../workflows/shared/cancelState.js';
 import { cleanResetText, usageLimitReply } from '../codex/infraRetry.js';
 import { channelDenialHint } from '../access/denialHint.js';
 import { buildHelpReply, isHelpRequest } from './helpReply.js';
+import { unsupportedReply } from './unsupportedReply.js';
 import { isMarketingStagingDeployAsk, namesStagingAsTarget } from './intentParser.js';
 import { marketingStagingReply } from '../repos/registry.js';
 import { acknowledgementText, pickupDelayMs } from './acknowledgement.js';
@@ -273,6 +274,8 @@ export async function routeTask(params: {
   /** Set when the router failed on the Claude usage limit: the reply then says when to come back. */
   let routerUsageLimit: { resetsAtText?: string } | undefined;
   let clarify: ClarifyAction = { kind: 'run' };
+  /** Set when miniOG was asked directly for an action none of its tools reach: the reply to post. */
+  let unsupportedText: string | undefined;
 
   // PR_REVIEW can only be seeded before this point by the deterministic gate
   // (isPrReviewRequest in intentParser.ts). It does not wait for the router,
@@ -417,6 +420,24 @@ export async function routeTask(params: {
             : clarify.kind === 'ask' && clarify.reason === 'owner_mention_change'
               ? classification.intent
               : 'INFORMATIONAL';
+      } else if (classification.tool === 'unsupported' && addressingOf(task) === 'direct') {
+        // An action none of the tools reach (grant access, set a reminder):
+        // said at once, instead of a lookup that takes minutes to say the same
+        // (issue #606). Nothing runs, so access is checked at the lowest tier.
+        // An owner mention or a mention in passing keeps its silence.
+        unsupportedText = unsupportedReply({ cannot: classification.cannot, whoCan: classification.whoCan });
+        logStep?.({
+          stage: 'router.unsupported',
+          message: 'The router says none of the tools can do this — replying at once, with no agent run.',
+          data: {
+            cannot: classification.cannot ?? null,
+            whoCan: classification.whoCan ?? null,
+            confidence: classification.confidence,
+            reasoning: classification.reasoning,
+            reply: unsupportedText,
+          },
+        });
+        resolvedIntent = 'INFORMATIONAL';
       } else if (holdOverride) {
         // The router was unsure and the message was not addressed to miniOG (a
         // direct address became a question above). The floor used to keep the
@@ -474,7 +495,9 @@ export async function routeTask(params: {
       ? { did: 'asking the requester', ran: 'ASK_USER' }
       : clarify.kind === 'give_up'
         ? { did: 'not asking a second time', ran: 'GAVE_UP' }
-        : {}),
+        : unsupportedText
+          ? { did: 'saying it cannot do this', ran: 'UNSUPPORTED' }
+          : {}),
   });
 
   // NONE = classifier determined this is human-to-human conversation, miniOG should stay silent
@@ -714,6 +737,21 @@ export async function routeTask(params: {
       workflow: 'CONVERSATIONAL',
       status: 'SUCCESS',
       message: 'Answered a help request with what miniOG can do here.',
+      notifyDesktop: false,
+      slackPosted: true,
+    };
+  }
+  if (unsupportedText) {
+    if (signal?.aborted) return cancelledResult('UNKNOWN');
+    await slack.chat.postMessage({
+      channel: task.event.channelId,
+      thread_ts: task.event.threadTs,
+      text: unsupportedText,
+    });
+    return {
+      workflow: 'UNKNOWN',
+      status: 'SKIPPED',
+      message: `Asked for something none of the tools do; said so and ran nothing: ${unsupportedText}`,
       notifyDesktop: false,
       slackPosted: true,
     };
