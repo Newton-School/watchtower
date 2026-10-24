@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx src/index.ts",
-    "build": "rm -rf dist && tsc -p tsconfig.json",
+    "build": "rm -rf dist && tsc -p tsconfig.json && node scripts/check-dist-imports.mjs",
     "test": "vitest run",
     "lint": "eslint .",
     "mcp": "node dist/mcp/stdioMcpServer.js"
