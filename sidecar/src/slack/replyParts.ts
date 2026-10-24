@@ -28,6 +28,12 @@ export const REST_IN_FILE = 'The rest of this reply was too long for Slack, so i
 /** Said when that file could not be attached. */
 export const REST_NOT_SHOWN = 'The rest of this reply was too long for Slack and could not be attached.';
 
+/** Said with the file that holds the rest of a reply after Slack turned a part of it down. */
+export const REST_IN_FILE_AFTER_ERROR = 'Slack did not take the rest of this reply as messages, so it is in this file.';
+
+/** Said when Slack turned a part down and the file could not be attached either. */
+export const REST_NOT_POSTED = 'The rest of this reply could not be posted to Slack.';
+
 /** What a cut inside a code block adds to the part before it. */
 const FENCE_CLOSE = '\n```';
 
@@ -210,20 +216,17 @@ function findCut(text: string, limit: number): Cut {
   return { at, how: 'hard' };
 }
 
-/**
- * A mention or link too long to fit anywhere whole, as plain text: its label,
- * else what it points at, or nothing when `keepTarget` is false.
- */
-function unwrapLongTokens(text: string, max: number, keepTarget: boolean): string {
+/** A mention or link too long to fit anywhere whole, as plain text: its label, else what it points at. */
+function unwrapLongTokens(text: string, max: number): string {
   return text.replace(/<([^<>\n|]+)(?:\|([^<>\n]*))?>/g, (token, target: string, label: string | undefined) =>
-    slackLength(token) > max ? label || (keepTarget ? target : '') : token,
+    slackLength(token) > max ? label || target : token,
   );
 }
 
 /** The first `max` parts of `text`, and what is left after them. */
 function takeParts(text: string, limit: number, max: number): { parts: string[]; rest: string } {
   const parts: string[] = [];
-  let rest = unwrapLongTokens(text, limit, true);
+  let rest = unwrapLongTokens(text, limit);
   while (parts.length < max && slackLength(rest) > limit) {
     const cut = findCut(rest, limit);
     let head: string;
@@ -276,17 +279,17 @@ export function splitSlackText(text: string, limit = SLACK_PART_CHARS): string[]
 
 /**
  * `text` cut to at most `max` characters at a space, with "…" when anything
- * was cut. A mention, a link or inline code is left whole or left out (a link
- * too long to keep becomes its label), and a code block cut short is closed
- * (its closing fence goes past `max`).
+ * was cut. A mention, a link or inline code is left whole or left out (a
+ * leading link too long to keep becomes its label, or its bare URL, cut like
+ * any other word), and a code block cut short is closed (its closing fence
+ * goes past `max`).
  */
 export function clipText(text: string, max: number): string {
   if (text.length <= max) return text;
   const room = Math.max(max - 1, 1);
   // A leading mention or link longer than the room would leave only "<https://…".
   const lead = /^<[^<>\n]+>/.exec(text);
-  const source =
-    lead && lead[0].length > room ? unwrapLongTokens(lead[0], room, false) + text.slice(lead[0].length) : text;
+  const source = lead && lead[0].length > room ? unwrapLongTokens(lead[0], room) + text.slice(lead[0].length) : text;
   if (source !== text) return clipText(source.trimStart(), max);
   const { fences, spans } = layoutOf(source);
   let at = -1;
@@ -326,12 +329,13 @@ export interface PartOptions<A, R> {
   /** The most messages the reply becomes; the rest goes to `fileRest`. */
   maxParts?: number;
   /**
-   * True when the first part went out some other way that allows only a few
-   * posts (a response_url): the other parts then go as one message.
+   * How many more posts the way the first part went allows (a response_url
+   * allows five in all), or undefined when there is no such limit. The last of
+   * them is kept for the line that says the rest is not shown.
    */
-  joinRest?: (first: R) => boolean;
-  /** Puts what did not fit in `maxParts` messages in the thread as a file. True when it arrived. */
-  fileRest?: (rest: string, args: A) => Promise<boolean>;
+  postsLeft?: (first: R) => number | undefined;
+  /** Puts the rest of the reply in the thread as a file, with `note` beside it. True when it arrived. */
+  fileRest?: (rest: string, args: A, note: string) => Promise<boolean>;
 }
 
 /**
@@ -341,10 +345,13 @@ export interface PartOptions<A, R> {
  *
  * Answers with the first part's response, so a caller that keeps the
  * message's ts points at where the reply starts. A first part that is refused
- * stops the rest. A later part that fails is logged, not thrown: the reply has
- * already begun in the thread, and a caller that saw an error would report the
- * whole reply as not posted. With blocks or attachments the text is only the
- * notification fallback and is posted as it is.
+ * stops the rest, and so does a later one (the thread is gone). A later part
+ * that throws is logged, not thrown: the reply has already begun in the
+ * thread, and a caller that saw an error would report the whole reply as not
+ * posted. What it and the parts after it held goes in a file, or a line says
+ * it could not be posted, so the answer does not just stop. With blocks or
+ * attachments the text is only the notification fallback and is posted as it
+ * is.
  */
 export async function postInParts<A extends PostArgs, R extends { ok?: boolean }>(
   post: (args: A) => Promise<R>,
@@ -360,31 +367,44 @@ export async function postInParts<A extends PostArgs, R extends { ok?: boolean }
   // Only the first part goes to the channel too.
   const later = (text: string) =>
     args.reply_broadcast ? { ...args, text, reply_broadcast: false } : { ...args, text };
-  const others = parts.slice(1);
-  const messages = others.length > 1 && options.joinRest?.(first) ? [others.join('\n\n')] : others;
+  const deliverRest = async (text: string, fileNote: string, lineNote: string) => {
+    let uploadError: string | undefined;
+    try {
+      if (options.fileRest && (await options.fileRest(text, args, fileNote))) return;
+    } catch (error) {
+      uploadError = String(error);
+    }
+    logger.warn(
+      { component: 'slack', parts: parts.length, restChars: text.length, error: uploadError },
+      'slack.post.rest_dropped: a long reply was cut short and its rest could not be attached',
+    );
+    await post(later(lineNote)).catch(() => undefined);
+  };
 
-  for (const [index, text] of messages.entries()) {
+  let others = parts.slice(1);
+  let leftover = rest;
+  const budget = options.postsLeft?.(first);
+  if (budget !== undefined && others.length + (rest ? 1 : 0) > budget) {
+    const keep = Math.max(budget - 1, 0);
+    leftover = [...others.slice(keep), rest].filter(Boolean).join('\n\n');
+    others = others.slice(0, keep);
+  }
+
+  for (const [index, text] of others.entries()) {
     try {
       const response = await post(later(text));
       if (response.ok === false) return first;
     } catch (error) {
       logger.warn(
-        { component: 'slack', part: index + 2, parts: messages.length + 1, error: String(error) },
+        { component: 'slack', part: index + 2, parts: parts.length, error: String(error) },
         'slack.post.part_failed: a later part of a long reply was not posted',
       );
+      const unposted = [...others.slice(index), leftover].filter(Boolean).join('\n\n');
+      await deliverRest(unposted, REST_IN_FILE_AFTER_ERROR, REST_NOT_POSTED);
       return first;
     }
   }
 
-  if (rest) {
-    const filed = options.fileRest ? await options.fileRest(rest, args).catch(() => false) : false;
-    if (!filed) {
-      logger.warn(
-        { component: 'slack', parts: parts.length, restChars: rest.length },
-        'slack.post.rest_dropped: a long reply was cut short and its rest could not be attached',
-      );
-      await post(later(REST_NOT_SHOWN)).catch(() => undefined);
-    }
-  }
+  if (leftover) await deliverRest(leftover, REST_IN_FILE, REST_NOT_SHOWN);
   return first;
 }

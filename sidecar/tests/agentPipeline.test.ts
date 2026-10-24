@@ -1264,7 +1264,7 @@ describe('formatExecutedPlanEdit: the plan message once the coder is done (issue
     expect(posted.length).toBeGreaterThan(1);
 
     const edit = formatExecutedPlanEdit(plan, FILES, 'small', REPO);
-    expect(edit).toBe(`${posted[0]}\n\n_✅ Plan executed._`);
+    expect(edit).toBe(`${posted[0]}\n_(continued below)_\n\n_✅ Plan executed._`);
     expect(edit.length).toBeLessThan(4_000);
   });
 });

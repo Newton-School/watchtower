@@ -4,6 +4,9 @@ import {
   clipText,
   MAX_REPLY_PARTS,
   postInParts,
+  REST_IN_FILE,
+  REST_IN_FILE_AFTER_ERROR,
+  REST_NOT_POSTED,
   REST_NOT_SHOWN,
   slackLength,
   SLACK_PART_CHARS,
@@ -239,10 +242,12 @@ describe('clipText', () => {
     );
   });
 
-  it('turns a leading link too long to keep into its label, or drops it', () => {
+  it('turns a leading link too long to keep into its label, or its bare URL', () => {
     const url = `https://example.com/${'a'.repeat(300)}`;
     expect(clipText(`<${url}|the design doc> is where the plan lives now`, 30)).toBe('the design doc is where the…');
-    expect(clipText(`<${url}> is where the plan lives, with the notes`, 30)).toBe('is where the plan lives, with…');
+    expect(clipText(`<${url}> is where the plan lives, with the notes`, 30)).toBe(
+      `https://example.com/${'a'.repeat(9)}…`,
+    );
   });
 });
 
@@ -285,7 +290,27 @@ describe('postInParts', () => {
       .mockRejectedValueOnce(new Error('ratelimited'))
       .mockResolvedValue({ ok: true, ts: '3' });
     await expect(postInParts(flaky, { text }, { limit: 100 })).resolves.toEqual({ ok: true, ts: '1' });
-    expect(flaky).toHaveBeenCalledTimes(2);
+    // The thread does not just stop: a line says the rest could not be posted.
+    expect(flaky).toHaveBeenCalledTimes(3);
+    expect(String((flaky.mock.calls[2][0] as { text: string }).text)).toBe(REST_NOT_POSTED);
+  });
+
+  it('puts the parts Slack turned down in a file', async () => {
+    const text = `${words(15, 'alpha')}\n\n${words(15, 'beta')}\n\n${words(15, 'gamma')}`;
+    const post = vi.fn().mockResolvedValueOnce({ ok: true, ts: '1' }).mockRejectedValueOnce(new Error('ratelimited'));
+    const fileRest = vi.fn().mockResolvedValue(true);
+    await postInParts(post, { text }, { limit: 100, fileRest });
+    expect(post).toHaveBeenCalledTimes(2);
+    const [unposted, , note] = fileRest.mock.calls[0] as [string, unknown, string];
+    expect(unposted.split('\n\n').map(part => part.split(' ')[0])).toEqual(['beta', 'gamma']);
+    expect(note).toBe(REST_IN_FILE_AFTER_ERROR);
+  });
+
+  it('stops quietly when a later part is refused (the thread is gone)', async () => {
+    const text = `${words(15, 'alpha')}\n\n${words(15, 'beta')}\n\n${words(15, 'gamma')}`;
+    const post = vi.fn().mockResolvedValueOnce({ ok: true, ts: '1' }).mockResolvedValue({ ok: false });
+    await postInParts(post, { text }, { limit: 100 });
+    expect(post).toHaveBeenCalledTimes(2);
   });
 
   it('posts text that only backs blocks as it is', async () => {
@@ -300,12 +325,19 @@ describe('postInParts', () => {
   const textOf = (post: ReturnType<typeof vi.fn>) =>
     post.mock.calls.map(call => String(((call as unknown[])[0] as { text: string }).text));
 
-  it('joins the other parts into one message when the first went a way that allows few posts', async () => {
+  it('stays within the posts the first part’s way allows, ending with a line', async () => {
+    const six = Array.from({ length: 6 }, (_, i) => words(15, `part${i}`)).join('\n\n');
     const post = vi.fn().mockResolvedValue({ ok: true, ts: '1', via: 'response_url' });
-    await postInParts(post, { text: five }, { limit: 100, joinRest: first => first.via === 'response_url' });
+    await postInParts(post, { text: six }, { limit: 100, postsLeft: first => (first.via ? 4 : undefined) });
     const texts = textOf(post);
-    expect(texts.length).toBe(2);
-    expect(texts[1].split('\n\n').map(text => text.split(' ')[0])).toEqual(['part1', 'part2', 'part3', 'part4']);
+    expect(texts.length).toBe(5);
+    expect(texts.slice(0, 4).map(text => text.split(' ')[0])).toEqual(['part0', 'part1', 'part2', 'part3']);
+    expect(texts[4]).toBe(REST_NOT_SHOWN);
+
+    // When every part fits the allowance, all of them go.
+    const all = vi.fn().mockResolvedValue({ ok: true, ts: '1', via: 'response_url' });
+    await postInParts(all, { text: five }, { limit: 100, postsLeft: () => 4 });
+    expect(all).toHaveBeenCalledTimes(5);
   });
 
   it('posts at most maxParts messages and puts the rest in a file', async () => {
@@ -315,9 +347,10 @@ describe('postInParts', () => {
     await postInParts(post, args, { limit: 100, maxParts: 2, fileRest });
     expect(textOf(post).map(text => text.split(' ')[0])).toEqual(['part0', 'part1']);
     expect(fileRest).toHaveBeenCalledTimes(1);
-    const [rest, passed] = fileRest.mock.calls[0] as [string, unknown];
+    const [rest, passed, note] = fileRest.mock.calls[0] as [string, unknown, string];
     expect(rest.split('\n\n').map(text => text.split(' ')[0])).toEqual(['part2', 'part3', 'part4']);
     expect(passed).toBe(args);
+    expect(note).toBe(REST_IN_FILE);
   });
 
   it('says so when the rest could not be attached', async () => {

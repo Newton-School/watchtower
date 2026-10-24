@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { WebClient } from '@slack/web-api';
 import { buildEventAwareClient } from '../src/slack/eventAwareClient.js';
-import { MAX_REPLY_PARTS, REST_IN_FILE } from '../src/slack/replyParts.js';
+import { MAX_REPLY_PARTS, REST_IN_FILE, REST_NOT_SHOWN } from '../src/slack/replyParts.js';
 import type { SlackEventEnvelope } from '../src/types/contracts.js';
 
 const THREAD = '1700000000.000100';
@@ -92,7 +92,32 @@ describe('buildEventAwareClient: long replies (issue #623)', () => {
     expect(postMessage).toHaveBeenCalledTimes(2);
   });
 
-  it('sends the other parts as one response_url post when the bot is not in the channel', async () => {
+  it('keeps a long reply through the response_url within its five posts, ending with a line', async () => {
+    const notInChannel = { data: { error: 'not_in_channel' } };
+    const postMessage = vi.fn().mockRejectedValue(notInChannel);
+    const fetch = vi.fn().mockResolvedValue({ ok: true, text: async () => '' });
+    vi.stubGlobal('fetch', fetch);
+    const { client, filesUploadV2 } = fakeClient(postMessage);
+    filesUploadV2.mockRejectedValue(notInChannel);
+    const slack = buildEventAwareClient(
+      client,
+      { ...event, responseUrl: 'https://hooks.slack.test/r' },
+      { onOrphanPromoted: vi.fn() },
+    );
+
+    const response = await slack.chat.postMessage({ channel: 'C1', thread_ts: THREAD, text: longReply(12) });
+
+    expect(response.ok).toBe(true);
+    expect(fetch).toHaveBeenCalledTimes(5);
+    const bodies = fetch.mock.calls.map(
+      call => JSON.parse(String((call[1] as { body: string }).body)) as { text: string; thread_ts: string },
+    );
+    expect(bodies.slice(0, 4).map(body => body.text.slice(0, 4))).toEqual(['p0xx', 'p2xx', 'p4xx', 'p6xx']);
+    expect(bodies[4].text).toBe(REST_NOT_SHOWN);
+    for (const body of bodies) expect(body.thread_ts).toBe(THREAD);
+  });
+
+  it('posts a short reply through the response_url once when the bot is not in the channel', async () => {
     const postMessage = vi.fn().mockRejectedValue({ data: { error: 'not_in_channel' } });
     const fetch = vi.fn().mockResolvedValue({ ok: true, text: async () => '' });
     vi.stubGlobal('fetch', fetch);
@@ -103,16 +128,36 @@ describe('buildEventAwareClient: long replies (issue #623)', () => {
       { onOrphanPromoted: vi.fn() },
     );
 
-    const response = await slack.chat.postMessage({ channel: 'C1', thread_ts: THREAD, text: longReply(5) });
+    const response = await slack.chat.postMessage({ channel: 'C1', thread_ts: THREAD, text: 'On it.' });
 
-    expect(response.ok).toBe(true);
-    expect(fetch).toHaveBeenCalledTimes(2);
-    const bodies = fetch.mock.calls.map(
-      call => JSON.parse(String((call[1] as { body: string }).body)) as { text: string },
-    );
-    expect(bodies[0].text.startsWith('p0xx')).toBe(true);
-    expect(bodies[1].text).toContain('p2xx');
-    expect(bodies[1].text).toContain('p4xx');
+    expect(response).toEqual(expect.objectContaining({ ok: true, ts: THREAD, channel: 'C1' }));
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String((fetch.mock.calls[0][1] as { body: string }).body))).toEqual({
+      response_type: 'in_channel',
+      replace_original: false,
+      text: 'On it.',
+      thread_ts: THREAD,
+    });
+  });
+
+  it('undoes a short reply Slack moved out of the thread', async () => {
+    const postMessage = vi.fn().mockResolvedValue({ ok: true, ts: '1700000001.000009', message: {} });
+    const { client, remove } = fakeClient(postMessage);
+    const onOrphanPromoted = vi.fn();
+    const slack = buildEventAwareClient(client, event, { onOrphanPromoted });
+
+    const response = await slack.chat.postMessage({ channel: 'C1', thread_ts: THREAD, text: 'Done.' });
+
+    expect(response).toEqual({ ok: false, error: 'thread_parent_deleted' });
+    expect(postMessage).toHaveBeenCalledTimes(1);
+    expect(remove).toHaveBeenCalledWith({ channel: 'C1', ts: '1700000001.000009' });
+    expect(onOrphanPromoted).toHaveBeenCalledWith({
+      channelId: 'C1',
+      requestedThreadTs: THREAD,
+      actualThreadTs: null,
+      orphanTs: '1700000001.000009',
+      eventTs: THREAD,
+    });
   });
 
   it(`posts at most ${MAX_REPLY_PARTS} parts and puts the rest of the reply in a file`, async () => {

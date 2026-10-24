@@ -149,6 +149,9 @@ function stripRepoPrefix(filePath: string, repoPath: string): string {
 /** How many files the plan message lists before it says "and N more". */
 const PLAN_MESSAGE_MAX_FILES = 8;
 
+/** Added to the plan message once the coder is done. */
+const PLAN_EXECUTED_SUFFIX = '\n\n_✅ Plan executed._';
+
 /**
  * The plan as posted for approval (issue #437).
  *
@@ -164,8 +167,6 @@ const PLAN_MESSAGE_MAX_FILES = 8;
  * The header counts files the change edits. It used to count every
  * path-shaped token in the plan.
  */
-const PLAN_EXECUTED_SUFFIX = '\n\n_✅ Plan executed._';
-
 export function formatPlanMessage(
   planMarkdown: string,
   affectedFiles: string[],
@@ -230,8 +231,9 @@ export function formatPlanMessage(
 /**
  * The plan message once the coder is done: the plan with "✅ Plan executed."
  * after it. A plan too long for one message went out in parts and its ts is
- * the first part's, so only that part is rewritten, with the marker after it
- * (issue #623); the whole plan in one edit would be cut or refused.
+ * the first part's, so only that part is rewritten, saying the plan goes on
+ * below so the marker is not read as its end (issue #623); the whole plan in
+ * one edit would be cut or refused.
  */
 export function formatExecutedPlanEdit(
   planMarkdown: string,
@@ -241,7 +243,7 @@ export function formatExecutedPlanEdit(
 ): string {
   const posted = splitSlackText(formatPlanMessage(planMarkdown, affectedFiles, scope, repoPath, false));
   if (posted.length <= 1) return formatPlanMessage(planMarkdown, affectedFiles, scope, repoPath, true);
-  return `${posted[0]}${PLAN_EXECUTED_SUFFIX}`;
+  return `${posted[0]}\n_(continued below)_${PLAN_EXECUTED_SUFFIX}`;
 }
 
 const CHANGED_HEADING_RE = /^#{1,6}\s*changed since the last plan\b/i;

@@ -1,7 +1,10 @@
 import type { WebClient } from '@slack/web-api';
 import { logger } from '../logging/logger.js';
 import type { SlackEventEnvelope } from '../types/contracts.js';
-import { postInParts, REST_IN_FILE } from './replyParts.js';
+import { postInParts } from './replyParts.js';
+
+/** How many messages Slack takes through one response_url. */
+const RESPONSE_URL_POSTS = 5;
 
 export function extractSlackErrorCode(error: unknown): string | undefined {
   if (!error || typeof error !== 'object') {
@@ -55,8 +58,9 @@ export interface OrphanPromotion {
  *   cancels the job);
  * - posts a long reply in parts cut where they read whole (issue #623), each
  *   part with the handling above. After a first part that went through the
- *   response_url, which allows five posts, the other parts go as one; what
- *   does not fit in the most parts a reply may take goes in a file.
+ *   response_url, which takes five posts, at most three more parts follow
+ *   and a line says the rest is not shown; otherwise what does not fit in the
+ *   most parts a reply may take goes in a file.
  */
 export function buildEventAwareClient(
   client: WebClient,
@@ -155,7 +159,7 @@ export function buildEventAwareClient(
     return response;
   };
 
-  const fileRest = async (rest: string, args: PostArgs): Promise<boolean> => {
+  const fileRest = async (rest: string, args: PostArgs, note: string): Promise<boolean> => {
     const { channel, thread_ts: threadTs } = args as { channel?: string; thread_ts?: string };
     if (!channel || !threadTs) return false;
     await client.filesUploadV2({
@@ -164,13 +168,16 @@ export function buildEventAwareClient(
       file: Buffer.from(rest, 'utf8'),
       filename: 'reply-continued.md',
       title: 'The rest of the reply',
-      initial_comment: REST_IN_FILE,
+      initial_comment: note,
     });
     return true;
   };
 
   wrappedChat.postMessage = async (...args: Parameters<typeof client.chat.postMessage>) =>
-    postInParts(postOne, args[0], { joinRest: first => viaResponseUrl.has(first), fileRest });
+    postInParts(postOne, args[0], {
+      postsLeft: first => (viaResponseUrl.has(first) ? RESPONSE_URL_POSTS - 1 : undefined),
+      fileRest,
+    });
 
   (wrappedClient as unknown as { chat: typeof client.chat }).chat = wrappedChat;
   return wrappedClient;
