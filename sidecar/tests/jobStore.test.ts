@@ -974,4 +974,40 @@ describe('listChangeRunPrs (issue #603)', () => {
     expect(store.listChangeRunPrs(new Date(Date.now() + 60_000).toISOString())).toEqual([]);
     store.close();
   });
+
+  // Issue #587: catch-up reads the threads miniOG has a running, paused or recent job in.
+  it('lists threads with a running or paused job, or one updated since a time', () => {
+    const store = new JobStore(tempDbPath());
+    const job = (id: string, threadTs: string, status?: 'SUCCESS' | 'FAILED' | 'PAUSED') => {
+      store.createJob({
+        id,
+        eventId: `e-${id}`,
+        dedupeKey: `k-${id}`,
+        workflow: 'IMPLEMENTATION',
+        channelId: 'C1',
+        threadTs,
+        payload: {},
+      });
+      if (status) store.markJob(id, status, {});
+    };
+    job('running', '1.1');
+    job('done', '2.2', 'SUCCESS');
+    job('failed', '3.3', 'FAILED');
+    job('paused', '4.4', 'PAUSED');
+    job('earlier', '1.1', 'SUCCESS');
+
+    const byThread = (rows: Array<{ threadTs: string; active: boolean }>) =>
+      Object.fromEntries(rows.map(row => [row.threadTs, row.active]));
+    expect(byThread(store.threadsWithRecentJobs(new Date(Date.now() - 60_000).toISOString()))).toEqual({
+      '1.1': true,
+      '2.2': false,
+      '3.3': false,
+      '4.4': true,
+    });
+    expect(byThread(store.threadsWithRecentJobs(new Date(Date.now() + 60_000).toISOString()))).toEqual({
+      '1.1': true,
+      '4.4': true,
+    });
+    store.close();
+  });
 });
