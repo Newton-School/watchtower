@@ -64,7 +64,8 @@ vi.mock('@slack/bolt', async () => {
       this.starts += 1;
     }
   }
-  return { App, SocketModeReceiver, LogLevel: { INFO: 'info' } };
+  const exports = { App, SocketModeReceiver, LogLevel: { INFO: 'info' } };
+  return { ...exports, default: exports };
 });
 
 const { retireSocketConnection, SocketSlackClient } = await import('../src/slack/socketClient.js');

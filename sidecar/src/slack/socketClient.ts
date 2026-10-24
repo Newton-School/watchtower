@@ -1,8 +1,14 @@
-import { App, LogLevel, SocketModeReceiver } from '@slack/bolt';
+import bolt, { App, LogLevel } from '@slack/bolt';
 import type { WebClient } from '@slack/web-api';
 import type { AppConfig, SlackEventEnvelope, SlackReactionEvent } from '../types/contracts.js';
 import { logger } from '../logging/logger.js';
 import { BUTTON_ACTION_RE, handleButtonClick, readButtonClick } from './buttonReplies.js';
+
+// Bolt is CommonJS, and Node's ESM loader can't see SocketModeReceiver as a
+// named export (vitest's interop can, so tests passed while 0.6.173's sidecar
+// crashed on start). Take it off the default export.
+const { SocketModeReceiver } = bolt;
+type SocketModeReceiver = InstanceType<typeof SocketModeReceiver>;
 
 type SlackEventHandler = (event: SlackEventEnvelope, client: WebClient) => Promise<void>;
 type SlackReactionHandler = (event: SlackReactionEvent, client: WebClient) => Promise<void>;
