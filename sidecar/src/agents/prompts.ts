@@ -1,6 +1,7 @@
 import type { AgentContext, AgentRole } from './types.js';
 import { sanitizeForBranch, buildSlackThreadLink } from '../workflows/shared/workflowUtils.js';
 import { getActiveBackendId } from '../codex/runCodex.js';
+import { depsPromptLine } from '../workspaces/depCache.js';
 
 function serializePreviousSteps(ctx: AgentContext): string {
   if (ctx.previousSteps.length === 0) return 'No previous agent steps.';
@@ -21,6 +22,12 @@ export const PROCESS_HYGIENE_RULE =
   'Other jobs run on this machine as the same user. Stop only processes you started, and only by PID (`kill <pid>`): ' +
   'when you start a dev server or any background process, note its PID then and stop that PID before you finish. ' +
   "Never use `pkill`, `killall` or `kill -1`: they stop other jobs' agents too, and are blocked.";
+
+/** The worktree's dependencies, as a line under "Repository:" (issue #611); empty when there is nothing to say. */
+function depsLine(ctx: AgentContext): string {
+  const line = depsPromptLine(ctx.repoPath);
+  return line ? `\n${line}` : '';
+}
 
 function policyBlock(ctx: AgentContext): string {
   const pack = ctx.policyPack
@@ -146,7 +153,7 @@ You are the CODER agent in a multi-agent pipeline.
 Your role: Implement the plan from the planner agent. Write code, create tests, commit, and open a PR.
 
 Workflow: ${ctx.workflowIntent}
-Repository: ${ctx.repoPath}
+Repository: ${ctx.repoPath}${depsLine(ctx)}
 Policy: ${policyBlock(ctx)}
 Plan scope: ${scope}
 ${affectedFiles.length > 0 ? `Likely files to touch: ${affectedFiles.map(f => `\`${f}\``).join(', ')}` : ''}
@@ -223,7 +230,7 @@ You are the REVIEWER agent in a multi-agent pipeline.
 Your role: Review the code changes for correctness, maintainability, and — above all — conformance to the approved plan.
 
 Workflow: ${ctx.workflowIntent}
-Repository: ${ctx.repoPath}
+Repository: ${ctx.repoPath}${depsLine(ctx)}
 Policy: ${policyBlock(ctx)}
 
 Approved plan (this is what was signed off — review against it):
@@ -340,7 +347,7 @@ You are the VERIFIER agent in a multi-agent pipeline.
 Your role: Verify that all previous agent outputs are consistent, tests pass, and the approved plan's requirements are actually met by the code.
 
 Workflow: ${ctx.workflowIntent}
-Repository: ${ctx.repoPath}
+Repository: ${ctx.repoPath}${depsLine(ctx)}
 Policy: ${policyBlock(ctx)}
 
 Approved plan (verify the code fulfils THIS):

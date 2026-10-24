@@ -8,6 +8,7 @@ import {
   sandboxReadDenyRules,
 } from '../src/backends/agentSandbox.js';
 import { claudeCodeBackend } from '../src/backends/claudeCodeBackend.js';
+import { __depCache } from '../src/workspaces/depCache.js';
 
 const home = os.homedir();
 const root = path.join(home, 'code', 'mini-og');
@@ -112,6 +113,25 @@ describe('the shell sandbox for agent runs', () => {
     };
     expect(filesystem.denyRead).not.toContain(home);
     expect(filesystem.allowRead).toBeUndefined();
+  });
+
+  it('leaves the dependency installs readable but not writable (issue #611)', () => {
+    configureAgentSandbox({
+      miniOgRepoRoot: root,
+      repoPaths: [path.join(root, 'newton-web')],
+      appDataDir: path.join(home, 'Library', 'Application Support', 'com.example.watchtower'),
+    });
+    const { filesystem } = agentSandboxSettings({ readOnly: false }).sandbox as {
+      filesystem: { denyRead: string[]; allowWrite: string[] };
+    };
+    const cache = __depCache.root;
+    const expand = (entry: string) => (entry.startsWith('~/') ? path.join(home, entry.slice(2)) : entry);
+    const covers = (entry: string) => cache === expand(entry) || cache.startsWith(`${expand(entry)}${path.sep}`);
+
+    // A worktree that could only link to an install still reads it.
+    expect(filesystem.denyRead.filter(covers)).toEqual([]);
+    // An agent's install must not change what other runs get.
+    expect(filesystem.allowWrite.filter(covers)).toEqual([]);
   });
 
   it('puts the Read rules among the deny rules and ahead of a flag', () => {
