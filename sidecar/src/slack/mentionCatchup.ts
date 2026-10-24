@@ -79,6 +79,8 @@ type CatchupDeps = {
   deliveredLive?: (channelId: string, ts: string) => boolean;
   /** Whether a job runs in the thread right now; without it, the jobs table's view when the pass began. */
   threadActive?: (channelId: string, threadTs: string) => boolean;
+  /** Whether a stop from `senderId` ends `requesterId`'s request; without it, only their own. */
+  mayStop?: (senderId: string, requesterId: string) => boolean;
   nowMs?: () => number;
   /** Gap between a sweep's Slack calls; tests set 0. */
   paceMs?: number;
@@ -122,32 +124,96 @@ export function skipWhileRunning(work: () => Promise<void>, what: string): () =>
   };
 }
 
+/** How often a stop looks for the job of the request just ahead of it. */
+const STOP_WAIT_POLL_MS = 250;
+
+type Replay = { event: SlackEventEnvelope; client: WebClient; source: 'socket' | 'catchup' };
+type ThreadReplays = { pending: Replay[]; inFlight: Replay | null };
+
 /**
  * Queue recovered events without waiting for them: the intake runs a queued
  * job to its end before it returns, so a scan that waited would stop for the
  * whole job. Events in one thread still go one after another, each once the
  * last is processed, as when the scan waited: queued together, two of them
  * could both pass the one-job-per-thread check before either registered, and
- * a stop would then end only one. A stop itself never waits: it is for the
- * job ahead of it.
+ * a stop would then end only one.
+ *
+ * A stop never waits its turn; it is for what is ahead of it. Requests still
+ * waiting in its thread that its sender may stop are dropped before they
+ * start, and the stop is acknowledged as a live one is ("Stopped."). A
+ * request already on its way gets to register its job, which the stop then
+ * ends the usual way. A thread's first request starts on a later turn, so a
+ * stop recovered right behind it in the same pass still finds it waiting.
  */
-export function detachPerThread(enqueue: CatchupDeps['enqueue']): CatchupDeps['enqueue'] {
-  const threads = new Map<string, Promise<void>>();
-  return async (event, client, source) => {
-    const run = () =>
-      enqueue(event, client, source).catch(error => {
-        logger.warn({ component: 'slack-catchup', eventId: event.eventId, error: String(error) }, 'replay failed');
-      });
-    if (isStopCommand(event.text)) {
-      void run();
+export function detachPerThread(
+  deps: Pick<CatchupDeps, 'enqueue' | 'store' | 'threadActive' | 'mayStop'>,
+): CatchupDeps['enqueue'] {
+  const threads = new Map<string, ThreadReplays>();
+  const mayStop = deps.mayStop ?? ((senderId: string, requesterId: string) => senderId === requesterId);
+  const run = (replay: Replay) =>
+    deps.enqueue(replay.event, replay.client, replay.source).catch(error => {
+      logger.warn({ component: 'slack-catchup', eventId: replay.event.eventId, error: String(error) }, 'replay failed');
+    });
+
+  const work = async (key: string, queue: ThreadReplays) => {
+    while (queue.pending.length > 0) {
+      const next = queue.pending.shift() as Replay;
+      queue.inFlight = next;
+      await run(next);
+      queue.inFlight = null;
+    }
+    threads.delete(key);
+  };
+
+  const stop = async (replay: Replay, queue: ThreadReplays | undefined) => {
+    const { event } = replay;
+    const dropped = queue ? queue.pending.filter(waiting => mayStop(event.userId, waiting.event.userId)) : [];
+    if (queue) queue.pending = queue.pending.filter(waiting => !dropped.includes(waiting));
+    for (const waiting of dropped) deps.store.recordEvent(waiting.event.eventId, event.channelId, event.threadTs);
+
+    const inFlight = queue?.inFlight;
+    if (inFlight && deps.threadActive) {
+      while (queue?.inFlight === inFlight && !deps.threadActive(event.channelId, event.threadTs)) {
+        await new Promise(resolve => setTimeout(resolve, STOP_WAIT_POLL_MS));
+      }
+    }
+    const running = deps.threadActive ? deps.threadActive(event.channelId, event.threadTs) : Boolean(queue?.inFlight);
+    if (running || dropped.length === 0) {
+      // The intake's stop lane ends the running job and says so.
+      await run(replay);
       return;
     }
+    deps.store.recordEvent(event.eventId, event.channelId, event.threadTs);
+    logger.info(
+      {
+        component: 'slack-catchup',
+        channelId: event.channelId,
+        threadTs: event.threadTs,
+        stoppedBy: event.userId,
+        dropped: dropped.map(waiting => waiting.event.eventId),
+      },
+      'a recovered stop dropped the requests ahead of it before they started',
+    );
+    await replay.client.chat
+      .postMessage({ channel: event.channelId, thread_ts: event.threadTs, text: 'Stopped.' })
+      .catch(() => {});
+  };
+
+  return async (event, client, source) => {
     const key = `${event.channelId}:${event.threadTs}`;
-    const next = (threads.get(key) ?? Promise.resolve()).then(run);
-    threads.set(key, next);
-    void next.finally(() => {
-      if (threads.get(key) === next) threads.delete(key);
-    });
+    const replay = { event, client, source };
+    if (isStopCommand(event.text)) {
+      void stop(replay, threads.get(key));
+      return;
+    }
+    const queue = threads.get(key);
+    if (queue) {
+      queue.pending.push(replay);
+      return;
+    }
+    const fresh: ThreadReplays = { pending: [replay], inFlight: null };
+    threads.set(key, fresh);
+    setTimeout(() => void work(key, fresh), 0);
   };
 }
 
@@ -208,7 +274,7 @@ export class ThreadSweeper {
 
 export function startMentionCatchup(deps: CatchupDeps): MentionCatchup {
   const state = newCatchupState();
-  const detached: CatchupDeps = { ...deps, enqueue: detachPerThread(deps.enqueue) };
+  const detached: CatchupDeps = { ...deps, enqueue: detachPerThread(deps) };
   const scan = skipWhileRunning(() => runMentionCatchup(detached, state), 'missed mention catch-up scan');
   const sweeper = new ThreadSweeper(detached, state);
 
@@ -472,9 +538,11 @@ export async function runThreadSweep(deps: CatchupDeps, state: CatchupState, sin
           .map(thread => [`${thread.channelId}:${thread.threadTs}`, thread.active]),
       );
 
+  // A read that failed may have hidden a mention: the gap stays open for the next sweep.
+  const failures: ReadFailures = { count: 0 };
   const threads: Array<{ channelId: string; parentTs: string; latestReply: number }> = [];
-  for (const channelId of await discoverChannels(webClient, store, config)) {
-    const parents = await fetchChannelHistory(webClient, channelId, nowTs - CATCHUP_LOOKBACK_SECONDS);
+  for (const channelId of await discoverChannels(webClient, store, config, failures)) {
+    const parents = await fetchChannelHistory(webClient, channelId, nowTs - CATCHUP_LOOKBACK_SECONDS, failures);
     for (const parent of parents) {
       const latestReply = toEpochSeconds(String(parent.latest_reply ?? ''));
       if (Number(parent.reply_count ?? 0) > 0 && latestReply > since) {
@@ -493,15 +561,35 @@ export async function runThreadSweep(deps: CatchupDeps, state: CatchupState, sin
 
   let recovered = 0;
   for (const thread of threads.slice(0, SWEEP_MAX_THREADS)) {
-    const replies = await fetchThreadReplies(webClient, thread.channelId, thread.parentTs, since);
+    const replies = await fetchThreadReplies(webClient, thread.channelId, thread.parentTs, since, failures);
     const active = jobThreads.get(`${thread.channelId}:${thread.parentTs}`) ?? false;
     recovered += await recoverThreadMentions(deps, state, { ...thread, active }, replies);
     await pace();
   }
   logger.info(
-    { component: 'slack-catchup', since, threads: Math.min(threads.length, SWEEP_MAX_THREADS), recovered },
+    {
+      component: 'slack-catchup',
+      since,
+      threads: Math.min(threads.length, SWEEP_MAX_THREADS),
+      recovered,
+      failedReads: failures.count,
+    },
     'completed thread sweep',
   );
+  if (failures.count > 0) throw new Error(`${failures.count} Slack reads failed during the thread sweep`);
+}
+
+/** Slack reads that failed during a pass, other than ones that fail the same way every time. */
+type ReadFailures = { count: number };
+
+/** A channel the token can't read (no groups:history), or one that is gone: retrying won't help. */
+function isLastingSlackError(error: unknown): boolean {
+  const code = (error as { data?: { error?: string } }).data?.error ?? '';
+  return ['missing_scope', 'not_in_channel', 'channel_not_found', 'thread_not_found'].includes(code);
+}
+
+function noteReadFailure(failures: ReadFailures | undefined, error: unknown): void {
+  if (failures && !isLastingSlackError(error)) failures.count += 1;
 }
 
 type ActionableMention = { text: string; userId: string; subtype: string; type: 'bot' | 'owner' };
@@ -528,7 +616,12 @@ function actionableMention(message: Record<string, unknown>, config: AppConfig):
   return { text, userId, subtype, type: mention.type };
 }
 
-async function discoverChannels(client: WebClient, store: CatchupStore, config: AppConfig): Promise<string[]> {
+async function discoverChannels(
+  client: WebClient,
+  store: CatchupStore,
+  config: AppConfig,
+  failures?: ReadFailures,
+): Promise<string[]> {
   const accessChannels = getBundlesForConfig(config).flatMap(bundle => bundle.allowedChannelIds);
   const channelSet = new Set<string>([
     ...store.listKnownChannels(500),
@@ -556,6 +649,7 @@ async function discoverChannels(client: WebClient, store: CatchupStore, config: 
       cursor = response.response_metadata?.next_cursor || undefined;
     } while (cursor);
   } catch (error) {
+    noteReadFailure(failures, error);
     logger.warn(
       {
         component: 'slack-catchup',
@@ -573,6 +667,7 @@ export async function fetchChannelHistory(
   client: WebClient,
   channelId: string,
   oldestTs: number,
+  failures?: ReadFailures,
 ): Promise<Array<Record<string, unknown>>> {
   const oldest = String(oldestTs);
   const messages: Array<Record<string, unknown>> = [];
@@ -613,6 +708,7 @@ export async function fetchChannelHistory(
       }
     } while (cursor);
   } catch (error) {
+    noteReadFailure(failures, error);
     logger.warn(
       {
         component: 'slack-catchup',
@@ -632,6 +728,7 @@ export async function fetchThreadReplies(
   channelId: string,
   threadTs: string,
   oldestTs: number,
+  failures?: ReadFailures,
 ): Promise<Array<Record<string, unknown>>> {
   const messages: Array<Record<string, unknown>> = [];
   let cursor: string | undefined;
@@ -668,11 +765,9 @@ export async function fetchThreadReplies(
       }
     } while (cursor);
   } catch (error) {
-    // A thread in a channel the token can't read (no groups:history) or one
-    // that is gone fails the same way every scan: not worth a warning each time.
-    const code = (error as { data?: { error?: string } }).data?.error ?? '';
-    const quiet = ['missing_scope', 'not_in_channel', 'channel_not_found', 'thread_not_found'].includes(code);
-    (quiet ? logger.debug.bind(logger) : logger.warn.bind(logger))(
+    noteReadFailure(failures, error);
+    // Failing the same way every scan is not worth a warning each time.
+    (isLastingSlackError(error) ? logger.debug.bind(logger) : logger.warn.bind(logger))(
       { component: 'slack-catchup', channelId, threadTs, error: String(error) },
       'failed to fetch thread replies during missed mention catch-up',
     );

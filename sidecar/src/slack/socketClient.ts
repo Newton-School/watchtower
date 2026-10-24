@@ -12,10 +12,14 @@ type SocketStateHandler = (state: 'connected' | 'closed') => void;
 /** The parts of @slack/socket-mode's client a restart needs. */
 type SocketModeConnection = {
   on(event: 'connected' | 'close', listener: () => void): unknown;
+  once(event: string, listener: () => void): unknown;
   removeListener(event: 'connected' | 'close', listener: () => void): unknown;
-  removeAllListeners(event: 'disconnected'): unknown;
+  emit(event: string, ...args: unknown[]): boolean;
   disconnect(): Promise<void>;
 };
+
+/** What a retired client's `disconnected` becomes; nothing of socket-mode's listens to it. */
+const RETIRED_DISCONNECTED = 'watchtower:retired-disconnected';
 
 /** How long a retired connection gets to close before it is dropped. */
 const RETIRE_GRACE_MS = 5000;
@@ -51,8 +55,9 @@ type SocketModeInternals = {
  * catch, so nothing here may make that start() reject (Node would end the
  * sidecar on the unhandled rejection):
  * - start() rejects when the client says `disconnected` before Slack's
- *   hello, which disconnect() does to a websocket still mid-handshake: its
- *   listener goes first;
+ *   hello. A retired client never says it: its emit swallows the event, so
+ *   a start() waiting on it, including one whose apps.connections.open was
+ *   already under way and listens only later, just waits for good;
  * - auto-reconnect stays on: disconnect() marks the client shutting down,
  *   which parks its retries, while auto-reconnect off would make a failed
  *   apps.connections.open throw instead;
@@ -62,7 +67,9 @@ type SocketModeInternals = {
  */
 export async function retireSocketConnection(socket: SocketModeConnection, graceMs = RETIRE_GRACE_MS): Promise<void> {
   const internals = socket as SocketModeConnection & SocketModeInternals;
-  socket.removeAllListeners('disconnected');
+  const emit = socket.emit.bind(socket);
+  socket.emit = (event: string, ...args: unknown[]) =>
+    event === 'disconnected' ? emit(RETIRED_DISCONNECTED, ...args) : emit(event, ...args);
   const requests = internals.webClient?.axios?.interceptors?.request;
   if (requests) {
     requests.use(() => new Promise(() => {}));
@@ -72,10 +79,11 @@ export async function retireSocketConnection(socket: SocketModeConnection, grace
       "socket-mode's internals changed: a retired socket client may keep calling apps.connections.open",
     );
   }
-  const closeAgain = () => void socket.disconnect().catch(() => {});
+  const closeAgain = () => void socket.disconnect();
   socket.on('connected', closeAgain);
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const dropped = new Promise<void>(resolve => {
+  const closed = new Promise<void>(resolve => {
+    socket.once(RETIRED_DISCONNECTED, () => resolve());
     timer = setTimeout(() => {
       try {
         internals.websocket?.terminate?.();
@@ -85,7 +93,9 @@ export async function retireSocketConnection(socket: SocketModeConnection, grace
       resolve();
     }, graceMs);
   });
-  await Promise.race([socket.disconnect().catch(() => {}), dropped]);
+  // Its promise waits on the swallowed `disconnected`; the close shows on our own event.
+  void socket.disconnect();
+  await closed;
   if (timer) clearTimeout(timer);
 }
 

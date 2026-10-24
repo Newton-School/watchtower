@@ -24,6 +24,7 @@ vi.mock('@slack/bolt', async () => {
     disconnects = 0;
     disconnect() {
       this.disconnects += 1;
+      this.emit('disconnected'); // as the real client does once closed
       return Promise.resolve();
     }
   }
@@ -80,7 +81,9 @@ class FakeConnection extends EventEmitter {
   }
   disconnect(): Promise<void> {
     this.disconnects += 1;
-    return this.answersClose ? Promise.resolve() : new Promise(() => {});
+    if (!this.answersClose) return new Promise(() => {});
+    this.emit('disconnected'); // as the real client does once closed
+    return Promise.resolve();
   }
 }
 

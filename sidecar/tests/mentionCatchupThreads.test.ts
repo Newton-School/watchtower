@@ -385,40 +385,96 @@ describe('mention catch-up: a scan and a sweep at once', () => {
 });
 
 describe('detachPerThread', () => {
-  const event = (eventTs: string, threadTs: string, text = `<@${BOT}> review #12`) =>
-    ({ eventId: `replay:C1:${eventTs}`, channelId: 'C1', threadTs, eventTs, userId: 'U1', text }) as SlackEventEnvelope;
+  const event = (eventTs: string, threadTs: string, text = `<@${BOT}> review #12`, userId = 'U1') =>
+    ({ eventId: `replay:C1:${eventTs}`, channelId: 'C1', threadTs, eventTs, userId, text }) as SlackEventEnvelope;
+  const settle = (ms = 0) => new Promise(resolve => setTimeout(resolve, ms));
 
-  it('runs one thread’s events one after another, other threads at once, and never holds a stop', async () => {
+  function harness(opts: { threadActive?: () => boolean } = {}) {
     const started: string[] = [];
     const finish = new Map<string, () => void>();
-    const detached = detachPerThread(async replay => {
-      started.push(replay.eventTs);
-      await new Promise<void>(resolve => finish.set(replay.eventTs, resolve));
+    const posted: string[] = [];
+    const { store, recorded } = makeStore();
+    const client = {
+      chat: {
+        postMessage: async ({ text }: { text: string }) => {
+          posted.push(text);
+        },
+      },
+    } as unknown as WebClient;
+    const detached = detachPerThread({
+      store: store as never,
+      threadActive: opts.threadActive,
+      enqueue: async replay => {
+        started.push(replay.eventTs);
+        await new Promise<void>(resolve => finish.set(replay.eventTs, resolve));
+      },
     });
-    const settle = () => new Promise(resolve => setTimeout(resolve, 0));
+    const add = (replay: SlackEventEnvelope) => detached(replay, client, 'catchup');
+    return { started, finish, posted, recorded, add };
+  }
 
-    await detached(event('1.1', 'T1'), {} as WebClient, 'catchup');
-    await detached(event('1.2', 'T1', `<@${BOT}> ?`), {} as WebClient, 'catchup');
-    await detached(event('2.1', 'T2'), {} as WebClient, 'catchup');
-    await detached(event('1.3', 'T1', `<@${BOT}> stop`), {} as WebClient, 'catchup');
+  it('runs one thread’s events one after another, and other threads at once', async () => {
+    const { started, finish, add } = harness();
+    await add(event('1.1', 'T1'));
+    await add(event('1.2', 'T1', `<@${BOT}> ?`));
+    await add(event('2.1', 'T2'));
     await settle();
-    // The scan did not wait; T1's second ask waits for its first; T2 and the stop go at once.
-    expect(started).toEqual(['1.1', '2.1', '1.3']);
+    expect(started).toEqual(['1.1', '2.1']);
 
     finish.get('1.1')?.();
     await settle();
-    expect(started).toEqual(['1.1', '2.1', '1.3', '1.2']);
+    expect(started).toEqual(['1.1', '2.1', '1.2']);
+  });
+
+  it('cancels a request recovered together with its stop before it starts, and says so', async () => {
+    const { started, posted, recorded, add } = harness({ threadActive: () => false });
+    await add(event('1.1', 'T1'));
+    await add(event('1.2', 'T1', `<@${BOT}> stop`));
+    await settle(10);
+    expect(started).toEqual([]);
+    expect(posted).toEqual(['Stopped.']);
+    expect(recorded).toEqual(['replay:C1:1.1', 'replay:C1:1.2']);
+  });
+
+  it('lets a request already on its way register its job, then stops that job the usual way', async () => {
+    let registered = false;
+    const { started, posted, add } = harness({ threadActive: () => registered });
+    await add(event('1.1', 'T1'));
+    await settle();
+    expect(started).toEqual(['1.1']);
+
+    await add(event('1.2', 'T1', `<@${BOT}> stop`));
+    await settle(10);
+    expect(started).toEqual(['1.1']); // waits for the job to show up
+
+    registered = true;
+    await settle(300);
+    expect(started).toEqual(['1.1', '1.2']); // the intake's stop lane takes it from here
+    expect(posted).toEqual([]);
+  });
+
+  it("does not drop someone else's request for a bystander's stop", async () => {
+    const { started, posted, add } = harness({ threadActive: () => false });
+    await add(event('1.1', 'T1'));
+    await add(event('1.2', 'T1', `<@${BOT}> stop`, 'U2'));
+    await settle();
+    expect(started.sort()).toEqual(['1.1', '1.2']);
+    expect(posted).toEqual([]);
   });
 
   it('goes on to the next event in the thread when one fails', async () => {
     const started: string[] = [];
-    const detached = detachPerThread(async replay => {
-      started.push(replay.eventTs);
-      if (replay.eventTs === '1.1') throw new Error('intake failed');
+    const { store } = makeStore();
+    const detached = detachPerThread({
+      store: store as never,
+      enqueue: async replay => {
+        started.push(replay.eventTs);
+        if (replay.eventTs === '1.1') throw new Error('intake failed');
+      },
     });
     await detached(event('1.1', 'T1'), {} as WebClient, 'catchup');
     await detached(event('1.2', 'T1'), {} as WebClient, 'catchup');
-    await new Promise(resolve => setTimeout(resolve, 0));
+    await settle();
     expect(started).toEqual(['1.1', '1.2']);
   });
 });
@@ -464,6 +520,37 @@ describe('ThreadSweeper', () => {
     enqueue: async () => {},
     nowMs: () => NOW_MS,
     paceMs: 0,
+  });
+
+  function slackFailingReplies(parentTs: string, error: string) {
+    return {
+      users: { conversations: async () => ({ channels: [], response_metadata: {} }) },
+      conversations: {
+        history: async () => ({
+          messages: [{ ts: parentTs, user: 'U1', text: 'thread', reply_count: 1, latest_reply: at(60) }],
+          response_metadata: {},
+        }),
+        replies: async () => {
+          throw Object.assign(new Error(`An API error occurred: ${error}`), { data: { ok: false, error } });
+        },
+      },
+    } as unknown as WebClient;
+  }
+
+  it('keeps the gap when a read failed, since it may have hidden a mention', async () => {
+    const { store, values } = keyedStore();
+    await new ThreadSweeper(depsFor(slackFailingReplies(at(7200), 'internal_error'), store), newCatchupState()).request(
+      NOW - 3600,
+    );
+    expect(values.get('mention_catchup_sweep_since')).toBe(String(NOW - 3600));
+  });
+
+  it('does not hold the gap open for a channel it can never read', async () => {
+    const { store, values } = keyedStore();
+    await new ThreadSweeper(depsFor(slackFailingReplies(at(7200), 'missing_scope'), store), newCatchupState()).request(
+      NOW - 3600,
+    );
+    expect(values.get('mention_catchup_sweep_since')).toBe('');
   });
 
   it('keeps the gap in sidecar_state until the sweep finishes', async () => {

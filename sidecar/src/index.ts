@@ -2246,6 +2246,11 @@ async function main(): Promise<void> {
     store,
     deliveredLive: (channelId, ts) => socketWatchdog.wasDelivered(channelId, ts),
     threadActive: (channelId, threadTs) => Boolean(activeJobForThread(channelId, threadTs)),
+    // Who may stop a request, as for a live stop (decideStop).
+    mayStop: (senderId, requesterId) =>
+      senderId === requesterId ||
+      getAdminUserIds(config).includes(senderId) ||
+      config.ownerSlackUserIds.includes(senderId),
     enqueue: async (event, webClient, source) => {
       // A bot mention only catch-up found is evidence the socket is dead.
       socketWatchdog.noteCatchupRecovery({

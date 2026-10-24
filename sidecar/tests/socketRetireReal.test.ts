@@ -70,6 +70,31 @@ describe('retireSocketConnection with the real socket-mode client', () => {
     expect(await standing(started, 400)).toBe('pending');
   });
 
+  it('does not make a start() reject whose apps.connections.open returns after the retire and whose handshake then fails', async () => {
+    // Answers the websocket upgrade with a 400: the handshake fails.
+    const server = net.createServer(socket => socket.end('HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n'));
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as net.AddressInfo;
+
+    const client = new SocketModeClient({ appToken: 'xapp-test', logLevel: 'error' as never });
+    const internals = client as unknown as Internals;
+    let answerOpen: (value: unknown) => void = () => {};
+    // Sent before the retire, so the parking hook never sees it.
+    internals.webClient.apps.connections.open = () =>
+      new Promise(resolve => {
+        answerOpen = resolve;
+      });
+    const started = client.start();
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    await retireSocketConnection(client as never, 200);
+    // Only now does start() get its URL, listen for `disconnected`, and try the handshake.
+    answerOpen({ ok: true, url: `ws://127.0.0.1:${port}/` });
+
+    expect(await standing(started, 500)).toBe('pending');
+  });
+
   it('parks the retired client through the private request hook it still has', async () => {
     const client = new SocketModeClient({ appToken: 'xapp-test', logLevel: 'error' as never });
     const hooks = (client as unknown as Internals).webClient.axios.interceptors.request.handlers;
