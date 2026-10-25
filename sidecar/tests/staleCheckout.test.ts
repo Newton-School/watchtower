@@ -164,6 +164,36 @@ describe('describeRepoRefresh (issue #709)', () => {
     expect(describeRepoRefresh('newton-web', { ...STUCK, setAsideSkipped: 'failed' }).message).toContain(
       'Setting them aside did not work, so they were left in place.',
     );
+    expect(describeRepoRefresh('newton-web', { ...STUCK, setAsideSkipped: 'other_staged' }).message).toContain(
+      'Other files have staged changes, so nothing was moved.',
+    );
+    expect(describeRepoRefresh('newton-web', { ...STUCK, setAsideSkipped: 'update_failed' }).message).toContain(
+      'They were set aside, but the update still failed for another reason, so they were put back.',
+    );
+  });
+
+  it('gives the age of the index.lock, and calls an old one a leftover', () => {
+    expect(
+      describeRepoRefresh('newton-web', { ...STUCK, setAsideSkipped: 'busy', indexLockAgeMs: 3 * 60_000 }).message,
+    ).toContain(
+      'A git command was running in the clone (its index.lock is 3 minutes old), so they were left in place.',
+    );
+    expect(
+      describeRepoRefresh('newton-web', { ...STUCK, setAsideSkipped: 'busy', indexLockAgeMs: 2 * 60 * 60_000 }).message,
+    ).toContain(
+      'The clone has an index.lock from 2 hours ago, probably left by a git command that crashed, so they were left in place; delete it if nothing is running there.',
+    );
+  });
+
+  it('says the changes are still in the stash list when no private ref could be made', () => {
+    const message = describeRepoRefresh('newton-web', {
+      ...STUCK,
+      setAsideSkipped: 'failed',
+      setAsideKept: { stashLabel: 'miniog-autostash x (#709): 1 uncommitted file set aside', restored: 'no' },
+    }).message;
+    expect(message).toContain(
+      `they are saved at the clone's stash list as "miniog-autostash x (#709): 1 uncommitted file set aside"`,
+    );
   });
 
   it('never says "left in place" when the changes could not be put back', () => {
@@ -172,7 +202,9 @@ describe('describeRepoRefresh (issue #709)', () => {
       setAsideSkipped: 'failed',
       setAsideKept: { ref: setAside.ref, patch: setAside.patch, restored: 'no' },
     }).message;
-    expect(notBack).toContain('they are NOT in the working tree, they are saved at refs/miniog/autostash/');
+    expect(notBack).toContain(
+      'Setting them aside did not finish and putting them back failed: they are NOT in the working tree, they are saved at refs/miniog/autostash/',
+    );
     expect(notBack).not.toContain('left in place');
 
     const unstaged = describeRepoRefresh('newton-web', {
@@ -180,7 +212,9 @@ describe('describeRepoRefresh (issue #709)', () => {
       setAsideSkipped: 'failed',
       setAsideKept: { ref: setAside.ref, restored: 'unstaged' },
     }).message;
-    expect(unstaged).toContain('they are back in the working tree, unstaged, and a copy is saved at refs/miniog/');
+    expect(unstaged).toContain(
+      'Setting them aside did not finish; they are back in the working tree, unstaged, and a copy is saved at refs/miniog/',
+    );
   });
 
   it('says when the clone last fetched when a fetch fails', () => {

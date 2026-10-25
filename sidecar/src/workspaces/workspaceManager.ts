@@ -269,14 +269,21 @@ export interface SetAsideChanges {
   stash: string;
   /** The stash message. */
   label: string;
-  /** A `--binary` patch of the same changes, as a second copy. */
+  /**
+   * A `--binary` patch of the same changes, as a second copy. Refs and
+   * patches are kept for `AUTOSTASH_KEEP_MS` (30 days), then pruned the next
+   * time something is set aside in that clone.
+   */
   patch?: string;
 }
 
-/** Where set-aside changes are kept when they could not be put back cleanly after a failed update. */
+/** Where set-aside changes are kept when they could not be put back cleanly. */
 export interface SetAsideKept {
-  ref: string;
+  /** The private ref holding them, when one was made. */
+  ref?: string;
   patch?: string;
+  /** When no private ref could be made: they are still in the clone's stash list under this message. */
+  stashLabel?: string;
   /** `unstaged`: back in the working tree, but what was staged is now unstaged. `no`: not back at all. */
   restored: 'unstaged' | 'no';
 }
@@ -304,12 +311,15 @@ export interface SharedRepoState {
   /** How many such files there were in all. */
   leftInPlaceCount?: number;
   /**
-   * Why the changes in the way were not set aside: changed in the last 15
-   * minutes, a git command was running in the clone, or setting them aside
-   * did not work.
+   * Why the changes in the way are not set aside: changed in the last 15
+   * minutes; a git command holds the clone's index; other files have staged
+   * changes; setting them aside did not work; or they were set aside, the
+   * update still failed for another reason, and they were put back.
    */
-  setAsideSkipped?: 'recent_edits' | 'busy' | 'failed';
-  /** Set when changes were set aside, the update still failed, and they could not all be put back. */
+  setAsideSkipped?: 'recent_edits' | 'busy' | 'other_staged' | 'failed' | 'update_failed';
+  /** For `busy`: how old the clone's index.lock is. */
+  indexLockAgeMs?: number;
+  /** Set when changes were stashed but could not all be put back or kept privately. */
   setAsideKept?: SetAsideKept;
 }
 
@@ -353,10 +363,15 @@ async function tryFastForward(repoPath: string, upstream: string): Promise<boole
   }
 }
 
+/** git's words for a ref or index lock held by another git command. */
+const LOCK_ERROR = /cannot lock ref|\.lock'?: File exists|Unable to create '[^']*\.lock'/i;
+
 /**
- * Fetches origin, once more after a short wait if the first try fails:
- * lookups and new worktrees fetch the same clones, and two fetches at once
- * fail on git's ref locks, which used to read as "fetch failed".
+ * Fetches origin, once more after a short wait when the first try failed on
+ * a lock: lookups and new worktrees fetch the same clones, and two fetches at
+ * once fail on git's ref locks, which used to read as "fetch failed". Any
+ * other failure (a bad remote, no network, a fetch killed by its timeout) is
+ * not retried, so a hanging GitHub costs one timeout, not two.
  */
 async function fetchOrigin(repoPath: string, retryMs: number): Promise<boolean> {
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -364,14 +379,9 @@ async function fetchOrigin(repoPath: string, retryMs: number): Promise<boolean> 
       await git(['fetch', 'origin', '--quiet'], { cwd: repoPath, timeoutMs: 30_000 });
       return true;
     } catch (error) {
-      // No retry for a path that isn't a git checkout at all: that won't change in a second.
+      const failure = error as { killed?: boolean; signal?: string | null; stderr?: unknown };
       const worthRetrying =
-        attempt === 0 &&
-        fs.existsSync(repoPath) &&
-        (await git(['rev-parse', '--git-dir'], { cwd: repoPath, timeoutMs: 10_000 }).then(
-          () => true,
-          () => false,
-        ));
+        attempt === 0 && !failure.killed && !failure.signal && LOCK_ERROR.test(String(failure.stderr ?? error));
       if (!worthRetrying) {
         logger.warn(
           { repoPath, error: String(error) },
@@ -409,6 +419,8 @@ async function lastFetchedDate(repoPath: string): Promise<string | undefined> {
 
 interface TrackedChange {
   path: string;
+  /** The index column has a change: something is staged for this file. */
+  staged: boolean;
   /** The index column says deleted: a staged deletion, which `git stash push -- <path>` can't name. */
   stagedDeletion: boolean;
 }
@@ -423,7 +435,7 @@ async function trackedChanges(repoPath: string): Promise<TrackedChange[]> {
   // Entries are "XY path": X is the index column, Y the working tree's.
   return nulList(out)
     .filter(entry => entry.length >= 4)
-    .map(entry => ({ path: entry.slice(3), stagedDeletion: entry[0] === 'D' }));
+    .map(entry => ({ path: entry.slice(3), staged: entry[0] !== ' ', stagedDeletion: entry[0] === 'D' }));
 }
 
 const fileExists =
@@ -431,13 +443,95 @@ const fileExists =
   (file: string): boolean =>
     fs.existsSync(path.join(repoPath, file));
 
+/**
+ * Set-aside refs and patch copies are kept this long, then pruned the next
+ * time a change is set aside in that clone. They are the only copy of what
+ * was moved, so they are never pruned sooner.
+ */
+export const AUTOSTASH_KEEP_MS = 30 * 24 * 60 * 60 * 1000;
+
 interface SetAsideOutcome {
   setAside?: SetAsideChanges;
-  skipped?: 'recent_edits' | 'busy' | 'failed';
+  skipped?: SharedRepoState['setAsideSkipped'];
   /** The files in the way, whether or not they were moved. */
   inTheWay?: string[];
   /** Uncommitted files the update doesn't touch: they stay. */
   leftInPlace?: string[];
+  /** For `busy`: how old the clone's index.lock is. */
+  indexLockAgeMs?: number;
+  /** Set when changes were stashed but could not be kept or put back cleanly. */
+  kept?: SetAsideKept;
+}
+
+/** The id inside a ref or patch name ("2026-10-26T01-02-03-456Z"), as a time, or NaN. */
+function autostashIdTime(id: string): number {
+  const match = /^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z/.exec(id);
+  return match ? Date.parse(`${match[1]}T${match[2]}:${match[3]}:${match[4]}.${match[5]}Z`) : Number.NaN;
+}
+
+/** Drops set-aside refs and patch copies older than `AUTOSTASH_KEEP_MS`. Best-effort. */
+async function pruneOldAutostashes(repoPath: string, now: number): Promise<void> {
+  const prefix = 'refs/miniog/autostash/';
+  try {
+    const refs = (await git(['for-each-ref', '--format=%(refname)', prefix], { cwd: repoPath, timeoutMs: 10_000 }))
+      .split('\n')
+      .filter(Boolean);
+    for (const ref of refs) {
+      const time = autostashIdTime(ref.slice(prefix.length));
+      if (Number.isFinite(time) && now - time > AUTOSTASH_KEEP_MS) {
+        await git(['update-ref', '-d', ref], { cwd: repoPath, timeoutMs: 10_000 });
+      }
+    }
+    const dir = path.join(autostashDir(), path.basename(fs.realpathSync(repoPath)));
+    for (const name of fs.existsSync(dir) ? fs.readdirSync(dir) : []) {
+      const time = autostashIdTime(name);
+      if (name.endsWith('.patch') && Number.isFinite(time) && now - time > AUTOSTASH_KEEP_MS) {
+        fs.rmSync(path.join(dir, name), { force: true });
+      }
+    }
+  } catch (error) {
+    logger.warn({ repoPath, error: String(error) }, 'could not prune old set-aside changes');
+  }
+}
+
+/**
+ * Puts stashed changes back by the stash commit's sha: `--index` first so
+ * staged work stays staged, else a plain apply (unstaged). Then drops the
+ * entry from the stash list if it is still there, found by its sha.
+ */
+async function applyBack(repoPath: string, sha: string): Promise<'full' | 'unstaged' | 'no'> {
+  const run = (args: string[]) => git(args, { cwd: repoPath, timeoutMs: 30_000 });
+  let restored: 'full' | 'unstaged' | 'no';
+  try {
+    await run(['stash', 'apply', '--index', sha]);
+    restored = 'full';
+  } catch {
+    try {
+      await run(['stash', 'apply', sha]);
+      restored = 'unstaged';
+    } catch (error) {
+      logger.warn({ repoPath, sha, error: String(error) }, 'could not put set-aside changes back');
+      return 'no';
+    }
+  }
+  await dropStashEntry(repoPath, sha);
+  return restored;
+}
+
+/** Drops a stash-list entry by its sha, checking the position still holds it. Best-effort. */
+async function dropStashEntry(repoPath: string, sha: string): Promise<boolean> {
+  const run = (args: string[]) => git(args, { cwd: repoPath, timeoutMs: 10_000 });
+  try {
+    const shas = (await run(['stash', 'list', '--format=%H'])).split('\n');
+    const index = shas.indexOf(sha);
+    if (index < 0) return true;
+    if ((await run(['rev-parse', `stash@{${index}}`])) !== sha) return false;
+    await run(['stash', 'drop', '-q', `stash@{${index}}`]);
+    return true;
+  } catch (error) {
+    logger.warn({ repoPath, sha, error: String(error) }, 'could not drop an autostash entry from the stash list');
+    return false;
+  }
 }
 
 /**
@@ -498,69 +592,98 @@ async function setAsideStrayChanges(
     if (recent) return { skipped: 'recent_edits', inTheWay: files, leftInPlace };
     // A git command is running in the clone (an agent or a person at work): leave it be.
     const indexLock = path.resolve(repoPath, await run(['rev-parse', '--git-path', 'index.lock']));
-    if (fs.existsSync(indexLock)) return { skipped: 'busy', inTheWay: files, leftInPlace };
+    if (fs.existsSync(indexLock)) {
+      const indexLockAgeMs = Math.max(0, now - fs.statSync(indexLock).mtimeMs);
+      return { skipped: 'busy', inTheWay: files, leftInPlace, indexLockAgeMs };
+    }
+    // Staged work on files the update doesn't touch: a pathspec stash would
+    // leave it, but the index is someone's work in progress. Leave it all be.
+    if (tracked.some(change => change.staged && !touched.has(norm(change.path)))) {
+      return { skipped: 'other_staged', inTheWay: files, leftInPlace };
+    }
 
+    await pruneOldAutostashes(repoPath, now);
     // `stash push -- <path>` can't name a path that is only in HEAD; unstaging
     // the deletion makes it a working-tree deletion it can (the file stays deleted).
     const stagedDeletions = trackedInTheWay.filter(change => change.stagedDeletion).map(change => change.path);
     if (stagedDeletions.length > 0) await run(['--literal-pathspecs', 'reset', '-q', '--', ...stagedDeletions]);
 
     const id = new Date(now).toISOString().replace(/[:.]/g, '-');
+    const prefix = `miniog-autostash ${id} `;
     const shown = files.slice(0, 5).join(', ') + (files.length > 5 ? ` and ${files.length - 5} more` : '');
-    const label = `miniog-autostash ${id} (#709): ${files.length} uncommitted file${
+    const label = `${prefix}(#709): ${files.length} uncommitted file${
       files.length === 1 ? '' : 's'
     } set aside so the clone could update: ${shown}`;
-    await run([
-      '--literal-pathspecs',
-      'stash',
-      'push',
-      ...(untrackedInTheWay.length > 0 ? ['--include-untracked'] : []),
-      '-m',
-      label,
-      '--',
-      ...files,
-    ]);
+    try {
+      await run([
+        '--literal-pathspecs',
+        'stash',
+        'push',
+        ...(untrackedInTheWay.length > 0 ? ['--include-untracked'] : []),
+        '-m',
+        label,
+        '--',
+        ...files,
+      ]);
+    } catch (error) {
+      // Checked below: a push that failed part-way may still have made the entry.
+      logger.warn({ repoPath, error: String(error) }, 'stash push failed while setting aside changes');
+    }
 
-    // Find the entry by its label, not by position: another process may have stashed meanwhile.
-    const findEntry = async (): Promise<{ sha: string; index: number } | undefined> => {
-      const lines = (await run(['stash', 'list', '--format=%H %gs'])).split('\n').filter(Boolean);
-      const index = lines.findIndex(line => line.includes(label));
-      return index >= 0 ? { sha: lines[index].split(' ')[0], index } : undefined;
-    };
-    const entry = await findEntry();
-    if (!entry) {
-      // Nothing was stashed (or it is already gone): say whether the files are still where they were.
+    // The entry is ours if its message starts with this run's prefix. git
+    // collapses whitespace in the message, so match the prefix, not the whole
+    // label; refs/stash first, the rest of the list if another stash landed on top.
+    const sha = await (async (): Promise<string | undefined> => {
+      try {
+        const top = await run(['rev-parse', '--quiet', '--verify', 'refs/stash']).catch(() => '');
+        if (top && (await run(['log', '-1', '--format=%s', top])).includes(prefix)) return top;
+        const line = (await run(['stash', 'list', '--format=%H %gs']))
+          .split('\n')
+          .find(entry => entry.includes(prefix));
+        return line?.split(' ')[0];
+      } catch {
+        return undefined;
+      }
+    })();
+    if (!sha) {
+      // Nothing was stashed: the files are where they were.
       const stillThere = (await trackedChanges(repoPath)).length > 0 || untrackedInTheWay.some(fileExists(repoPath));
       logger.warn({ repoPath, label, stillThere }, 'stash push left no entry for the set-aside changes');
       return { skipped: 'failed', inTheWay: files, leftInPlace };
     }
 
     const ref = `refs/miniog/autostash/${id}`;
-    await run(['update-ref', ref, entry.sha]);
+    try {
+      await run(['update-ref', ref, sha]);
+    } catch (error) {
+      // Without the private ref the stash list would be the only copy, and the
+      // clone's worktrees share it: put the changes back instead.
+      logger.warn({ repoPath, ref, error: String(error) }, 'could not save set-aside changes under a private ref');
+      const restored = await applyBack(repoPath, sha);
+      return {
+        skipped: 'failed',
+        inTheWay: files,
+        leftInPlace,
+        ...(restored === 'full' ? {} : { kept: { stashLabel: label, restored } }),
+      };
+    }
     let patch: string | undefined;
     try {
       const dir = path.join(autostashDir(), path.basename(fs.realpathSync(repoPath)));
       fs.mkdirSync(dir, { recursive: true });
-      const parts = [await run(['diff', '--binary', `${entry.sha}^1`, entry.sha], true)];
-      if (untrackedInTheWay.length > 0)
-        parts.push(await run(['show', '--binary', '--format=', `${entry.sha}^3`], true));
+      // Only the set-aside files, whatever else the stash commit's tree holds.
+      const parts = [await run(['--literal-pathspecs', 'diff', '--binary', `${sha}^1`, sha, '--', ...files], true)];
+      if (untrackedInTheWay.length > 0) parts.push(await run(['show', '--binary', '--format=', `${sha}^3`], true));
       patch = path.join(dir, `${id}.patch`);
       fs.writeFileSync(patch, parts.join('\n'));
     } catch (error) {
       patch = undefined;
       logger.warn({ repoPath, ref, error: String(error) }, 'could not write the patch copy of set-aside changes');
     }
-    // Out of the shared stash list, dropped by identity: check the position still holds our entry.
-    try {
-      const again = await findEntry();
-      if (again && (await run(['rev-parse', `stash@{${again.index}}`])) === entry.sha) {
-        await run(['stash', 'drop', '-q', `stash@{${again.index}}`]);
-      }
-    } catch (error) {
-      logger.warn({ repoPath, ref, error: String(error) }, 'could not drop the autostash entry from the stash list');
-    }
+    // Out of the shared stash list, dropped by identity.
+    await dropStashEntry(repoPath, sha);
     return {
-      setAside: { files, ref, stash: entry.sha, label, ...(patch ? { patch } : {}) },
+      setAside: { files, ref, stash: sha, label, ...(patch ? { patch } : {}) },
       inTheWay: files,
       leftInPlace,
     };
@@ -575,26 +698,20 @@ async function setAsideStrayChanges(
  * left as it was found: staged work stays staged (`--index`). If that can't
  * be done, a plain apply brings the changes back unstaged and the private
  * ref is kept; if neither works, the ref and the patch are where they are.
+ * The ref and patch are removed only after a full restore, outside the
+ * apply, so a failed cleanup can't trigger a second apply.
  */
 async function restoreSetAside(repoPath: string, setAside: SetAsideChanges): Promise<'full' | 'unstaged' | 'no'> {
-  const run = (args: string[]) => git(args, { cwd: repoPath, timeoutMs: 30_000 });
-  try {
-    await run(['stash', 'apply', '--index', setAside.stash]);
-    await run(['update-ref', '-d', setAside.ref]).catch(() => undefined);
-    if (setAside.patch) fs.rmSync(setAside.patch, { force: true });
-    return 'full';
-  } catch {
+  const restored = await applyBack(repoPath, setAside.stash);
+  if (restored === 'full') {
+    await git(['update-ref', '-d', setAside.ref], { cwd: repoPath, timeoutMs: 10_000 }).catch(() => undefined);
     try {
-      await run(['stash', 'apply', setAside.stash]);
-      return 'unstaged';
+      if (setAside.patch) fs.rmSync(setAside.patch, { force: true });
     } catch (error) {
-      logger.warn(
-        { repoPath, ref: setAside.ref, error: String(error) },
-        'could not put set-aside changes back after a failed update',
-      );
-      return 'no';
+      logger.warn({ patch: setAside.patch, error: String(error) }, 'could not remove a patch copy after restoring it');
     }
   }
+  return restored;
 }
 
 /**
@@ -625,17 +742,20 @@ export function refreshSharedRepoToDefaultBranch(
   const setAside = Boolean(opts.setAsideStrayChanges);
   const current = inFlightRefreshes.get(key);
   if (current && (current.setAside || !setAside)) return current.promise;
-  const promise = (current?.promise ?? Promise.resolve(null))
+  // The entry leaves the map inside the run, before callers see the result,
+  // so a call made right after one finishes starts a fresh refresh.
+  const entry: { promise: Promise<SharedRepoState | null>; setAside: boolean } = {
+    promise: Promise.resolve(null),
+    setAside,
+  };
+  entry.promise = (current?.promise ?? Promise.resolve(null))
     .catch(() => null)
-    .then(() => refreshSharedRepo(repoPath, opts));
-  const entry = { promise, setAside };
-  inFlightRefreshes.set(key, entry);
-  void promise
-    .catch(() => null)
+    .then(() => refreshSharedRepo(repoPath, opts))
     .finally(() => {
       if (inFlightRefreshes.get(key) === entry) inFlightRefreshes.delete(key);
     });
-  return promise;
+  inFlightRefreshes.set(key, entry);
+  return entry.promise;
 }
 
 async function refreshSharedRepo(repoPath: string, opts: SharedRepoRefreshOptions): Promise<SharedRepoState | null> {
@@ -644,12 +764,15 @@ async function refreshSharedRepo(repoPath: string, opts: SharedRepoRefreshOption
   let setAside: SetAsideChanges | undefined;
   let setAsideSkipped: SharedRepoState['setAsideSkipped'];
   let setAsideKept: SetAsideKept | undefined;
+  let indexLockAgeMs: number | undefined;
   let inTheWay: string[] = [];
   let leftInPlace: string[] = [];
   if (!fetchFailed && !(await tryFastForward(repoPath, upstream))) {
     if (opts.setAsideStrayChanges) {
       const outcome = await setAsideStrayChanges(repoPath, upstream, opts);
       setAsideSkipped = outcome.skipped;
+      setAsideKept = outcome.kept;
+      indexLockAgeMs = outcome.indexLockAgeMs;
       inTheWay = outcome.inTheWay ?? [];
       leftInPlace = outcome.leftInPlace ?? [];
       if (outcome.setAside) {
@@ -657,7 +780,7 @@ async function refreshSharedRepo(repoPath: string, opts: SharedRepoRefreshOption
           setAside = outcome.setAside;
         } else {
           const restored = await restoreSetAside(repoPath, outcome.setAside);
-          setAsideSkipped = 'failed';
+          setAsideSkipped = restored === 'full' ? 'update_failed' : 'failed';
           if (restored !== 'full') {
             setAsideKept = {
               ref: outcome.setAside.ref,
@@ -746,6 +869,7 @@ async function refreshSharedRepo(repoPath: string, opts: SharedRepoRefreshOption
         staleReason: 'dirty_tree',
         dirtyFiles: named.slice(0, 5),
         ...(setAsideSkipped ? { setAsideSkipped } : {}),
+        ...(indexLockAgeMs !== undefined ? { indexLockAgeMs } : {}),
       };
     }
   } catch {

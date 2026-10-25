@@ -56,29 +56,54 @@ function isUnconfirmedCheckout(state: SharedRepoState | null): boolean {
 /** " as of 2026-05-26", or nothing when the HEAD date is unknown. */
 const asOf = (state: SharedRepoState): string => (state.headDate ? ` as of ${state.headDate}` : '');
 
-/** Where set-aside changes are saved: the private ref, and the patch copy when there is one. */
-const savedAt = (kept: { ref: string; patch?: string }): string =>
-  `${kept.ref}${kept.patch ? ` (patch copy: ${kept.patch})` : ''}`;
+/** Where set-aside changes are saved: the private ref (or the stash list), and the patch copy when there is one. */
+const savedAt = (kept: { ref?: string; patch?: string; stashLabel?: string }): string =>
+  `${kept.ref ?? `the clone's stash list as "${kept.stashLabel ?? 'miniog-autostash'}"`}${
+    kept.patch ? ` (patch copy: ${kept.patch})` : ''
+  }`;
+
+/** An index.lock older than this is reported as probably left by a git command that crashed. */
+export const STALE_INDEX_LOCK_MS = 10 * 60 * 1000;
+
+/** "3 minutes", "2 hours". */
+function age(ms: number): string {
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 1) return 'under a minute';
+  if (minutes < 120) return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours} hours`;
+  return `${Math.round(hours / 24)} days`;
+}
 
 /** What happened to the changes in the way when they were not set aside, as a sentence, or nothing. */
 function setAsideSkippedText(state: SharedRepoState): string {
-  if (state.setAsideSkipped === 'recent_edits') {
-    return ' They changed in the last 15 minutes, so they were left in place.';
-  }
-  if (state.setAsideSkipped === 'busy') {
-    return ' A git command was running in the clone, so they were left in place.';
-  }
-  if (state.setAsideSkipped === 'failed') {
-    const kept = state.setAsideKept;
-    if (kept?.restored === 'no') {
-      return ` They were set aside but the update still failed, and putting them back failed too: they are NOT in the working tree, they are saved at ${savedAt(kept)}.`;
+  switch (state.setAsideSkipped) {
+    case 'recent_edits':
+      return ' They changed in the last 15 minutes, so they were left in place.';
+    case 'busy': {
+      const lockAge = state.indexLockAgeMs;
+      if (lockAge !== undefined && lockAge > STALE_INDEX_LOCK_MS) {
+        return ` The clone has an index.lock from ${age(lockAge)} ago, probably left by a git command that crashed, so they were left in place; delete it if nothing is running there.`;
+      }
+      return ` A git command was running in the clone${lockAge !== undefined ? ` (its index.lock is ${age(lockAge)} old)` : ''}, so they were left in place.`;
     }
-    if (kept?.restored === 'unstaged') {
-      return ` They were set aside but the update still failed; they are back in the working tree, unstaged, and a copy is saved at ${savedAt(kept)}.`;
+    case 'other_staged':
+      return ' Other files have staged changes, so nothing was moved.';
+    case 'update_failed':
+      return ' They were set aside, but the update still failed for another reason, so they were put back.';
+    case 'failed': {
+      const kept = state.setAsideKept;
+      if (kept?.restored === 'no') {
+        return ` Setting them aside did not finish and putting them back failed: they are NOT in the working tree, they are saved at ${savedAt(kept)}.`;
+      }
+      if (kept?.restored === 'unstaged') {
+        return ` Setting them aside did not finish; they are back in the working tree, unstaged, and a copy is saved at ${savedAt(kept)}.`;
+      }
+      return ' Setting them aside did not work, so they were left in place.';
     }
-    return ' Setting them aside did not work, so they were left in place.';
+    default:
+      return '';
   }
-  return '';
 }
 
 /** "2 files", "1 file". */
