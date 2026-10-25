@@ -62,6 +62,12 @@ describe('the verifier prompt', () => {
     expect(prompt).toContain('"severityBasis"?: "no-behaviour-change"|"not-shipped"|"smaller-impact"');
   });
 
+  it('does not let new code with no caller yet go low as "not-shipped"', () => {
+    expect(prompt).toContain('New code that has no caller yet is not "not-shipped"');
+    expect(prompt).not.toContain('a path nothing calls');
+    expect(SEVERITY_RUBRIC).toContain('New code that nothing calls yet');
+  });
+
   it('says that narrow, uncommon or untested is a medium, not a reason to go lower', () => {
     expect(prompt).toContain(
       '"Real but narrow", "an uncommon setup", "nice to have" and "the module has no other tests"',
