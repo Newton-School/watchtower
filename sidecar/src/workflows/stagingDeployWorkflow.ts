@@ -651,6 +651,137 @@ export async function runStagingDeployWorkflow(params: {
   return result(status, msg, posted);
 }
 
+/** Said when main went back on staging after a merge (issue #703). */
+export const STAGING_BACK_ON_MAIN = 'Staging is back on main.';
+
+/**
+ * After miniOG merged a marketing PR (issue #703): when the last staging
+ * deploy put that PR's branch there and nothing has been dispatched since,
+ * puts main back, so the next person to test doesn't see a merged branch.
+ * Staging is left alone in every other case. Says one line when it is done
+ * or could not be done; never throws.
+ */
+export async function putMainBackOnStagingAfterMerge(params: {
+  config: AppConfig;
+  slack: WebClient;
+  store?: StagingDeployStore;
+  channelId: string;
+  channelType?: string;
+  threadTs: string;
+  /** Head branches of the PRs that were merged. */
+  mergedBranches: string[];
+  logStep?: WorkflowStepLogger;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const { config, slack, store, channelId, channelType, threadTs, logStep, signal } = params;
+  const say = (text: string) =>
+    slack.chat.postMessage({ channel: channelId, thread_ts: threadTs, text }).then(
+      () => true,
+      () => false,
+    );
+  try {
+    const repoPath = repoPathOrNull(config, REPO_KEY);
+    const merged = new Set(params.mergedBranches.filter(branch => branch && branch !== 'main'));
+    if (!repoPath || merged.size === 0) return;
+
+    // The newest run of any kind: one still going, or a later one of another
+    // branch, means staging is someone else's now.
+    let latest: Awaited<ReturnType<typeof listWorkflowRuns>>[number] | undefined;
+    try {
+      [latest] = await listWorkflowRuns({ repoPath, workflowFile: STAGING_WORKFLOW, limit: 1 });
+    } catch (error) {
+      logStep?.({
+        stage: 'staging.restore.skipped',
+        level: 'WARN',
+        message: `Couldn't read the staging runs, so staging was left as it is: ${String(error)}`,
+      });
+      return;
+    }
+    const replaced = latest?.headBranch;
+    const showsMerged =
+      latest?.status === 'completed' &&
+      latest.conclusion === 'success' &&
+      replaced !== undefined &&
+      merged.has(replaced);
+    if (!showsMerged || replaced === undefined) {
+      logStep?.({
+        stage: 'staging.restore.skipped',
+        message: `Staging doesn't show a merged branch (last run: ${replaced ?? 'none'}, ${latest?.status ?? '-'}/${latest?.conclusion ?? '-'}): left as it is.`,
+      });
+      return;
+    }
+    if (signal?.aborted) return;
+    if (isDeployDryRun(store)) {
+      const msg = 'Dry run: this is where I would put main back on staging. Nothing was deployed.';
+      logStep?.({ stage: 'staging.restore.dry_run', message: msg, level: 'WARN' });
+      await say(msg);
+      return;
+    }
+
+    logStep?.({
+      stage: 'staging.restore.start',
+      message: `Staging shows ${replaced}, which was just merged: putting main back.`,
+      data: { replacedBranch: replaced },
+    });
+    const outcome = await dispatchWorkflowRun({
+      repoPath,
+      workflowFile: STAGING_WORKFLOW,
+      ref: 'main',
+      filterByRef: true,
+      signal,
+      logStep,
+      stagePrefix: 'staging.restore',
+    });
+    // Stopped: the stop says so itself.
+    if (outcome.kind === 'stopped' || signal?.aborted) {
+      logStep?.({ stage: 'staging.restore.stopped', message: `Stopped while putting main back (${outcome.kind}).` });
+      return;
+    }
+    if (outcome.kind === 'dispatch_failed') {
+      logStep?.({
+        stage: 'staging.restore.dispatch_failed',
+        level: 'ERROR',
+        message: `Couldn't dispatch ${STAGING_WORKFLOW} on main: ${outcome.error}`,
+      });
+      await say("I couldn't put main back on staging. Check the Deploy → staging workflow in GitHub Actions.");
+      return;
+    }
+    const wentUp = outcome.kind === 'completed' && outcome.conclusion === 'success';
+    const runId = 'id' in outcome ? outcome.id : undefined;
+    const url = 'url' in outcome ? outcome.url : undefined;
+    // A deploy that failed or was cancelled left staging as it was; one still going will most likely land.
+    if (outcome.kind !== 'completed' || wentUp) {
+      await noteStagingDeploy({
+        store,
+        slack,
+        repoPath,
+        next: { branch: 'main', channelId, channelType, threadTs, atMs: __stagingDeps.now() },
+        runId: wentUp ? runId : undefined,
+        logStep,
+      });
+    }
+    const runLink = url ? ` Run: ${url}` : '';
+    const msg = wentUp
+      ? STAGING_BACK_ON_MAIN
+      : outcome.kind === 'completed'
+        ? `Putting main back on staging didn't finish (${outcome.conclusion ?? 'unknown'}).${runLink}`
+        : `Putting main back on staging is still going in GitHub Actions.${runLink}`;
+    logStep?.({
+      stage: 'staging.restore.done',
+      message: msg,
+      level: wentUp ? 'INFO' : 'WARN',
+      data: { outcome: outcome.kind, runId: runId ?? null, replacedBranch: replaced },
+    });
+    await say(msg);
+  } catch (error) {
+    logStep?.({
+      stage: 'staging.restore.failed',
+      level: 'WARN',
+      message: `Putting main back on staging failed: ${String(error)}`,
+    });
+  }
+}
+
 /** The newest staging run, when it is newer than `runId`. Best effort. */
 async function newerStagingRun(repoPath: string, runId: number) {
   try {

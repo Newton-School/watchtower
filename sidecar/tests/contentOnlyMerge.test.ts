@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   __contentMergeGh,
+  __marketingDeployOffer,
   __quickActionConfirm,
   contentOwnerReason,
   runImplementationWorkflow,
 } from '../src/workflows/implementationWorkflow.js';
+import { DEPLOY_OFFER_LINE } from '../src/workflows/marketingDeployOffer.js';
 import { runCodex } from '../src/codex/runCodex.js';
 import { checkContentOnlyPr } from '../src/github/contentOnlyDiff.js';
 import { fetchChecksState, fetchMergeState, fetchUnresolvedReviewThreadCount } from '../src/github/prReviewComments.js';
@@ -147,7 +149,24 @@ async function run(text: string, options: RunOptions = {}) {
 }
 
 const ghExec = vi.fn();
-const MERGED_PAST_REVIEW = `Merged ${MARKETING_PR}: it only changes text and numbers, so it went in without the usual review. It isn't live yet; someone from core-dev has to deploy it.`;
+const MERGED_PAST_REVIEW = `Merged ${MARKETING_PR}: it only changes text and numbers, so it went in without the usual review. ${DEPLOY_OFFER_LINE}`;
+
+/**
+ * The deploy offer after a merge (issue #703), as far as this file cares: it
+ * posts the merge reply with the offer line, as the real one does, for a
+ * merge this run made itself. Its own suite covers the wait and the deploy.
+ */
+type OfferArgs = Parameters<typeof __marketingDeployOffer.offer>[0];
+const offerMock = vi.fn(async (args: OfferArgs) => {
+  if (!args.lead) return undefined;
+  await args.slack.chat.postMessage({
+    channel: args.task.event.channelId,
+    thread_ts: args.task.event.threadTs,
+    text: `${args.lead} ${DEPLOY_OFFER_LINE}`,
+  });
+  return { status: 'SUCCESS' as const, message: 'offered', notifyDesktop: false, slackPosted: true };
+});
+const realOfferImpl = offerMock.getMockImplementation();
 
 beforeEach(() => {
   vi.mocked(runCodex)
@@ -156,6 +175,8 @@ beforeEach(() => {
   __quickActionConfirm.wait = vi.fn().mockResolvedValue({ outcome: 'confirmed', userId: 'UOWNER1' });
   ghExec.mockReset().mockResolvedValue('');
   __contentMergeGh.exec = ghExec;
+  offerMock.mockReset().mockImplementation(realOfferImpl!);
+  __marketingDeployOffer.offer = offerMock;
   vi.mocked(fetchUnresolvedReviewThreadCount).mockReset().mockResolvedValue({ unresolvedCount: 0, totalThreads: 0 });
   vi.mocked(fetchMergeState).mockReset().mockResolvedValue({
     reviewDecision: 'REVIEW_REQUIRED',
@@ -284,9 +305,7 @@ describe('merging a content-only marketing PR (#701)', () => {
     const { posted } = await run('<@UBOT1> merge it');
 
     expect(ghExec).toHaveBeenCalledWith(mergeArgs(), 'ghs_test');
-    expect(posted).toEqual([
-      `Merged ${MARKETING_PR}: it only changes text and numbers. It isn't live yet; someone from core-dev has to deploy it.`,
-    ]);
+    expect(posted).toEqual([`Merged ${MARKETING_PR}: it only changes text and numbers. ${DEPLOY_OFFER_LINE}`]);
   });
 
   it.each([
@@ -625,5 +644,78 @@ describe('contentOwnerReason', () => {
     [{ kind: 'unreadable' }, "I couldn't check that it only changes text, so an owner has to confirm."],
   ])('says %j in one sentence', (verdict, sentence) => {
     expect(contentOwnerReason({ contentOnly: false, reason: 'r', ...verdict } as never)).toBe(sentence);
+  });
+});
+
+describe('the deploy offer after a merge (#703)', () => {
+  it('goes with a content-only merge, as the merge reply, for the PR this run merged', async () => {
+    const { result } = await run('<@UBOT1> merge it');
+
+    expect(offerMock).toHaveBeenCalledTimes(1);
+    const args = offerMock.mock.calls[0][0];
+    expect(args.merged).toEqual([
+      { pr: expect.objectContaining({ url: MARKETING_PR, number: 1490 }), knownMerged: true },
+    ]);
+    expect(args.lead).toBe(
+      `Merged ${MARKETING_PR}: it only changes text and numbers, so it went in without the usual review.`,
+    );
+    expect(args.githubToken).toBe('ghs_test');
+    expect(result).toMatchObject({ workflow: 'IMPLEMENTATION', status: 'SUCCESS' });
+  });
+
+  it('falls back to the plain merge reply when nothing could be offered', async () => {
+    offerMock.mockResolvedValue(undefined);
+
+    const { posted, result } = await run('<@UBOT1> merge it');
+
+    expect(posted).toEqual([
+      `Merged ${MARKETING_PR}: it only changes text and numbers, so it went in without the usual review. It isn't live yet; someone from core-dev has to deploy it.`,
+    ]);
+    expect(result).toMatchObject({ status: 'SUCCESS' });
+  });
+
+  it('is not offered when the merge failed', async () => {
+    ghExec.mockRejectedValueOnce(
+      Object.assign(new Error('boom'), { stderr: 'GraphQL: Pull request is not mergeable' }),
+    );
+    ghExec.mockResolvedValueOnce('OPEN\n');
+
+    await run('<@UBOT1> merge it');
+
+    expect(offerMock).not.toHaveBeenCalled();
+  });
+
+  it('follows an owner-confirmed merge by the agent, which GitHub has to show as merged', async () => {
+    vi.mocked(checkContentOnlyPr).mockResolvedValue({
+      contentOnly: false,
+      kind: 'not_content',
+      reason: 'It changes code.',
+      offending: ['src/lib/forms/x.ts'],
+    });
+    offerMock.mockResolvedValue({ status: 'FAILED', message: 'deploy failed', notifyDesktop: true, slackPosted: true });
+
+    const { result } = await run('<@UBOT1> merge it');
+
+    expect(runCodex).toHaveBeenCalledTimes(1);
+    expect(offerMock).toHaveBeenCalledTimes(1);
+    const args = offerMock.mock.calls[0][0];
+    expect(args.merged).toEqual([{ pr: expect.objectContaining({ url: MARKETING_PR }), knownMerged: false }]);
+    expect(args.lead).toBeUndefined();
+    expect(vi.mocked(runCodex).mock.invocationCallOrder[0]).toBeLessThan(offerMock.mock.invocationCallOrder[0]);
+    // The deploy it carried out failed: so did the run.
+    expect(result).toMatchObject({ status: 'FAILED' });
+  });
+
+  it("follows the owner's own merge by the agent", async () => {
+    await run('<@UBOT1> merge it', { byOwner: true });
+
+    expect(offerMock).toHaveBeenCalledTimes(1);
+    expect(offerMock.mock.calls[0][0].merged[0].knownMerged).toBe(false);
+  });
+
+  it('is never offered after a close', async () => {
+    await run('<@UBOT1> close it', { byOwner: true });
+
+    expect(offerMock).not.toHaveBeenCalled();
   });
 });

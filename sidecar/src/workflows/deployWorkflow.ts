@@ -23,6 +23,9 @@ export const __deployConfirm = { wait: waitForExactConfirmation };
 
 export const DEPLOY_CONFIRM_PHRASE = 'confirm deploy';
 
+/** The marketing site's production deploy workflow. */
+export const MARKETING_PROD_WORKFLOW = 'deploy-prod.yml';
+
 /**
  * Last gate before anything irreversible (issue #428). Returns undefined once
  * the requester has confirmed; otherwise the result to return, with nothing
@@ -96,6 +99,11 @@ async function confirmDeploy(params: {
   return stop('SKIPPED', msg, slackPosted);
 }
 
+/** What a confirmed production deploy says while the deploy dry-run switch is on. */
+export function deployDryRunText(targetLabel: string): string {
+  return `Dry run: this is where I would deploy *${targetLabel}* to production. Nothing was deployed.`;
+}
+
 async function reportDryRun(params: {
   task: NormalizedTask;
   slack: WebClient;
@@ -103,7 +111,7 @@ async function reportDryRun(params: {
   logStep?: WorkflowStepLogger;
 }): Promise<WorkflowResult> {
   const { task, slack, targetLabel, logStep } = params;
-  const msg = `Dry run: this is where I would deploy *${targetLabel}* to production. Nothing was deployed.`;
+  const msg = deployDryRunText(targetLabel);
   logStep?.({ stage: 'deploy.dry_run', message: msg, level: 'WARN', data: { targetLabel } });
   const slackPosted = await slack.chat
     .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: msg })
@@ -430,17 +438,44 @@ async function runMarketingDeploy(params: {
   if (notConfirmed) return notConfirmed;
   if (isDeployDryRun(store)) return reportDryRun({ task, slack, targetLabel: 'newton-marketing-web', logStep });
 
+  const done = await dispatchMarketingProdDeploy({
+    repoPath,
+    slack,
+    channelId: task.event.channelId,
+    threadTs: task.event.threadTs,
+    logStep,
+    signal,
+  });
+  return { workflow: 'DEPLOY', ...done };
+}
+
+/**
+ * Dispatches the marketing production deploy and follows it, posting what
+ * happened: the "Dispatching…" line, then the outcome. Shared by the deploy
+ * ask and the deploy offered after a merge (issue #703), so both start the
+ * same workflow with the same inputs and say the same things. Whoever calls
+ * it has checked who asked and that they confirmed.
+ */
+export async function dispatchMarketingProdDeploy(params: {
+  repoPath: string;
+  slack: WebClient;
+  channelId: string;
+  threadTs: string;
+  logStep?: WorkflowStepLogger;
+  signal?: AbortSignal;
+}): Promise<Omit<WorkflowResult, 'workflow'>> {
+  const { repoPath, slack, channelId, threadTs, logStep, signal } = params;
   await slack.chat
     .postMessage({
-      channel: task.event.channelId,
-      thread_ts: task.event.threadTs,
+      channel: channelId,
+      thread_ts: threadTs,
       text: ':rocket: Dispatching the *newton-marketing-web* production deploy (GitHub Actions)…',
     })
     .catch(() => {});
 
   const outcome = await dispatchWorkflowRun({
     repoPath,
-    workflowFile: 'deploy-prod.yml',
+    workflowFile: MARKETING_PROD_WORKFLOW,
     ref: 'main',
     inputs: { confirm: 'deploy' },
     signal,
@@ -452,26 +487,14 @@ async function runMarketingDeploy(params: {
   if (outcome.kind === 'stopped') {
     const msg = 'Nothing was deployed: it stopped before the deploy was dispatched.';
     logStep?.({ stage: 'deploy.marketing.stopped', message: msg });
-    const slackPosted = await postDeployReplyBestEffort({
-      slack,
-      channelId: task.event.channelId,
-      threadTs: task.event.threadTs,
-      text: msg,
-      logStep,
-    });
-    return { workflow: 'DEPLOY', status: 'CANCELLED', message: msg, notifyDesktop: false, slackPosted };
+    const slackPosted = await postDeployReplyBestEffort({ slack, channelId, threadTs, text: msg, logStep });
+    return { status: 'CANCELLED', message: msg, notifyDesktop: false, slackPosted };
   }
   if (outcome.kind === 'dispatch_failed') {
     const msg = `Couldn't dispatch the marketing prod deploy: ${outcome.error}`;
     logStep?.({ stage: 'deploy.marketing.dispatch_failed', message: msg, level: 'ERROR' });
-    const slackPosted = await postDeployReplyBestEffort({
-      slack,
-      channelId: task.event.channelId,
-      threadTs: task.event.threadTs,
-      text: msg,
-      logStep,
-    });
-    return { workflow: 'DEPLOY', status: 'FAILED', message: msg, notifyDesktop: true, slackPosted };
+    const slackPosted = await postDeployReplyBestEffort({ slack, channelId, threadTs, text: msg, logStep });
+    return { status: 'FAILED', message: msg, notifyDesktop: true, slackPosted };
   }
 
   // Like the newton-web path, the side-effect has already executed — every
@@ -484,16 +507,9 @@ async function runMarketingDeploy(params: {
     data: { conclusion: run.conclusion, url: run.url },
   });
 
-  const slackPosted = await postDeployReplyBestEffort({
-    slack,
-    channelId: task.event.channelId,
-    threadTs: task.event.threadTs,
-    text: run.summary,
-    logStep,
-  });
+  const slackPosted = await postDeployReplyBestEffort({ slack, channelId, threadTs, text: run.summary, logStep });
 
   return {
-    workflow: 'DEPLOY',
     status: run.conclusion === 'failure' ? 'FAILED' : 'SUCCESS',
     message: run.summary,
     notifyDesktop: true,
