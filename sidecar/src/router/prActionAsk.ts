@@ -74,30 +74,55 @@ const PR_URL_RE = /^https?:\/\/(?:www\.)?github\.com\/([^/\s]+)\/([^/\s]+)\/pull
 
 // The other ways people ask for a sync (issue #719), read on normalizeControlText's
 // output: "bring that PR's branch up to date with master" arrives as "bring that prs
-// branch up to date with master". Each object is the pull request or its branch, so
-// "update the copy" or "get the docs up to date" is never a sync.
+// branch up to date with master", and a link to the pull request as "this pr"
+// (prPlaceholders). Each object is the pull request or its branch, so "update the
+// copy" or "get the docs up to date" is never a sync.
 const DET = '(?:the|this|that|its|my|our|your)';
 const PR_NOUN = '(?:prs|pr|pull requests|pull request)';
 const SYNC_OBJECT = `(?:it|this|that|${DET} ${PR_NOUN} branch|${DET} branch|${DET} ${PR_NOUN}|${PR_NOUN} branch|branch)`;
-const BASE_BRANCH = '(?:(?:the )?base(?: branch)?|master|main|latest)';
-/** Where a branch-shaped "update" has to stop, so "update the branch name" is not a sync. */
+/** The pull request an "update the branch of …" names. */
+const PR_REF = `(?:it|this|that|${DET} ${PR_NOUN}|${PR_NOUN})`;
+const BASE_BRANCH = '(?:(?:the )?(?:latest )?(?:origin )?(?:base(?: branch)?|master|main)|latest)';
+/** Where a phrase has to stop, so "update the branch name" or "rebase it interactively" is not a sync. */
 const PHRASE_END = '(?=$| please| pls| now| thanks| thank you)';
 const SYNC_PHRASES = [
-  new RegExp(`\\b(?:bring|get)(?: ${SYNC_OBJECT})? up to date(?: with ${BASE_BRANCH})?\\b`, 'g'),
-  new RegExp(`\\bupdate (?:${DET} )?(?:${PR_NOUN} )?branch with ${BASE_BRANCH}\\b`, 'g'),
-  new RegExp(`\\bupdate (?:${DET} )?(?:${PR_NOUN} )?branch${PHRASE_END}`, 'g'),
-  new RegExp(`\\bupdate (?:it|this|that|${DET} ${PR_NOUN}|${PR_NOUN}) with ${BASE_BRANCH}\\b`, 'g'),
-  new RegExp(`\\bmerge (?:in )?${BASE_BRANCH} (?:into|in to) ${SYNC_OBJECT}\\b`, 'g'),
-  new RegExp(`\\bmerge (?:in ${BASE_BRANCH}|${BASE_BRANCH} in)${PHRASE_END}`, 'g'),
-  new RegExp(`\\bcatch(?: ${SYNC_OBJECT})? up with ${BASE_BRANCH}\\b`, 'g'),
+  // "bring it up to date (with master)", "get up to date with main": an object or a base branch.
+  new RegExp(`\\b(?:bring|get) ${SYNC_OBJECT} up to date(?: with ${BASE_BRANCH})?\\b`, 'g'),
+  new RegExp(`\\b(?:bring|get) up to date with ${BASE_BRANCH}\\b`, 'g'),
+  new RegExp(
+    `\\bupdate (?:${DET} )?(?:${PR_NOUN} )?branch(?: (?:of|on|for|in) ${PR_REF})? with ${BASE_BRANCH}\\b`,
+    'g',
+  ),
+  new RegExp(`\\bupdate (?:${DET} )?(?:${PR_NOUN} )?branch(?: (?:of|on|for|in) ${PR_REF})?${PHRASE_END}`, 'g'),
+  new RegExp(`\\bupdate ${PR_REF} with ${BASE_BRANCH}\\b`, 'g'),
+  // "merge master into it", "merge in main", "merge from master", "pull master into this pr".
+  new RegExp(`\\b(?:merge|pull) (?:from |in )?${BASE_BRANCH} (?:into|in to|to) ${SYNC_OBJECT}\\b`, 'g'),
+  new RegExp(`\\b(?:merge|pull) (?:in ${BASE_BRANCH}|${BASE_BRANCH} in|from ${BASE_BRANCH})${PHRASE_END}`, 'g'),
+  new RegExp(`\\bcatch ${SYNC_OBJECT} up with ${BASE_BRANCH}\\b`, 'g'),
+  new RegExp(`\\bcatch up with ${BASE_BRANCH}\\b`, 'g'),
 ];
 /** miniOG merges the base in and never rebases a branch with an open PR: a rebase ask is a sync. */
 const REBASE_PHRASES = [
   new RegExp(`\\brebase(?: ${SYNC_OBJECT})? (?:on|onto|with|against) ${BASE_BRANCH}\\b`, 'g'),
-  new RegExp(`\\brebase ${SYNC_OBJECT}\\b`, 'g'),
+  new RegExp(`\\brebase ${SYNC_OBJECT}(?=$| please| pls| now| thanks| thank you| and squash)`, 'g'),
   new RegExp(`\\brebase${PHRASE_END}`, 'g'),
 ];
-const NEGATION = /\b(?:dont|do not|never|not|no|without)\b/;
+/** "don't", "no rush", "never", "merge mat karo": with a negation anywhere, the words name no operation. */
+const NEGATION = /\b(?:dont|do not|donot|dnt|never|not|no|nope|nah|without|hold|wait|stop|mat|nahi|nahin)\b/;
+const PR_URL_IN_TEXT_RE =
+  /<https?:\/\/(?:www\.)?github\.com\/[^/\s|>]+\/[^/\s|>]+\/pull\/\d+[^|>]*(?:\|[^>]*)?>|https?:\/\/(?:www\.)?github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+\S*/gi;
+
+/**
+ * Links to pull requests replaced by "this pr", so "merge master into <link>"
+ * reads like "merge master into this pr", and "origin/master" written as
+ * "origin master", so a caller that drops slash words (typed branch names)
+ * keeps it. Other links are left to the caller.
+ */
+export function prPlaceholders(text: string): string {
+  return text
+    .replace(PR_URL_IN_TEXT_RE, ' this pr ')
+    .replace(/\b(?:origin|upstream)\/(master|main)\b/gi, (_match, branch: string) => `origin ${branch}`);
+}
 
 export interface SyncPhrase {
   /** The text with each sync phrasing replaced by "sync it". */
@@ -113,7 +138,7 @@ export interface SyncPhrase {
  * with a negation is left as it is: "don't rebase, merge it" is not a sync.
  */
 export function readSyncPhrase(text: string): SyncPhrase {
-  const normalized = normalizeControlText(text);
+  const normalized = normalizeControlText(prPlaceholders(text));
   if (NEGATION.test(normalized)) return { text: normalized, sync: false, rebase: false };
   let rewritten = normalized;
   for (const phrase of SYNC_PHRASES) rewritten = rewritten.replace(phrase, 'sync it');
@@ -123,7 +148,45 @@ export function readSyncPhrase(text: string): SyncPhrase {
   return { text: rewritten, sync: rewritten !== normalized, rebase };
 }
 
-export type PrActionAsk = { action: PrActionVerb; pr: PrContext; rebase?: boolean };
+export type QuickOperation =
+  | { kind: 'operation'; action: PrActionVerb | 'revert'; rebase: boolean }
+  /** The words name no pull-request operation. */
+  | { kind: 'none' }
+  /** They name one but can't be read safely: a negation, two operations, or "merge" next to the base branch. */
+  | { kind: 'unclear'; reason: 'negation' | 'several' | 'base_branch_merge' }
+  /** A question about the pull request, not a request ("did you merge it?"). */
+  | { kind: 'question' };
+
+const OPERATION_WORDS = /\b(merge|close|revert|sync)\b/g;
+/** "merge master", "merge it with main": the base branch next to "merge" is never a merge of the pull request. */
+const MERGE_WITH_BASE = new RegExp(`\\bmerge(?: ${SYNC_OBJECT})? (?:with |from |in )?${BASE_BRANCH}\\b`);
+/** "can you merge it?": a question put to miniOG is a request. */
+const REQUEST_QUESTION = /\b(?:can|could|would|will) (?:you|u)\b/;
+const QUESTION_MARK = /[?？؟¿]/;
+
+/**
+ * The pull-request operation a quick action may run, read from the words of
+ * the message (links, code and typed names already taken out by the caller).
+ * Only one plainly named operation is picked: anything that could mean
+ * something else is "unclear", and the caller asks instead of guessing (#719).
+ */
+export function readQuickOperation(words: string): QuickOperation {
+  // Struck-through words were taken back.
+  const kept = words.replace(/~[^~]+~/g, ' ');
+  const sync = readSyncPhrase(kept);
+  const plain = sync.text;
+  const named = new Set([...plain.matchAll(OPERATION_WORDS)].map(match => match[1] as PrActionVerb | 'revert'));
+  // "sync up with me" is a meeting.
+  if (!sync.sync && /\bsync up\b/.test(plain)) named.delete('sync');
+  if (named.size === 0) return { kind: 'none' };
+  if (QUESTION_MARK.test(kept) && !REQUEST_QUESTION.test(plain)) return { kind: 'question' };
+  if (NEGATION.test(plain)) return { kind: 'unclear', reason: 'negation' };
+  if (named.size > 1) return { kind: 'unclear', reason: 'several' };
+  if (MERGE_WITH_BASE.test(plain)) return { kind: 'unclear', reason: 'base_branch_merge' };
+  return { kind: 'operation', action: [...named][0], rebase: sync.rebase };
+}
+
+export type PrActionAsk = { action: PrActionVerb; pr: PrContext };
 
 /** Who the message may mention: miniOG, and the owner when tagging the owner is how the ask reached it. */
 export type PrActionAddressees = { botUserId: string; ownerUserIds: string[] };
@@ -141,14 +204,16 @@ export function readPrActionAsk(task: AskTask, addressees: PrActionAddressees): 
   if (text === undefined) return undefined;
   // "merge मत करो" is "don't merge"; normalizeControlText would keep only "merge".
   if (/[^\P{L}a-zA-Z]/u.test(text)) return undefined;
+  // "~merge it~": taken back, and normalizeControlText would drop the tildes.
+  if (/~[^~]+~/.test(text)) return undefined;
   // "bring it up to date with master" and the like are a sync (issue #719).
-  const syncPhrase = readSyncPhrase(text);
-  const words = syncPhrase.text.split(' ').filter(Boolean);
-  // "merge?", "can it merge?": a question, unless it is put to miniOG ("can you merge it?").
-  if (/[?？]/.test(text) && !words.some(word => ADDRESSEE.has(word))) return undefined;
+  const words = readSyncPhrase(text).text.split(' ').filter(Boolean);
+  // "merge it?", "you merge it?": a question, unless it is put to miniOG ("can you merge it?").
+  if (QUESTION_MARK.test(text) && !REQUEST_QUESTION.test(words.join(' '))) return undefined;
 
   const actions = new Set<PrActionVerb>();
   const numbers = new Set<number>();
+  let withBranch = false;
   for (let i = 0; i < words.length; i++) {
     const word = words[i];
     const action = ACTIONS.get(word);
@@ -163,6 +228,7 @@ export function readPrActionAsk(task: AskTask, addressees: PrActionAddressees): 
       let next = i + 1;
       if (words[next] === 'the') next++;
       if (!BRANCH_NAMES.has(words[next] ?? '')) return undefined;
+      if (word === 'with') withBranch = true;
       i = words[next + 1] === 'branch' ? next + 1 : next;
     } else if (word === 'for') {
       if (!BENEFICIARIES.has(words[i + 1] ?? '')) return undefined;
@@ -172,10 +238,11 @@ export function readPrActionAsk(task: AskTask, addressees: PrActionAddressees): 
     }
   }
   if (actions.size !== 1 || numbers.size > 1) return undefined;
-  const pr = targetPr(task, numbers.size === 1 ? [...numbers][0] : undefined);
-  if (!pr) return undefined;
   const action = [...actions][0];
-  return action === 'sync' && syncPhrase.rebase ? { action, pr, rebase: true } : { action, pr };
+  // "merge it with master" could mean either way round: the router reads it.
+  if (action === 'merge' && withBranch) return undefined;
+  const pr = targetPr(task, numbers.size === 1 ? [...numbers][0] : undefined);
+  return pr ? { action, pr } : undefined;
 }
 
 /**
@@ -209,16 +276,18 @@ function stripAllowedTokens(task: AskTask, addressees: PrActionAddressees): stri
   const text = task.event.text
     .replace(/\*sent using\*[\s\S]*$/i, '')
     // Slack's markup: <@U…|name>, <https://…|label>, <#C…|channel>, <!here>.
+    // The pull request's own link reads as "this pr", so "merge master into <link>"
+    // is read like "merge master into this pr" (issue #719).
     .replace(/<([^>]*)>/g, (_token, inner: string) => {
       const target = inner.split('|')[0];
       const mention = /^@([A-Z0-9]+)$/i.exec(target);
       if (mention ? !allowedMentions.has(mention[1]) : !isLinkedPr(target)) allowed = false;
-      return ' ';
+      return mention ? ' ' : ' this pr ';
     })
     .replace(/https?:\/\/\S+/gi, url => {
       // A full stop or comma after a pasted link is the sentence's, not the link's.
       if (!isLinkedPr(url.replace(/[.,!?;:)]+$/, ''))) allowed = false;
-      return ' ';
+      return ' this pr ';
     })
     // Emoji shortcodes (":pray:") carry no instruction.
     .replace(/:[a-z0-9_+'-]+:/gi, ' ');

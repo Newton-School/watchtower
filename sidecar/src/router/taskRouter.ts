@@ -285,16 +285,23 @@ export async function routeTask(params: {
    * "sync <PR link>"): the change workflow's fast path runs it with no router
    * and no planner (issue #605). Left to the router, "sync <PR link>" once read
    * as a review and got a question instead (issue #719). Owner tags still go
-   * to the router, which reads a merge asked of the owner as a review.
+   * to the router, which reads a merge asked of the owner as a review. A reply
+   * that resumed a paused job without naming miniOG (anyone's "go ahead" after
+   * a usage-limit pause) is not addressed to it: only the message that names
+   * miniOG, a DM, or the answer to miniOG's own question opens this.
    */
+  const addressedToMiniog =
+    (task.event.text ?? '').includes(`<@${config.botUserId}`) ||
+    task.event.channelType === 'im' ||
+    Boolean(task.clarification);
   const prActionAsk =
-    directAsk && !helpRequested && !stagingAsked
+    directAsk && !helpRequested && !stagingAsked && addressedToMiniog
       ? readPrActionAsk(task, { botUserId: config.botUserId, ownerUserIds: config.ownerSlackUserIds })
       : undefined;
   // STAGING_DEPLOY is seeded only by an answer to the staging tool's "which
   // PR or branch?" (pausedResume.ts): nothing for a model to read.
   const routerShadow =
-    helpRequested || stagingAsked || prActionAsk || task.intent === 'STAGING_DEPLOY'
+    helpRequested || stagingAsked || task.intent === 'STAGING_DEPLOY'
       ? undefined
       : startRouterShadow({ task, userMessage, reviewedPrInThread, logStep, signal });
   let legacyDecidedBy: LegacyDecidedBy = 'gate';

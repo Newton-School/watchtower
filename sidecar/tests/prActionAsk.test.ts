@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { readPrActionAsk, readSyncPhrase } from '../src/router/prActionAsk.js';
+import { readPrActionAsk, readQuickOperation, readSyncPhrase } from '../src/router/prActionAsk.js';
 import { mergeProtectionNote } from '../src/workflows/implementationWorkflow.js';
 import { fetchChecksState, fetchMergeState, fetchUnresolvedReviewThreadCount } from '../src/github/prReviewComments.js';
 import type { NormalizedTask, PrTarget } from '../src/types/contracts.js';
@@ -165,9 +165,42 @@ describe('readPrActionAsk', () => {
     expect(ask(text)).toEqual({ action: 'sync', pr: expect.objectContaining({ number: 1404 }) });
   });
 
-  it('reads a rebase as a sync, and says it was a rebase', () => {
-    expect(ask('<@UBOT1> rebase it on master')).toMatchObject({ action: 'sync', rebase: true });
-    expect(ask('<@UBOT1> rebase onto main')).toMatchObject({ action: 'sync', rebase: true });
+  it('reads a rebase as a sync', () => {
+    expect(ask('<@UBOT1> rebase it on master')).toMatchObject({ action: 'sync' });
+    expect(ask('<@UBOT1> rebase onto main')).toMatchObject({ action: 'sync' });
+  });
+
+  it('reads the sync phrasings with the PR linked in the message', () => {
+    const linked = pr(9437, 'trigger', 'newton-web');
+    const link = `<${linked.url}|newton-web#9437>`;
+    for (const text of [
+      `<@UBOT1> merge master into ${link}`,
+      `<@UBOT1> merge origin/master into ${link}`,
+      `<@UBOT1> update the branch of ${link} with master`,
+      `<@UBOT1> update the branch on ${link}`,
+      `<@UBOT1> update ${link} with master`,
+      `<@UBOT1> pull master into ${linked.url}`,
+    ]) {
+      expect(ask(text, [linked]), text).toEqual({ action: 'sync', pr: expect.objectContaining({ number: 9437 }) });
+    }
+  });
+
+  // #719 review: a yes/no question acted with no model reading it.
+  it.each(['<@UBOT1> u merge it?', '<@UBOT1> you close it?', '<@UBOT1> u close the pr?', '<@UBOT1> merge it, you?'])(
+    'leaves the question %s to the router',
+    text => {
+      expect(ask(text)).toBeUndefined();
+    },
+  );
+
+  it.each([
+    '<@UBOT1> merge it with master',
+    '<@UBOT1> get up to date',
+    '<@UBOT1> bring up to date thanks',
+    '<@UBOT1> ~merge it~',
+    '<@UBOT1> ~close~ merge it',
+  ])('leaves %s to the router', text => {
+    expect(ask(text)).toBeUndefined();
   });
 
   it.each([
@@ -185,6 +218,65 @@ describe('readPrActionAsk', () => {
 
   it('keeps "merge it into master" a merge of the PR', () => {
     expect(ask('<@UBOT1> merge it into master')).toMatchObject({ action: 'merge' });
+  });
+});
+
+describe('readQuickOperation', () => {
+  // #719 review: after a planner, "merge master into <PR link>" merged the PR.
+  it.each([
+    ['merge master into this pr', 'sync'],
+    ['merge the latest master into it', 'sync'],
+    ['merge origin master into this pr', 'sync'],
+    ['merge master to this pr', 'sync'],
+    ['pull master into this pr', 'sync'],
+    ["bring that PR's branch up to date with master", 'sync'],
+    ['update the branch of this pr with master', 'sync'],
+    ['update the branch on this pr', 'sync'],
+    ['update this pr with master', 'sync'],
+    ['please merge it', 'merge'],
+    ['close it, we will redo it', 'close'],
+    ['can you merge it?', 'merge'],
+  ])('reads %s as %s', (words, action) => {
+    expect(readQuickOperation(words)).toMatchObject({ kind: 'operation', action });
+  });
+
+  it.each([
+    ['merge main', 'base_branch_merge'],
+    ['merge master', 'base_branch_merge'],
+    ['merge it with master', 'base_branch_merge'],
+    ['merge main into release', 'base_branch_merge'],
+    ['merge master into and then merge it', 'base_branch_merge'],
+    ["don't rebase it, merge master in", 'negation'],
+    ['no rush, merge master into it', 'negation'],
+    ["don't merge it, just bring it up to date with master", 'negation'],
+    ['master ko merge mat karo', 'negation'],
+    ['bring it up to date with master and merge it', 'several'],
+    ['sync it then close it', 'several'],
+  ])('asks instead of acting on %s', (words, reason) => {
+    expect(readQuickOperation(words)).toEqual({ kind: 'unclear', reason });
+  });
+
+  it.each(['did you merge it?', 'u merge it?', 'you close it?'])('reads %s as a question', words => {
+    expect(readQuickOperation(words)).toEqual({ kind: 'question' });
+  });
+
+  it('names no operation for a meeting, a re-run or a question with no operation in it', () => {
+    expect(readQuickOperation('sync up with me tomorrow')).toEqual({ kind: 'none' });
+    expect(readQuickOperation('re-run the tests')).toEqual({ kind: 'none' });
+    expect(readQuickOperation('is it up to date with master?')).toEqual({ kind: 'none' });
+  });
+
+  it('reads a rebase as a sync, and says so', () => {
+    expect(readQuickOperation('rebase it on main')).toEqual({ kind: 'operation', action: 'sync', rebase: true });
+    expect(readQuickOperation('rebase it and squash')).toMatchObject({
+      kind: 'operation',
+      action: 'sync',
+      rebase: true,
+    });
+  });
+
+  it('drops struck-through words', () => {
+    expect(readQuickOperation('~merge~ close it')).toEqual({ kind: 'operation', action: 'close', rebase: false });
   });
 });
 

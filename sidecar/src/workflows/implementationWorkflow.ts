@@ -76,7 +76,13 @@ import {
   extractReplyFromCodexResult,
   type WorkflowContext,
 } from './shared/workflowUtils.js';
-import { readPrActionAsk, readSyncPhrase } from '../router/prActionAsk.js';
+import {
+  prPlaceholders,
+  readPrActionAsk,
+  readQuickOperation,
+  readSyncPhrase,
+  type QuickOperation,
+} from '../router/prActionAsk.js';
 import { guardWords } from '../router/stagingTarget.js';
 import { refreshSharedClones } from '../workspaces/staleCheckout.js';
 import { assertThreadParentExists } from '../slack/threadContext.js';
@@ -243,9 +249,9 @@ export const QUICK_ACTION_DEPLOY_REDIRECT =
  * Quick actions that change a pull request and cannot be taken back cheaply.
  * "sync" merges the base branch into the PR branch (issue #603): the daily
  * follow-up offers it when a PR conflicts or is behind. Never a rebase or a
- * force-push: the branch has an open PR.
+ * force-push: the branch has an open PR. Read from the words by
+ * `readQuickOperation` (issue #719).
  */
-const QUICK_ACTION_PR_ACTION_RE = /\b(merge|close|revert|sync)\b/i;
 type QuickPrAction = 'merge' | 'close' | 'revert' | 'sync';
 
 export const QUICK_ACTION_APPROVE_REFUSAL =
@@ -793,18 +799,36 @@ async function runQuickAction(params: {
   // a code span or a typed branch or file name ("fix/merge-banner",
   // "close-modal.tsx") naming "merge", "close" or "deploy" is not an
   // instruction (#710).
-  const linkFreeWords = guardWords(task.event.text).replace(/\S+\.[a-z0-9]{1,6}\b\S*/g, ' ');
+  // A link to the pull request reads as "this pr" (issue #719).
+  const linkFreeWords = guardWords(prPlaceholders(task.event.text)).replace(/\S+\.[a-z0-9]{1,6}\b\S*/g, ' ');
   // "bring it up to date with master", "merge main into it", "rebase on master":
-  // a sync, never a merge of the PR (issue #719).
+  // a sync, never a merge of the PR. "Don't merge it, just sync it", "merge it
+  // with master" or "did you merge it?" name no operation to run (issue #719).
   const syncPhrase = readSyncPhrase(linkFreeWords);
   const words = syncPhrase.sync ? syncPhrase.text : linkFreeWords;
-  const prAction =
-    params.action ?? (QUICK_ACTION_PR_ACTION_RE.exec(words)?.[1].toLowerCase() as QuickPrAction | undefined);
-  const mergeIntent = params.action ? params.action === 'merge' : /\bmerge\b/i.test(words);
+  const operation: QuickOperation = params.action
+    ? { kind: 'operation', action: params.action, rebase: syncPhrase.rebase }
+    : readQuickOperation(linkFreeWords);
+  const prAction: QuickPrAction | undefined = operation.kind === 'operation' ? operation.action : undefined;
+  const mergeIntent = prAction === 'merge';
+
+  if (operation.kind === 'unclear') {
+    const target = prs.length === 1 ? prs[0].url : 'the pull request';
+    const reply = `I wasn't sure what to do with ${target}, so I haven't changed anything. Mention me again with just the one you want: merge it, close it, or sync it with its base branch.`;
+    logStep?.({
+      stage: 'implementation.quick_action.unclear',
+      message: `The words name a pull-request operation but can't be read safely (${operation.reason}) — asking, not acting.`,
+      data: { reason: operation.reason },
+    });
+    const posted = await slack.chat
+      .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: reply })
+      .then(() => true)
+      .catch(() => false);
+    return { workflow: 'IMPLEMENTATION', status: 'SKIPPED', message: reply, notifyDesktop: false, slackPosted: posted };
+  }
+
   const mergeChecks =
-    (mergeIntent || prAction === 'merge') && checkPr && ctx.githubToken
-      ? await readMergeChecks(checkPr, ctx.githubToken)
-      : undefined;
+    mergeIntent && checkPr && ctx.githubToken ? await readMergeChecks(checkPr, ctx.githubToken) : undefined;
 
   // Nobody can merge a PR with conflicts, admin rights or not: a message that
   // is only that merge gets no confirmation to answer and no agent (issue
@@ -910,6 +934,7 @@ async function runQuickAction(params: {
   // INFORMATIONAL path instead. Default to informational — both misroute
   // directions are non-destructive (a misrouted op just gets explained).
   const operationalAction =
+    operation.kind !== 'question' &&
     /\b(merge|close|reopen|revert|sync|restart|rerun|re-run|run (?:the )?tests?|approve|assign)\b/i.test(words);
 
   // Deploys never run from here (issue #407). This path has no deploy
@@ -991,7 +1016,9 @@ async function runQuickAction(params: {
     // A run the owner started or picked up for someone else still needs
     // the phrase: answering their question isn't saying yes to a merge.
     const forSomeoneElse = requesterOf(task) !== task.event.userId;
-    if (!task.isOwnerAuthor || forSomeoneElse) {
+    // A rebase ask runs as a merge of the base branch: even the owner sees that first (#719).
+    const rebaseAsked = prAction === 'sync' && operation.kind === 'operation' && operation.rebase;
+    if (!task.isOwnerAuthor || forSomeoneElse || rebaseAsked) {
       const checks = prAction === 'merge' ? mergeChecks : undefined;
       // A message that is only this merge, of a PR that only changes content,
       // from someone who could have asked for the change: their word is the
@@ -1012,7 +1039,11 @@ async function runQuickAction(params: {
         action: prAction,
         prUrls,
         unresolvedCount: checks?.unresolvedCount,
-        protectionNote: checks ? mergeProtectionNote(checks.state) : undefined,
+        protectionNote: checks
+          ? mergeProtectionNote(checks.state)
+          : rebaseAsked
+            ? "I'll merge its base branch into it, a merge commit: I don't rebase or squash a branch with an open pull request."
+            : undefined,
         ownerReason: contentMerge?.kind === 'owner' ? contentMerge.reason : undefined,
         logStep,
         signal,
@@ -1048,7 +1079,7 @@ Never submit an approving review or request changes on a pull request (no \`gh p
       ? `\n\nPull requests you may act on: ${prUrls.join(', ')}. Do not merge, close, revert or sync any other pull request.`
       : ''
   }${prAction ? `\n\nThe confirmed operation is \`${prAction}\`; perform no other pull-request operation.` : ''}${
-    prAction === 'sync' && syncPhrase.rebase
+    prAction === 'sync' && operation.kind === 'operation' && operation.rebase
       ? '\n\nThey asked for a rebase. Merge the base branch in instead, because a branch with an open pull request is never rebased, and say so in one short sentence.'
       : ''
   }
