@@ -14,6 +14,8 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     globals: true,
-    setupFiles: [],
+    setupFiles: ['./src/testSetup.ts'],
+    // Room for the longer per-wait timeout in testSetup.ts.
+    testTimeout: 20_000,
   },
 });

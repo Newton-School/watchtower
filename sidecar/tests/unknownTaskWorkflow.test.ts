@@ -107,6 +107,8 @@ describe('unknownTaskWorkflow', () => {
         model: 'gpt-5.2-codex',
         prompt: expect.stringContaining('Context track: direct_reply'),
         reasoningEffort: 'low',
+        // A one-line reply needs no tools, so nothing runs bypassed (#695).
+        noTools: true,
       }),
     );
     expect(slack.chat.postMessage).toHaveBeenCalledWith(

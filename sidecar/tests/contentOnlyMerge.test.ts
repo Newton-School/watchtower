@@ -171,7 +171,13 @@ const realOfferImpl = offerMock.getMockImplementation();
 beforeEach(() => {
   vi.mocked(runCodex)
     .mockReset()
-    .mockResolvedValue({ ok: true, exitCode: 0, parsedJson: { summary: 'Merged it.' } } as never);
+    // A planner that answers "no code changes" in so many words: one that
+    // leaves the verdict out now counts as a change (#695).
+    .mockResolvedValue({
+      ok: true,
+      exitCode: 0,
+      parsedJson: { summary: 'Merged it.', requiresCodeChanges: false },
+    } as never);
   __quickActionConfirm.wait = vi.fn().mockResolvedValue({ outcome: 'confirmed', userId: 'UOWNER1' });
   ghExec.mockReset().mockResolvedValue('');
   __contentMergeGh.exec = ghExec;
