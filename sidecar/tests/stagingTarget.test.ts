@@ -92,6 +92,33 @@ describe('readStagingAsk', () => {
   });
 });
 
+describe('readStagingAsk, round 2', () => {
+  it('reads the word after "branch is/was/has" as a branch only when it looks like one', () => {
+    expect(readStagingAsk('the branch is ready for testing, can I get a staging link?')).toMatchObject({
+      looseBranches: ['ready'],
+    });
+    expect(readStagingAsk('the branch is ready for testing').explicitBranch).toBeUndefined();
+    expect(readStagingAsk('can I get a testing link? the branch was rebased')).toMatchObject({
+      looseBranches: ['rebased'],
+    });
+    expect(readStagingAsk('testing link please, branch has the hero fix')).toEqual({
+      main: false,
+      looseBranches: [],
+      prNumbers: [],
+    });
+    expect(readStagingAsk('branch: hero').explicitBranch).toBe('hero');
+    expect(readStagingAsk('branch `hero` please').explicitBranch).toBe('hero');
+    expect(readStagingAsk('branch hero-v2 on staging').explicitBranch).toBe('hero-v2');
+    expect(readStagingAsk('my branch name is fix/hero').explicitBranch).toBe('fix/hero');
+  });
+
+  it('reads main as the ask only when it is asked for now, and not beside a testing-link ask', () => {
+    expect(readStagingAsk('give me a testing link, and switch staging back to main tomorrow').main).toBe(false);
+    expect(readStagingAsk('restore staging to main once QA is done').main).toBe(false);
+    expect(readStagingAsk('put main back on staging, thanks').main).toBe(true);
+  });
+});
+
 describe('isStagingTargetAnswer', () => {
   it('is true for a reply shaped like an answer', () => {
     for (const text of [
@@ -101,6 +128,10 @@ describe('isStagingTargetAnswer', () => {
       'PR #1484',
       'main',
       'branch fix/hero',
+      'PR1484',
+      'hero-v2',
+      '`hero`',
+      'branch hero',
       'https://github.com/Newton-School/newton-marketing-web/pull/1484',
       '<https://github.com/Newton-School/newton-marketing-web/pull/1484|#1484> this one',
     ]) {
@@ -116,6 +147,17 @@ describe('isStagingTargetAnswer', () => {
       'yes',
       'cancel that',
       '',
+      'help',
+      'stop',
+      'cancel',
+      'nvm',
+      'yup',
+      'both',
+      'latest',
+      'try again',
+      'hero',
+      'the PR',
+      'branch please',
     ]) {
       expect(isStagingTargetAnswer(text), text).toBe(false);
     }
@@ -128,11 +170,20 @@ describe('the other guards', () => {
     expect(mentionsProd('a testing link before production')).toBe(true);
     expect(mentionsProd('testing link for <https://github.com/x/y/pull/1|fix production banner>')).toBe(false);
     expect(mentionsProd('ping <#C123|prod-alerts> with the staging link')).toBe(false);
+    expect(mentionsProd('put branch fix/prod-banner on staging')).toBe(false);
+    expect(mentionsProd('a testing link for the pre-prod check')).toBe(false);
+    expect(mentionsProd('the `prod` flag is off, testing link please')).toBe(false);
+    expect(mentionsProd('the products page, testing link please')).toBe(false);
   });
 
-  it('reads another app named without the marketing site', () => {
+  it('reads another app only as where the deploy goes', () => {
     expect(namesOtherApp('deploy newton-web to staging')).toBe(true);
     expect(namesOtherApp('put the newton api fix on staging')).toBe(true);
+    expect(namesOtherApp('testing link for the api please')).toBe(true);
+    expect(namesOtherApp('can I get the newton-web staging link')).toBe(true);
+    expect(namesOtherApp('testing link please, the api change is merged already')).toBe(false);
+    expect(namesOtherApp('can I get a testing link? the backend part is already live')).toBe(false);
+    expect(namesOtherApp('put branch fix/backend-copy on staging')).toBe(false);
     expect(namesOtherApp('the marketing copy of the newton web hero')).toBe(false);
     expect(namesOtherApp('deploy marketing to staging')).toBe(false);
   });
@@ -153,5 +204,9 @@ describe('the other guards', () => {
     ).toBe(false);
     expect(isMarketingStagingAsk(task('deploy this to staging'), 'Newton-School')).toBe(false);
     expect(isMarketingStagingAsk(task('deploy marketing to prod'), 'Newton-School')).toBe(false);
+    // A report of a failed staging deploy is not an ask to deploy.
+    expect(isMarketingStagingAsk(task('the marketing deploy to staging failed, can you check?'), 'Newton-School')).toBe(
+      false,
+    );
   });
 });

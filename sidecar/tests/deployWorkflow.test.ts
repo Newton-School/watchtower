@@ -345,7 +345,7 @@ describe('runDeployWorkflow marketing branch', () => {
     expect(result.message).toContain("clone isn't configured");
   });
 
-  it('dispatches nothing, and says nothing, when stopped between the confirmation and the dispatch', async () => {
+  it('dispatches nothing, and says so, when stopped between the confirmation and the dispatch', async () => {
     const controller = new AbortController();
     const ghExec = vi.fn(async (args: string[]) => {
       if (args[0] === 'run' && args[1] === 'list') controller.abort();
@@ -364,6 +364,10 @@ describe('runDeployWorkflow marketing branch', () => {
 
     expect(result.status).toBe('CANCELLED');
     expect(ghExec.mock.calls.some(call => call[0][0] === 'workflow')).toBe(false);
+    // The stop itself says "Stopped."; this corrects the "Dispatching…" line.
+    expect(postMessage.mock.calls.at(-1)?.[0].text).toBe(
+      'Nothing was deployed: it stopped before the deploy was dispatched.',
+    );
   });
 
   it('dispatches the GitHub Actions prod deploy and reports the completed run', async () => {

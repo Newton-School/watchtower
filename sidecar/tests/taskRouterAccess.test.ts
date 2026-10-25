@@ -2123,6 +2123,64 @@ describe('a marketing staging deploy ask (issue #702)', () => {
     expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'router.deploy_to_staging' }));
   });
 
+  it('never deploys on a low-confidence deploy pick for a report of a failed staging deploy', async () => {
+    for (const confidence of [0.3, 0.4, 0.9]) {
+      runStagingDeployWorkflow.mockClear();
+      decideTool.mockResolvedValue({
+        ok: true,
+        decision: { tool: 'deploy', confidence, reason: 'deploy words' },
+        durationMs: 1,
+      });
+      await routeTask({
+        task: makeTask({
+          userId: 'UBUILDER',
+          channelId: 'C-BUILD',
+          text: '<@UBOT1> the marketing deploy to staging failed, can you check?',
+          intent: 'IMPLEMENTATION',
+        }),
+        config: makeConfig('enforce'),
+        slack: makeSlack() as never,
+        store: {} as never,
+      });
+      expect(runStagingDeployWorkflow, String(confidence)).not.toHaveBeenCalled();
+    }
+  });
+
+  it('asks first when a deploy pick on a marketing staging ask is below the floor', async () => {
+    const slack = makeSlack();
+    decideTool.mockResolvedValue({
+      ok: true,
+      decision: { tool: 'deploy', confidence: 0.5, reason: 'deploy words' },
+      durationMs: 1,
+    });
+    await routeTask({
+      task: makeTask({
+        userId: 'UBUILDER',
+        channelId: 'C-BUILD',
+        text: '<@UBOT1> once the copy is in, ship my marketing branch fix/hero to stg',
+      }),
+      config: makeConfig('enforce'),
+      slack: slack as never,
+      store: {} as never,
+    });
+    expect(runStagingDeployWorkflow).not.toHaveBeenCalled();
+    expect(repliesOf(slack).some(text => text.includes('put this on the marketing staging site'))).toBe(true);
+  });
+
+  it('gives the help reply to "help" sent in answer to the staging question', async () => {
+    const slack = makeSlack();
+    const task = makeTask({ userId: 'UBUILDER', channelId: 'C-BUILD', text: 'help', intent: 'IMPLEMENTATION' });
+    task.clarification = {
+      question: 'Which PR or branch should I put on staging?',
+      askedText: 'give me a testing link',
+    };
+
+    await routeTask({ task, config: makeConfig('enforce'), slack: slack as never, store: {} as never });
+
+    expect(runStagingDeployWorkflow).not.toHaveBeenCalled();
+    expect(repliesOf(slack)[0]).toMatch(/^Here's what I can do for you/);
+  });
+
   it('never runs it for an owner mention the router reads as a staging ask', async () => {
     const slack = makeSlack();
     routerPicks('STAGING_DEPLOY');

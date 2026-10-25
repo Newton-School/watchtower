@@ -447,9 +447,20 @@ async function runMarketingDeploy(params: {
     logStep,
     stagePrefix: 'deploy.marketing',
   });
-  // Stopped before the dispatch went out: nothing was deployed, and a stop says so itself.
-  if (outcome.kind === 'stopped')
-    return { ...skipped('Deploy cancelled before dispatch.'), status: 'CANCELLED', slackPosted: false };
+  // Stopped before the dispatch went out. The stop itself already said "Stopped."; this
+  // corrects the "Dispatching…" line above it.
+  if (outcome.kind === 'stopped') {
+    const msg = 'Nothing was deployed: it stopped before the deploy was dispatched.';
+    logStep?.({ stage: 'deploy.marketing.stopped', message: msg });
+    const slackPosted = await postDeployReplyBestEffort({
+      slack,
+      channelId: task.event.channelId,
+      threadTs: task.event.threadTs,
+      text: msg,
+      logStep,
+    });
+    return { workflow: 'DEPLOY', status: 'CANCELLED', message: msg, notifyDesktop: false, slackPosted };
+  }
   if (outcome.kind === 'dispatch_failed') {
     const msg = `Couldn't dispatch the marketing prod deploy: ${outcome.error}`;
     logStep?.({ stage: 'deploy.marketing.dispatch_failed', message: msg, level: 'ERROR' });

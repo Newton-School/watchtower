@@ -54,6 +54,22 @@ describe('decideClarify', () => {
     });
   });
 
+  it('holds a deploy pick on a marketing staging ask to the staging floor (round 2)', () => {
+    const pick = { tool: 'deploy' as const, deployAllowed: false, stagingAsk: true, marketingStagingAsk: true };
+    expect(decide({ ...pick, confidence: 0.4 })).toEqual({
+      kind: 'ask',
+      question: LOW_CONFIDENCE_STAGING_QUESTION,
+      reason: 'low_confidence_staging',
+    });
+    expect(decide({ ...pick, confidence: 0.4, answering: true })).toEqual({
+      kind: 'give_up',
+      reason: 'low_confidence_staging',
+    });
+    expect(decide({ ...pick, confidence: 0.9 })).toEqual({ kind: 'run' });
+    // Any other staging ask falls back to a read-only lookup, at any confidence.
+    expect(decide({ ...pick, marketingStagingAsk: false, confidence: 0.4 })).toEqual({ kind: 'run' });
+  });
+
   it("asks the router's question when the router says it cannot tell", () => {
     expect(decide({ tool: 'ask_user', question: 'Which page?' })).toEqual({
       kind: 'ask',

@@ -13,6 +13,7 @@ import {
   mentionsProd,
   namesOtherApp,
   readStagingAsk,
+  type StagingAsk,
 } from '../router/stagingTarget.js';
 import { buildSlackThreadLink } from './shared/workflowUtils.js';
 import {
@@ -46,6 +47,9 @@ export const STAGING_TARGET_GIVE_UP =
   "I still can't tell which PR or branch to put on staging. Mention me again with the PR link or the branch name.";
 export const STAGING_PROD_WORD_REPLY =
   "Staging or production? Your message mentions production, so I haven't put anything on staging. For a testing link, ask again without mentioning prod. For production, ask me to deploy marketing to prod.";
+const NEWER_PUSH_NOTE = (branch: string) =>
+  ` \`${branch}\` got a newer push after I checked it, so staging runs a commit I didn't check.`;
+const emptyStagingAsk = (): StagingAsk => ({ main: false, looseBranches: [], prNumbers: [] });
 const GITHUB_UNREACHABLE =
   "I couldn't reach GitHub to check that, so I haven't put anything on staging. Try again in a bit.";
 
@@ -74,6 +78,7 @@ interface PrInfo {
   url: string;
   number: number;
   headRef?: string;
+  headSha?: string;
   headRepo?: string;
   baseRepo?: string;
   state?: string;
@@ -84,7 +89,8 @@ interface PrInfo {
 type Lookup<T> = { kind: 'found'; value: T } | { kind: 'missing' } | { kind: 'unreachable'; error: string };
 
 type Target =
-  | { kind: 'branch'; branch: string; pr?: PrInfo }
+  /** `sha`: the commit checked before dispatch, when GitHub said which. */
+  | { kind: 'branch'; branch: string; pr?: PrInfo; sha?: string }
   | { kind: 'ask' }
   | { kind: 'refuse'; message: string; status?: 'FAILED' };
 
@@ -224,7 +230,7 @@ async function readPr(slug: string, number: number, repoPath: string): Promise<L
       number?: number;
       state?: string;
       merged?: boolean;
-      head?: { ref?: string; repo?: { full_name?: string } | null };
+      head?: { ref?: string; sha?: string; repo?: { full_name?: string } | null };
       base?: { repo?: { full_name?: string } | null };
     }>(['api', `repos/${slug}/pulls/${number}`], repoPath);
     if (!pr || typeof pr.number !== 'number') return { kind: 'missing' };
@@ -234,6 +240,7 @@ async function readPr(slug: string, number: number, repoPath: string): Promise<L
         url: pr.html_url ?? `https://github.com/${slug}/pull/${number}`,
         number: pr.number,
         headRef: pr.head?.ref,
+        headSha: pr.head?.sha,
         headRepo: pr.head?.repo?.full_name ?? undefined,
         baseRepo: pr.base?.repo?.full_name ?? undefined,
         state: pr.state,
@@ -245,20 +252,30 @@ async function readPr(slug: string, number: number, repoPath: string): Promise<L
   }
 }
 
-async function readBranch(slug: string, branch: string, repoPath: string): Promise<Lookup<string>> {
-  if (isMainBranch(branch)) return { kind: 'found', value: branch };
+/** A branch and the commit it points at now. Only exactly `main` is taken on trust. */
+async function readBranch(
+  slug: string,
+  branch: string,
+  repoPath: string,
+): Promise<Lookup<{ name: string; sha?: string }>> {
+  if (isMainBranch(branch)) return { kind: 'found', value: { name: branch } };
   try {
-    const found = await ghJson<{ name?: string }>(['api', `repos/${slug}/branches/${branch}`], repoPath);
-    return found?.name === branch ? { kind: 'found', value: branch } : { kind: 'missing' };
+    const found = await ghJson<{ name?: string; commit?: { sha?: string } }>(
+      ['api', `repos/${slug}/branches/${branch}`],
+      repoPath,
+    );
+    return found?.name === branch
+      ? { kind: 'found', value: { name: branch, sha: found.commit?.sha } }
+      : { kind: 'missing' };
   } catch (error) {
     return isNotFound(error) ? { kind: 'missing' } : { kind: 'unreachable', error: String(error) };
   }
 }
 
-/** What a branch changes against main. Throws when GitHub can't be asked. */
-async function compareToMain(slug: string, branch: string, repoPath: string): Promise<string[]> {
+/** What a commit (or branch) changes against main. Throws when GitHub can't be asked. */
+async function compareToMain(slug: string, ref: string, repoPath: string): Promise<string[]> {
   const stdout = await __ghCli.exec(
-    ['api', `repos/${slug}/compare/main...${branch}`, '--jq', '.files[].filename'],
+    ['api', `repos/${slug}/compare/main...${ref}`, '--jq', '.files[].filename'],
     repoPath,
     30_000,
   );
@@ -283,7 +300,51 @@ function prTarget(pr: PrInfo, slug: string): Target {
       message: `${label} comes from a fork, and I can only put branches of ${REPO_KEY} itself on staging.`,
     };
   }
-  return { kind: 'branch', branch: pr.headRef, pr };
+  return { kind: 'branch', branch: pr.headRef, pr, sha: pr.headSha };
+}
+
+/** Not a refusal: GitHub could not be asked, so the run failed. */
+const UNREACHABLE_TARGET: Target = { kind: 'refuse', message: GITHUB_UNREACHABLE, status: 'FAILED' };
+
+/**
+ * What one message names, resolved on GitHub: a ref-like branch after
+ * "branch", then a PR (named, or linked in it), then main, then loose names.
+ * Undefined when it names nothing that exists.
+ */
+async function resolveNamed(
+  ask: StagingAsk,
+  linkedPrs: number[],
+  ctx: { slug: string; repoPath: string },
+): Promise<Target | undefined> {
+  const { slug, repoPath } = ctx;
+  if (ask.explicitBranch) {
+    const branch = await readBranch(slug, ask.explicitBranch, repoPath);
+    if (branch.kind === 'unreachable') return UNREACHABLE_TARGET;
+    if (branch.kind === 'missing') {
+      return { kind: 'refuse', message: `I can't find a branch named \`${ask.explicitBranch}\` in ${REPO_KEY}.` };
+    }
+    return { kind: 'branch', branch: branch.value.name, sha: branch.value.sha };
+  }
+
+  // A PR named in the message beats main mentioned in it.
+  const numbers = [...new Set([...ask.prNumbers, ...linkedPrs])];
+  if (numbers.length > 1) return { kind: 'ask' };
+  if (numbers.length === 1) {
+    const pr = await readPr(slug, numbers[0], repoPath);
+    if (pr.kind === 'unreachable') return UNREACHABLE_TARGET;
+    if (pr.kind === 'missing') return { kind: 'refuse', message: `I couldn't find PR #${numbers[0]} in ${REPO_KEY}.` };
+    return prTarget(pr.value, slug);
+  }
+
+  if (ask.main) return { kind: 'branch', branch: 'main' };
+
+  // Names that may be words ("UI/UX", "the branch is ready"): the first that exists wins.
+  for (const candidate of ask.looseBranches) {
+    const branch = await readBranch(slug, candidate, repoPath);
+    if (branch.kind === 'unreachable') return UNREACHABLE_TARGET;
+    if (branch.kind === 'found') return { kind: 'branch', branch: branch.value.name, sha: branch.value.sha };
+  }
+  return undefined;
 }
 
 async function resolveTarget(params: {
@@ -295,9 +356,6 @@ async function resolveTarget(params: {
   const { task, config, slug, repoPath } = params;
   const text = task.event.text ?? '';
   const answeringWhich = task.clarification?.question === STAGING_TARGET_QUESTION;
-  // The message first; a reply to a question is read with the message it answers.
-  const asks = [readStagingAsk(text, { answeringWhich })];
-  if (task.clarification?.askedText) asks.push(readStagingAsk(task.clarification.askedText));
   const org = config.allowedPrOrg;
   const prs = task.prContexts ?? [];
   const triggerPrs = prs.filter(pr => pr.source === 'trigger');
@@ -314,50 +372,22 @@ async function resolveTarget(params: {
     if (namesOtherApp(text)) return { kind: 'refuse', message: `I only put ${REPO_KEY} changes on staging.` };
   }
 
-  // Not a refusal: GitHub could not be asked, so the run failed.
-  const unreachable = (): Target => ({ kind: 'refuse', message: GITHUB_UNREACHABLE, status: 'FAILED' });
-  const fromPr = async (numbers: number[]): Promise<Target | undefined> => {
-    if (numbers.length === 0) return undefined;
-    if (numbers.length > 1) return { kind: 'ask' };
-    const pr = await readPr(slug, numbers[0], repoPath);
-    if (pr.kind === 'unreachable') return unreachable();
-    if (pr.kind === 'missing') return { kind: 'refuse', message: `I couldn't find PR #${numbers[0]} in ${REPO_KEY}.` };
-    return prTarget(pr.value, slug);
-  };
-
-  for (const ask of asks) {
-    if (!ask.explicitBranch) continue;
-    const branch = await readBranch(slug, ask.explicitBranch, repoPath);
-    if (branch.kind === 'unreachable') return unreachable();
-    if (branch.kind === 'missing') {
-      return { kind: 'refuse', message: `I can't find a branch named \`${ask.explicitBranch}\` in ${REPO_KEY}.` };
-    }
-    return { kind: 'branch', branch: branch.value };
-  }
-
-  // A PR named in the message beats main mentioned in it.
-  const inMessage = [
-    ...new Set([
-      ...asks.flatMap(ask => ask.prNumbers),
-      ...triggerPrs.filter(pr => isMarketingPr(pr, org)).map(pr => pr.number),
-    ]),
-  ];
-  const named = await fromPr(inMessage);
-  if (named) return named;
-
-  if (asks.some(ask => ask.main)) return { kind: 'branch', branch: 'main' };
-
-  // Bare `team/topic` words may be words ("UI/UX"): the first that exists wins.
-  for (const candidate of asks.flatMap(ask => ask.looseBranches)) {
-    const branch = await readBranch(slug, candidate, repoPath);
-    if (branch.kind === 'unreachable') return unreachable();
-    if (branch.kind === 'found') return { kind: 'branch', branch: branch.value };
+  // The message on its own first. A reply to a question outranks the message
+  // it answers ("no, put main on staging instead"); that one is read only
+  // when the reply names nothing.
+  const ctx = { slug, repoPath };
+  const linked = triggerPrs.filter(pr => isMarketingPr(pr, org)).map(pr => pr.number);
+  const fromMessage = await resolveNamed(readStagingAsk(text, { answeringWhich }), linked, ctx);
+  if (fromMessage) return fromMessage;
+  if (task.clarification?.askedText) {
+    const fromAsked = await resolveNamed(readStagingAsk(task.clarification.askedText), [], ctx);
+    if (fromAsked) return fromAsked;
   }
 
   const inThread = [
     ...new Set(prs.filter(pr => pr.source === 'thread' && isMarketingPr(pr, org)).map(pr => pr.number)),
   ];
-  const fromThread = await fromPr(inThread);
+  const fromThread = await resolveNamed(emptyStagingAsk(), inThread, ctx);
   if (fromThread) return fromThread;
 
   const other = prs.find(pr => !isMarketingPr(pr, org));
@@ -452,7 +482,7 @@ export async function runStagingDeployWorkflow(params: {
   }
   if (target.kind === 'refuse') return refuse(target.message, target.status);
 
-  const { branch, pr } = target;
+  const { branch, pr, sha: checkedSha } = target;
   // Named branches are parsed to this shape already; a PR's head ref may be
   // anything git allows, and it goes to `gh` and into other threads' text.
   if (!isSafeRef(branch)) {
@@ -464,14 +494,19 @@ export async function runStagingDeployWorkflow(params: {
   let files: string[] = [];
   if (!isMainBranch(branch)) {
     try {
-      files = await compareToMain(slug, branch, repoPath);
+      // The commit GitHub named, so what is checked is what was named.
+      files = await compareToMain(slug, checkedSha ?? branch, repoPath);
     } catch (error) {
       logStep?.({
         stage: 'staging.compare_failed',
         level: 'WARN',
         message: `Couldn't compare ${branch}: ${String(error)}`,
       });
-      return refuse(`I couldn't check what \`${branch}\` changes, so I haven't put it on staging. Try again in a bit.`);
+      // Like GitHub being unreachable: it couldn't be checked, so the run failed.
+      return refuse(
+        `I couldn't check what \`${branch}\` changes, so I haven't put it on staging. Try again in a bit.`,
+        'FAILED',
+      );
     }
     if (files.length >= COMPARE_FILE_LIMIT) {
       return refuse(`\`${branch}\` changes too many files for me to check, so I haven't put it on staging.`);
@@ -506,7 +541,13 @@ export async function runStagingDeployWorkflow(params: {
     stagePrefix: 'staging',
   });
 
-  if (outcome.kind === 'stopped') return result('CANCELLED', 'Stopped before the staging deploy started.', false);
+  // Stopped before the dispatch went out. The stop already said "Stopped."; this
+  // corrects the "Putting … on staging" line above it.
+  if (outcome.kind === 'stopped') {
+    const msg = 'Nothing was put on staging: it stopped before the deploy started.';
+    logStep?.({ stage: 'staging.stopped', message: msg, data: { branch, dispatched: false } });
+    return result('CANCELLED', msg, await say(msg));
+  }
   if (outcome.kind === 'dispatch_failed') {
     logStep?.({
       stage: 'staging.dispatch_failed',
@@ -528,8 +569,14 @@ export async function runStagingDeployWorkflow(params: {
   // and will replace staging, so say that, and keep the record true.
   if (signal?.aborted && outcome.kind !== 'completed') {
     const url = 'url' in outcome ? outcome.url : undefined;
-    const msg = `Stopped. The staging deploy of \`${branch}\` had already started, so it carries on in GitHub Actions and will replace what's on staging.${runLink(url)}`;
-    logStep?.({ stage: 'staging.stopped', message: msg, level: 'WARN', data: { branch, runId: runId ?? null } });
+    // The stop already said "Stopped."
+    const msg = `The staging deploy of \`${branch}\` had already started, so it carries on in GitHub Actions and will replace what's on staging.${runLink(url)}`;
+    logStep?.({
+      stage: 'staging.stopped',
+      message: msg,
+      level: 'WARN',
+      data: { branch, dispatched: true, runId: runId ?? null },
+    });
     await noteStagingDeploy({ store, slack, repoPath, next: record, logStep });
     return result('CANCELLED', msg, await say(msg));
   }
@@ -559,6 +606,19 @@ export async function runStagingDeployWorkflow(params: {
     msg = `The staging deploy of \`${branch}\` is still running.${runLink(outcome.url)}`;
   } else {
     msg = `I started the staging deploy of \`${branch}\`, but couldn't find its run to follow. Check the latest Deploy → staging run in GitHub Actions.`;
+  }
+
+  // The run took the branch as it was at dispatch: a push after the check
+  // means staging runs a commit nobody checked. It can't be undone; say so.
+  const ranSha = 'headSha' in outcome ? outcome.headSha : undefined;
+  if (checkedSha && ranSha && ranSha !== checkedSha) {
+    if (wentUp || outcome.kind === 'waiting' || outcome.kind === 'running') msg += NEWER_PUSH_NOTE(branch);
+    logStep?.({
+      stage: 'staging.sha_mismatch',
+      level: 'WARN',
+      message: `Checked ${branch} at ${checkedSha}, but the staging run took ${ranSha}.`,
+      data: { branch, checkedSha, ranSha, runId: runId ?? null },
+    });
   }
 
   logStep?.({

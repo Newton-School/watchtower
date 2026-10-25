@@ -398,6 +398,8 @@ export async function routeTask(params: {
 
       // A decision that should not be acted on as given becomes one question
       // to the requester, instead of the keyword seed or a guess (issue #431).
+      // The marketing site's staging ask: a `deploy` pick on it is the staging tool's (issue #702).
+      const marketingStagingAsk = isMarketingStagingAsk(task, config.allowedPrOrg);
       if (classification.tool && !classification.failed) {
         clarify = decideClarify({
           tool: classification.tool,
@@ -409,6 +411,7 @@ export async function routeTask(params: {
           confidenceFloor: CLASSIFIER_CONFIDENCE_FLOOR,
           deployAllowed: classification.deployAllowed,
           stagingAsk: namesStagingAsTarget(task.event.text ?? ''),
+          marketingStagingAsk,
         });
       }
 
@@ -468,7 +471,7 @@ export async function routeTask(params: {
         classification.tool === 'deploy' &&
         !classification.deployAllowed &&
         addressingOf(task) === 'direct' &&
-        isMarketingStagingAsk(task, config.allowedPrOrg)
+        marketingStagingAsk
       ) {
         // The router read a marketing staging ask as a production deploy. Code
         // found no production target in it, and a lookup would only say "ask

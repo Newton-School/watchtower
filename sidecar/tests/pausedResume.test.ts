@@ -224,6 +224,7 @@ describe('decidePausedResume for a parked question (issue #431)', () => {
       '1484',
       '#1484',
       'PR 1484',
+      'PR1484',
       'main',
       '<@UBOT1> fix-hero-banner',
       'https://github.com/Newton-School/newton-marketing-web/pull/1484',
@@ -238,6 +239,15 @@ describe('decidePausedResume for a parked question (issue #431)', () => {
       'the hero one',
       'yes',
       'never mind',
+      // Plain words go to the router: "help" still gets the help reply, "stop" still stops.
+      'help',
+      'stop',
+      'cancel',
+      'nvm',
+      'yup',
+      'both',
+      'latest',
+      'try again',
     ]) {
       const decision = decideStaging(reply);
       expect(decision.resume, reply).toBe(true);

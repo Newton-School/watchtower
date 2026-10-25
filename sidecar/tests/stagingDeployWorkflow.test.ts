@@ -97,6 +97,7 @@ interface FakePr {
 interface FakeRun {
   id: number;
   branch: string;
+  headSha?: string;
   status: string;
   conclusion?: string;
 }
@@ -121,6 +122,8 @@ function fakeGh(
     apiError?: string;
     compareError?: string;
     runNeverAppears?: boolean;
+    /** The commit a branch was pushed to between the check and the dispatch. */
+    pushedSha?: Record<string, string>;
   } = {},
 ) {
   const runs: FakeRun[] = [...(opts.runs ?? [])];
@@ -144,21 +147,30 @@ function fakeGh(
           number: Number(pr[1]),
           state: found.state ?? 'open',
           merged: found.merged ?? false,
-          head: { ref: found.head, repo: found.headRepo === null ? null : { full_name: found.headRepo ?? SLUG } },
+          head: {
+            ref: found.head,
+            sha: `sha-${found.head}`,
+            repo: found.headRepo === null ? null : { full_name: found.headRepo ?? SLUG },
+          },
           base: { repo: { full_name: SLUG } },
         });
       }
       const branch = /^repos\/[^/]+\/[^/]+\/branches\/(.+)$/.exec(route);
       if (branch) {
         if (!opts.branches?.includes(branch[1])) throw new Error('gh: Branch not found (HTTP 404)');
-        return JSON.stringify({ name: branch[1] });
+        return JSON.stringify({ name: branch[1], commit: { sha: `sha-${branch[1]}` } });
       }
       throw new Error(`unexpected api ${route}`);
     }
     if (cmd === 'workflow' && sub === 'run') {
       if (opts.dispatchError) throw new Error(opts.dispatchError);
       const ref = args[args.indexOf('--ref') + 1];
-      newRun = { id: Math.max(100, ...runs.map(run => run.id)) + 1, branch: ref, status: 'queued' };
+      newRun = {
+        id: Math.max(100, ...runs.map(run => run.id)) + 1,
+        branch: ref,
+        headSha: opts.pushedSha?.[ref] ?? `sha-${ref}`,
+        status: 'queued',
+      };
       if (!opts.runNeverAppears) runs.push(newRun);
       return '';
     }
@@ -178,6 +190,7 @@ function fakeGh(
         visible.map(run => ({
           databaseId: run.id,
           headBranch: run.branch,
+          headSha: run.headSha,
           url: `https://github.com/x/actions/runs/${run.id}`,
           status: run.status,
           conclusion: run.conclusion,
@@ -503,6 +516,125 @@ describe('runStagingDeployWorkflow: which branch', () => {
   });
 });
 
+describe('runStagingDeployWorkflow: round-2 review', () => {
+  const thread = [prTarget(1484, 'thread')];
+  const prs = { 1484: { head: 'feat/a' }, 1490: { head: 'feat/b' } };
+
+  it('reads a reply on its own first: what it names outranks the message it answers', async () => {
+    const cases: Array<[string, string, string, Partial<NormalizedTask>]> = [
+      ['no, put main on staging instead', LOW_CONFIDENCE_STAGING_QUESTION, 'maybe put PR #1484 on staging?', {}],
+      ['no, PR #1490', LOW_CONFIDENCE_STAGING_QUESTION, 'maybe put PR #1484 on staging?', {}],
+      ['no, PR #1490 instead', LOW_CONFIDENCE_STAGING_QUESTION, 'maybe put branch feat/x on staging?', {}],
+      ['1490', STAGING_TARGET_QUESTION, 'testing links for PR #1484 and PR #1490 please', {}],
+      ['main', STAGING_TARGET_QUESTION, 'testing links for PR #1484 and PR #1490 please', {}],
+      [
+        '<https://github.com/Newton-School/newton-marketing-web/pull/1490>',
+        STAGING_TARGET_QUESTION,
+        'testing links for PR #1484 and PR #1490 please',
+        { prContexts: [prTarget(1490, 'trigger')] },
+      ],
+    ];
+    const expected = ['main', 'feat/b', 'feat/b', 'feat/b', 'main', 'feat/b'];
+    for (const [index, [reply, question, askedText, extra]] of cases.entries()) {
+      const gh = fakeGh({ prs, branches: ['feat/x'] });
+      await run(makeTask(reply, { clarification: { question, askedText }, ...extra }));
+      expect(dispatchedRef(gh), reply).toBe(expected[index]);
+    }
+  });
+
+  it('falls back to the message a reply answers only when the reply names nothing', async () => {
+    const gh = fakeGh({ prs });
+    await run(
+      makeTask('yes please', {
+        clarification: { question: LOW_CONFIDENCE_STAGING_QUESTION, askedText: 'maybe put PR #1484 on staging?' },
+      }),
+    );
+    expect(dispatchedRef(gh)).toBe('feat/a');
+  });
+
+  it('passes over "the branch is ready" in silence and uses the thread PR', async () => {
+    for (const text of [
+      '<@UBOT1> the branch is ready for testing, can I get a staging link?',
+      '<@UBOT1> can I get a testing link? the branch was rebased',
+      '<@UBOT1> testing link please, branch has the hero fix',
+    ]) {
+      const gh = fakeGh({ prs });
+      const { texts } = await run(makeTask(text, { prContexts: thread }));
+      expect(dispatchedRef(gh), text).toBe('feat/a');
+      expect(texts.join('\n')).not.toContain("can't find a branch");
+    }
+  });
+
+  it('checks a head branch named Master or MAIN like any other branch', async () => {
+    for (const head of ['Master', 'MAIN', 'master']) {
+      const gh = fakeGh({ prs: { 77: { head } }, files: ['.github/workflows/deploy-staging.yml'] });
+      const { result, texts } = await run(makeTask('<@UBOT1> testing link for PR #77'));
+      expect(result.status, head).toBe('SKIPPED');
+      expect(texts[0]).toContain('changes files under .github/');
+      expect(gh.mock.calls.some(call => /\/compare\//.test(String(call[0][1])))).toBe(true);
+      expect(dispatchedRef(gh)).toBeUndefined();
+    }
+  });
+
+  it('compares the exact commit it was given', async () => {
+    const gh = fakeGh({ prs });
+    await run(makeTask('<@UBOT1> testing link for PR #1490'));
+    expect(gh.mock.calls.find(call => /\/compare\//.test(String(call[0][1])))?.[0][1]).toBe(
+      'repos/Newton-School/newton-marketing-web/compare/main...sha-feat/b',
+    );
+  });
+
+  it('says so when staging got a newer push than the commit it checked', async () => {
+    const logStep = vi.fn();
+    fakeGh({ prs, pushedSha: { 'feat/b': 'sha-newer' } });
+    const slack = makeSlack();
+    await runStagingDeployWorkflow({
+      task: makeTask('<@UBOT1> testing link for PR #1490'),
+      config,
+      slack: slack as any,
+      store: makeStore(),
+      logStep,
+    });
+    expect(posted(slack).at(-1)?.text).toMatch(
+      /is on staging.*`feat\/b` got a newer push after I checked it, so staging runs a commit I didn't check\.$/,
+    );
+    expect(logStep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stage: 'staging.sha_mismatch',
+        data: expect.objectContaining({ checkedSha: 'sha-feat/b', ranSha: 'sha-newer' }),
+      }),
+    );
+  });
+
+  it('reads prod and other apps in the words only, never in branch names or side remarks', async () => {
+    for (const [text, branch] of [
+      ['<@UBOT1> put branch fix/prod-banner on staging', 'fix/prod-banner'],
+      ['<@UBOT1> put branch fix/backend-copy on staging', 'fix/backend-copy'],
+    ]) {
+      const gh = fakeGh({ branches: [branch] });
+      await run(makeTask(text));
+      expect(dispatchedRef(gh), text).toBe(branch);
+    }
+    for (const text of [
+      '<@UBOT1> testing link please, the api change is merged already',
+      '<@UBOT1> can I get a testing link? the backend part is already live',
+      '<@UBOT1> give me a testing link for the pre-prod check',
+    ]) {
+      const gh = fakeGh({ prs });
+      await run(makeTask(text, { prContexts: thread }));
+      expect(dispatchedRef(gh), text).toBe('feat/a');
+    }
+  });
+
+  it('deploys the thread PR when main is only asked for later', async () => {
+    const gh = fakeGh({ prs });
+    await run(
+      makeTask('<@UBOT1> give me a testing link, and switch staging back to main tomorrow', { prContexts: thread }),
+    );
+    expect(dispatchedRef(gh)).toBe('feat/a');
+  });
+});
+
 describe('runStagingDeployWorkflow: refusals', () => {
   it('refuses a merged PR, a closed PR and a fork PR', async () => {
     const cases: Array<[FakePr, RegExp]> = [
@@ -588,6 +720,8 @@ describe('runStagingDeployWorkflow: refusals', () => {
     expect(outcome.texts[0]).toBe(
       "I couldn't check what `feat/x` changes, so I haven't put it on staging. Try again in a bit.",
     );
+    // Like GitHub being unreachable: it couldn't be checked.
+    expect(outcome.result).toMatchObject({ status: 'FAILED', notifyDesktop: true });
     expect(dispatchedRef(gh)).toBeUndefined();
 
     gh = fakeGh({ branches: ['feat/x'], files: Array.from({ length: 300 }, (_, i) => `src/f${i}.ts`) });
@@ -662,7 +796,7 @@ describe('runStagingDeployWorkflow: the run', () => {
       '--limit',
       '1',
       '--json',
-      'databaseId,url,status,conclusion',
+      'databaseId,url,status,conclusion,headSha',
     ]);
     // Neither the anchor (50, a failure) nor main's newer run (90) is reported as this one.
     const views = gh.mock.calls.filter(call => call[0][0] === 'run' && call[0][1] === 'view').map(call => call[0][2]);
@@ -730,7 +864,7 @@ describe('runStagingDeployWorkflow: the run', () => {
     expect(result.status).toBe('CANCELLED');
     expect(result.slackPosted).toBe(true);
     expect(texts.at(-1)).toBe(
-      "Stopped. The staging deploy of `main` had already started, so it carries on in GitHub Actions and will replace what's on staging. Run: https://github.com/x/actions/runs/101",
+      "The staging deploy of `main` had already started, so it carries on in GitHub Actions and will replace what's on staging. Run: https://github.com/x/actions/runs/101",
     );
     expect(JSON.parse(store.state.get(STAGING_STATE_KEY) ?? '{}').branch).toBe('main');
   });
@@ -743,9 +877,16 @@ describe('runStagingDeployWorkflow: the run', () => {
       if (args[0] === 'run' && args[1] === 'list') controller.abort();
       return original(args);
     });
-    const { result } = await run(makeTask('<@UBOT1> put branch feat/x on staging'), makeStore(), controller.signal);
+    const { result, texts } = await run(
+      makeTask('<@UBOT1> put branch feat/x on staging'),
+      makeStore(),
+      controller.signal,
+    );
     expect(result.status).toBe('CANCELLED');
     expect(dispatchedRef(gh)).toBeUndefined();
+    // The stop itself says "Stopped."; this corrects "Putting … on staging".
+    expect(texts.at(-1)).toBe('Nothing was put on staging: it stopped before the deploy started.');
+    expect(texts.join('\n')).not.toMatch(/^Stopped/m);
   });
 
   it('in dry-run mode reports instead of deploying', async () => {

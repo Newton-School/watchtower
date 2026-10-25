@@ -98,6 +98,11 @@ export function decideClarify(params: {
   deployAllowed?: boolean;
   /** The message names staging as where the deploy goes: not a production deploy to ask about. */
   stagingAsk?: boolean;
+  /**
+   * The marketing site's staging ask (`isMarketingStagingAsk`): a `deploy`
+   * pick on it is the staging tool's, held to the same floor (issue #702).
+   */
+  marketingStagingAsk?: boolean;
 }): ClarifyAction {
   const { tool, confidence, addressing, answering, heldByFloor, confidenceFloor } = params;
   if (addressing === 'owner_mention' && tool === 'change_code' && !answering) {
@@ -106,10 +111,15 @@ export function decideClarify(params: {
   if (addressing !== 'direct') return { kind: 'run' };
 
   let ask: { question: string; reason: ClarifyReason; park?: boolean } | undefined;
-  if (tool === 'deploy' && !params.deployAllowed && params.stagingAsk) {
-    // Not a production deploy to ask about. A deploy pick for a marketing
-    // staging ask goes to the staging tool (taskRouter, issue #702); any other
-    // falls back to a lookup, which says how staging works.
+  // A deploy pick on a marketing staging ask runs the staging tool
+  // (taskRouter), so it is held to that tool's floor, not waved through.
+  const stagingPick =
+    tool === 'deploy_staging' || (tool === 'deploy' && !params.deployAllowed && Boolean(params.marketingStagingAsk));
+  if (stagingPick && confidence < confidenceFloor) {
+    ask = { question: LOW_CONFIDENCE_STAGING_QUESTION, reason: 'low_confidence_staging' };
+  } else if (stagingPick || (tool === 'deploy' && !params.deployAllowed && params.stagingAsk)) {
+    // Not a production deploy to ask about. Any other staging ask falls back
+    // to a lookup, which says how staging works.
     return { kind: 'run' };
   } else if (tool === 'deploy' && !params.deployAllowed) {
     // The model read a deploy ask where code found no target, or in a reply to
@@ -123,8 +133,6 @@ export function decideClarify(params: {
     ask = { question: DEFAULT_CLARIFY_QUESTION, reason: 'silenced_direct_mention' };
   } else if (tool === 'change_code' && confidence < confidenceFloor) {
     ask = { question: LOW_CONFIDENCE_CHANGE_QUESTION, reason: 'low_confidence_change' };
-  } else if (tool === 'deploy_staging' && confidence < confidenceFloor) {
-    ask = { question: LOW_CONFIDENCE_STAGING_QUESTION, reason: 'low_confidence_staging' };
   } else if (heldByFloor) {
     ask = { question: DEFAULT_CLARIFY_QUESTION, reason: 'floor_hold' };
   }
