@@ -77,6 +77,7 @@ import {
   type WorkflowContext,
 } from './shared/workflowUtils.js';
 import { readPrActionAsk } from '../router/prActionAsk.js';
+import { guardWords } from '../router/stagingTarget.js';
 import { refreshSharedClones } from '../workspaces/staleCheckout.js';
 import { assertThreadParentExists } from '../slack/threadContext.js';
 import { runAgenticEntry } from '../agentic/agenticEntry.js';
@@ -732,9 +733,14 @@ async function runQuickAction(params: {
   action?: QuickPrAction;
 }): Promise<WorkflowResult> {
   const { task, config, slack, ctx, store, jobId, logStep, signal, plan, prs, checkPr } = params;
+  // The operation is read from the words alone: a link, its label, a mention,
+  // a code span or a typed branch or file name ("fix/merge-banner",
+  // "close-modal.tsx") naming "merge", "close" or "deploy" is not an
+  // instruction (#710).
+  const words = guardWords(task.event.text).replace(/\S+\.[a-z0-9]{1,6}\b\S*/g, ' ');
   const prAction =
-    params.action ?? (QUICK_ACTION_PR_ACTION_RE.exec(task.event.text)?.[1].toLowerCase() as QuickPrAction | undefined);
-  const mergeIntent = params.action ? params.action === 'merge' : /\bmerge\b/i.test(task.event.text);
+    params.action ?? (QUICK_ACTION_PR_ACTION_RE.exec(words)?.[1].toLowerCase() as QuickPrAction | undefined);
+  const mergeIntent = params.action ? params.action === 'merge' : /\bmerge\b/i.test(words);
   const mergeChecks =
     (mergeIntent || prAction === 'merge') && checkPr && ctx.githubToken
       ? await readMergeChecks(checkPr, ctx.githubToken)
@@ -844,9 +850,7 @@ async function runQuickAction(params: {
   // INFORMATIONAL path instead. Default to informational — both misroute
   // directions are non-destructive (a misrouted op just gets explained).
   const operationalAction =
-    /\b(merge|close|reopen|revert|sync|restart|rerun|re-run|run (?:the )?tests?|approve|assign)\b/i.test(
-      task.event.text,
-    );
+    /\b(merge|close|reopen|revert|sync|restart|rerun|re-run|run (?:the )?tests?|approve|assign)\b/i.test(words);
 
   // Deploys never run from here (issue #407). This path has no deploy
   // capability check and no confirmation, and its agent runs with
@@ -854,7 +858,7 @@ async function runQuickAction(params: {
   // ungated production deploy. A deploy-only ask is redirected to the
   // deploy command; a mixed ask ("merge and deploy") keeps its other
   // operation and the prompt below forbids the deploy half.
-  if (QUICK_ACTION_DEPLOY_RE.test(task.event.text) && !operationalAction) {
+  if (QUICK_ACTION_DEPLOY_RE.test(words) && !operationalAction) {
     logStep?.({
       stage: 'implementation.quick_action.deploy_redirect',
       message: 'Deploy-shaped ask reached the quick-action path — redirecting to the deploy command.',
@@ -900,7 +904,7 @@ async function runQuickAction(params: {
   // An approval from this agent would be submitted under the owner's
   // GitHub identity (issue #429). An approve-only ask is declined; in a
   // mixed ask the prompt below forbids the approving review.
-  if (!prAction && /\bapprove\b/i.test(task.event.text)) {
+  if (!prAction && /\bapprove\b/i.test(words)) {
     logStep?.({
       stage: 'implementation.quick_action.approve_refused',
       message: 'Approve-only ask reached the quick-action path — declined.',
@@ -983,7 +987,7 @@ Never submit an approving review or request changes on a pull request (no \`gh p
     prUrls.length > 0
       ? `\n\nPull requests you may act on: ${prUrls.join(', ')}. Do not merge, close, revert or sync any other pull request.`
       : ''
-  }
+  }${prAction ? `\n\nThe confirmed operation is \`${prAction}\`; perform no other pull-request operation.` : ''}
 
 Slack thread context:
 ${ctx.threadContext}${ctx.imageContext}
