@@ -63,11 +63,17 @@ export function globToRegExp(glob: string): RegExp {
   return new RegExp(`^${pattern}$`);
 }
 
+const matchesAny = (globs: string[], filePath: string) => globs.some(glob => globToRegExp(glob).test(filePath));
+
 /** Whether a path is a TypeScript file a content-only change may touch. */
 export function isContentPath(filePath: string, policy: ContentPolicy): boolean {
   if (!/\.tsx?$/.test(filePath) || filePath.endsWith('.d.ts')) return false;
-  const matches = (globs: string[]) => globs.some(glob => globToRegExp(glob).test(filePath));
-  return matches(policy.allow) && !matches(policy.deny);
+  return matchesAny(policy.allow, filePath) && !matchesAny(policy.deny, filePath);
+}
+
+/** Whether a path is a Markdown note that never ships, which a content-only change may edit unread. */
+export function isNotePath(filePath: string, policy: ContentPolicy): boolean {
+  return filePath.endsWith('.md') && matchesAny(policy.notes, filePath);
 }
 
 type Ts = typeof import('typescript');
@@ -545,8 +551,9 @@ export async function checkContentOnlyPr(params: {
       };
     }
 
+    const allowed = (filePath: string) => isContentPath(filePath, policy) || isNotePath(filePath, policy);
     const misplaced = files
-      .filter(file => !file.filename || file.status !== 'modified' || !isContentPath(file.filename, policy))
+      .filter(file => !file.filename || file.status !== 'modified' || !allowed(file.filename))
       .map(file => file.filename ?? '(unnamed file)');
     if (misplaced.length > 0) {
       return {
@@ -570,7 +577,8 @@ export async function checkContentOnlyPr(params: {
 
     const changed: string[] = [];
     const names = files.map(file => file.filename as string);
-    for (const filePath of names) {
+    // Notes never reach the site, so only the code files are read.
+    for (const filePath of names.filter(name => !isNotePath(name, policy))) {
       const [before, after] = await Promise.all([readAt(filePath, mergeBase), readAt(filePath, headSha)]);
       if (before === undefined || after === undefined) {
         return unreadable(`Couldn't read ${filePath} (missing, unreadable or too large).`, files.length);

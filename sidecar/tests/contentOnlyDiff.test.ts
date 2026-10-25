@@ -6,6 +6,7 @@ import {
   globToRegExp,
   isActiveUrl,
   isContentPath,
+  isNotePath,
   looksLikeCode,
 } from '../src/github/contentOnlyDiff.js';
 import { REPO_REGISTRY } from '../src/repos/registry.js';
@@ -386,6 +387,23 @@ describe('isContentPath', () => {
     expect(isContentPath(filePath, policy)).toBe(expected);
   });
 
+  // A feature's own notes never ship to the site; 8 of 29 recent miniOG copy
+  // PRs touched one alongside the copy.
+  it.each([
+    ['src/features/nst-home/CLAUDE.md', true],
+    ['src/features/nst-apply/_design/REHOST-CAMPUS-AMENITIES.md', true],
+    ['src/features/x/README.md', true],
+    ['CLAUDE.md', false],
+    ['AGENTS.md', false],
+    ['src/app/(landing)/newton-school-of-technology-nst/placement/CLAUDE.md', false],
+    ['src/components/README.md', false],
+    ['.claude/skills/parity-audit/SKILL.md', false],
+    ['src/features/x/notes.mdx', false],
+    ['src/features/x/ledger.json', false],
+  ])('counts %s as a note: %s', (filePath, expected) => {
+    expect(isNotePath(filePath, policy)).toBe(expected);
+  });
+
   it('reads ** as any number of folders, none included', () => {
     expect(globToRegExp('**/forms/**').test('forms/a.tsx')).toBe(true);
     expect(globToRegExp('**/forms/**').test('src/x/forms/a.tsx')).toBe(true);
@@ -542,6 +560,31 @@ describe('checkContentOnlyPr', () => {
       reason: 'The run was cancelled.',
     });
     expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes a copy edit with the feature's notes, without reading the notes", async () => {
+    const note = 'src/features/agentic-ai-course/CLAUDE.md';
+    const routes = copyEdit();
+    const fetcher = github({
+      ...routes,
+      [`${api}/compare/main...HEAD`]: compare([PATH, 'modified'], [note, 'modified']),
+    });
+
+    expect(await check(fetcher)).toEqual({ contentOnly: true, files: [PATH, note], headSha: 'HEAD' });
+    expect(fetcher.mock.calls.some(call => String(call[0]).includes('CLAUDE.md'))).toBe(false);
+  });
+
+  it.each([
+    ['an added note', ['src/features/x/CLAUDE.md', 'added']],
+    ['a removed note', ['src/features/x/README.md', 'removed']],
+    ['a renamed note', ['src/features/x/README.md', 'renamed']],
+    ['the root CLAUDE.md', ['CLAUDE.md', 'modified']],
+    ['the root AGENTS.md', ['AGENTS.md', 'modified']],
+    ['a note outside features', ['src/app/(landing)/x/CLAUDE.md', 'modified']],
+  ] as Array<[string, [string, string]]>)('turns down a copy edit with %s', async (_case, entry) => {
+    const fetcher = github({ ...copyEdit(), [`${api}/compare/main...HEAD`]: compare([PATH, 'modified'], entry) });
+
+    expect(await check(fetcher)).toMatchObject({ contentOnly: false, kind: 'not_content', offending: [entry[0]] });
   });
 
   it('encodes route folders in a file path', async () => {

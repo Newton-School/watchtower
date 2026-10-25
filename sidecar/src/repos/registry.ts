@@ -22,6 +22,12 @@ export interface ContentPolicy {
   allow: string[];
   /** Globs it never touches, even inside `allow`. */
   deny: string[];
+  /**
+   * Markdown notes that never ship to the site (a feature's CLAUDE.md or
+   * README.md): a content-only PR may edit them, unread. Only `.md` files
+   * matching these globs.
+   */
+  notes: string[];
   /** How miniOG merges such a PR. */
   mergeMethod: 'squash' | 'merge' | 'rebase';
 }
@@ -134,6 +140,8 @@ export const REPO_REGISTRY: Record<RepoKey, RepoDescriptor> = {
     },
     contentPolicy: {
       allow: ['src/features/**', 'src/app/**', 'src/components/**'],
+      // A coder often updates the feature's own notes alongside a copy edit.
+      notes: ['src/features/**'],
       deny: [
         'src/lib/**',
         'worker/**',
