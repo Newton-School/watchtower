@@ -1,6 +1,7 @@
 import type { WorkflowIntent } from '../types/contracts.js';
 import { extractPrContext } from './intentParser.js';
-import { isRouteAnswer, type PendingRouteQuestion } from './routeClarify.js';
+import { STAGING_TARGET_QUESTION, isRouteAnswer, type PendingRouteQuestion } from './routeClarify.js';
+import { isStagingTargetAnswer } from './stagingTarget.js';
 
 export interface PausedJobSummary {
   id: string;
@@ -46,6 +47,20 @@ export interface PausedResumeDecision {
 }
 
 /**
+ * A branch, a PR number or a PR link in reply to the staging tool's "which PR
+ * or branch?" goes straight back to it, not through the router's confidence
+ * floor (issue #702). Anything else is the router's to read.
+ */
+function stagingAnswer(
+  routeQuestion: PendingRouteQuestion | undefined,
+  eventText: string,
+): { forceIntent?: 'STAGING_DEPLOY' } {
+  return routeQuestion?.question === STAGING_TARGET_QUESTION && isStagingTargetAnswer(eventText)
+    ? { forceIntent: 'STAGING_DEPLOY' }
+    : {};
+}
+
+/**
  * Decide whether a follow-up Slack reply in a paused-job's thread should be
  * treated as a resume signal — bypassing the @miniOG mention requirement that
  * processEvent normally enforces.
@@ -88,6 +103,7 @@ export function decidePausedResume(params: {
       reason: 'watchtower_answer',
       paused: pausedJob,
       ...(pauseSignal === 'pr_review_target_choice' ? { forceIntent: 'PR_REVIEW' as const } : {}),
+      ...(pauseSignal === 'route_clarify' ? stagingAnswer(params.routeQuestion, eventText) : {}),
     };
   }
 
@@ -126,7 +142,12 @@ export function decidePausedResume(params: {
       senderId &&
       isRouteAnswer({ pending: routeQuestion, senderId, nowMs: params.nowMs ?? Date.now() })
     ) {
-      return { resume: true, reason: 'route_clarify_answer', paused: pausedJob };
+      return {
+        resume: true,
+        reason: 'route_clarify_answer',
+        paused: pausedJob,
+        ...stagingAnswer(routeQuestion, eventText),
+      };
     }
     return { resume: false, reason: 'route_clarify_not_the_answer' };
   }

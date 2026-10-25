@@ -56,10 +56,10 @@ export function buildRouterFacts(
   const prs = task.prContexts ?? [];
   const inTrigger = prs.some(pr => pr.source === 'trigger');
   // The deploy keywords do not seed a workflow; they are a hint, read from the
-  // message as the old gate read it. The target that can allow a deploy is
-  // held to more: the message has to lead with the ask, and must not name
-  // staging as where it goes. miniOG runs no staging deploys, and with no
-  // target a deploy pick falls back to a lookup, which has the staging steps.
+  // message as the old gate read it. The target that can allow a production
+  // deploy is held to more: the message has to lead with the ask, and must
+  // not name staging as where it goes. Staging is its own tool (issue #702),
+  // and with no target a deploy pick falls back to a lookup.
   const text = task.event.text ?? '';
   const deployTarget = namesStagingAsTarget(text) ? undefined : (leadingDeployTarget(text) ?? undefined);
   const hint = GATE_HINTS[task.intent] ?? (classifyDeployTarget(text) ? DEPLOY_KEYWORDS_HINT : undefined);
@@ -94,6 +94,8 @@ export function routerWouldRun(outcome: RouterOutcome): string {
       return 'NONE';
     case 'deploy':
       return 'DEPLOY';
+    case 'deploy_staging':
+      return 'STAGING_DEPLOY';
     case 'qa_webapp':
       return 'WEBAPP_QA';
     case 'ask_user':

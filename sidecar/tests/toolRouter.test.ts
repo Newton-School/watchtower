@@ -67,8 +67,11 @@ describe('buildRouterPrompt', () => {
   it('carries the rules the misroutes came from', () => {
     expect(prompt).toContain('A link is not a request');
     expect(prompt).toContain('deploy only when this message itself tells you to deploy');
-    // "deploy marketing to staging" once went to change_code and got a clarifying question.
-    expect(prompt).toContain('asks only for a staging deploy is answer, not deploy or change_code');
+    // "deploy marketing to staging" once went to change_code and got a clarifying question;
+    // since issue #702 it is the staging tool's.
+    expect(prompt).toContain('- deploy_staging: the person asks you for a link to test or preview a change');
+    expect(prompt).toContain('A question about staging (what is on it, why a staging deploy failed or looks wrong)');
+    expect(prompt).toContain('A staging deploy of anything else (newton-web, the API) is answer');
     expect(prompt).toContain('A staging deploy asked for together with a change, a fix or a merge is that change.');
     expect(prompt).toContain(
       'Asked of the owner instead of you, a staging deploy is for the owner to do: stay_silent.',
@@ -297,6 +300,12 @@ describe('outcomeToLegacyIntent', () => {
     expect(outcomeToLegacyIntent(decided('answer'), 'direct', { allowDeploy: true })).toBe('INFORMATIONAL');
   });
 
+  it('runs the staging tool only for someone who asked miniOG (issue #702)', () => {
+    expect(outcomeToLegacyIntent(decided('deploy_staging'), 'direct')).toBe('STAGING_DEPLOY');
+    expect(outcomeToLegacyIntent(decided('deploy_staging'), 'owner_mention')).toBe('NONE');
+    expect(outcomeToLegacyIntent(decided('deploy_staging'), 'reference')).toBe('NONE');
+  });
+
   it('falls back the same way when the router failed', () => {
     const failed: RouterOutcome = { ok: false, error: 'x', durationMs: 1 };
     expect(outcomeToLegacyIntent(failed, 'direct')).toBe('INFORMATIONAL');
@@ -308,6 +317,7 @@ describe('routerWouldRun', () => {
   it('names deploy, QA, asking and unsupported as what they are', () => {
     expect(routerWouldRun(decided('deploy'))).toBe('DEPLOY');
     expect(routerWouldRun(decided('qa_webapp'))).toBe('WEBAPP_QA');
+    expect(routerWouldRun(decided('deploy_staging'))).toBe('STAGING_DEPLOY');
     expect(routerWouldRun(decided('ask_user'))).toBe('ASK_USER');
     expect(routerWouldRun(decided('unsupported'))).toBe('UNSUPPORTED');
     expect(routerWouldRun({ ok: false, error: 'x', durationMs: 0 })).toBe('FAILED');

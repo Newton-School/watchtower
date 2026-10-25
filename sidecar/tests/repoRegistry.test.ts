@@ -4,7 +4,6 @@ import {
   REPO_REGISTRY,
   RepoNotConfiguredError,
   describeEnabledRepos,
-  marketingStagingReply,
   enabledRepoKeys,
   enabledRepoPaths,
   guardrailBlockFor,
@@ -138,27 +137,20 @@ describe('prompt blocks', () => {
     expect(three).toContain('newton-marketing-web:');
     // A lookup asked how marketing staging works reads the answer here, not a guess.
     const marketingLine = three.split('\n').find(line => line.startsWith('- newton-marketing-web:')) ?? '';
-    // The same steps the deploy workflow gives, since the router sends staging questions here.
-    expect(marketingLine).toContain('Staging (staging-marketing-web.newtonschool.co): Staging deploys are manual');
+    // Staging questions come here; a staging deploy is the staging tool's (issue #702).
+    expect(marketingLine).toContain('Staging (staging-marketing-web.newtonschool.co): Staging is shared');
+    expect(marketingLine).toContain('Ask miniOG for a testing link');
     expect(marketingLine).toContain('gh workflow run deploy-staging.yml --ref YOUR_BRANCH');
-    expect(marketingLine).toContain('Point people to that workflow; never dispatch it yourself.');
+    expect(marketingLine).toContain('never dispatch it yourself: point people to asking miniOG for a testing link.');
     expect(marketingLine).not.toMatch(/[<>&]/);
     expect(three.split('\n').find(line => line.startsWith('- newton-web:'))).not.toContain('Staging');
   });
 });
 
-describe('marketingStagingReply', () => {
-  it('says miniOG runs no staging deploys and how to run one, and nothing a viewer cannot do', () => {
-    const reply = marketingStagingReply();
-    expect(reply).toMatch(/^I don't run staging deploys\. Staging deploys are manual/);
-    expect(reply).toContain('gh workflow run deploy-staging.yml --ref YOUR_BRANCH');
-    // The router gate answers every tier; production is admin-only.
-    expect(reply).not.toContain('prod');
-    // Posted to Slack as is: <, > or & would be read as markup.
-    expect(reply).not.toMatch(/[<>&]/);
-  });
-
+describe('marketing staging guardrail', () => {
   it('is backed by a planner and coder guardrail against dispatching any workflow', () => {
     expect(guardrailBlockFor('newton-marketing-web')).toContain('Never dispatch a GitHub Actions workflow');
+    // A coder's report points at the staging tool, not at commands a PM can't run.
+    expect(guardrailBlockFor('newton-marketing-web')).toContain('they can ask me for a testing link');
   });
 });

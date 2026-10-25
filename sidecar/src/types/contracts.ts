@@ -82,6 +82,7 @@ export type WorkflowIntent =
   | 'NONE'
   | 'DEV_ASSIST'
   | 'DEPLOY'
+  | 'STAGING_DEPLOY'
   | 'MINIOG_DOSSIER'
   | 'WEBAPP_QA'
   | 'UNKNOWN';

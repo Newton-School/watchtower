@@ -19,6 +19,7 @@ export type ToolId =
   | 'chat'
   | 'qa_webapp'
   | 'deploy'
+  | 'deploy_staging'
   | 'dev_assist'
   | 'dossier'
   | 'stay_silent';
@@ -125,6 +126,19 @@ export const TOOLS: readonly ToolSpec[] = [
     irreversible: true,
     routerSelectable: true,
     description: 'Deploy an application to production.',
+  },
+  {
+    id: 'deploy_staging',
+    intents: ['STAGING_DEPLOY'],
+    capability: 'start_implementation',
+    requiredLevel: 'builder',
+    // It replaces what is on the shared staging site, so it acts; but the
+    // next staging deploy puts anything back, so it is not irreversible.
+    sideEffect: 'mutating',
+    irreversible: false,
+    routerSelectable: true,
+    description:
+      'Put a marketing-site (newton-marketing-web) pull request or branch on the shared staging site and post the link to test it.',
   },
   {
     id: 'dev_assist',
