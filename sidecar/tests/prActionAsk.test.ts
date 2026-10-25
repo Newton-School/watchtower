@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { readPrActionAsk } from '../src/router/prActionAsk.js';
 import { mergeProtectionNote } from '../src/workflows/implementationWorkflow.js';
-import { fetchMergeState, fetchUnresolvedReviewThreadCount } from '../src/github/prReviewComments.js';
+import { fetchChecksState, fetchMergeState, fetchUnresolvedReviewThreadCount } from '../src/github/prReviewComments.js';
 import type { NormalizedTask, PrTarget } from '../src/types/contracts.js';
 
 // Issue #605: "merge the pr" ran a 3.5-minute planner before the merge. A
@@ -264,5 +264,114 @@ describe('fetchMergeState', () => {
 
     expect(await fetchUnresolvedReviewThreadCount(target)).toEqual({ unresolvedCount: 1, totalThreads: 2 });
     expect(await fetchMergeState({ ...target, retryDelayMs: 0 })).toBeUndefined();
+  });
+});
+
+// Issue #701: a content-only merge without the owner needs to know the checks
+// passed and the review threads were read, not just a count of 0.
+describe('fetchChecksState', () => {
+  const target = { owner: 'Newton-School', repo: 'newton-marketing-web', sha: 'abc123', githubToken: 'ghs_test' };
+  const answer = (object: unknown, extra: Record<string, unknown> = {}, status = 200) =>
+    new Response(JSON.stringify({ ...extra, data: { repository: { object } } }), { status });
+  const read = (fetcher: unknown) => fetchChecksState({ ...target, fetcher: fetcher as never });
+
+  it('reads the combined state of the commit it is given, and null when it has no checks', async () => {
+    const fetcher = vi.fn().mockResolvedValue(answer({ statusCheckRollup: { state: 'SUCCESS' } }));
+    expect(await read(fetcher)).toBe('SUCCESS');
+    expect(JSON.parse(fetcher.mock.calls[0][1].body).variables).toEqual({
+      owner: 'Newton-School',
+      repo: 'newton-marketing-web',
+      oid: 'abc123',
+    });
+    expect(await read(vi.fn().mockResolvedValue(answer({ statusCheckRollup: null })))).toBeNull();
+  });
+
+  it('is undefined, not "no checks", when the commit or the field cannot be read', async () => {
+    expect(await read(vi.fn().mockResolvedValue(answer(null)))).toBeUndefined();
+    // Not a commit: the field is absent rather than null.
+    expect(await read(vi.fn().mockResolvedValue(answer({})))).toBeUndefined();
+    expect(
+      await read(
+        vi.fn().mockResolvedValue(answer({ statusCheckRollup: null }, { errors: [{ message: 'Not accessible' }] })),
+      ),
+    ).toBeUndefined();
+    expect(await read(vi.fn().mockResolvedValue(answer(null, {}, 502)))).toBeUndefined();
+    expect(await read(vi.fn().mockRejectedValue(new Error('ECONNRESET')))).toBeUndefined();
+  });
+});
+
+describe('fetchMergeState: the head commit and base branch', () => {
+  it('says which commit and base the state describes, so a merge can be pinned to what was read', async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data: {
+            repository: {
+              pullRequest: {
+                reviewDecision: 'REVIEW_REQUIRED',
+                mergeStateStatus: 'BLOCKED',
+                isDraft: false,
+                headRefOid: 'abc123',
+                baseRefName: 'main',
+              },
+            },
+          },
+        }),
+      ),
+    );
+
+    const state = await fetchMergeState({
+      owner: 'Newton-School',
+      repo: 'newton-marketing-web',
+      pullNumber: 1490,
+      githubToken: 'ghs_test',
+      fetcher: fetcher as never,
+      retryDelayMs: 0,
+    });
+
+    expect(state).toEqual({
+      reviewDecision: 'REVIEW_REQUIRED',
+      mergeStateStatus: 'BLOCKED',
+      isDraft: false,
+      headSha: 'abc123',
+      baseRef: 'main',
+    });
+    const query = JSON.parse(fetcher.mock.calls[0][1].body).query;
+    expect(query).toContain('headRefOid');
+    expect(query).toContain('baseRefName');
+  });
+});
+
+describe('fetchUnresolvedReviewThreadCount', () => {
+  const target = { owner: 'Newton-School', repo: 'newton-marketing-web', pullNumber: 1490, githubToken: 'ghs_test' };
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('marks a count it could not read, so a merge that needs it knows', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('ECONNRESET')));
+
+    expect(await fetchUnresolvedReviewThreadCount(target)).toEqual({
+      unresolvedCount: 0,
+      totalThreads: 0,
+      failed: true,
+    });
+  });
+
+  it('marks a count from more threads than it read (the first 100)', async () => {
+    const nodes = Array.from({ length: 100 }, () => ({ isResolved: true }));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes, totalCount: 140 } } } } }),
+          ),
+      ),
+    );
+
+    expect(await fetchUnresolvedReviewThreadCount(target)).toEqual({
+      unresolvedCount: 0,
+      totalThreads: 140,
+      incomplete: true,
+    });
   });
 });

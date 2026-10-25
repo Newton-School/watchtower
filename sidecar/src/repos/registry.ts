@@ -10,6 +10,41 @@ import type { AppConfig } from '../types/contracts.js';
 export const REPO_KEYS = ['newton-web', 'newton-api', 'newton-marketing-web'] as const;
 export type RepoKey = (typeof REPO_KEYS)[number];
 
+/**
+ * Which pull requests count as content-only for a repo: copy, numbers and
+ * asset links on pages, nothing else (issue #701). Such a PR may be merged on
+ * the word of anyone who could have asked for the change. The paths only
+ * narrow where a content-only change can be; `github/contentOnlyDiff.ts`
+ * reads the files themselves.
+ */
+export interface ContentPolicy {
+  /** Globs a content-only change may touch (`**` spans folders, `*` stays within one). */
+  allow: string[];
+  /** Globs it never touches, even inside `allow`. */
+  deny: string[];
+  /**
+   * Markdown notes that never ship to the site and that no agent is pointed
+   * at (a feature's README.md): a content-only PR may edit them, unread. Only
+   * `.md` files matching these globs and not `deny`, and never agent
+   * instructions (CLAUDE.md, AGENTS.md, skills), which later runs would read
+   * as orders.
+   */
+  notes: string[];
+  /**
+   * Hosts the site serves images and documents from. A changed link that
+   * loads something (not one the reader follows) keeps its host or moves to
+   * one of these.
+   */
+  assetHosts: string[];
+  /**
+   * What the repo's own lint forbids in string literals. The repo has no CI
+   * to catch it, so a changed value matching one would only fail at deploy.
+   */
+  lintForbidden: RegExp[];
+  /** How miniOG merges such a PR. */
+  mergeMethod: 'squash' | 'merge' | 'rebase';
+}
+
 export interface RepoDescriptor {
   key: RepoKey;
   kind: 'frontend' | 'backend';
@@ -47,6 +82,8 @@ export interface RepoDescriptor {
         prodCommand: string;
       }
     | { method: 'none' };
+  /** Set for repos whose content-only PRs builders may merge; absent everywhere else. */
+  contentPolicy?: ContentPolicy;
 }
 
 export const REPO_REGISTRY: Record<RepoKey, RepoDescriptor> = {
@@ -114,6 +151,125 @@ export const REPO_REGISTRY: Record<RepoKey, RepoDescriptor> = {
       stagingNote:
         'Staging is shared and shows whichever branch was deployed there last. Ask miniOG for a testing link and it puts the PR branch on staging and posts the link; developers can also run *Deploy → staging* in GitHub Actions on a branch (`gh workflow run deploy-staging.yml --ref YOUR_BRANCH`). Either way it replaces what is on staging now, so deploy `main` again when you are done.',
       prodCommand: 'gh workflow run deploy-prod.yml --ref main -f confirm=deploy',
+    },
+    contentPolicy: {
+      allow: ['src/features/**', 'src/app/**', 'src/components/**'],
+      // A coder often updates the feature's README alongside a copy edit. Design
+      // notes (`_design/`) steer agents, so they are not notes.
+      notes: ['src/features/**/README.md'],
+      // The CloudFront CDN images and PDFs are uploaded to, Webflow's legacy CDN, YouTube.
+      assetHosts: [
+        'd3dyfaf3iutrxo.cloudfront.net',
+        'cdn.prod.website-files.com',
+        'www.youtube.com',
+        'youtube.com',
+        'www.youtube-nocookie.com',
+      ],
+      // eslint.config.mjs: no hardcoded site-host URLs in literals or templates.
+      lintForbidden: [/newtonschool\.co/],
+      deny: [
+        'src/lib/**',
+        'worker/**',
+        '.github/**',
+        // App-wide shells, server code and crawler files.
+        'src/app/layout.tsx',
+        'src/app/**/layout.tsx',
+        'src/app/**/template.tsx',
+        'src/app/**/error.tsx',
+        'src/app/**/global-error.tsx',
+        'src/app/api/**',
+        'src/app/**/route.ts',
+        'src/app/**/route.tsx',
+        'src/app/robots.ts',
+        'src/app/sitemap.ts',
+        'src/app/manifest.ts',
+        '**/api/**',
+        '**/*-api.ts',
+        '**/middleware*',
+        // Forms, sign-in, sessions and state.
+        '**/forms/**',
+        '**/auth/**',
+        '**/gate/**',
+        '**/*gate*',
+        '**/*session*',
+        '**/*signup*',
+        '**/*lead-form*',
+        '**/*-lead.ts',
+        '**/*-lead-*',
+        '**/lead-*',
+        '**/*popup*',
+        '**/*nudge*',
+        '**/*provider*',
+        '**/*context*',
+        '**/*config*',
+        '**/store.ts',
+        '**/*-store.ts',
+        '**/*cookie*',
+        '**/*storage*',
+        '**/hooks/**',
+        '**/use-*.ts',
+        // Scripts, tracking and experiments.
+        // (Globs ignore case, so no `*script*`: it would take description.tsx.)
+        '**/script*',
+        '**/*-script*',
+        '**/*_script*',
+        '**/*.script.*',
+        '**/analytics*',
+        '**/analytics*/**',
+        '**/tracking/**',
+        '**/*tracker*',
+        '**/*tracking*',
+        '**/tracked-*',
+        '**/*attribution*',
+        '**/events.ts',
+        '**/*-events.ts',
+        '**/*pixel*',
+        '**/*utm*',
+        '**/*gtag*',
+        '**/*gtm*',
+        '**/ads.ts',
+        '**/*-ads.ts',
+        '**/device-id*',
+        '**/openpanel*',
+        '**/*consent*',
+        '**/instrumentation*',
+        '**/*experiment*',
+        '**/*experiment*/**',
+        '**/*ab-test*',
+        '**/*abtest*',
+        '**/*feature-flag*',
+        '**/flags.ts',
+        '**/*bucket*',
+        '**/funnel/**',
+        // Routing, redirects, payments and sign-in codes.
+        '**/*redirect*',
+        '**/routes.ts',
+        '**/*-routes.ts',
+        '**/otp*',
+        '**/*-otp*',
+        '**/*_otp*',
+        '**/*payment*',
+        '**/*checkout*',
+        '**/*razorpay*',
+        '**/whatsapp.ts',
+        // Settings, and files that render structured data as scripts.
+        '**/env.ts',
+        '**/env/**',
+        '**/*constants*',
+        '**/*json-ld*',
+        '**/*jsonld*',
+        '**/*structured-data*',
+        '**/schema.ts',
+        'src/app/**/sitemap.ts',
+        'src/app/**/robots.ts',
+        'src/app/**/opengraph-image*',
+        'src/app/**/twitter-image*',
+        '**/_design/**',
+        '**/*.test.*',
+        '**/*.spec.*',
+      ],
+      // The repo's ruleset requires a linear history.
+      mergeMethod: 'squash',
     },
   },
 };

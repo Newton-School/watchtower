@@ -1,0 +1,1020 @@
+import type { JsxAttribute, Node, SourceFile } from 'typescript';
+import type { ContentPolicy } from '../repos/registry.js';
+
+/**
+ * Whether a pull request only changes content: copy, numbers and asset links
+ * on pages (issue #701). Such a PR may be merged on the word of anyone who
+ * could have asked for the change, without the usual review, so the check
+ * errs towards "no": a file it cannot read, parse or place is not content.
+ *
+ * A file passes when its old and new versions are the same program once the
+ * literals in content positions are masked out: page text, copy attributes
+ * like `alt` or `href`, and values inside data objects and arrays. A literal
+ * that is a variable's whole value, a return value, compared, passed to a
+ * call or used as a key stays as it is, so changing it is a change of
+ * behaviour. Each masked value that changed must still read as copy: not
+ * code or markup, not an identifier or a link under a key that holds
+ * neither words nor links, and nothing the repo's own lint forbids.
+ */
+export type ContentOnlyVerdict =
+  /**
+   * `headSha` is the commit that was read: a merge must be of that commit and
+   * no later one, into `baseRef`.
+   */
+  | { contentOnly: true; files: string[]; headSha: string; baseRef: string }
+  | {
+      contentOnly: false;
+      /** For the logs. */
+      reason: string;
+      /**
+       * What kept it from counting: a file that is more than content, too many
+       * files, a base other than the default branch, or a diff that could not
+       * be read.
+       */
+      kind: 'not_content' | 'too_many_files' | 'not_default_base' | 'unreadable';
+      /** The files that are more than content, when known. */
+      offending?: string[];
+      /** How many files the PR changes, when known. */
+      fileCount?: number;
+    };
+
+export type Fetcher = (url: string, init?: RequestInit) => Promise<Response>;
+
+/** More files than this is more than a copy edit, whatever they contain. */
+export const CONTENT_ONLY_MAX_FILES = 20;
+/** GitHub's compare API lists at most this many files; a list that long may be cut. */
+const COMPARE_FILE_CAP = 300;
+const MAX_FILE_BYTES = 200_000;
+
+/** `**` spans any number of folders (none included), `*` stays within one. Case-insensitive. */
+export function globToRegExp(glob: string): RegExp {
+  let pattern = '';
+  for (let i = 0; i < glob.length; i += 1) {
+    const char = glob[i];
+    if (char === '*' && glob[i + 1] === '*') {
+      if (glob[i + 2] === '/') {
+        pattern += '(?:.*/)?';
+        i += 2;
+      } else {
+        pattern += '.*';
+        i += 1;
+      }
+    } else if (char === '*') {
+      pattern += '[^/]*';
+    } else {
+      pattern += char.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
+    }
+  }
+  return new RegExp(`^${pattern}$`, 'i');
+}
+
+const matchesAny = (globs: string[], filePath: string) => globs.some(glob => globToRegExp(glob).test(filePath));
+
+/** Whether a path is a TypeScript file a content-only change may touch. */
+export function isContentPath(filePath: string, policy: ContentPolicy): boolean {
+  if (!/\.tsx?$/i.test(filePath) || /\.d\.ts$/i.test(filePath)) return false;
+  return matchesAny(policy.allow, filePath) && !matchesAny(policy.deny, filePath);
+}
+
+/**
+ * Instructions for coding agents (CLAUDE.md, AGENTS.md, skills and the
+ * like): a later run reads them as orders, so they are never a note.
+ */
+const AGENT_INSTRUCTIONS = /claude|agents|gemini|copilot|cursor|^skill\.md$/i;
+
+/**
+ * Whether a path is a Markdown note that never ships and that no agent
+ * reads as instructions, which a content-only change may edit unread: a
+ * README the policy names, outside the deny list.
+ */
+export function isNotePath(filePath: string, policy: ContentPolicy): boolean {
+  if (!/\.md$/i.test(filePath) || /(?:^|\/)\.(?:claude|agents)\//i.test(filePath)) return false;
+  if (AGENT_INSTRUCTIONS.test(filePath.split('/').pop() ?? '')) return false;
+  return matchesAny(policy.notes, filePath) && !matchesAny(policy.deny, filePath);
+}
+
+type Ts = typeof import('typescript');
+let tsModule: Promise<Ts> | undefined;
+/** Loaded on first use: the compiler is large and only a merge needs it. */
+function loadTypescript(): Promise<Ts> {
+  tsModule ??= import('typescript').then(module => module.default);
+  return tsModule;
+}
+
+/**
+ * A file that renders raw HTML or loads or runs scripts is never content
+ * only: a harmless-looking value in it can end up as code. Read with the
+ * comments taken out, so a comment that names <iframe> doesn't count.
+ */
+const RAW_HTML_OR_SCRIPT =
+  /dangerouslySetInnerHTML|<script\b|<Script\b|<iframe\b|<embed\b|<object\b|document\.write|\beval\s*\(|\bnew\s+Function\s*\(|\.innerHTML\s*=|\.outerHTML\s*=|insertAdjacentHTML/;
+
+/** Elements whose text and attributes are code or load code: never content. */
+const CODE_ELEMENTS = new Set(['script', 'Script', 'style', 'iframe', 'link', 'object', 'embed', 'base']);
+
+/** Copy attributes of plain HTML elements (`content` only on a describing <meta>, below). */
+const HTML_COPY_ATTRIBUTES = new Set(['alt', 'title', 'placeholder', 'label', 'href', 'src', 'srcSet', 'poster']);
+/** Copy props of components: exact names, and names ending in one of the suffixes. */
+const COMPONENT_COPY_PROPS = new Set([
+  'title',
+  'subtitle',
+  'heading',
+  'subheading',
+  'eyebrow',
+  'tagline',
+  'label',
+  'text',
+  'description',
+  'caption',
+  'alt',
+  'href',
+  'src',
+  'image',
+  'placeholder',
+]);
+const COMPONENT_COPY_SUFFIX = /[a-z0-9](?:Text|Label|Title|Heading|Subtitle|Description|Caption|Copy|Alt)$/;
+/** <meta> tags whose `content` is words on the page or in a preview. */
+const DESCRIBING_META =
+  /^(?:description|keywords|title|og:title|og:description|og:image|og:image:alt|twitter:title|twitter:description|twitter:image)$/i;
+
+/**
+ * Keys and variable names whose values set behaviour, styling, tracking,
+ * routing or where data goes, not words on the page.
+ */
+const KNOB_NAMES = new Set([
+  'classname',
+  'class',
+  'classes',
+  'style',
+  'styles',
+  'id',
+  'key',
+  'ref',
+  'type',
+  'name',
+  'htmlfor',
+  'target',
+  'rel',
+  'variant',
+  'variants',
+  'size',
+  'color',
+  'colors',
+  'theme',
+  'tokens',
+  'as',
+  'method',
+  'action',
+  'loading',
+  'priority',
+  'strategy',
+  'sizes',
+  'fill',
+  'layout',
+  'objectfit',
+  'objectposition',
+  'tabindex',
+  'dangerouslysetinnerhtml',
+  '__html',
+  'iframe',
+  'embed',
+  'script',
+  'scripts',
+  'html',
+  'css',
+  'robots',
+  'googlebot',
+  'split',
+  'enabled',
+  'disabled',
+  'weight',
+  'ratio',
+  'rollout',
+  'traffic',
+  'allocation',
+  'probability',
+  'cookie',
+  'cookies',
+  'storage',
+  'media',
+  'query',
+  'params',
+  'headers',
+  'cache',
+  'webhook',
+  // Routing, lead tagging and form wiring.
+  'slug',
+  'path',
+  'route',
+  'from',
+  'source',
+  'mode',
+  'kind',
+  'value',
+  'next',
+  'destination',
+  'redirect',
+  'callback',
+  'origin',
+  'pagename',
+  'eventname',
+  // Next.js route segment config.
+  'dynamic',
+  'dynamicparams',
+  'revalidate',
+  'runtime',
+  'fetchcache',
+  'preferredregion',
+  'maxduration',
+]);
+/** The last word of a name that makes it a knob: `formId`, `FORM_ID`, `submitUrl`, `labelClassName`, `ENDPOINTS`. */
+const KNOB_WORDS = new Set(
+  (
+    'id ids key keys event events arm arms variant variants endpoint endpoints api apis ms delay delays timeout ' +
+    'timeouts interval intervals duration durations seconds secs threshold thresholds url urls uri uris cookie ' +
+    'cookies media class classes classname classnames storage script scripts html css style styles config configs ' +
+    'settings setting flag flags test tests experiment experiments param params query queries regex regexp pattern ' +
+    'patterns selector selectors attr attrs attribute attributes token tokens secret secrets webhook webhooks offset ' +
+    'offsets cutoff hour hours minute minutes limit limits max min type types slug slugs path paths route routes ' +
+    'identifier identifiers verification verifications host hosts domain domains iframe iframes embed embeds action ' +
+    'actions source sources mode modes kind kinds redirect redirects callback callbacks ab'
+  ).split(' '),
+);
+/** The first word of a name that makes it a knob: `maxSeats`, `utmPageIdentifier`, `MIN_AGE`. */
+const KNOB_FIRST_WORDS = new Set(['max', 'min', 'limit', 'threshold', 'timeout', 'delay', 'utm']);
+/** A link to an image or document is an asset, not where data goes. */
+const ASSET_URL_NAME = /(?:image|img|photo|logo|icon|thumb|banner|video|poster|avatar|brochure|pdf)/i;
+
+/** The words of a camel, snake or kebab name, lower-cased: `labelClassName` → label, class, name. */
+function nameWords(name: string): string[] {
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .split(/[\s_\-:.]+/)
+    .filter(Boolean)
+    .map(word => word.toLowerCase());
+}
+
+/** Whether the last word, or the last two run together (`class`+`name`), is in a set. */
+function endsWithWord(words: string[], set: Set<string>): boolean {
+  const last = words[words.length - 1] ?? '';
+  const lastTwo = words.slice(-2).join('');
+  return set.has(last) || (words.length > 1 && set.has(lastTwo));
+}
+
+function isKnobName(name: string | undefined): boolean {
+  if (!name) return true;
+  if (KNOB_NAMES.has(name.toLowerCase()) || name.startsWith('data-')) return true;
+  const words = nameWords(name);
+  if (words.length > 1 && KNOB_FIRST_WORDS.has(words[0])) return true;
+  if (!endsWithWord(words, KNOB_WORDS)) return false;
+  // `heroImageUrl`, `brochureUrl`: an asset link, which is content.
+  return !(/ur[li]s?$/i.test(name) && ASSET_URL_NAME.test(name));
+}
+
+/**
+ * Keys whose values are words, so a one-word value under them is still copy.
+ * Under any other key a one-word value reads as an identifier: a slug, a
+ * mode, a lead tag, a host.
+ */
+const COPY_KEYS = new Set([
+  'text',
+  'title',
+  'subtitle',
+  'heading',
+  'subheading',
+  'eyebrow',
+  'tagline',
+  'label',
+  'description',
+  'caption',
+  'button',
+  'alt',
+  'placeholder',
+  'company',
+  'role',
+  'quote',
+  'author',
+  'designation',
+  'badge',
+  'bio',
+  'city',
+  'location',
+  'college',
+  'degree',
+  'question',
+  'answer',
+  'body',
+  'summary',
+  'unit',
+  'content',
+]);
+/** The last word of a copy key: `heroTitle`, `ctaText`, `HERO_HEADING`, `buttonLabel`. */
+const COPY_WORDS = new Set([
+  'text',
+  'label',
+  'title',
+  'heading',
+  'subtitle',
+  'subheading',
+  'description',
+  'caption',
+  'copy',
+  'alt',
+  'button',
+]);
+/** Text a screen reader says: the only aria attributes that are copy. */
+const ARIA_COPY = /^aria-(?:label|description|roledescription|valuetext|placeholder)$/;
+
+function isCopyKey(key: string): boolean {
+  return COPY_KEYS.has(key) || ARIA_COPY.test(key) || endsWithWord(nameWords(key), COPY_WORDS);
+}
+
+/**
+ * Lists whose entries are copy: table rows and cells, bullets, lessons. Any
+ * other list may be form options or a lookup (categories, states, degrees),
+ * so an entry of one is compared as written.
+ */
+const LIST_COPY_WORDS = new Set([
+  'items',
+  'bullets',
+  'points',
+  'rows',
+  'cells',
+  'lines',
+  'paragraphs',
+  'chips',
+  'lessons',
+  'checklist',
+  'notes',
+  'features',
+  'deliverables',
+  'values',
+  'head',
+  'terms',
+  'highlights',
+  'benefits',
+  'skills',
+  'tools',
+  'topics',
+  'technologies',
+]);
+
+function isListCopyKey(key: string): boolean {
+  return endsWithWord(nameWords(key), LIST_COPY_WORDS);
+}
+
+/**
+ * Numbers copy shows: counts, ratings, years, seats, prices, fees, salaries.
+ * Any other number in data may be a step, a delay, a threshold or a split.
+ */
+const NUMBER_COPY_WORDS = new Set([
+  'count',
+  'counts',
+  'number',
+  'numbers',
+  'stat',
+  'stats',
+  'rating',
+  'ratings',
+  'star',
+  'stars',
+  'year',
+  'years',
+  'month',
+  'months',
+  'alumni',
+  'students',
+  'learners',
+  'seats',
+  'percent',
+  'percentage',
+  'price',
+  'prices',
+  'fee',
+  'fees',
+  'amount',
+  'salary',
+  'ctc',
+  'lpa',
+  'hike',
+  'end',
+]);
+
+/** Words that make a number logic whatever else the name says: `retryCount`, `percentRollout`, `statRadius`. */
+const NUMBER_KNOB_WORDS = new Set([
+  ...KNOB_WORDS,
+  'retry',
+  'retries',
+  'rollout',
+  'index',
+  'idx',
+  'attempt',
+  'attempts',
+  'split',
+  'weight',
+  'weights',
+  'bucket',
+  'buckets',
+  'offset',
+  'radius',
+  'size',
+  'width',
+  'height',
+  'step',
+  'steps',
+  'x',
+  'y',
+  'z',
+]);
+
+/** A number copy shows: `rating`, `studentCount`, `ratingStars`, `feeAmount`; not `seatsLeft` or `retryCount`. */
+function isNumberCopyKey(key: string): boolean {
+  if (isCopyKey(key)) return true;
+  const words = nameWords(key);
+  return NUMBER_COPY_WORDS.has(words[words.length - 1] ?? '') && !words.some(word => NUMBER_KNOB_WORDS.has(word));
+}
+
+/** Keys whose values are links or assets: `href`, `ctaHref`, `src`, `link`, `heroImage`, `videoUrl`. */
+function isLinkKey(key: string): boolean {
+  return /(?:^|[a-z0-9])(?:href|link|src|srcset|poster)$/i.test(key) || ASSET_URL_NAME.test(key);
+}
+
+/** Keys that send the reader somewhere rather than load something into the page. */
+function isNavigationKey(key: string): boolean {
+  return /(?:^|[a-z0-9])(?:href|link)$/i.test(key);
+}
+
+/** The hosts of every absolute link in a value (`srcSet` lists several), lower-cased. */
+function hostsOf(value: string): string[] {
+  return [...value.matchAll(/(?:^|[\s,(])(?:https?:)?\/\/([^/?#:\s,)]+)/gi)].map(match => match[1].toLowerCase());
+}
+
+/** A key whose value is loaded into the page (an image, a PDF in a frame, a script), not followed. */
+function isLoadKey(keys: string[]): boolean {
+  return keys.some(isLinkKey) && !keys.some(isNavigationKey);
+}
+
+/** SVG elements whose `href` loads a resource rather than being a link: `<image href>`. */
+const SVG_LOADING_ELEMENTS = new Set(['image', 'use', 'feImage']);
+
+/** A one-word value shaped like an identifier under any key: `hero_contact_us`, `nav-request-callback`, `heroCta`. */
+const IDENTIFIER_SHAPE = /_|^[a-z][a-z0-9]*(?:-[a-z0-9]+)+$|^[a-z]+[A-Z][A-Za-z0-9]*$/;
+
+/**
+ * A class list or CSS: a token with an arbitrary value (`bg-[#fff]`) or a
+ * variant prefix (`md:flex`), a CSS function, or nothing but utility-shaped
+ * tokens.
+ */
+function looksLikeStyling(value: string): boolean {
+  const tokens = value.trim().split(/\s+/).filter(Boolean);
+  const styled = (token: string) =>
+    /\[[^\]]*\]/.test(token) ||
+    /^!?(?:[a-z0-9-]+(?:\[[^\]]*\])?(?:\/[a-z0-9-]+)?:)+\S/.test(token) ||
+    /(?:^|[^a-z])(?:url|linear-gradient|radial-gradient|conic-gradient|rgba?|hsla?|var|calc)\(/i.test(token);
+  if (tokens.some(styled)) return true;
+  const utility = (token: string) =>
+    /^-?[a-z]+(?:-[a-z0-9./%#]+)+$/.test(token) ||
+    /^(?:flex|grid|block|hidden|inline|contents|relative|absolute|fixed|sticky|truncate|italic|underline|uppercase|lowercase|capitalize|invisible|visible)$/.test(
+      token,
+    );
+  return tokens.length > 1 && tokens.every(utility);
+}
+
+/** A link or path: `https://…`, `//…`, `/apply`, `#faq`. */
+const LINK_VALUE = /^(?:https?:)?\/\/|^\/|^#/i;
+/** Numbers as copy writes them: `98.3%`, `₹1.5L`, `50+`, `4.8/5`, `1,49,999`, `+919999999999`. */
+const NUMBER_VALUE = /^[~<>+-]?[^\s\w]?\d[\d,.]*(?:\/\d+(?:\.\d+)?)?(?:%|x|k|m|b|l|lpa|cr|lakh|crore)?[+*]?$/i;
+/** Dates and times: `2027-01-15`, `15/01/2027`, `15-Jan-2027`, `2027-01-15T23:59:59+05:30`, `7PM`. */
+const DATE_VALUE =
+  /^(?:\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}(?:T[\d:.]+(?:Z|[+-]\d{2}:?\d{2})?)?|\d{1,2}-?[a-z]{3,9}-?\d{2,4}|\d{1,2}(?::\d{2})?(?:am|pm))$/i;
+
+/** Decodes the HTML character references a browser would, in JSX text and attributes. */
+function decodeEntities(text: string): string {
+  const named: Record<string, string> = {
+    colon: ':',
+    tab: '\t',
+    newline: '\n',
+    amp: '&',
+    lt: '<',
+    gt: '>',
+    quot: '"',
+    apos: "'",
+    nbsp: '\u00a0',
+    sol: '/',
+    period: '.',
+    lpar: '(',
+    rpar: ')',
+    semi: ';',
+  };
+  return text
+    .replace(/&#x([0-9a-f]+);?/gi, (_, hex: string) => safeCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);?/g, (_, dec: string) => safeCodePoint(parseInt(dec, 10)))
+    .replace(/&([a-z]+);/gi, (match, entity: string) => named[entity.toLowerCase()] ?? match);
+}
+
+function safeCodePoint(code: number): string {
+  return Number.isFinite(code) && code >= 0 && code <= 0x10ffff ? String.fromCodePoint(code) : '';
+}
+
+/** A link that runs or embeds something rather than going somewhere, however it is spelled. */
+export function isActiveUrl(text: string): boolean {
+  // Browsers drop whitespace and control characters inside a scheme.
+  const squeezed = decodeEntities(text).replace(
+    // eslint-disable-next-line no-control-regex
+    /[\u0000-\u0020\u007f-\u009f\u00a0\u200b-\u200d\u2028\u2029\ufeff]/g,
+    '',
+  );
+  return /^(?:javascript|vbscript|data):/i.test(squeezed);
+}
+
+/**
+ * A changed value that reads like code or markup is not a copy edit. A
+ * character reference like `&rsquo;` is text React shows as it is, so it
+ * never counts; a semicolon alone is punctuation.
+ */
+export function looksLikeCode(text: string): boolean {
+  // JSX decodes `&lt;` and `&gt;` (`&lt;/script&gt;` is a real tag); other references are just text.
+  const plain = text
+    .replace(/&lt;|&#0*60;|&#x0*3c;/gi, '<')
+    .replace(/&gt;|&#0*62;|&#x0*3e;/gi, '>')
+    .replace(/&(?:[a-z][a-z0-9]*|#\d+|#x[0-9a-f]+);/gi, ' ');
+  return (
+    /<\/?[a-z!]|[{}]|=>|\bfunction\s*\(/i.test(plain) ||
+    // A property read (`document.cookie`), not a sentence ending in the word.
+    /\b(?:document|window|localStorage|sessionStorage|navigator|top|parent|self|location|history|globalThis)\.[a-z_$]/i.test(
+      plain,
+    ) ||
+    /\b(?:eval|fetch|alert|setTimeout|import|require)\s*\(/.test(plain) ||
+    // A call with a quoted argument (`assign('…')`; prose puts a space before
+    // its brackets), or a string closed and joined to code: script, not prose.
+    /[\w)\]]\(\s*['"`]|['"`]\s*\+\s*[a-z_$(]/i.test(plain) ||
+    isActiveUrl(text)
+  );
+}
+
+/** A masked literal: where it sat, and what it said. */
+type MaskedValue = {
+  /**
+   * The names it was held under, nearest first: an attribute name, the keys
+   * of the objects around it and the variable holding them; `text` for page
+   * text; empty for none.
+   */
+  keys: string[];
+  kind: 'text' | 'string' | 'number' | 'template';
+  text: string;
+  /** A direct entry of an array, which counts only in a list of copy. */
+  inArray?: boolean;
+};
+
+/**
+ * Why a changed masked value is not a copy edit; undefined when it is one.
+ * Words change freely; anything else only under a key that says it holds
+ * that: numbers under number or copy keys, one-word values under copy keys,
+ * links under link keys, list entries in lists of copy.
+ */
+function changedValueProblem(
+  before: MaskedValue,
+  after: MaskedValue,
+  rules: Required<ContentRules>,
+): string | undefined {
+  if (looksLikeCode(before.text) || looksLikeCode(after.text)) return 'reads like code or markup';
+  if (rules.lintForbidden.some(pattern => pattern.test(after.text))) return "has something the repo's lint forbids";
+  const nearest = after.keys[0] ?? '';
+  const under = `under \`${nearest || '(no key)'}\``;
+  if (after.kind === 'number') return isNumberCopyKey(nearest) ? undefined : `is a number ${under}`;
+  // A built link that loads something can't be checked for its host, so it never passes.
+  if (after.kind === 'template' && isLoadKey(after.keys)) return `is a built link ${under}`;
+  if (after.kind !== 'string') return undefined;
+  if (after.inArray && !isCopyKey(nearest) && !isListCopyKey(nearest)) return `is a list entry ${under}`;
+  for (const { text } of [before, after]) {
+    const value = text.trim();
+    if (value === '' || /^(?:tel|mailto):/i.test(value)) continue;
+    if (LINK_VALUE.test(value)) {
+      // `href`, or a list of links: `images: { hero: … }`.
+      if (!after.keys.some(isLinkKey)) return `is a link ${under}`;
+      continue;
+    }
+    if (looksLikeStyling(value)) return 'reads like a class list or CSS';
+    if (/\s/.test(value) || NUMBER_VALUE.test(value) || DATE_VALUE.test(value)) continue;
+    if (IDENTIFIER_SHAPE.test(value)) return 'reads as an identifier';
+    // A chip in a list of skills or a cell in a table may be one word.
+    if (!isCopyKey(nearest) && !(after.inArray && isListCopyKey(nearest))) {
+      return `is one word ${under}, so reads as an identifier`;
+    }
+  }
+  // A link that loads something (an image, a PDF in a frame) stays on its
+  // hosts or moves to one the site serves assets from, every link in the
+  // value counted. One you follow may go anywhere.
+  if (isLoadKey(after.keys)) {
+    const from = new Set(hostsOf(before.text));
+    const moved = hostsOf(after.text).find(host => !from.has(host) && !rules.assetHosts.includes(host));
+    if (moved) return `moves an asset to ${moved}`;
+    if (LINK_VALUE.test(after.text.trim()) && from.size > 0 && hostsOf(after.text).length === 0) {
+      return 'moves an asset to a path on this site';
+    }
+  }
+  return undefined;
+}
+
+function nameText(ts: Ts, name: Node): string | undefined {
+  if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNumericLiteral(name)) return name.text;
+  if (ts.isJsxNamespacedName(name)) return `${name.namespace.text}:${name.name.text}`;
+  if (ts.isPrivateIdentifier(name)) return name.text;
+  return undefined;
+}
+
+function tagNameOf(ts: Ts, element: Node | undefined): string | undefined {
+  if (!element) return undefined;
+  if (ts.isJsxElement(element)) return element.openingElement.tagName.getText();
+  if (ts.isJsxOpeningElement(element) || ts.isJsxSelfClosingElement(element)) return element.tagName.getText();
+  return undefined;
+}
+
+/** The literal value of another attribute on the same element, when it is a plain string. */
+function siblingAttributeText(ts: Ts, attribute: JsxAttribute, wanted: string): string | undefined {
+  for (const other of attribute.parent.properties) {
+    if (!ts.isJsxAttribute(other) || nameText(ts, other.name) !== wanted) continue;
+    return other.initializer && ts.isStringLiteral(other.initializer) ? other.initializer.text : undefined;
+  }
+  return undefined;
+}
+
+/** The key an attribute's value is held under; an SVG `<image href>` loads, so it is a `src`. */
+function attributeKey(ts: Ts, attribute: JsxAttribute): string {
+  const name = nameText(ts, attribute.name) ?? '';
+  const tag = tagNameOf(ts, attribute.parent.parent) ?? '';
+  return /^(?:href|xlinkHref|xlink:href)$/.test(name) && SVG_LOADING_ELEMENTS.has(tag) ? 'src' : name;
+}
+
+/**
+ * Whether an attribute is copy, by an allow list: on a plain element only
+ * the attributes that hold words, links or images; on a component only props
+ * whose names say they hold words.
+ */
+function isCopyAttribute(ts: Ts, attribute: JsxAttribute): boolean {
+  const name = nameText(ts, attribute.name);
+  const tag = tagNameOf(ts, attribute.parent.parent);
+  if (!name || !tag || CODE_ELEMENTS.has(tag)) return false;
+  if (ARIA_COPY.test(name)) return true;
+  const plainElement = /^[a-z]/.test(tag) && !tag.includes('.');
+  if (!plainElement) return COMPONENT_COPY_PROPS.has(name) || COMPONENT_COPY_SUFFIX.test(name);
+  if (HTML_COPY_ATTRIBUTES.has(name)) return true;
+  if (name !== 'content' || tag !== 'meta') return false;
+  if (siblingAttributeText(ts, attribute, 'httpEquiv') !== undefined) return false;
+  const described = siblingAttributeText(ts, attribute, 'name') ?? siblingAttributeText(ts, attribute, 'property');
+  return described !== undefined && DESCRIBING_META.test(described);
+}
+
+/**
+ * Where a literal's value is content, the names it is held under, nearest
+ * first (`text` for page text); undefined when it is not content. Content is text in JSX, a
+ * copy attribute holding the literal itself, or a value inside an object or
+ * array assigned to a variable or exported as the default. A literal that is
+ * a variable's whole value, a return value or an arrow's body is compared as
+ * written: such a constant is as likely a delay, a URL or a key as words. An
+ * object or array inside JSX is never content, and a template with `${}` is
+ * content only as JSX text or a copy attribute.
+ */
+function contentKeys(ts: Ts, node: Node, template = false): string[] | undefined {
+  let child: Node = node;
+  let parent: Node | undefined = node.parent;
+  let inContainer = false;
+  const keys: string[] = [];
+  while (parent) {
+    if (
+      ts.isParenthesizedExpression(parent) ||
+      ts.isAsExpression(parent) ||
+      ts.isSatisfiesExpression(parent) ||
+      ts.isTypeAssertionExpression(parent)
+    ) {
+      if (parent.expression !== child) return undefined;
+    } else if (ts.isConditionalExpression(parent)) {
+      if (parent.condition === child) return undefined;
+    } else if (ts.isArrayLiteralExpression(parent)) {
+      if (template) return undefined;
+      inContainer = true;
+    } else if (ts.isPropertyAssignment(parent)) {
+      const name = nameText(ts, parent.name);
+      if (template || parent.initializer !== child || isKnobName(name)) return undefined;
+      if (name) keys.push(name);
+      inContainer = true;
+      // Up to the object literal holding this property.
+      parent = parent.parent;
+    } else if (ts.isJsxAttribute(parent)) {
+      return parent.initializer === child && isCopyAttribute(ts, parent) ? [attributeKey(ts, parent)] : undefined;
+    } else if (ts.isJsxExpression(parent)) {
+      if (inContainer) return undefined;
+      const holder = parent.parent;
+      if (ts.isJsxAttribute(holder)) return isCopyAttribute(ts, holder) ? [attributeKey(ts, holder)] : undefined;
+      if (ts.isJsxFragment(holder)) return ['text'];
+      return ts.isJsxElement(holder) && !CODE_ELEMENTS.has(tagNameOf(ts, holder) ?? '') ? ['text'] : undefined;
+    } else if (ts.isVariableDeclaration(parent)) {
+      const name = nameText(ts, parent.name);
+      if (!inContainer || parent.initializer !== child || isKnobName(name)) return undefined;
+      return name ? [...keys, name] : keys;
+    } else if (ts.isExportAssignment(parent)) {
+      return inContainer ? keys : undefined;
+    } else {
+      return undefined;
+    }
+    child = parent;
+    parent = parent.parent;
+  }
+  return undefined;
+}
+
+function isSignedNumber(ts: Ts, node: Node): boolean {
+  return (
+    ts.isPrefixUnaryExpression(node) &&
+    (node.operator === ts.SyntaxKind.MinusToken || node.operator === ts.SyntaxKind.PlusToken) &&
+    (ts.isNumericLiteral(node.operand) || ts.isBigIntLiteral(node.operand))
+  );
+}
+
+function isJsxNode(ts: Ts, node: Node): boolean {
+  return ts.isJsxElement(node) || ts.isJsxSelfClosingElement(node) || ts.isJsxFragment(node);
+}
+
+const CLOSERS = new Set(['}', ']', ')', '>']);
+
+/**
+ * The file as tokens, comments and whitespace dropped and content literals
+ * replaced by their kind, with the masked values alongside in order (`values`
+ * their text, `slots` where each sat too), and the source with its comments
+ * blanked out; or undefined when it does not parse.
+ */
+export async function contentMasked(
+  source: string,
+  fileName: string,
+): Promise<{ tokens: string[]; values: string[]; slots: MaskedValue[]; code: string } | undefined> {
+  const ts = await loadTypescript();
+  const kind = /\.tsx$/i.test(fileName) ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
+  const file: SourceFile = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true, kind);
+  // Not in the public typings, but set on every parsed file.
+  const diagnostics = (file as unknown as { parseDiagnostics?: unknown[] }).parseDiagnostics;
+  if (diagnostics && diagnostics.length > 0) return undefined;
+
+  const tokens: string[] = [];
+  const slots: MaskedValue[] = [];
+  const comments: Array<[number, number]> = [];
+  const mask = (token: string, value: MaskedValue) => {
+    tokens.push(token);
+    slots.push(value);
+  };
+  /** Whether a literal is an entry of an array itself, not a value in an object inside one. */
+  const inArray = (node: Node): boolean => {
+    let parent: Node | undefined = node.parent;
+    while (
+      parent &&
+      (ts.isParenthesizedExpression(parent) ||
+        ts.isAsExpression(parent) ||
+        ts.isSatisfiesExpression(parent) ||
+        ts.isConditionalExpression(parent) ||
+        ts.isPrefixUnaryExpression(parent))
+    ) {
+      parent = parent.parent;
+    }
+    return parent !== undefined && ts.isArrayLiteralExpression(parent);
+  };
+  /** Comments sit in the trivia before a token; JSX text has none of its own. */
+  const noteComments = (node: Node) => {
+    ts.forEachLeadingCommentRange(source, node.getFullStart(), (pos, end) => {
+      comments.push([pos, end]);
+    });
+  };
+  const visit = (node: Node): void => {
+    if (node.kind >= ts.SyntaxKind.FirstJSDocNode && node.kind <= ts.SyntaxKind.LastJSDocNode) return;
+    if (ts.isJsxText(node)) {
+      if (node.containsOnlyTriviaWhiteSpaces) return;
+      const text = node.text.replace(/\s+/g, ' ').trim();
+      // The body of a <script> or <style> is code, compared as written.
+      if (CODE_ELEMENTS.has(tagNameOf(ts, node.parent) ?? '')) tokens.push(text);
+      else mask('<text>', { keys: ['text'], kind: 'text', text });
+      return;
+    }
+    // What a formatter adds when a longer text no longer fits on one line:
+    // parentheses around JSX and `{' '}` between words and tags.
+    if (ts.isParenthesizedExpression(node) && isJsxNode(ts, node.expression)) {
+      noteComments(node);
+      visit(node.expression);
+      return;
+    }
+    if (
+      ts.isJsxExpression(node) &&
+      (ts.isJsxElement(node.parent) || ts.isJsxFragment(node.parent)) &&
+      node.expression &&
+      (ts.isStringLiteral(node.expression) || ts.isNoSubstitutionTemplateLiteral(node.expression)) &&
+      node.expression.text.trim() === ''
+    ) {
+      return;
+    }
+    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
+      const keys = isActiveUrl(node.text) ? undefined : contentKeys(ts, node);
+      if (keys) {
+        noteComments(node);
+        mask('<string>', { keys, kind: 'string', text: node.text, inArray: inArray(node) });
+        return;
+      }
+    } else if (ts.isNumericLiteral(node) || ts.isBigIntLiteral(node)) {
+      // A signed number is masked whole, as the unary expression.
+      const keys = isSignedNumber(ts, node.parent) ? undefined : contentKeys(ts, node);
+      if (keys) {
+        noteComments(node);
+        mask('<number>', { keys, kind: 'number', text: node.getText(file), inArray: inArray(node) });
+        return;
+      }
+    } else if (isSignedNumber(ts, node)) {
+      const keys = contentKeys(ts, node);
+      if (keys) {
+        noteComments(node);
+        mask('<number>', { keys, kind: 'number', text: node.getText(file), inArray: inArray(node) });
+        return;
+      }
+    } else if (ts.isTemplateExpression(node)) {
+      const keys = isActiveUrl(node.head.text) ? undefined : contentKeys(ts, node, true);
+      if (keys) {
+        noteComments(node);
+        // The text around each `${}` is content; the expressions are not. The
+        // pieces are kept apart by line breaks, which read as nothing.
+        const pieces = [node.head.text, ...node.templateSpans.map(span => span.literal.text)];
+        mask('<template>', { keys, kind: 'template', text: pieces.join('\n') });
+        for (const span of node.templateSpans) {
+          tokens.push('${');
+          visit(span.expression);
+          tokens.push('}');
+        }
+        tokens.push('</template>');
+        return;
+      }
+    }
+    const children = node.getChildren(file);
+    if (children.length === 0) {
+      noteComments(node);
+      if (node.kind !== ts.SyntaxKind.EndOfFileToken) tokens.push(node.getText(file));
+      return;
+    }
+    for (const childNode of children) visit(childNode);
+  };
+  visit(file);
+  let code = source;
+  for (const [pos, end] of comments) code = code.slice(0, pos) + ' '.repeat(end - pos) + code.slice(end);
+  return {
+    // A trailing comma, which a formatter adds when a list breaks over lines, changes nothing.
+    tokens: tokens.filter((token, index) => token !== ',' || !CLOSERS.has(tokens[index + 1] ?? '')),
+    values: slots.map(slot => slot.text),
+    slots,
+    code,
+  };
+}
+
+/** What the repo's policy adds to the check of a changed value. */
+export type ContentRules = Partial<Pick<ContentPolicy, 'lintForbidden' | 'assetHosts'>>;
+
+/**
+ * Whether two versions of a file differ only in content: the same program
+ * once content literals are masked, every changed value still reading as
+ * copy, in a file that renders no raw HTML and loads no scripts. Undefined
+ * when either version does not parse.
+ */
+export async function differsOnlyInContent(
+  base: string,
+  head: string,
+  fileName: string,
+  rules?: ContentRules,
+): Promise<boolean | undefined> {
+  const [before, after] = await Promise.all([contentMasked(base, fileName), contentMasked(head, fileName)]);
+  if (!before || !after) return undefined;
+  if (RAW_HTML_OR_SCRIPT.test(before.code) || RAW_HTML_OR_SCRIPT.test(after.code)) return false;
+  if (before.tokens.length !== after.tokens.length) return false;
+  if (!before.tokens.every((token, index) => token === after.tokens[index])) return false;
+  const resolved = { lintForbidden: rules?.lintForbidden ?? [], assetHosts: rules?.assetHosts ?? [] };
+  return before.slots.every((slot, index) => {
+    const next = after.slots[index];
+    return slot.text === next.text || changedValueProblem(slot, next, resolved) === undefined;
+  });
+}
+
+function encodePath(filePath: string): string {
+  return filePath.split('/').map(encodeURIComponent).join('/');
+}
+
+/** Reads whether a pull request is content-only under a repo's policy. Never throws. */
+export async function checkContentOnlyPr(params: {
+  owner: string;
+  repo: string;
+  number: number;
+  githubToken: string;
+  policy: ContentPolicy;
+  fetcher?: Fetcher;
+  /** Stops the reads: a cancelled run reads no more of GitHub. */
+  signal?: AbortSignal;
+}): Promise<ContentOnlyVerdict> {
+  const { owner, repo, number, githubToken, policy, signal } = params;
+  const fetcher = params.fetcher ?? fetch;
+  const api = `https://api.github.com/repos/${owner}/${repo}`;
+  const get = (url: string, accept = 'application/vnd.github+json') => {
+    if (signal?.aborted) throw new Error('cancelled');
+    const timeout = AbortSignal.timeout(15_000);
+    return fetcher(url, {
+      headers: { Accept: accept, Authorization: `Bearer ${githubToken}` },
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+    });
+  };
+  const unreadable = (reason: string, fileCount?: number): ContentOnlyVerdict => ({
+    contentOnly: false,
+    kind: 'unreadable',
+    reason,
+    ...(fileCount !== undefined ? { fileCount } : {}),
+  });
+
+  try {
+    const prResponse = await get(`${api}/pulls/${number}`);
+    if (!prResponse.ok) return unreadable(`GitHub answered ${prResponse.status} for the pull request.`);
+    const pr = (await prResponse.json()) as {
+      state?: string;
+      head?: { sha?: string };
+      base?: { ref?: string; repo?: { default_branch?: string } };
+    };
+    const headSha = pr.head?.sha;
+    const baseRef = pr.base?.ref;
+    const defaultBranch = pr.base?.repo?.default_branch;
+    if (pr.state !== 'open' || !headSha || !baseRef) return unreadable('The pull request is not open.');
+    if (!defaultBranch || baseRef !== defaultBranch) {
+      return {
+        contentOnly: false,
+        kind: 'not_default_base',
+        reason: `It merges into ${baseRef}, not the default branch ${defaultBranch ?? '(unknown)'}.`,
+      };
+    }
+
+    // The files and merge base of the exact commit that would be merged.
+    const compareResponse = await get(`${api}/compare/${encodePath(baseRef)}...${headSha}`);
+    if (!compareResponse.ok) return unreadable(`GitHub answered ${compareResponse.status} for the comparison.`);
+    const compare = (await compareResponse.json()) as {
+      merge_base_commit?: { sha?: string };
+      files?: Array<{ filename?: string; status?: string }>;
+    };
+    const mergeBase = compare.merge_base_commit?.sha;
+    const files = compare.files;
+    if (!mergeBase || !Array.isArray(files) || files.length === 0) return unreadable('GitHub gave no comparison.');
+    if (files.length > CONTENT_ONLY_MAX_FILES) {
+      return {
+        contentOnly: false,
+        kind: 'too_many_files',
+        reason: `It changes ${files.length >= COMPARE_FILE_CAP ? `${COMPARE_FILE_CAP} or more` : files.length} files.`,
+        fileCount: files.length,
+      };
+    }
+
+    const allowed = (filePath: string) => isContentPath(filePath, policy) || isNotePath(filePath, policy);
+    const misplaced = files
+      .filter(file => !file.filename || file.status !== 'modified' || !allowed(file.filename))
+      .map(file => file.filename ?? '(unnamed file)');
+    if (misplaced.length > 0) {
+      return {
+        contentOnly: false,
+        kind: 'not_content',
+        reason: 'It adds, removes or renames files, or changes files outside content.',
+        offending: misplaced,
+        fileCount: files.length,
+      };
+    }
+
+    const readAt = async (filePath: string, ref: string): Promise<string | undefined> => {
+      const response = await get(
+        `${api}/contents/${encodePath(filePath)}?ref=${ref}`,
+        'application/vnd.github.raw+json',
+      );
+      if (!response.ok) return undefined;
+      const text = await response.text();
+      return Buffer.byteLength(text) > MAX_FILE_BYTES ? undefined : text;
+    };
+
+    const changed: string[] = [];
+    const names = files.map(file => file.filename as string);
+    // Notes never reach the site, so only the code files are read.
+    for (const filePath of names.filter(name => !isNotePath(name, policy))) {
+      const [before, after] = await Promise.all([readAt(filePath, mergeBase), readAt(filePath, headSha)]);
+      if (before === undefined || after === undefined) {
+        return unreadable(`Couldn't read ${filePath} (missing, unreadable or too large).`, files.length);
+      }
+      const same = await differsOnlyInContent(before, after, filePath, policy);
+      if (same === undefined) return unreadable(`Couldn't parse ${filePath}.`, files.length);
+      if (!same) changed.push(filePath);
+    }
+    if (changed.length > 0) {
+      return {
+        contentOnly: false,
+        kind: 'not_content',
+        reason: 'It changes code, not only text, numbers or links.',
+        offending: changed,
+        fileCount: files.length,
+      };
+    }
+    return { contentOnly: true, files: names, headSha, baseRef };
+  } catch (error) {
+    if (signal?.aborted) return unreadable('The run was cancelled.');
+    return unreadable(`Couldn't read the diff: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
