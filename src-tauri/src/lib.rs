@@ -30,6 +30,7 @@ use uuid::Uuid;
 
 mod run_controls;
 mod slack;
+mod ux_metrics;
 
 const TRAY_ID: &str = "watchtower-tray";
 const TRAY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
@@ -591,6 +592,7 @@ pub fn run() {
             run_controls::cancel_started_run,
             get_job_cost_summary,
             get_performance_overview,
+            get_ux_metrics,
             list_dossiers,
             get_dossier,
             save_dossier_field,
@@ -809,6 +811,24 @@ async fn get_job_cost_summary(
     }
     summary.calls = calls;
     Ok(summary)
+}
+
+/// The UX metrics page (issue #711): the 7 days up to `until_iso` beside the
+/// 7 before, read-only.
+#[tauri::command]
+async fn get_ux_metrics(
+    until_iso: String,
+    state: State<'_, AppState>,
+) -> Result<ux_metrics::UxMetrics, String> {
+    let until = chrono::DateTime::parse_from_rfc3339(&until_iso)
+        .map_err(|err| format!("invalid until_iso: {err}"))?
+        .with_timezone(&Utc);
+    let connection = Connection::open_with_flags(
+        &*state.db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|err| format!("db open failed: {err}"))?;
+    ux_metrics::ux_metrics(&connection, until)
 }
 
 #[tauri::command]
