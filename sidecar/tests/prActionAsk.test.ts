@@ -38,7 +38,7 @@ describe('readPrActionAsk', () => {
     ['<@UBOT1> can you merge this PR please?', 'merge'],
     ['<@UBOT1> could u merge it', 'merge'],
     ['<@UBOT1> lgtm, squash and merge it', 'merge'],
-    ['<@UBOT1> go ahead and merge it into main, thanks!', 'merge'],
+    ['<@UBOT1> go ahead and merge it, thanks!', 'merge'],
     // #719: a short approval at the start, then exactly one of the gate's sentences.
     ['<@UBOT1> looks good on staging, merge it', 'merge'],
     ['<@UBOT1> perfect, go ahead and merge it', 'merge'],
@@ -163,6 +163,16 @@ describe('readPrActionAsk', () => {
     '<@UBOT1> merge main into the branch please',
   ])('reads %s as a sync', text => {
     expect(ask(text)).toEqual({ action: 'sync', pr: expect.objectContaining({ number: 1404 }) });
+  });
+
+  // #719 round 3: "merge it into main" runs unplanned only when main is the PR's base; the workflow checks.
+  it('marks the branch a "merge it into …" names', () => {
+    expect(ask('<@UBOT1> go ahead and merge it into main, thanks!')).toMatchObject({
+      action: 'merge',
+      intoBase: 'main',
+    });
+    expect(ask('<@UBOT1> merge it to master')).toMatchObject({ action: 'merge', intoBase: 'master' });
+    expect(ask('<@UBOT1> merge it')).not.toHaveProperty('intoBase');
   });
 
   // A rebase runs as a merge of the base branch: the router and planner read it, and it is confirmed.

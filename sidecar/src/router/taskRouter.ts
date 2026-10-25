@@ -291,9 +291,9 @@ export async function routeTask(params: {
    * miniOG, a DM, or the answer to miniOG's own question opens this.
    */
   const addressedToMiniog =
-    (task.event.text ?? '').includes(`<@${config.botUserId}`) ||
-    task.event.channelType === 'im' ||
-    Boolean(task.clarification);
+    Boolean(task.clarification) ||
+    (!task.resumedPausedJob &&
+      ((task.event.text ?? '').includes(`<@${config.botUserId}`) || task.event.channelType === 'im'));
   const prActionAsk =
     directAsk && !helpRequested && !stagingAsked && addressedToMiniog
       ? readPrActionAsk(task, { botUserId: config.botUserId, ownerUserIds: config.ownerSlackUserIds })
@@ -566,6 +566,20 @@ export async function routeTask(params: {
     resolvedIntent !== task.intent || toneMode !== task.toneMode || dossierRole !== task.dossierRole
       ? { ...task, intent: resolvedIntent, toneMode, dossierRole }
       : task;
+  // Only the gate's own decision lets the change workflow skip the planner and,
+  // for the owner, the confirmation (issue #719).
+  if (prActionAsk && resolvedIntent === 'IMPLEMENTATION') {
+    routedTask = {
+      ...routedTask,
+      prActionGate: {
+        action: prActionAsk.action,
+        pr: prActionAsk.pr,
+        ...(prActionAsk.intoBase ? { intoBase: prActionAsk.intoBase } : {}),
+      },
+    };
+  } else if (routedTask.prActionGate) {
+    routedTask = { ...routedTask, prActionGate: undefined };
+  }
 
   routerShadow?.compare({
     intent: resolvedIntent,

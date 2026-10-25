@@ -2376,6 +2376,8 @@ describe('a message that is only an operation on one pull request (issue #719)',
     expect(runImplementationWorkflow).toHaveBeenCalledOnce();
     expect(runImplementationWorkflow.mock.calls[0][0].task.intent).toBe('IMPLEMENTATION');
     expect(gate?.data).toMatchObject({ action: 'sync', prUrl: PR_URL });
+    // The gate's decision travels with the task: the workflow skips its planner only for this (#719).
+    expect(runImplementationWorkflow.mock.calls[0][0].task.prActionGate).toEqual({ action: 'sync', pr });
   });
 
   it.each([
@@ -2444,6 +2446,33 @@ describe('a message that is only an operation on one pull request (issue #719)',
     const { gate } = await route(prTask('go ahead and merge it', 'thread'));
     expect(gate).toBeUndefined();
     expect(runAgenticPrReview).toHaveBeenCalledOnce();
+  });
+
+  // #719 round 3: a resumed reply (intake marks it `mentionType: 'bot'`) never opens the gate,
+  // mention or not, unless it answers miniOG's own question; the change workflow it reaches
+  // gets no gate decision, so it plans and confirms. The router stub must not hide that.
+  it.each([
+    ['go ahead and merge it', 'C-BUILD'],
+    ['<@UBOT1> go ahead and merge it', 'C-BUILD'],
+    ['merge it', 'D-ADMIN'],
+  ])('hands no gate decision for the resumed reply %s', async (text, channelId) => {
+    routerPicks('IMPLEMENTATION');
+    const userId = channelId === 'D-ADMIN' ? 'UADMIN' : 'UBUILDER';
+    const { gate } = await route(prTask(text, 'thread', { resumedPausedJob: true }, userId, channelId));
+    expect(gate).toBeUndefined();
+    expect(runImplementationWorkflow).toHaveBeenCalledOnce();
+    expect(runImplementationWorkflow.mock.calls[0][0].task.prActionGate).toBeUndefined();
+  });
+
+  it("still opens for the requester's resumed answer to miniOG's question", async () => {
+    const { gate } = await route(
+      prTask('merge it', 'thread', {
+        resumedPausedJob: true,
+        clarification: { question: 'What do you need?', askedText: '' },
+      }),
+    );
+    expect(gate?.data).toMatchObject({ action: 'merge' });
+    expect(runImplementationWorkflow.mock.calls[0][0].task.prActionGate).toMatchObject({ action: 'merge' });
   });
 
   it.each([

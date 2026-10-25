@@ -10,6 +10,7 @@ import { DEPLOY_OFFER_LINE } from '../src/workflows/marketingDeployOffer.js';
 import { runCodex } from '../src/codex/runCodex.js';
 import { checkContentOnlyPr } from '../src/github/contentOnlyDiff.js';
 import { fetchChecksState, fetchMergeState, fetchUnresolvedReviewThreadCount } from '../src/github/prReviewComments.js';
+import { readPrActionAsk } from '../src/router/prActionAsk.js';
 
 // Issue #701: the owner decided that admins and builders may merge a
 // marketing PR that only changes content. "merge it" from one of them goes
@@ -137,8 +138,10 @@ async function run(text: string, options: RunOptions = {}) {
     prContext: pr,
     prContexts: [pr],
   };
+  // What the router hands the workflow: its gate's decision, for one of the gate's sentences (#719).
+  const gate = readPrActionAsk(task, { botUserId: 'UBOT1', ownerUserIds: ['UOWNER1'] });
   const result = await runImplementationWorkflow({
-    task,
+    task: gate ? { ...task, prActionGate: gate } : task,
     config: config as never,
     slack: slack as unknown as import('@slack/web-api').WebClient,
     logStep: entry => logs.push(entry),
@@ -553,6 +556,38 @@ describe('merging a content-only marketing PR (#701)', () => {
       `I read this as: merge ${MARKETING_PR}. It only changes text and numbers, so your word is enough. <@UBUILDER>, reply \`confirm merge\` within 10 minutes and I'll do it. Without that, nothing changes.`,
     );
     expect(ghExec).toHaveBeenCalledWith(mergeArgs('--admin'), 'ghs_test');
+  });
+
+  // #719 round 3: the confirmation can come ten minutes later; what merges is what was checked.
+  it('merges nothing when the PR changed while the requester was confirming', async () => {
+    const state = { reviewDecision: 'REVIEW_REQUIRED', mergeStateStatus: 'BLOCKED', isDraft: false, baseRef: 'main' };
+    // Checked at abc123 (read, then re-read before deciding); pushed to def456 by the time of the confirmation.
+    vi.mocked(fetchMergeState)
+      .mockResolvedValueOnce({ ...state, headSha: 'abc123' })
+      .mockResolvedValueOnce({ ...state, headSha: 'abc123' })
+      .mockResolvedValue({ ...state, headSha: 'def456' });
+    vi.mocked(checkContentOnlyPr)
+      .mockResolvedValueOnce({
+        contentOnly: true,
+        files: ['src/features/x/content.ts'],
+        headSha: 'abc123',
+        baseRef: 'main',
+      })
+      .mockResolvedValueOnce({
+        contentOnly: true,
+        files: ['src/features/x/content.ts'],
+        headSha: 'def456',
+        baseRef: 'main',
+      });
+
+    const { posted, result } = await run('<@UBOT1> merge it, the copy got approved by marketing');
+
+    expect(__quickActionConfirm.wait).toHaveBeenCalledOnce();
+    expect(ghExec).not.toHaveBeenCalled();
+    expect(result.status).toBe('SKIPPED');
+    expect(posted).toContainEqual(
+      `${MARKETING_PR} changed while I waited for your confirmation: someone pushed to it, so I haven't merged it. Ask again and I'll check it afresh.`,
+    );
   });
 
   it('merges nothing once the run is cancelled, and hands the check the signal', async () => {

@@ -48,10 +48,11 @@ const GATE_OBJECT =
   '(?:it|this|this pr|the pr|that pr|this pull request|the pull request|that pull request|(?:pr |pull request )?#?(\\d+))';
 const GATE_BRANCH = '(?:(?:the|this|its) branch|branch|(?:the|this|that) (?:pr|prs|pull request) branch)';
 const GATE_BASE = '(?:master|main)';
-const GATE_TEMPLATES: Array<{ re: RegExp; action?: PrActionVerb }> = [
+const GATE_TEMPLATES: Array<{ re: RegExp; action?: PrActionVerb; intoBase?: true }> = [
   // "merge it", "close this pr", "sync 1404"; the verb is the action.
   { re: new RegExp(`^(merge|close|sync)(?: ${GATE_OBJECT})?$`) },
-  { re: new RegExp(`^merge(?: ${GATE_OBJECT})? (?:into|to) ${GATE_BASE}$`), action: 'merge' },
+  // Only when that is the PR's base branch: the change workflow checks it on GitHub.
+  { re: new RegExp(`^merge(?: ${GATE_OBJECT})? (?:into|to) ${GATE_BASE}$`), action: 'merge', intoBase: true },
   { re: new RegExp(`^squash and merge(?: ${GATE_OBJECT})?$`), action: 'merge' },
   // The sync sentences: always the pull request or its branch, and its base branch.
   {
@@ -91,7 +92,7 @@ const GATE_REFUSES = [
   /[^\P{L}a-zA-Z]/u,
 ];
 
-export type PrActionAsk = { action: PrActionVerb; pr: PrContext };
+export type PrActionAsk = { action: PrActionVerb; pr: PrContext; intoBase?: 'master' | 'main' };
 
 /** Who the message may mention: miniOG, and the owner when tagging the owner is how the ask reached it. */
 export type PrActionAddressees = { botUserId: string; ownerUserIds: string[] };
@@ -132,7 +133,8 @@ export function readPrActionAsk(task: AskTask, addressees: PrActionAddressees): 
     const action = template.action ?? (match[1] as PrActionVerb);
     const number = match.slice(1).find(group => group !== undefined && /^\d+$/.test(group));
     const pr = targetPr(task, number === undefined ? undefined : Number(number));
-    return pr ? { action, pr } : undefined;
+    if (!pr) return undefined;
+    return template.intoBase ? { action, pr, intoBase: core.endsWith('main') ? 'main' : 'master' } : { action, pr };
   }
   return undefined;
 }

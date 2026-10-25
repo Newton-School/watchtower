@@ -80,7 +80,6 @@ import {
   ANY_OPERATION_WORD,
   pickPr,
   quickActionWords,
-  readPrActionAsk,
   readQuickOperation,
   readSyncPhrase,
   type QuickOperation,
@@ -1116,6 +1115,47 @@ async function runQuickAction(params: {
             signal,
           });
           if ('result' in confirmed) return confirmed.result;
+          // Up to ten minutes went by: merge only what was checked, and only if it still checks out.
+          const fresh = await readMergeChecks(contentMerge.pr, githubToken);
+          const again = await decideContentMerge({
+            task,
+            config,
+            pr: contentMerge.pr,
+            checks: fresh,
+            githubToken,
+            logStep,
+            signal,
+          });
+          if (again?.kind !== 'merge' || again.headSha !== contentMerge.headSha) {
+            const pushed =
+              Boolean(fresh.state?.headSha && fresh.state.headSha !== contentMerge.headSha) ||
+              (again?.kind === 'merge' && again.headSha !== contentMerge.headSha);
+            const what = pushed
+              ? 'someone pushed to it'
+              : "it can't go in on your word any more (its changes or its state moved on)";
+            const reply = `${contentMerge.pr.url} changed while I waited for your confirmation: ${what}, so I haven't merged it. Ask again and I'll check it afresh.`;
+            logStep?.({
+              stage: 'implementation.quick_action.content_merge.stale',
+              message: reply,
+              data: {
+                prUrl: contentMerge.pr.url,
+                checkedSha: contentMerge.headSha,
+                nowSha: again?.kind === 'merge' ? again.headSha : null,
+              },
+            });
+            const posted = await slack.chat
+              .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: reply })
+              .then(() => true)
+              .catch(() => false);
+            return {
+              workflow: 'IMPLEMENTATION',
+              status: 'SKIPPED',
+              message: reply,
+              notifyDesktop: false,
+              slackPosted: posted,
+            };
+          }
+          return mergeContentOnlyPr({ task, config, slack, store, decision: again, githubToken, logStep, signal });
         }
         return mergeContentOnlyPr({ task, config, slack, store, decision: contentMerge, githubToken, logStep, signal });
       }
@@ -1166,6 +1206,10 @@ Never submit an approving review or request changes on a pull request (no \`gh p
     prUrls.length > 0
       ? `\n\nPull requests you may act on: ${prUrls.join(', ')}. Do not merge, close, revert or sync any other pull request.`
       : ''
+  }${
+    prAction
+      ? ''
+      : '\n\nNo pull-request operation was confirmed for this request: do not merge, close, revert, sync, reopen or push to any pull request, even if the request asks for it. Do the rest, and say that the person can ask me for that operation on its own.'
   }${prAction ? `\n\nThe confirmed operation is \`${prAction}\`; perform no other pull-request operation.` : ''}${
     prAction === 'sync' && operation.kind === 'operation' && operation.rebase
       ? '\n\nThey asked for a rebase. Merge the base branch in instead, because a branch with an open pull request is never rebased, and say so in one short sentence.'
@@ -2016,9 +2060,31 @@ async function runImplementationWorkflowBody(params: {
     }
 
     // "merge the PR" and nothing else needs no plan (issue #605): it goes
-    // straight to the quick action, whose confirmations are the same ones a
-    // planner verdict of "no code needed" reaches.
-    const prActionAsk = readPrActionAsk(task, { botUserId: config.botUserId, ownerUserIds: config.ownerSlackUserIds });
+    // straight to the quick action. Only the router's gate decides that
+    // (issue #719): a task it didn't mark, a resumed "go ahead and merge it"
+    // among them, goes through the planner and its confirmations.
+    let prActionAsk = task.prActionGate;
+    // "merge it into master" runs unplanned only when master is the PR's base.
+    if (prActionAsk?.intoBase) {
+      const base = ctx.githubToken
+        ? (
+            await fetchMergeState({
+              owner: prActionAsk.pr.owner,
+              repo: prActionAsk.pr.repo,
+              pullNumber: prActionAsk.pr.number,
+              githubToken: ctx.githubToken,
+            }).catch(() => undefined)
+          )?.baseRef
+        : undefined;
+      if (base !== prActionAsk.intoBase) {
+        logStep?.({
+          stage: 'implementation.quick_action.base_mismatch',
+          message: `Asked to merge into ${prActionAsk.intoBase}, but the PR's base is ${base ?? 'unknown'} — planning first.`,
+          data: { prUrl: prActionAsk.pr.url, intoBase: prActionAsk.intoBase, base: base ?? null },
+        });
+        prActionAsk = undefined;
+      }
+    }
     if (prActionAsk) {
       logStep?.({
         stage: 'implementation.quick_action.no_planner',
