@@ -706,6 +706,22 @@ describe('the deploy offer after a merge (#703)', () => {
     expect(result).toMatchObject({ status: 'FAILED' });
   });
 
+  it('keeps a failed agent run failed when GitHub shows the merge anyway', async () => {
+    vi.mocked(runCodex).mockResolvedValue({ ok: false, exitCode: 1, parsedJson: { summary: 'Crashed.' } } as never);
+    offerMock.mockResolvedValue({
+      status: 'SUCCESS',
+      message: 'Merged. Already live.',
+      notifyDesktop: false,
+      slackPosted: false,
+    });
+
+    const { result } = await run('<@UBOT1> merge it', { byOwner: true });
+
+    expect(offerMock).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ status: 'FAILED', notifyDesktop: true, slackPosted: false });
+    expect(result.message).toContain('Merged. Already live.');
+  });
+
   it("follows the owner's own merge by the agent", async () => {
     await run('<@UBOT1> merge it', { byOwner: true });
 

@@ -438,15 +438,60 @@ async function runMarketingDeploy(params: {
   if (notConfirmed) return notConfirmed;
   if (isDeployDryRun(store)) return reportDryRun({ task, slack, targetLabel: 'newton-marketing-web', logStep });
 
-  const done = await dispatchMarketingProdDeploy({
-    repoPath,
-    slack,
-    channelId: task.event.channelId,
-    threadTs: task.event.threadTs,
-    logStep,
-    signal,
-  });
+  const done = await oneMarketingProdDeployAtATime(
+    () =>
+      dispatchMarketingProdDeploy({
+        repoPath,
+        slack,
+        channelId: task.event.channelId,
+        threadTs: task.event.threadTs,
+        logStep,
+        signal,
+      }),
+    () =>
+      postDeployReplyBestEffort({
+        slack,
+        channelId: task.event.channelId,
+        threadTs: task.event.threadTs,
+        text: MARKETING_PROD_DEPLOY_QUEUED,
+        logStep,
+      }),
+  );
   return { workflow: 'DEPLOY', ...done };
+}
+
+/** Said when a marketing prod deploy waits for another one to finish first. */
+export const MARKETING_PROD_DEPLOY_QUEUED =
+  "Another production deploy of the marketing site is running, so I'll start once it's done.";
+
+let marketingProdTail: Promise<void> = Promise.resolve();
+let marketingProdPending = 0;
+
+/**
+ * One marketing production deploy at a time in this process (issue #703):
+ * two taps in two threads, or a tap and a deploy ask, must not both
+ * dispatch. A later one waits for the earlier to finish, in order; `onWait`
+ * runs when it has to wait.
+ */
+export async function oneMarketingProdDeployAtATime<T>(
+  run: () => Promise<T>,
+  onWait?: () => Promise<unknown> | void,
+): Promise<T> {
+  const previous = marketingProdTail;
+  let release!: () => void;
+  marketingProdTail = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  const mustWait = marketingProdPending > 0;
+  marketingProdPending += 1;
+  try {
+    if (mustWait) await onWait?.();
+    await previous;
+    return await run();
+  } finally {
+    marketingProdPending -= 1;
+    release();
+  }
 }
 
 /**

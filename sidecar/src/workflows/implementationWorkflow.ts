@@ -1085,7 +1085,15 @@ Write your response as a ready-to-post Slack message describing what you did.
         })
       : undefined;
   if (offered) {
-    return { workflow: 'IMPLEMENTATION', ...offered, message: `${reply}\n${offered.message}`, slackPosted: true };
+    // The agent's own failure stays the run's outcome: the offer only adds to it.
+    const failed = !quickResult.ok && offered.status !== 'CANCELLED';
+    return {
+      workflow: 'IMPLEMENTATION',
+      ...offered,
+      status: failed ? 'FAILED' : offered.status,
+      notifyDesktop: failed || offered.notifyDesktop,
+      message: `${reply}\n${offered.message}`,
+    };
   }
 
   return {

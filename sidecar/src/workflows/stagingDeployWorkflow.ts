@@ -732,9 +732,16 @@ export async function putMainBackOnStagingAfterMerge(params: {
       logStep,
       stagePrefix: 'staging.restore',
     });
-    // Stopped: the stop says so itself.
-    if (outcome.kind === 'stopped' || signal?.aborted) {
-      logStep?.({ stage: 'staging.restore.stopped', message: `Stopped while putting main back (${outcome.kind}).` });
+    const record: StagingRecord = { branch: 'main', channelId, channelType, threadTs, atMs: __stagingDeps.now() };
+    // Stopped: the stop says so itself. Once dispatched, main will most likely
+    // land, so the record says so.
+    if (outcome.kind === 'stopped') {
+      logStep?.({ stage: 'staging.restore.stopped', message: 'Stopped before main went back on staging.' });
+      return;
+    }
+    if (signal?.aborted && outcome.kind !== 'dispatch_failed') {
+      logStep?.({ stage: 'staging.restore.stopped', message: `Stopped after main was dispatched (${outcome.kind}).` });
+      await noteStagingDeploy({ store, slack, repoPath, next: record, headsUp: false, logStep });
       return;
     }
     if (outcome.kind === 'dispatch_failed') {
@@ -750,15 +757,9 @@ export async function putMainBackOnStagingAfterMerge(params: {
     const runId = 'id' in outcome ? outcome.id : undefined;
     const url = 'url' in outcome ? outcome.url : undefined;
     // A deploy that failed or was cancelled left staging as it was; one still going will most likely land.
+    // What it replaced is the merged branch: its thread needs no heads-up (it is told here, or it is done).
     if (outcome.kind !== 'completed' || wentUp) {
-      await noteStagingDeploy({
-        store,
-        slack,
-        repoPath,
-        next: { branch: 'main', channelId, channelType, threadTs, atMs: __stagingDeps.now() },
-        runId: wentUp ? runId : undefined,
-        logStep,
-      });
+      await noteStagingDeploy({ store, slack, repoPath, next: record, headsUp: false, logStep });
     }
     const runLink = url ? ` Run: ${url}` : '';
     const msg = wentUp
@@ -805,6 +806,8 @@ async function noteStagingDeploy(params: {
   next: StagingRecord;
   /** The run that put `next` on staging; without it nobody is told. */
   runId?: number;
+  /** False: record it, tell nobody (main going back after a merge, issue #703). */
+  headsUp?: boolean;
   logStep?: WorkflowStepLogger;
 }): Promise<void> {
   const { store, slack, repoPath, next, runId, logStep } = params;
@@ -819,7 +822,7 @@ async function noteStagingDeploy(params: {
       message: `Couldn't record the deploy: ${String(error)}`,
     });
   }
-  if (runId === undefined) return;
+  if (runId === undefined || params.headsUp === false) return;
   const headsUp = stagingHeadsUp({ previous, next, nowMs: next.atMs });
   if (!headsUp || !previous) return;
 

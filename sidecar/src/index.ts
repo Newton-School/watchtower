@@ -53,6 +53,8 @@ import { fetchThreadContext } from './slack/threadContext.js';
 import { createThreadStatus, type ThreadStatus } from './slack/threadStatus.js';
 import { isOlderVersion, readSidecarBuild } from './runtime/buildInfo.js';
 import { recoveryFor } from './runtime/restartRecovery.js';
+import { holdBusyThreadMessage, takeThreadReplays, THREAD_REPLAY_EVENT_PREFIX } from './runtime/busyThreadMessages.js';
+import { closeDeployOfferAfterRestart } from './workflows/marketingDeployOffer.js';
 import { connectorAlertText, connectorsToAlert, onConnectorStatuses } from './runtime/connectorAlerts.js';
 import { acquireInstanceLock, instanceLockPath, releaseInstanceLock } from './runtime/instanceLock.js';
 import {
@@ -861,6 +863,9 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
       return;
     }
     store.recordEvent(event.eventId, event.channelId, event.threadTs);
+    // Kept for a while: a run that holds the thread only to wait (the deploy
+    // offer, issue #703) can ask for it to run once the thread is free.
+    if (!event.launchpadRequestId) holdBusyThreadMessage(event, client);
     logger.info(
       {
         eventId: event.eventId,
@@ -1439,6 +1444,20 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
         });
         unregisterActiveJob(jobId);
 
+        // A message the run asked to pick up once the thread is free (issue
+        // #703): it came in while the run held the thread, and started nothing.
+        for (const replay of takeThreadReplays(event.channelId, event.threadTs)) {
+          const replayed = { ...replay.event, eventId: `${THREAD_REPLAY_EVENT_PREFIX}${replay.event.eventId}` };
+          logStep({
+            stage: 'job.thread_replay',
+            message: 'Picking up a message that came in while this run held the thread.',
+            data: { eventTs: replay.event.eventTs, userId: replay.event.userId },
+          });
+          void enqueueSlackEvent(replayed, replay.client, 'catchup').catch(err =>
+            logger.warn({ jobId, err: String(err) }, 'could not pick up a message held for a busy thread'),
+          );
+        }
+
         // Swap :eyes: for outcome reaction. PAUSED gets a distinct emoji so a
         // glance at the thread tells you "parked, mention me to resume" rather
         // than the misleading :x: it used to share with cancelled/failed jobs.
@@ -1781,7 +1800,15 @@ async function main(): Promise<void> {
   if (lostAtRestart.length > 0 && config.slackBotToken) {
     const noticeClient = new WebClient(config.slackBotToken);
     for (const job of lostAtRestart) {
-      const { notice, kind, requeue } = job.recovery;
+      const { notice, kind, requeue, closeDeployOffer } = job.recovery;
+      // The offer's message would still read as open: it is closed now (issue #703).
+      if (closeDeployOffer) {
+        void closeDeployOfferAfterRestart(noticeClient, {
+          channelId: job.channelId,
+          threadTs: job.threadTs,
+          promptTs: closeDeployOffer.promptTs,
+        });
+      }
       void noticeClient.chat
         .postMessage({ channel: job.channelId, thread_ts: job.threadTs, text: notice })
         .then(() =>

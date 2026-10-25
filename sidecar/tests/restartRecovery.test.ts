@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { recoveryFor, RESTART_EVENT_PREFIX, type LostJob } from '../src/runtime/restartRecovery.js';
+import { DEPLOY_OFFER_RESTART_NOTICE } from '../src/runtime/restartNotice.js';
 
 // Issue #589: a PR review lost to a restart said nothing; its author told the
 // admins they were still waiting. A plan held for 14 hours was dropped.
@@ -62,5 +63,45 @@ describe('a job lost to a restart', () => {
 
   it('cannot re-run a review whose request was not recorded', () => {
     expect(recoveryFor({ ...review, text: undefined }).kind).toBe('lost');
+  });
+});
+
+describe('a deploy offer lost to a restart (#703)', () => {
+  const offerJob: LostJob = {
+    id: 'job-offer',
+    channelId: 'C1',
+    threadTs: '400.1',
+    requestedBy: 'UBUILDER',
+    workflow: 'IMPLEMENTATION',
+    // The offer goes on logging while it waits: staging went back to main after it went up.
+    lastStage: 'staging.restore.done',
+    openWait: { kind: 'confirm', promptTs: '500.1', expects: 'deploy it' },
+  };
+
+  it('is found from its open wait, whatever it logged last, says the offer is closed, and closes its message', () => {
+    const recovery = recoveryFor(offerJob);
+
+    expect(recovery.kind).toBe('waiting');
+    expect(recovery.notice).toBe(DEPLOY_OFFER_RESTART_NOTICE);
+    expect(recovery.notice).toContain('nothing was deployed');
+    expect(recovery.closeDeployOffer).toEqual({ promptTs: '500.1' });
+  });
+
+  it('is found from its waiting stage when the open wait was not recorded', () => {
+    const recovery = recoveryFor({ ...offerJob, openWait: undefined, lastStage: 'deploy_offer.waiting' });
+
+    expect(recovery.notice).toBe(DEPLOY_OFFER_RESTART_NOTICE);
+    expect(recovery.closeDeployOffer).toBeUndefined();
+  });
+
+  it('leaves other confirmations as they were', () => {
+    const recovery = recoveryFor({
+      ...offerJob,
+      lastStage: 'deploy.confirm.waiting',
+      openWait: { kind: 'confirm', promptTs: '500.1', expects: 'confirm deploy' },
+    });
+
+    expect(recovery.notice).toContain('waiting for a confirmation');
+    expect(recovery.closeDeployOffer).toBeUndefined();
   });
 });
