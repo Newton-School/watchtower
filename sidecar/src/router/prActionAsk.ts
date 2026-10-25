@@ -246,15 +246,60 @@ const REBASE_PHRASES = [
   new RegExp(`\\brebase${PHRASE_END}`, 'g'),
 ];
 /**
- * "don't", "won't", "no rush", "never", "merge mat karo", "merge na karo": with
- * a negation anywhere, the words name no operation. Contractions are spelled
- * out because a bare "nt" ending would also catch "comment" and "content".
+ * "don't", "won't", "never", "no need to", "cancel": a negation blocks the
+ * operation only when it governs the verb, with nothing but small words
+ * between ("do not merge it", "no need to close"). "We don't need this
+ * anymore, close it" and "it doesn't work, close it" negate something else.
+ * Contractions are spelled out because a bare "nt" ending would also catch
+ * "comment" and "content". Every merge, close or revert this reads is still
+ * confirmed (#719), so this is a net for the obvious cases, not the guard.
  */
-const NEGATION =
-  /\b(?:(?:do|does|did|wo|ca|should|would|could|is|are|was|were|has|have|had|must|need)nt|do not|donot|dnt|never|not|no|nope|nah|without|hold|wait|stop|avoid|rather|instead|cancel|skip|abort|mat|mt|na|nhi|nai|nahi|nahin)\b/;
-/** "merge it after QA", "close it if it's stale", "merge it tomorrow": a condition is not an order now. */
-const CONDITION =
-  /\b(?:later|yet|until|till|after|once|if|unless|before|when|whenever|tomorrow|tonight|eod|baad|pehle|kal|ruk|ruko)\b/;
+const NEGATION_WORD =
+  /^(?:(?:do|does|did|wo|ca|should|would|could|is|are|was|were|has|have|had|must|need)nt|dnt|donot|never|not|no|nope|nah|without|hold|wait|stop|avoid|cancel|skip|abort)$/;
+/** Words that may stand between a negation and the verb it governs. */
+const NEGATION_LINKS = new Set([
+  'to',
+  'the',
+  'it',
+  'this',
+  'that',
+  'pr',
+  'please',
+  'pls',
+  'just',
+  'yet',
+  'need',
+  'needs',
+  'you',
+  'u',
+  'we',
+  'i',
+  'really',
+  'even',
+  'ever',
+  'be',
+  'get',
+  'go',
+  'ahead',
+  'and',
+  'dare',
+  'gonna',
+  'going',
+  'want',
+  'wanna',
+  'do',
+  'a',
+  'off',
+  'on',
+]);
+/** Hinglish puts the negation after the verb: "merge mat karo", "close na karo", "merge nahi". */
+const HINGLISH_NEGATION = /^(?:mat|mt|na|nhi|nai|nahi|nahin)$/;
+const HINGLISH_LINKS = new Set(['kar', 'karo', 'karna', 'krna', 'kro', 'do', 'ye', 'isko', 'abhi', 'ko', 'se']);
+/** "merge it after QA", "close it if it's stale", "once approved, merge": a condition near the verb is not an order now. */
+const CONDITION_WORD =
+  /^(?:later|yet|until|till|after|once|if|unless|before|when|whenever|tomorrow|tonight|eod|baad|pehle|kal|ruk|ruko)$/;
+/** How far from the verb a negation, condition or reporting subject still governs it. */
+const GOVERNING_WINDOW = 3;
 /** "close it, it's not needed" negates the PR, not the verb. */
 const NOT_NEEDED = /\b(?:(?:it is|its|is|isnt|is not) )?(?:not|no longer) needed(?: anymore)?\b/g;
 /** Nouns, not orders: "the merge request looks good", "fix the merge conflict", "thanks for the merge". */
@@ -265,10 +310,10 @@ const OPERATION_NOUNS = [
 ];
 /** "is it safe to merge", "should I merge it", "what does close do": a question, with or without the mark. */
 const QUESTION_START =
-  /^(?:is|are|was|were|should|can we|could we|what|why|how|when|where|does|do|did|has|have|which|who)\b/;
+  /^(?:is|are|was|were|should|can we|could we|what|why|how|when|where|does|do(?! not\b)|did|has|have|which|who)\b/;
 /** "I'll merge it myself", "Shiv said merge it", "someone should merge it": a report, not an order to miniOG. */
 const REPORT_SUBJECT =
-  /\b(?:i|ill|im|ive|we|well|he|she|they|someone|somebody|let me|said|says|asked|will|should|would|wants|wanted)\b/;
+  /\b(?:i|ill|im|ive|we|well|he|she|they|someone|somebody|let me|said|says|asked|will|should|would|youd|wants|wanted)\b/;
 /** "> merge it", "\"merge it\" is what the bot said": quoted words are someone else's. */
 const QUOTED = /&gt;|^\s*>|["“”]/;
 
@@ -282,16 +327,25 @@ export interface SyncPhrase {
 
 /**
  * Reads "bring it up to date with master", "update the branch", "merge main
- * into it", "catch up with master" and "rebase on master" as a sync. Anything
- * with a negation is left as it is: "don't rebase, merge it" is not a sync.
+ * into it", "catch up with master" and "rebase on master" as a sync. A phrase
+ * a negation governs is left as it is: "don't merge master into it" is no sync.
  */
 export function readSyncPhrase(text: string): SyncPhrase {
   const normalized = normalizeControlText(prPlaceholders(text));
-  if (NEGATION.test(normalized)) return { text: normalized, sync: false, rebase: false };
+  // A phrase a negation governs stays as it is: "don't merge master into it" is no sync.
+  const unlessNegated = (...args: unknown[]): string => {
+    const [phrase, offset, whole] = [
+      args[0] as string,
+      args[args.length - 2] as number,
+      args[args.length - 1] as string,
+    ];
+    const before = whole.slice(0, offset).trim().split(' ').filter(Boolean);
+    return negationGoverns([...before, 'sync'], before.length) ? phrase : 'sync it';
+  };
   let rewritten = normalized;
-  for (const phrase of SYNC_PHRASES) rewritten = rewritten.replace(phrase, 'sync it');
+  for (const phrase of SYNC_PHRASES) rewritten = rewritten.replace(phrase, unlessNegated);
   const beforeRebase = rewritten;
-  for (const phrase of REBASE_PHRASES) rewritten = rewritten.replace(phrase, 'sync it');
+  for (const phrase of REBASE_PHRASES) rewritten = rewritten.replace(phrase, unlessNegated);
   const rebase = rewritten !== beforeRebase;
   return { text: rewritten, sync: rewritten !== normalized, rebase };
 }
@@ -369,13 +423,14 @@ export function readQuickOperation(words: string): QuickOperation {
   if ((QUESTION_MARK.test(kept) || QUESTION_START.test(plain)) && !REQUEST_QUESTION.test(plain)) {
     return { kind: 'question' };
   }
-  if (NEGATION.test(plain)) return { kind: 'unclear', reason: 'negation' };
-  if (CONDITION.test(plain)) return { kind: 'unclear', reason: 'condition' };
+  const tokens = plain.split(' ');
+  const verbIndex = tokens.findIndex(token => OPERATION_WORD.test(token));
+  if (negationGoverns(tokens, verbIndex)) return { kind: 'unclear', reason: 'negation' };
+  if (conditionGoverns(tokens, verbIndex)) return { kind: 'unclear', reason: 'condition' };
   if (named.size > 1) return { kind: 'unclear', reason: 'several' };
   const verbAt = plain.search(OPERATION_WORD);
-  if (REPORT_SUBJECT.test(plain.slice(0, verbAt).replace(REQUEST_QUESTION, ' '))) {
-    return { kind: 'unclear', reason: 'report' };
-  }
+  const leadIn = tokens.slice(Math.max(0, verbIndex - GOVERNING_WINDOW), verbIndex).join(' ');
+  if (REPORT_SUBJECT.test(leadIn.replace(REQUEST_QUESTION, ' '))) return { kind: 'unclear', reason: 'report' };
   if (named.has('merge')) {
     const fromMerge = plain.slice(plain.search(/\bmerge\b/)).trim();
     const ofThePr = MERGE_OF_THE_PR.test(fromMerge) && !BASE_WORDS.test(plain.slice(0, verbAt));
@@ -390,6 +445,25 @@ export function readQuickOperation(words: string): QuickOperation {
     }
   }
   return { kind: 'operation', action: [...named][0], rebase: sync.rebase };
+}
+
+/** A negation right before the verb with only small words between, or Hinglish's right after it. */
+function negationGoverns(tokens: string[], verbIndex: number): boolean {
+  for (let i = verbIndex - 1; i >= Math.max(0, verbIndex - GOVERNING_WINDOW - 1); i--) {
+    if (NEGATION_WORD.test(tokens[i])) return true;
+    if (!NEGATION_LINKS.has(tokens[i])) break;
+  }
+  for (let i = verbIndex + 1; i <= Math.min(tokens.length - 1, verbIndex + GOVERNING_WINDOW); i++) {
+    if (HINGLISH_NEGATION.test(tokens[i])) return true;
+    if (!HINGLISH_LINKS.has(tokens[i])) break;
+  }
+  return false;
+}
+
+/** A condition within a few words of the verb, on either side. */
+function conditionGoverns(tokens: string[], verbIndex: number): boolean {
+  const near = tokens.slice(Math.max(0, verbIndex - GOVERNING_WINDOW), verbIndex + GOVERNING_WINDOW + 1);
+  return near.some(token => CONDITION_WORD.test(token));
 }
 
 /** Words that name a pull-request operation in any form: the agent never runs one that wasn't confirmed. */

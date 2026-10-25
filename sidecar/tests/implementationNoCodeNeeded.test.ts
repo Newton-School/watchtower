@@ -1116,6 +1116,8 @@ describe('implementationWorkflow — words inside links are not the operation (#
     `<@UBOT1> merge origin/master into <${PR_URL}|newton-web#9300>, see ${ISSUE_LINK}`,
     `<@UBOT1> merge master to <${PR_URL}>, see ${ISSUE_LINK}`,
     `<@UBOT1> update the branch of <${PR_URL}> with master, see ${ISSUE_LINK}`,
+    // The negation is about the hurry, not the merge (fix/quick-op-negation-scope).
+    `<@UBOT1> no rush, merge master into it, see ${ISSUE_LINK}`,
   ])('syncs, never merges, for the owner: %s', async text => {
     const { posted } = await run(text, { withPr: true, byOwner: true });
     const agentPrompts = vi
@@ -1131,7 +1133,6 @@ describe('implementationWorkflow — words inside links are not the operation (#
     `<@UBOT1> merge main, see ${ISSUE_LINK}`,
     `<@UBOT1> merge it with master, see ${ISSUE_LINK}`,
     `<@UBOT1> don't merge it, just bring it up to date with master, see ${ISSUE_LINK}`,
-    `<@UBOT1> no rush, merge master into it, see ${ISSUE_LINK}`,
     `<@UBOT1> master ko merge mat karo, see ${ISSUE_LINK}`,
     `<@UBOT1> sync it and merge it, see ${ISSUE_LINK}`,
   ])('asks which operation, and runs nothing, for the owner: %s', async text => {
@@ -1140,6 +1141,21 @@ describe('implementationWorkflow — words inside links are not the operation (#
     expect(result.status).toBe('SKIPPED');
     expect(posted.some(text => text.includes("I wasn't sure what to do with"))).toBe(true);
     expect(posted.some(text => /unresolved review comment/.test(text))).toBe(false);
+  });
+
+  // Live test on 0.6.185: the owner's polite close was asked about ("I wasn't sure…")
+  // because a negation elsewhere in it counted. It now reaches the owner's `confirm close`,
+  // which says there is no plan, since the opening line promised one.
+  it('confirms a polite close whose negation is about something else', async () => {
+    const { posted } = await run(
+      `<@UBOT1> thanks. We don't need this one anymore, the change went in another way. Please close the PR. ${ISSUE_LINK}`,
+      { withPr: true, byOwner: true },
+    );
+    expect(__quickActionConfirm.wait).toHaveBeenCalledWith(expect.objectContaining({ phrase: 'confirm close' }));
+    expect(posted).toContainEqual(
+      `No code change is needed, so there is no plan to approve. <@UOWNER1> asked me to close ${PR_URL}. <@UOWNER1>, reply \`confirm close\` within 10 minutes and I'll do it. Without that, nothing changes.`,
+    );
+    expect(posted.some(text => text.includes("I wasn't sure"))).toBe(false);
   });
 
   // #719 round 2: after a planner, a merge, close or revert is always confirmed,
