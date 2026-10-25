@@ -364,14 +364,22 @@ async function fetchOrigin(repoPath: string, retryMs: number): Promise<boolean> 
       await git(['fetch', 'origin', '--quiet'], { cwd: repoPath, timeoutMs: 30_000 });
       return true;
     } catch (error) {
-      if (attempt === 1) {
+      // No retry for a path that isn't a git checkout at all: that won't change in a second.
+      const worthRetrying =
+        attempt === 0 &&
+        fs.existsSync(repoPath) &&
+        (await git(['rev-parse', '--git-dir'], { cwd: repoPath, timeoutMs: 10_000 }).then(
+          () => true,
+          () => false,
+        ));
+      if (!worthRetrying) {
         logger.warn(
           { repoPath, error: String(error) },
           'git fetch failed before agent read; answering against local repo state',
         );
-      } else {
-        await new Promise(resolve => setTimeout(resolve, retryMs + Math.floor(Math.random() * retryMs)));
+        return false;
       }
+      await new Promise(resolve => setTimeout(resolve, retryMs + Math.floor(Math.random() * retryMs)));
     }
   }
   return false;
