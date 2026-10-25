@@ -53,6 +53,8 @@ import { fetchThreadContext } from './slack/threadContext.js';
 import { createThreadStatus, type ThreadStatus } from './slack/threadStatus.js';
 import { isOlderVersion, readSidecarBuild } from './runtime/buildInfo.js';
 import { recoveryFor } from './runtime/restartRecovery.js';
+import { reloadBundlesIfChanged } from './runtime/bundleReload.js';
+import { closeDeployOfferAfterRestart } from './workflows/marketingDeployOffer.js';
 import { connectorAlertText, connectorsToAlert, onConnectorStatuses } from './runtime/connectorAlerts.js';
 import { acquireInstanceLock, instanceLockPath, releaseInstanceLock } from './runtime/instanceLock.js';
 import {
@@ -138,7 +140,6 @@ const store = new JobStore(dbPath);
 // D3-derived bundles (config.bundles, populated by mapSettingsToConfig from
 // the legacy AccessControlConfig). After this block, config.bundles always
 // reflects the table.
-let bundlesLoadedAt = new Date().toISOString();
 {
   const storedBundles = store.getBundles();
   if (storedBundles.length > 0) {
@@ -1258,14 +1259,8 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
         // D5a — hot-reload bundles if the Tauri UI (or direct SQL) edited
         // them since the last build. Mirrors the readAgentBackend pattern:
         // signal-driven (no polling cost when nothing changed).
-        const signalAt = store.getAccessCacheSignalAt();
-        if (signalAt && signalAt > bundlesLoadedAt) {
-          const reloaded = store.getBundles();
-          if (reloaded.length > 0) {
-            config.bundles = hydrateBundleUserIds(reloaded, config.ownerSlackUserIds);
-            bundlesLoadedAt = signalAt;
-            logger.info({ bundleCount: reloaded.length, signalAt }, 'reloaded bundles after access cache signal');
-          }
+        if (reloadBundlesIfChanged(config, store)) {
+          logger.info({ bundleCount: config.bundles?.length ?? 0 }, 'reloaded bundles after access cache signal');
         }
 
         const workflowResult = await agentCallContext.run({ jobId, store }, () =>
@@ -1781,7 +1776,15 @@ async function main(): Promise<void> {
   if (lostAtRestart.length > 0 && config.slackBotToken) {
     const noticeClient = new WebClient(config.slackBotToken);
     for (const job of lostAtRestart) {
-      const { notice, kind, requeue } = job.recovery;
+      const { notice, kind, requeue, closeDeployOffer } = job.recovery;
+      // The offer's message would still read as open: it is closed now (issue #703).
+      if (closeDeployOffer) {
+        void closeDeployOfferAfterRestart(noticeClient, {
+          channelId: job.channelId,
+          threadTs: job.threadTs,
+          promptTs: closeDeployOffer.promptTs,
+        });
+      }
       void noticeClient.chat
         .postMessage({ channel: job.channelId, thread_ts: job.threadTs, text: notice })
         .then(() =>

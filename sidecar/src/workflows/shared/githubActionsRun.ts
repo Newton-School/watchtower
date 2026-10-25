@@ -205,15 +205,19 @@ export async function listWorkflowRuns(params: {
   /** Only runs that finished with this conclusion (`gh run list --status`). */
   status?: string;
   limit: number;
-}): Promise<Array<{ id: number; headBranch?: string; status?: string; conclusion?: string }>> {
+}): Promise<
+  Array<{ id: number; headBranch?: string; status?: string; conclusion?: string; createdAt?: string; url?: string }>
+> {
   const args = ['run', 'list', `--workflow=${params.workflowFile}`];
   if (params.status) args.push('--status', params.status);
-  args.push('--limit', String(params.limit), '--json', 'databaseId,headBranch,status,conclusion');
+  args.push('--limit', String(params.limit), '--json', 'databaseId,headBranch,status,conclusion,createdAt,url');
   const rows = JSON.parse((await __ghCli.exec(args, params.repoPath, 30_000)) || '[]') as Array<{
     databaseId?: number;
     headBranch?: string;
     status?: string;
     conclusion?: string;
+    createdAt?: string;
+    url?: string;
   }>;
   return rows
     .filter(row => typeof row.databaseId === 'number')
@@ -222,5 +226,7 @@ export async function listWorkflowRuns(params: {
       headBranch: row.headBranch,
       status: row.status,
       conclusion: row.conclusion,
+      createdAt: row.createdAt,
+      url: row.url,
     }));
 }

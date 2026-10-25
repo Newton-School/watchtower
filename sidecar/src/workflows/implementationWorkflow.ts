@@ -81,6 +81,9 @@ import { guardWords } from '../router/stagingTarget.js';
 import { refreshSharedClones } from '../workspaces/staleCheckout.js';
 import { assertThreadParentExists } from '../slack/threadContext.js';
 import { runAgenticEntry } from '../agentic/agenticEntry.js';
+import { offerMarketingProdDeploy } from './marketingDeployOffer.js';
+import type { StagingDeployStore } from './stagingDeployWorkflow.js';
+import { reloadBundlesIfChanged } from '../runtime/bundleReload.js';
 import type { JobStore } from '../state/jobStore.js';
 
 const execFileAsync = promisify(execFile);
@@ -336,6 +339,30 @@ export const __contentMergeGh = {
   },
 };
 
+/** Internal seam — tests stub the deploy offer after a merge (issue #703). */
+export const __marketingDeployOffer = { offer: offerMarketingProdDeploy };
+
+/** The job store as the deploy offer reads it: the dry-run switch and the staging record. */
+function deployStoreOf(store: ImplementationStore | undefined): StagingDeployStore | undefined {
+  if (!store?.getState) return undefined;
+  return {
+    getState: key => store.getState?.(key),
+    setState: (key, value) => store.setState?.(key, value),
+  };
+}
+
+/** Reloads access edited in the app since the run started, for a wait that outlasts it (issue #703). */
+function accessRefresherOf(store: ImplementationStore | undefined, config: AppConfig): (() => void) | undefined {
+  const { getAccessCacheSignalAt, getBundles } = store ?? {};
+  if (!store || !getAccessCacheSignalAt || !getBundles) return undefined;
+  return () => {
+    reloadBundlesIfChanged(config, {
+      getAccessCacheSignalAt: () => getAccessCacheSignalAt.call(store),
+      getBundles: () => getBundles.call(store),
+    });
+  };
+}
+
 /** Why an owner still has to confirm a change that is more than content, in one sentence. */
 export function contentOwnerReason(verdict: Exclude<ContentOnlyVerdict, { contentOnly: true }>): string {
   if (verdict.kind === 'unreadable') return "I couldn't check that it only changes text, so an owner has to confirm.";
@@ -477,9 +504,14 @@ function checksReason(state: string | null | undefined): string | undefined {
   return 'Its checks are failing, so an owner has to confirm.';
 }
 
-function contentMergedReply(url: string, skipsReview: boolean): string {
+function contentMergedLead(url: string, skipsReview: boolean): string {
   const how = skipsReview ? ', so it went in without the usual review' : '';
-  return `Merged ${url}: it only changes text and numbers${how}. It isn't live yet; someone from core-dev has to deploy it.`;
+  return `Merged ${url}: it only changes text and numbers${how}.`;
+}
+
+/** The merge reply when no deploy offer goes with it. */
+function contentMergedReply(url: string, skipsReview: boolean): string {
+  return `${contentMergedLead(url, skipsReview)} It isn't live yet; someone from core-dev has to deploy it.`;
 }
 
 /**
@@ -490,13 +522,15 @@ function contentMergedReply(url: string, skipsReview: boolean): string {
  */
 async function mergeContentOnlyPr(params: {
   task: NormalizedTask;
+  config: AppConfig;
   slack: WebClient;
+  store?: ImplementationStore;
   decision: Extract<ContentMergeDecision, { kind: 'merge' }>;
   githubToken: string;
   logStep?: WorkflowStepLogger;
   signal?: AbortSignal;
 }): Promise<WorkflowResult> {
-  const { task, slack, decision, githubToken, logStep, signal } = params;
+  const { task, config, slack, store, decision, githubToken, logStep, signal } = params;
   const { pr, policy, files, headSha, admin, skipsReview } = decision;
   if (signal?.aborted) return cancelledResult('IMPLEMENTATION');
   const requester = requesterOf(task);
@@ -513,6 +547,7 @@ async function mergeContentOnlyPr(params: {
 
   let reply: string;
   let status: WorkflowResult['status'];
+  const startedAtMs = Date.now();
   try {
     await __contentMergeGh.exec(args, githubToken);
     reply = contentMergedReply(pr.url, skipsReview);
@@ -570,6 +605,23 @@ async function mergeContentOnlyPr(params: {
       reply = `I couldn't tell whether ${pr.url} merged: ${detail} Check the PR before asking again.`;
       status = 'FAILED';
     }
+  }
+  // Merged: the reply carries the offer to deploy it (issue #703).
+  if (status === 'SUCCESS') {
+    const offered = await __marketingDeployOffer.offer({
+      task,
+      config,
+      slack,
+      store: deployStoreOf(store),
+      githubToken,
+      merged: [{ pr, knownMerged: true }],
+      startedAtMs,
+      lead: contentMergedLead(pr.url, skipsReview),
+      refreshAccess: accessRefresherOf(store, config),
+      logStep,
+      signal,
+    });
+    if (offered) return { workflow: 'IMPLEMENTATION', ...offered };
   }
   const posted = await slack.chat
     .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: reply })
@@ -692,6 +744,10 @@ async function confirmQuickPrAction(params: {
   return stop('SKIPPED', msg, await say(msg));
 }
 type ImplementationStore = PipelineStore & {
+  getState?: (key: string) => string | undefined;
+  setState?: (key: string, value: string) => void;
+  getAccessCacheSignalAt?: () => string | undefined;
+  getBundles?: () => import('../types/contracts.js').Bundle[];
   dossierStore?: () => import('../state/dossierStore.js').DossierStore;
   readVaultSettings?: () => { vaultPath: string; vaultEnabled: boolean };
   recentSignalsForUser?: (
@@ -942,7 +998,7 @@ async function runQuickAction(params: {
           ? await decideContentMerge({ task, config, pr: checkPr, checks, githubToken, logStep, signal })
           : undefined;
       if (contentMerge?.kind === 'merge' && githubToken) {
-        return mergeContentOnlyPr({ task, slack, decision: contentMerge, githubToken, logStep, signal });
+        return mergeContentOnlyPr({ task, config, slack, store, decision: contentMerge, githubToken, logStep, signal });
       }
       if (signal?.aborted) return cancelledResult('IMPLEMENTATION');
       const confirmation = await confirmQuickPrAction({
@@ -1008,6 +1064,7 @@ Write your response as a ready-to-post Slack message describing what you did.
           }),
       })
     : getActiveBackendId();
+  const quickStartedAtMs = Date.now();
   const quickResult = await runCodex({
     cwd: ctx.cwd,
     prompt: quickPrompt,
@@ -1030,6 +1087,35 @@ Write your response as a ready-to-post Slack message describing what you did.
     thread_ts: task.event.threadTs,
     text: reply,
   });
+
+  // A marketing PR the agent actually merged gets the deploy offer (issue #703).
+  // GitHub is asked whether it merged: the agent's words are not enough.
+  const offered =
+    prAction === 'merge' && !signal?.aborted
+      ? await __marketingDeployOffer.offer({
+          task,
+          config,
+          slack,
+          store: deployStoreOf(store),
+          githubToken: ctx.githubToken,
+          merged: prs.map(pr => ({ pr, knownMerged: false })),
+          startedAtMs: quickStartedAtMs,
+          refreshAccess: accessRefresherOf(store, config),
+          logStep,
+          signal,
+        })
+      : undefined;
+  if (offered) {
+    // The agent's own failure stays the run's outcome: the offer only adds to it.
+    const failed = !quickResult.ok && offered.status !== 'CANCELLED';
+    return {
+      workflow: 'IMPLEMENTATION',
+      ...offered,
+      status: failed ? 'FAILED' : offered.status,
+      notifyDesktop: failed || offered.notifyDesktop,
+      message: `${reply}\n${offered.message}`,
+    };
+  }
 
   return {
     workflow: 'IMPLEMENTATION',

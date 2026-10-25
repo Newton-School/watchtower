@@ -1,5 +1,5 @@
 import type { SlackEventEnvelope } from '../types/contracts.js';
-import { buildRestartNotice, humanGateForStage } from './restartNotice.js';
+import { buildRestartNotice, DEPLOY_TAP_PHRASE, humanGateForStage, type HumanGate } from './restartNotice.js';
 
 /**
  * What happens to a job that was running when the sidecar went away
@@ -21,6 +21,8 @@ export interface LostJob {
   eventId?: string;
   text?: string;
   eventTs?: string;
+  /** The gate the job was waiting at, from its open wait. */
+  openWait?: { kind: string; promptTs: string; expects?: string };
 }
 
 /** The event id of a job re-run after a restart. A re-run is never re-run again. */
@@ -32,10 +34,29 @@ export interface Recovery {
   /** The request to run again, for a PR review that has not been retried yet. */
   requeue?: SlackEventEnvelope;
   kind: 'waiting' | 'review_rerun' | 'lost';
+  /** A deploy offer whose message should stop looking open (issue #703). */
+  closeDeployOffer?: { promptTs: string };
+}
+
+/**
+ * The gate a job was waiting at. Its open wait says so whatever it logged
+ * last: the deploy offer goes on logging (staging going back to main) while
+ * it waits (issue #703).
+ */
+function gateOf(job: LostJob): HumanGate | undefined {
+  if (job.openWait?.kind === 'confirm' && job.openWait.expects === DEPLOY_TAP_PHRASE) return 'deploy_offer';
+  return humanGateForStage(job.lastStage);
 }
 
 export function recoveryFor(job: LostJob): Recovery {
-  const gate = humanGateForStage(job.lastStage);
+  const gate = gateOf(job);
+  if (gate === 'deploy_offer') {
+    return {
+      kind: 'waiting',
+      notice: buildRestartNotice({ gate }),
+      ...(job.openWait ? { closeDeployOffer: { promptTs: job.openWait.promptTs } } : {}),
+    };
+  }
   if (gate) {
     return { kind: 'waiting', notice: buildRestartNotice({ gate, requestedBy: job.requestedBy }) };
   }

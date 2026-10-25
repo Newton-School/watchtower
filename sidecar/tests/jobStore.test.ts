@@ -340,6 +340,32 @@ describe('listRunningJobsWithLastStage (issue #436)', () => {
     store.close();
   });
 
+  it('carries the gate a job was waiting at, from its open wait (issue #703)', () => {
+    const store = new JobStore(tempDbPath());
+    makeJob(store, 'job-offer', 'T-offer');
+    store.appendJobLog({ jobId: 'job-offer', stage: 'staging.restore.done', level: 'INFO', message: 'main back' });
+    store.beginHumanWait({
+      jobId: 'job-offer',
+      kind: 'confirm',
+      channelId: 'C1',
+      threadTs: 'T-offer',
+      promptTs: '500.1',
+      allowedUserIds: ['UADMIN'],
+      expects: 'deploy it',
+    });
+    makeJob(store, 'job-plain', 'T-plain');
+
+    const jobs = store.listRunningJobsWithLastStage().sort((a, b) => a.id.localeCompare(b.id));
+
+    expect(jobs[0]).toMatchObject({
+      id: 'job-offer',
+      lastStage: 'staging.restore.done',
+      openWait: { kind: 'confirm', promptTs: '500.1', expects: 'deploy it' },
+    });
+    expect(jobs[1].openWait).toBeUndefined();
+    store.close();
+  });
+
   it('is read before the orphan cleanup, which then fails those jobs', () => {
     const store = new JobStore(tempDbPath());
     makeJob(store, 'job-orphan', 'T-orphan');
