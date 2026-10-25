@@ -386,17 +386,8 @@ async function decideContentMerge(params: {
     });
     return { kind: 'owner', reason };
   };
-  // Whatever of these stands in the way, the confirmation already says it.
-  const { state, unresolvedCount, threadsKnown } = checks;
-  const status = state?.mergeStateStatus;
-  const blockedOnlyByReview = status === 'BLOCKED' && state?.reviewDecision === 'REVIEW_REQUIRED';
-  if (!state || !status || !(CONTENT_MERGEABLE_STATES.has(status) || blockedOnlyByReview)) {
-    return owner(`merge state ${status ?? 'unknown'}, review ${state?.reviewDecision ?? 'unknown'}.`);
-  }
-  if (state.isDraft) return owner('it is a draft.');
-  if (state.reviewDecision === 'CHANGES_REQUESTED') return owner('a reviewer asked for changes.');
-  if (!threadsKnown) return owner("the review comments couldn't all be read.");
-  if (unresolvedCount > 0) return owner(`${unresolvedCount} unresolved review comments.`);
+  const early = contentMergeBlock(checks);
+  if (early) return owner(early.why, early.reason);
 
   const verdict = await checkContentOnlyPr({
     owner: pr.owner,
@@ -411,18 +402,72 @@ async function decideContentMerge(params: {
     const files = verdict.offending ? ` (${verdict.offending.join(', ')})` : '';
     return owner(`${verdict.reason}${files}`, contentOwnerReason(verdict));
   }
-  // The checks of the commit the merge is pinned to, read after the files were.
+
+  // GitHub again, now that the files are read: a push, a review or a comment
+  // meanwhile changes the answer, and the merge is pinned to what was read.
+  const fresh = await readMergeChecks(pr, githubToken);
+  const late = contentMergeBlock(fresh);
+  if (late) return owner(late.why, late.reason);
+  if (fresh.state?.headSha !== verdict.headSha) {
+    return owner(
+      `the head moved from ${verdict.headSha} to ${fresh.state?.headSha ?? 'unknown'} while checking.`,
+      'Someone pushed to it while I was checking, so an owner has to confirm.',
+    );
+  }
   const checksState = await fetchChecksState({ owner: pr.owner, repo: pr.repo, sha: verdict.headSha, githubToken });
-  if (checksState !== null && checksState !== 'SUCCESS') return owner(`checks are ${checksState ?? 'unreadable'}.`);
+  const checksProblem = checksReason(checksState);
+  if (checksProblem) return owner(`checks are ${checksState ?? 'unreadable'}.`, checksProblem);
+  const status = fresh.state?.mergeStateStatus;
   return {
     kind: 'merge',
     pr,
     policy,
     files: verdict.files,
     headSha: verdict.headSha,
-    admin: status === 'BEHIND' || blockedOnlyByReview,
-    skipsReview: blockedOnlyByReview,
+    // Past the missing review, or a branch behind its base: the only blocks the gate lets through.
+    admin: status === 'BLOCKED' || status === 'BEHIND',
+    skipsReview: fresh.state?.reviewDecision === 'REVIEW_REQUIRED',
   };
+}
+
+/**
+ * What in a PR's merge checks keeps a content-only merge from going ahead
+ * without the owner: `why` for the logs, and `reason` for the requester when
+ * the owner's confirmation doesn't already say it. Undefined when nothing
+ * does.
+ */
+function contentMergeBlock(checks: MergeChecks): { why: string; reason?: string } | undefined {
+  const { state, unresolvedCount, threadsKnown } = checks;
+  const status = state?.mergeStateStatus;
+  if (!state || !status || status === 'UNKNOWN') {
+    // The confirmation says it couldn't check branch protection.
+    return { why: `merge state ${status ?? 'unreadable'}.`, reason: 'Without that, an owner has to confirm.' };
+  }
+  if (status === 'UNSTABLE') {
+    return { why: 'merge state UNSTABLE.', reason: "Some of its checks aren't passing, so an owner has to confirm." };
+  }
+  if (state.isDraft || status === 'DRAFT') return { why: 'it is a draft.' };
+  if (state.reviewDecision === 'CHANGES_REQUESTED') return { why: 'a reviewer asked for changes.' };
+  const blockedOnlyByReview = status === 'BLOCKED' && state.reviewDecision === 'REVIEW_REQUIRED';
+  if (!CONTENT_MERGEABLE_STATES.has(status) && !blockedOnlyByReview) {
+    return { why: `merge state ${status}, review ${state.reviewDecision ?? 'none'}.` };
+  }
+  if (!threadsKnown) {
+    return {
+      why: "the review comments couldn't all be read.",
+      reason: "I couldn't read all of its review comments, so an owner has to confirm.",
+    };
+  }
+  if (unresolvedCount > 0) return { why: `${unresolvedCount} unresolved review comments.` };
+  return undefined;
+}
+
+/** What to tell the requester about the checks of the commit to merge; undefined when they passed or there are none. */
+function checksReason(state: string | null | undefined): string | undefined {
+  if (state === null || state === 'SUCCESS') return undefined;
+  if (state === 'PENDING' || state === 'EXPECTED') return 'Its checks are still running, so an owner has to confirm.';
+  if (state === undefined) return "I couldn't read its checks, so an owner has to confirm.";
+  return 'Its checks are failing, so an owner has to confirm.';
 }
 
 function contentMergedReply(url: string, skipsReview: boolean): string {
@@ -467,6 +512,26 @@ async function mergeContentOnlyPr(params: {
     status = 'SUCCESS';
   } catch (error) {
     const failure = error as { code?: unknown; killed?: unknown; signal?: unknown };
+    if (HEAD_MOVED.test(ghErrorLine(error))) {
+      // --match-head-commit refused it: GitHub merged nothing.
+      logStep?.({
+        stage: 'implementation.quick_action.content_merge_head_moved',
+        message: `${pr.url} moved past ${headSha} after the check; GitHub refused the merge.`,
+        data: { prUrl: pr.url, headSha },
+      });
+      const text = "Someone pushed to it after I checked, so nothing was merged. Ask again and I'll re-check.";
+      const posted = await slack.chat
+        .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text })
+        .then(() => true)
+        .catch(() => false);
+      return {
+        workflow: 'IMPLEMENTATION',
+        status: 'SKIPPED',
+        message: text,
+        notifyDesktop: false,
+        slackPosted: posted,
+      };
+    }
     // gh never ran, so nothing can have happened.
     const notRun = failure.code === 'ENOENT';
     // Killed mid-run: GitHub may have merged it anyway, whatever it says a moment later.
@@ -511,6 +576,9 @@ async function mergeContentOnlyPr(params: {
     slackPosted: posted,
   };
 }
+
+/** What GitHub says when the PR's head is no longer the commit a merge was pinned to. */
+const HEAD_MOVED = /head branch was modified/i;
 
 /** The first line of what `gh` said, as a sentence. */
 function ghErrorLine(error: unknown): string {

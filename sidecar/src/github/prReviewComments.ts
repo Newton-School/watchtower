@@ -75,6 +75,8 @@ export interface MergeState {
   /** BLOCKED, BEHIND, CLEAN, DIRTY, DRAFT, HAS_HOOKS, UNSTABLE or UNKNOWN. */
   mergeStateStatus?: string;
   isDraft?: boolean;
+  /** The commit the PR's head is at, which the rest describes. */
+  headSha?: string;
 }
 
 /** GitHub computes mergeability lazily: the first read after a push says UNKNOWN. */
@@ -104,6 +106,7 @@ export async function fetchMergeState(params: {
           reviewDecision
           mergeStateStatus
           isDraft
+          headRefOid
         }
       }
     }
@@ -122,7 +125,12 @@ export async function fetchMergeState(params: {
     const json = (await response.json()) as {
       data?: {
         repository?: {
-          pullRequest?: { reviewDecision?: string | null; mergeStateStatus?: string | null; isDraft?: boolean } | null;
+          pullRequest?: {
+            reviewDecision?: string | null;
+            mergeStateStatus?: string | null;
+            isDraft?: boolean;
+            headRefOid?: string | null;
+          } | null;
         } | null;
       };
     };
@@ -132,6 +140,7 @@ export async function fetchMergeState(params: {
       ...(pr.reviewDecision ? { reviewDecision: pr.reviewDecision } : {}),
       ...(pr.mergeStateStatus ? { mergeStateStatus: pr.mergeStateStatus } : {}),
       ...(typeof pr.isDraft === 'boolean' ? { isDraft: pr.isDraft } : {}),
+      ...(pr.headRefOid ? { headSha: pr.headRefOid } : {}),
     };
   };
   try {

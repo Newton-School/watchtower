@@ -157,9 +157,12 @@ beforeEach(() => {
   ghExec.mockReset().mockResolvedValue('');
   __contentMergeGh.exec = ghExec;
   vi.mocked(fetchUnresolvedReviewThreadCount).mockReset().mockResolvedValue({ unresolvedCount: 0, totalThreads: 0 });
-  vi.mocked(fetchMergeState)
-    .mockReset()
-    .mockResolvedValue({ reviewDecision: 'REVIEW_REQUIRED', mergeStateStatus: 'BLOCKED', isDraft: false });
+  vi.mocked(fetchMergeState).mockReset().mockResolvedValue({
+    reviewDecision: 'REVIEW_REQUIRED',
+    mergeStateStatus: 'BLOCKED',
+    isDraft: false,
+    headSha: 'abc123',
+  });
   vi.mocked(fetchChecksState).mockReset().mockResolvedValue(null);
   vi.mocked(checkContentOnlyPr)
     .mockReset()
@@ -211,8 +214,42 @@ describe('merging a content-only marketing PR (#701)', () => {
     expect(vi.mocked(fetchChecksState).mock.invocationCallOrder[0]).toBeGreaterThan(checkedAt);
   });
 
+  it('reads the review threads and merge state again after reading the files', async () => {
+    await run('<@UBOT1> merge it');
+
+    const checkedAt = vi.mocked(checkContentOnlyPr).mock.invocationCallOrder[0];
+    expect(vi.mocked(fetchMergeState).mock.invocationCallOrder[1]).toBeGreaterThan(checkedAt);
+    expect(vi.mocked(fetchUnresolvedReviewThreadCount).mock.invocationCallOrder[1]).toBeGreaterThan(checkedAt);
+  });
+
+  it('asks the owner when someone pushed while the files were being read', async () => {
+    vi.mocked(fetchMergeState)
+      .mockResolvedValueOnce({ reviewDecision: 'REVIEW_REQUIRED', mergeStateStatus: 'BLOCKED', headSha: 'abc123' })
+      .mockResolvedValueOnce({ reviewDecision: 'REVIEW_REQUIRED', mergeStateStatus: 'BLOCKED', headSha: 'def456' });
+
+    const { posted } = await run('<@UBOT1> merge it');
+
+    expect(ghExec).not.toHaveBeenCalled();
+    expect(confirmPrompt(posted)).toContain('Someone pushed to it while I was checking, so an owner has to confirm.');
+  });
+
+  it('asks the owner when a review comment arrived while the files were being read', async () => {
+    vi.mocked(fetchUnresolvedReviewThreadCount)
+      .mockResolvedValueOnce({ unresolvedCount: 0, totalThreads: 0 })
+      .mockResolvedValueOnce({ unresolvedCount: 1, totalThreads: 1 });
+
+    const { posted } = await run('<@UBOT1> merge it');
+
+    expect(ghExec).not.toHaveBeenCalled();
+    expect(confirmPrompt(posted)).toBeDefined();
+  });
+
   it('merges without admin rights, and says nothing about the review, when nothing blocks the merge', async () => {
-    vi.mocked(fetchMergeState).mockResolvedValue({ reviewDecision: 'APPROVED', mergeStateStatus: 'CLEAN' });
+    vi.mocked(fetchMergeState).mockResolvedValue({
+      reviewDecision: 'APPROVED',
+      mergeStateStatus: 'CLEAN',
+      headSha: 'abc123',
+    });
 
     const { posted } = await run('<@UBOT1> merge it');
 
@@ -222,12 +259,16 @@ describe('merging a content-only marketing PR (#701)', () => {
     ]);
   });
 
-  it('uses admin rights for a branch behind its base', async () => {
-    vi.mocked(fetchMergeState).mockResolvedValue({ mergeStateStatus: 'BEHIND' });
+  it.each([
+    ['with no review asked for, says nothing about the review', undefined, false],
+    ['still needing its review, says it went in without it', 'REVIEW_REQUIRED', true],
+  ])('uses admin rights for a branch behind its base and, %s', async (_case, reviewDecision, skipsReview) => {
+    vi.mocked(fetchMergeState).mockResolvedValue({ mergeStateStatus: 'BEHIND', reviewDecision, headSha: 'abc123' });
 
-    await run('<@UBOT1> merge it');
+    const { posted } = await run('<@UBOT1> merge it');
 
     expect(ghExec).toHaveBeenCalledWith(mergeArgs('--admin'), 'ghs_test');
+    expect(posted[0].includes('without the usual review')).toBe(skipsReview);
   });
 
   it.each([
@@ -351,20 +392,6 @@ describe('merging a content-only marketing PR (#701)', () => {
       () => vi.mocked(fetchUnresolvedReviewThreadCount).mockResolvedValue({ unresolvedCount: 1, totalThreads: 1 }),
     ],
     [
-      'review comments that could not be read',
-      () =>
-        vi
-          .mocked(fetchUnresolvedReviewThreadCount)
-          .mockResolvedValue({ unresolvedCount: 0, totalThreads: 0, failed: true }),
-    ],
-    [
-      'more review threads than were read',
-      () =>
-        vi
-          .mocked(fetchUnresolvedReviewThreadCount)
-          .mockResolvedValue({ unresolvedCount: 0, totalThreads: 140, incomplete: true }),
-    ],
-    [
       'requested changes',
       () =>
         vi
@@ -372,34 +399,75 @@ describe('merging a content-only marketing PR (#701)', () => {
           .mockResolvedValue({ reviewDecision: 'CHANGES_REQUESTED', mergeStateStatus: 'BLOCKED' }),
     ],
     ['a draft', () => vi.mocked(fetchMergeState).mockResolvedValue({ mergeStateStatus: 'DRAFT', isDraft: true })],
+  ])(
+    'asks the owner, before reading the diff, for a PR with %s, which the prompt already says',
+    async (_case, arrange) => {
+      arrange();
+
+      const { posted, logs } = await run('<@UBOT1> merge it');
+
+      expect(ghExec).not.toHaveBeenCalled();
+      expect(checkContentOnlyPr).not.toHaveBeenCalled();
+      expect(confirmPrompt(posted)).toBeDefined();
+      expect(confirmPrompt(posted)).not.toContain('so an owner has to confirm');
+      expect(logs.map(entry => entry.stage)).toContain('implementation.quick_action.content_check');
+    },
+  );
+
+  it.each([
+    [
+      'review comments that could not be read',
+      () =>
+        vi
+          .mocked(fetchUnresolvedReviewThreadCount)
+          .mockResolvedValue({ unresolvedCount: 0, totalThreads: 0, failed: true }),
+      "I couldn't read all of its review comments, so an owner has to confirm.",
+    ],
+    [
+      'more review threads than were read',
+      () =>
+        vi
+          .mocked(fetchUnresolvedReviewThreadCount)
+          .mockResolvedValue({ unresolvedCount: 0, totalThreads: 140, incomplete: true }),
+      "I couldn't read all of its review comments, so an owner has to confirm.",
+    ],
+    [
+      'checks failing on a branch GitHub calls unstable',
+      () => vi.mocked(fetchMergeState).mockResolvedValue({ mergeStateStatus: 'UNSTABLE' }),
+      "Some of its checks aren't passing, so an owner has to confirm.",
+    ],
     [
       'a merge state GitHub has not worked out',
       () => vi.mocked(fetchMergeState).mockResolvedValue({ mergeStateStatus: 'UNKNOWN' }),
+      "I couldn't check branch protection. Without that, an owner has to confirm.",
     ],
-    ['an unreadable merge state', () => vi.mocked(fetchMergeState).mockResolvedValue(undefined)],
-  ])('asks the owner, before reading the diff, for a PR with %s', async (_case, arrange) => {
+    [
+      'an unreadable merge state',
+      () => vi.mocked(fetchMergeState).mockResolvedValue(undefined),
+      "I couldn't check branch protection. Without that, an owner has to confirm.",
+    ],
+  ])('asks the owner, saying why, for a PR with %s', async (_case, arrange, reason) => {
     arrange();
 
-    const { posted, logs } = await run('<@UBOT1> merge it');
+    const { posted } = await run('<@UBOT1> merge it');
 
     expect(ghExec).not.toHaveBeenCalled();
     expect(checkContentOnlyPr).not.toHaveBeenCalled();
-    expect(confirmPrompt(posted)).toBeDefined();
-    expect(confirmPrompt(posted)).not.toContain('so an owner has to confirm');
-    expect(logs.map(entry => entry.stage)).toContain('implementation.quick_action.content_check');
+    expect(confirmPrompt(posted)).toContain(reason);
   });
 
   it.each([
-    ['failing', 'FAILURE'],
-    ['still running', 'PENDING'],
-    ['unreadable', undefined],
-  ])('asks the owner for a content-only PR whose checks are %s', async (_case, checks) => {
+    ['failing', 'FAILURE', 'Its checks are failing, so an owner has to confirm.'],
+    ['erroring', 'ERROR', 'Its checks are failing, so an owner has to confirm.'],
+    ['still running', 'PENDING', 'Its checks are still running, so an owner has to confirm.'],
+    ['unreadable', undefined, "I couldn't read its checks, so an owner has to confirm."],
+  ])('asks the owner, saying why, for a content-only PR whose checks are %s', async (_case, checks, reason) => {
     vi.mocked(fetchChecksState).mockResolvedValue(checks);
 
     const { posted } = await run('<@UBOT1> merge it');
 
     expect(ghExec).not.toHaveBeenCalled();
-    expect(confirmPrompt(posted)).toBeDefined();
+    expect(confirmPrompt(posted)).toContain(reason);
   });
 
   it('does not skip the owner when the ask is more than the merge', async () => {
@@ -434,16 +502,33 @@ describe('merging a content-only marketing PR (#701)', () => {
 
     it('says nothing was merged when gh refused and the PR is still open', async () => {
       failMerge(
-        Object.assign(new Error('Command failed'), { stderr: 'GraphQL: Head branch was modified\n' }),
+        Object.assign(new Error('Command failed'), { stderr: 'GraphQL: Pull Request is not mergeable\n' }),
         async () => 'OPEN\n',
       );
 
       const { posted, result } = await run('<@UBOT1> merge it');
 
       expect(posted).toEqual([
-        `I couldn't merge ${MARKETING_PR}: GraphQL: Head branch was modified. Nothing was merged.`,
+        `I couldn't merge ${MARKETING_PR}: GraphQL: Pull Request is not mergeable. Nothing was merged.`,
       ]);
       expect(result.status).toBe('FAILED');
+    });
+
+    it('says someone pushed after the check when GitHub refuses the pinned commit', async () => {
+      failMerge(
+        Object.assign(new Error('Command failed'), {
+          stderr: 'GraphQL: Head branch was modified. Review and try the merge again. (mergePullRequest)\n',
+        }),
+        async () => 'OPEN\n',
+      );
+
+      const { posted, result } = await run('<@UBOT1> merge it');
+
+      expect(posted).toEqual([
+        "Someone pushed to it after I checked, so nothing was merged. Ask again and I'll re-check.",
+      ]);
+      expect(ghExec).toHaveBeenCalledTimes(1);
+      expect(result.status).toBe('SKIPPED');
     });
 
     it('says nothing was merged when gh is not installed, without asking it anything else', async () => {

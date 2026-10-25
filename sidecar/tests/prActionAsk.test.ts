@@ -300,6 +300,44 @@ describe('fetchChecksState', () => {
   });
 });
 
+describe('fetchMergeState: the head commit', () => {
+  it('says which commit the state describes, so a merge can be pinned to the one that was read', async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data: {
+            repository: {
+              pullRequest: {
+                reviewDecision: 'REVIEW_REQUIRED',
+                mergeStateStatus: 'BLOCKED',
+                isDraft: false,
+                headRefOid: 'abc123',
+              },
+            },
+          },
+        }),
+      ),
+    );
+
+    const state = await fetchMergeState({
+      owner: 'Newton-School',
+      repo: 'newton-marketing-web',
+      pullNumber: 1490,
+      githubToken: 'ghs_test',
+      fetcher: fetcher as never,
+      retryDelayMs: 0,
+    });
+
+    expect(state).toEqual({
+      reviewDecision: 'REVIEW_REQUIRED',
+      mergeStateStatus: 'BLOCKED',
+      isDraft: false,
+      headSha: 'abc123',
+    });
+    expect(JSON.parse(fetcher.mock.calls[0][1].body).query).toContain('headRefOid');
+  });
+});
+
 describe('fetchUnresolvedReviewThreadCount', () => {
   const target = { owner: 'Newton-School', repo: 'newton-marketing-web', pullNumber: 1490, githubToken: 'ghs_test' };
   afterEach(() => vi.unstubAllGlobals());

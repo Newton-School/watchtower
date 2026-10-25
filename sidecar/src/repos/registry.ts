@@ -23,11 +23,17 @@ export interface ContentPolicy {
   /** Globs it never touches, even inside `allow`. */
   deny: string[];
   /**
-   * Markdown notes that never ship to the site (a feature's CLAUDE.md or
-   * README.md): a content-only PR may edit them, unread. Only `.md` files
-   * matching these globs.
+   * Markdown notes that never ship to the site (a feature's README.md or
+   * design notes): a content-only PR may edit them, unread. Only `.md` files
+   * matching these globs and not `deny`, and never agent instructions
+   * (CLAUDE.md, AGENTS.md, skills), which later runs would read as orders.
    */
   notes: string[];
+  /**
+   * What the repo's own lint forbids in string literals. The repo has no CI
+   * to catch it, so a changed value matching one would only fail at deploy.
+   */
+  lintForbidden: RegExp[];
   /** How miniOG merges such a PR. */
   mergeMethod: 'squash' | 'merge' | 'rebase';
 }
@@ -142,6 +148,8 @@ export const REPO_REGISTRY: Record<RepoKey, RepoDescriptor> = {
       allow: ['src/features/**', 'src/app/**', 'src/components/**'],
       // A coder often updates the feature's own notes alongside a copy edit.
       notes: ['src/features/**'],
+      // eslint.config.mjs: no hardcoded site-host URLs in literals or templates.
+      lintForbidden: [/newtonschool\.co/],
       deny: [
         'src/lib/**',
         'worker/**',
@@ -184,10 +192,11 @@ export const REPO_REGISTRY: Record<RepoKey, RepoDescriptor> = {
         '**/hooks/**',
         '**/use-*.ts',
         // Scripts, tracking and experiments.
+        // (Globs ignore case, so no `*script*`: it would take description.tsx.)
         '**/script*',
         '**/*-script*',
         '**/*_script*',
-        '**/*Script*',
+        '**/*.script.*',
         '**/analytics*',
         '**/analytics*/**',
         '**/tracking/**',
@@ -195,18 +204,49 @@ export const REPO_REGISTRY: Record<RepoKey, RepoDescriptor> = {
         '**/*tracking*',
         '**/tracked-*',
         '**/*attribution*',
+        '**/events.ts',
+        '**/*-events.ts',
         '**/*pixel*',
-        '**/utm-*',
+        '**/*utm*',
+        '**/*gtag*',
+        '**/*gtm*',
+        '**/ads.ts',
+        '**/*-ads.ts',
         '**/device-id*',
         '**/openpanel*',
-        '**/experiment*',
-        '**/experiment*/**',
+        '**/*consent*',
+        '**/instrumentation*',
+        '**/*experiment*',
+        '**/*experiment*/**',
         '**/*ab-test*',
         '**/*abtest*',
-        '**/*AbTest*',
         '**/*feature-flag*',
         '**/flags.ts',
         '**/*bucket*',
+        '**/funnel/**',
+        // Routing, redirects, payments and sign-in codes.
+        '**/*redirect*',
+        '**/routes.ts',
+        '**/*-routes.ts',
+        '**/otp*',
+        '**/*-otp*',
+        '**/*_otp*',
+        '**/*payment*',
+        '**/*checkout*',
+        '**/*razorpay*',
+        '**/whatsapp.ts',
+        // Settings, and files that render structured data as scripts.
+        '**/env.ts',
+        '**/env/**',
+        '**/*constants*',
+        '**/*json-ld*',
+        '**/*jsonld*',
+        '**/*structured-data*',
+        '**/schema.ts',
+        'src/app/**/sitemap.ts',
+        'src/app/**/robots.ts',
+        'src/app/**/opengraph-image*',
+        'src/app/**/twitter-image*',
         '**/*.test.*',
         '**/*.spec.*',
       ],
