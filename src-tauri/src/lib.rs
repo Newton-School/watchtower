@@ -4610,6 +4610,21 @@ mod tests {
         }
     }
 
+    /// Settings that pass `is_settings_complete` on any checkout. The repo paths
+    /// must sit under the mini-og root (#233); the stored root defaults to the
+    /// owner's machine path, and Settings never writes it, so point it at the
+    /// tree the test paths come from.
+    fn persist_complete_settings(connection: &Connection) {
+        let settings = complete_settings();
+        persist_app_settings(connection, &settings).expect("persist settings");
+        connection
+            .execute(
+                "UPDATE app_settings SET mini_og_repo_root = ?1 WHERE id = 1",
+                params![settings.newton_web_path],
+            )
+            .expect("set mini-og root");
+    }
+
     #[test]
     fn submit_launchpad_task_rejects_blank_prompt() {
         let db_path = test_db_path();
@@ -4646,7 +4661,7 @@ mod tests {
         let db_path = test_db_path();
         initialize_db(&db_path).expect("initialize db");
         let connection = Connection::open(&db_path).expect("open db");
-        persist_app_settings(&connection, &complete_settings()).expect("persist settings");
+        persist_complete_settings(&connection);
 
         let response = submit_launchpad_task_inner(&connection, "miniog", "Ship the feature")
             .expect("request should be created");
