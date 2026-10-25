@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { readPrActionAsk } from '../src/router/prActionAsk.js';
 import { mergeProtectionNote } from '../src/workflows/implementationWorkflow.js';
-import { fetchMergeState, fetchUnresolvedReviewThreadCount } from '../src/github/prReviewComments.js';
+import { fetchChecksState, fetchMergeState, fetchUnresolvedReviewThreadCount } from '../src/github/prReviewComments.js';
 import type { NormalizedTask, PrTarget } from '../src/types/contracts.js';
 
 // Issue #605: "merge the pr" ran a 3.5-minute planner before the merge. A
@@ -264,5 +264,48 @@ describe('fetchMergeState', () => {
 
     expect(await fetchUnresolvedReviewThreadCount(target)).toEqual({ unresolvedCount: 1, totalThreads: 2 });
     expect(await fetchMergeState({ ...target, retryDelayMs: 0 })).toBeUndefined();
+  });
+});
+
+// Issue #701: a content-only merge without the owner needs to know the checks
+// passed and the review threads were read, not just a count of 0.
+describe('fetchChecksState', () => {
+  const target = { owner: 'Newton-School', repo: 'newton-marketing-web', pullNumber: 1490, githubToken: 'ghs_test' };
+  const answer = (rollup: unknown, extra: Record<string, unknown> = {}, status = 200) =>
+    new Response(
+      JSON.stringify({
+        ...extra,
+        data: { repository: { pullRequest: { commits: { nodes: [{ commit: { statusCheckRollup: rollup } }] } } } },
+      }),
+      { status },
+    );
+  const read = (fetcher: unknown) => fetchChecksState({ ...target, fetcher: fetcher as never });
+
+  it('reads the combined state, and null when there are no checks', async () => {
+    expect(await read(vi.fn().mockResolvedValue(answer({ state: 'SUCCESS' })))).toBe('SUCCESS');
+    expect(await read(vi.fn().mockResolvedValue(answer(null)))).toBeNull();
+  });
+
+  it('is undefined, not "no checks", when GitHub refuses the field or the request', async () => {
+    expect(
+      await read(vi.fn().mockResolvedValue(answer(null, { errors: [{ message: 'Not accessible' }] }))),
+    ).toBeUndefined();
+    expect(await read(vi.fn().mockResolvedValue(answer(null, {}, 502)))).toBeUndefined();
+    expect(await read(vi.fn().mockRejectedValue(new Error('ECONNRESET')))).toBeUndefined();
+  });
+});
+
+describe('fetchUnresolvedReviewThreadCount', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('marks a count it could not read, so a merge that needs it knows', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('ECONNRESET')));
+    const target = { owner: 'Newton-School', repo: 'newton-marketing-web', pullNumber: 1490, githubToken: 'ghs_test' };
+
+    expect(await fetchUnresolvedReviewThreadCount(target)).toEqual({
+      unresolvedCount: 0,
+      totalThreads: 0,
+      failed: true,
+    });
   });
 });

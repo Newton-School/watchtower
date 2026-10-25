@@ -10,6 +10,22 @@ import type { AppConfig } from '../types/contracts.js';
 export const REPO_KEYS = ['newton-web', 'newton-api', 'newton-marketing-web'] as const;
 export type RepoKey = (typeof REPO_KEYS)[number];
 
+/**
+ * Which pull requests count as content-only for a repo: copy, numbers and
+ * asset links on pages, nothing else (issue #701). Such a PR may be merged on
+ * the word of anyone who could have asked for the change. The paths only
+ * narrow where a content-only change can be; `github/contentOnlyDiff.ts`
+ * reads the files themselves.
+ */
+export interface ContentPolicy {
+  /** Globs a content-only change may touch (`**` spans folders, `*` stays within one). */
+  allow: string[];
+  /** Globs it never touches, even inside `allow`. */
+  deny: string[];
+  /** How miniOG merges such a PR. */
+  mergeMethod: 'squash' | 'merge' | 'rebase';
+}
+
 export interface RepoDescriptor {
   key: RepoKey;
   kind: 'frontend' | 'backend';
@@ -47,6 +63,8 @@ export interface RepoDescriptor {
         prodCommand: string;
       }
     | { method: 'none' };
+  /** Set for repos whose content-only PRs builders may merge; absent everywhere else. */
+  contentPolicy?: ContentPolicy;
 }
 
 export const REPO_REGISTRY: Record<RepoKey, RepoDescriptor> = {
@@ -113,6 +131,23 @@ export const REPO_REGISTRY: Record<RepoKey, RepoDescriptor> = {
       stagingNote:
         'Staging deploys are manual: run *Deploy → staging* in GitHub Actions on your branch (`gh workflow run deploy-staging.yml --ref YOUR_BRANCH`). It replaces whatever is on staging now, so check nobody is testing there, and deploy `main` again when you are done.',
       prodCommand: 'gh workflow run deploy-prod.yml --ref main -f confirm=deploy',
+    },
+    contentPolicy: {
+      allow: ['src/features/**', 'src/app/**', 'src/components/**'],
+      deny: [
+        'src/lib/**',
+        'worker/**',
+        '.github/**',
+        '**/forms/**',
+        '**/analytics*',
+        '**/analytics*/**',
+        '**/experiment*',
+        '**/experiment*/**',
+        '**/*.test.*',
+        '**/*.spec.*',
+      ],
+      // The repo's ruleset requires a linear history.
+      mergeMethod: 'squash',
     },
   },
 };

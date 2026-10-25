@@ -1,4 +1,6 @@
+import { execFile } from 'node:child_process';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import type { WebClient } from '@slack/web-api';
 import type {
   DossierRole,
@@ -37,7 +39,13 @@ import {
 } from '../agents/pipeline.js';
 import { normalizePlannerOutput, planListsFiles } from '../agents/normalizePlannerOutput.js';
 import { inferRepoFromAffectedFiles, readRepoAffinity, repoPathFor, resolveRepoOrAsk } from './shared/repoResolver.js';
-import { enabledRepoKeys, getRepo, repoKeyForWorkspacePath } from '../repos/registry.js';
+import {
+  enabledRepoKeys,
+  getRepo,
+  repoKeyForWorkspacePath,
+  repoKeyFromGithubRepoName,
+  type ContentPolicy,
+} from '../repos/registry.js';
 import type { RepoAffinity } from '../router/repoClassifier.js';
 import { waitForClarificationWithIdle, detectClarificationLoop } from './shared/clarificationGuards.js';
 import { requesterOf } from './shared/requester.js';
@@ -47,7 +55,14 @@ import { buildPlannerPrompt, buildPlannerPlanModePrompt } from '../agents/prompt
 import { refreshWorktreeToBase, resolveWorkspace } from '../workspaces/workspaceManager.js';
 import { createPrFromWorkspace, findRunPr } from '../github/postPipelinePr.js';
 import { buildUnfinishedRunMessage, coderReportedPrUrl } from '../agents/unfinishedRun.js';
-import { fetchMergeState, fetchUnresolvedReviewThreadCount, type MergeState } from '../github/prReviewComments.js';
+import {
+  fetchChecksState,
+  fetchMergeState,
+  fetchUnresolvedReviewThreadCount,
+  type MergeState,
+} from '../github/prReviewComments.js';
+import { checkContentOnlyPr, type ContentOnlyVerdict } from '../github/contentOnlyDiff.js';
+import { toolchainEnv } from '../backends/codexBackend.js';
 import { waitForExactConfirmation } from './shared/confirmationGate.js';
 import { cancelledResult } from './shared/cancelState.js';
 import { headsUpOnSameFiles, type OpenPr } from './shared/sameFileGuard.js';
@@ -66,6 +81,8 @@ import { refreshSharedClones } from '../workspaces/staleCheckout.js';
 import { assertThreadParentExists } from '../slack/threadContext.js';
 import { runAgenticEntry } from '../agentic/agenticEntry.js';
 import type { JobStore } from '../state/jobStore.js';
+
+const execFileAsync = promisify(execFile);
 
 function buildOwnerPrimaryPrompt(params: {
   task: NormalizedTask;
@@ -266,16 +283,198 @@ export function mergeProtectionNote(state: MergeState | undefined): string {
  * the merge state come from separate queries, so a failure reading the state
  * leaves the count, which gates the owner's own merges, intact.
  */
-async function readMergeChecks(
-  pr: PrContext,
-  githubToken: string,
-): Promise<{ unresolvedCount: number; state: MergeState | undefined }> {
+async function readMergeChecks(pr: PrContext, githubToken: string): Promise<MergeChecks> {
   const target = { owner: pr.owner, repo: pr.repo, pullNumber: pr.number, githubToken };
   const [threads, state] = await Promise.all([
-    fetchUnresolvedReviewThreadCount(target).catch(() => ({ unresolvedCount: 0, totalThreads: 0 })),
+    fetchUnresolvedReviewThreadCount(target).catch(() => ({ unresolvedCount: 0, totalThreads: 0, failed: true })),
     fetchMergeState(target).catch(() => undefined),
   ]);
-  return { unresolvedCount: threads.unresolvedCount, state };
+  return { unresolvedCount: threads.unresolvedCount, threadsKnown: !threads.failed, state };
+}
+
+type MergeChecks = {
+  unresolvedCount: number;
+  /** False when the review threads could not be read, so the count of 0 means nothing. */
+  threadsKnown: boolean;
+  state: MergeState | undefined;
+};
+
+/** Merge states a content-only PR may be merged from without the owner (issue #701). */
+const CONTENT_MERGEABLE_STATES = new Set(['CLEAN', 'HAS_HOOKS', 'BLOCKED', 'BEHIND']);
+
+type ContentMergeDecision =
+  | { kind: 'merge'; pr: PrContext; policy: ContentPolicy; files: string[]; headSha: string; admin: boolean }
+  /** `reason` is said in the owner's confirmation; none when what blocks it is said there already. */
+  | { kind: 'owner'; reason?: string };
+
+/** Internal seam — tests stub `gh` instead of merging for real. */
+export const __contentMergeGh = {
+  async exec(args: string[], githubToken: string): Promise<string> {
+    const { stdout } = await execFileAsync('gh', args, {
+      timeout: 60_000,
+      env: { ...toolchainEnv(), GH_TOKEN: githubToken },
+    });
+    return stdout;
+  },
+};
+
+/** Why an owner still has to confirm a change that is more than content, in one sentence. */
+export function contentOwnerReason(verdict: Exclude<ContentOnlyVerdict, { contentOnly: true }>): string {
+  if (verdict.kind === 'unreadable') return "I couldn't check that it only changes text, so an owner has to confirm.";
+  if (verdict.kind === 'too_many_files' || !verdict.offending?.length) {
+    return `It changes more than text (${verdict.fileCount ?? 'many'} files), so an owner has to confirm.`;
+  }
+  const named = verdict.offending.slice(0, 2).map(file => `\`${file}\``);
+  const more = verdict.offending.length - named.length;
+  return `It changes more than text (${named.join(', ')}${more > 0 ? ` and ${more} more` : ''}), so an owner has to confirm.`;
+}
+
+/**
+ * Whether a merge someone other than the owner asked for can go ahead on
+ * their word (issue #701): the owner decided that admins and builders may
+ * merge a PR that only changes content. Undefined when that does not apply
+ * here at all (a repo without a content policy, or a requester who could not
+ * have asked for the change), so the confirmation stays exactly as it was.
+ */
+async function decideContentMerge(params: {
+  task: NormalizedTask;
+  config: AppConfig;
+  pr: PrContext;
+  checks: MergeChecks;
+  githubToken: string;
+  logStep?: WorkflowStepLogger;
+}): Promise<ContentMergeDecision | undefined> {
+  const { task, config, pr, checks, githubToken, logStep } = params;
+  const repoKey = repoKeyFromGithubRepoName(pr.repo);
+  const descriptor = repoKey ? getRepo(repoKey) : undefined;
+  const policy = descriptor?.contentPolicy;
+  if (!policy || descriptor.githubSlug.toLowerCase() !== `${pr.owner}/${pr.repo}`.toLowerCase()) return undefined;
+  const requester = requesterOf(task);
+  const mayAsk = evaluateCapability({
+    config,
+    userId: requester,
+    channelId: task.event.channelId,
+    channelType: task.event.channelType,
+    capability: 'start_implementation',
+  }).allowed;
+  if (!mayAsk) return undefined;
+
+  const owner = (why: string, reason?: string): ContentMergeDecision => {
+    logStep?.({
+      stage: 'implementation.quick_action.content_check',
+      message: `Not merging ${pr.url} on <@${requester}>'s word: ${why}`,
+      data: { prUrl: pr.url, requestedBy: requester, why },
+    });
+    return { kind: 'owner', reason };
+  };
+  // Whatever of these stands in the way, the confirmation already says it.
+  const { state, unresolvedCount, threadsKnown } = checks;
+  const status = state?.mergeStateStatus;
+  if (!state || !status || !CONTENT_MERGEABLE_STATES.has(status)) return owner(`merge state ${status ?? 'unknown'}.`);
+  if (state.isDraft) return owner('it is a draft.');
+  if (state.reviewDecision === 'CHANGES_REQUESTED') return owner('a reviewer asked for changes.');
+  if (!threadsKnown) return owner("the review comments couldn't be read.");
+  if (unresolvedCount > 0) return owner(`${unresolvedCount} unresolved review comments.`);
+  const target = { owner: pr.owner, repo: pr.repo, pullNumber: pr.number, githubToken };
+  const checksState = await fetchChecksState(target);
+  if (checksState !== null && checksState !== 'SUCCESS') return owner(`checks are ${checksState ?? 'unreadable'}.`);
+
+  const verdict = await checkContentOnlyPr({ owner: pr.owner, repo: pr.repo, number: pr.number, githubToken, policy });
+  if (!verdict.contentOnly) {
+    const files = verdict.offending ? ` (${verdict.offending.join(', ')})` : '';
+    return owner(`${verdict.reason}${files}`, contentOwnerReason(verdict));
+  }
+  return {
+    kind: 'merge',
+    pr,
+    policy,
+    files: verdict.files,
+    headSha: verdict.headSha,
+    admin: status === 'BLOCKED' || status === 'BEHIND',
+  };
+}
+
+const CONTENT_MERGED_REPLY = (url: string) =>
+  `Merged ${url}: it only changes text, numbers and links. It isn't live yet; someone from core-dev has to deploy it.`;
+
+/**
+ * Merge a content-only PR on the requester's word (issue #701), with `gh`
+ * rather than an agent: the action is one command. A merge past the required
+ * review uses the owner identity's admin rights, as every marketing merge so
+ * far has. The branch stays: staging may still be showing it.
+ */
+async function mergeContentOnlyPr(params: {
+  task: NormalizedTask;
+  slack: WebClient;
+  decision: Extract<ContentMergeDecision, { kind: 'merge' }>;
+  githubToken: string;
+  logStep?: WorkflowStepLogger;
+  signal?: AbortSignal;
+}): Promise<WorkflowResult> {
+  const { task, slack, decision, githubToken, logStep, signal } = params;
+  const { pr, policy, files, headSha, admin } = decision;
+  if (signal?.aborted) return cancelledResult('IMPLEMENTATION');
+  const requester = requesterOf(task);
+  logStep?.({
+    stage: 'implementation.quick_action.content_merge',
+    message: `Merging ${pr.url} without the owner's confirmation: it only changes content, and <@${requester}> asked.`,
+    data: { prUrl: pr.url, files, requestedBy: requester, admin, mergeMethod: policy.mergeMethod },
+  });
+  const repoArg = `${pr.owner}/${pr.repo}`;
+  // Only the commit that was read: a push after the check makes GitHub refuse the merge.
+  const args = ['pr', 'merge', String(pr.number), '--repo', repoArg, `--${policy.mergeMethod}`];
+  args.push('--match-head-commit', headSha);
+  if (admin) args.push('--admin');
+
+  let reply: string;
+  let status: WorkflowResult['status'];
+  try {
+    await __contentMergeGh.exec(args, githubToken);
+    reply = CONTENT_MERGED_REPLY(pr.url);
+    status = 'SUCCESS';
+  } catch (error) {
+    const detail = ghErrorLine(error);
+    // A failed command does not always mean nothing happened (a timeout after GitHub merged it).
+    const prState = await __contentMergeGh
+      .exec(['pr', 'view', String(pr.number), '--repo', repoArg, '--json', 'state', '-q', '.state'], githubToken)
+      .then(out => out.trim())
+      .catch(() => undefined);
+    logStep?.({
+      stage: 'implementation.quick_action.content_merge_failed',
+      message: `gh pr merge failed for ${pr.url}: ${detail}`,
+      level: prState === 'MERGED' ? 'WARN' : 'ERROR',
+      data: { prUrl: pr.url, prState },
+    });
+    if (prState === 'MERGED') {
+      reply = CONTENT_MERGED_REPLY(pr.url);
+      status = 'SUCCESS';
+    } else if (prState) {
+      reply = `I couldn't merge ${pr.url}: ${detail} Nothing was merged.`;
+      status = 'FAILED';
+    } else {
+      reply = `I couldn't tell whether ${pr.url} merged: ${detail} Check the PR before asking again.`;
+      status = 'FAILED';
+    }
+  }
+  const posted = await slack.chat
+    .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: reply })
+    .then(() => true)
+    .catch(() => false);
+  return {
+    workflow: 'IMPLEMENTATION',
+    status,
+    message: reply,
+    notifyDesktop: status === 'FAILED',
+    slackPosted: posted,
+  };
+}
+
+/** The first line of what `gh` said, as a sentence. */
+function ghErrorLine(error: unknown): string {
+  const stderr = (error as { stderr?: unknown })?.stderr;
+  const raw = (typeof stderr === 'string' && stderr.trim()) || (error instanceof Error ? error.message : String(error));
+  const line = raw.trim().split('\n')[0].trim().slice(0, 200);
+  return /[.!?]$/.test(line) ? line : `${line}.`;
 }
 
 /**
@@ -292,10 +491,12 @@ async function confirmQuickPrAction(params: {
   unresolvedCount?: number;
   /** What branch protection means for a merge now (`mergeProtectionNote`). */
   protectionNote?: string;
+  /** Why the owner has to confirm a merge the requester could otherwise make (issue #701). */
+  ownerReason?: string;
   logStep?: WorkflowStepLogger;
   signal?: AbortSignal;
 }): Promise<{ confirmedBy: string } | { result: WorkflowResult }> {
-  const { task, config, slack, action, prUrls, unresolvedCount, protectionNote, logStep, signal } = params;
+  const { task, config, slack, action, prUrls, unresolvedCount, protectionNote, ownerReason, logStep, signal } = params;
   const { channelId, threadTs } = task.event;
   const userId = requesterOf(task);
   const phrase = `confirm ${action}`;
@@ -328,7 +529,8 @@ async function confirmQuickPrAction(params: {
       : '';
   let promptTs: string | undefined;
   try {
-    const confirmText = `<@${userId}> asked me to ${action} ${target}.${unresolvedNote}${protectionNote ? ` ${protectionNote}` : ''} ${ownerMentions}, reply \`${phrase}\` within 10 minutes and I'll do it. Without that, nothing changes.`;
+    const notes = [protectionNote, ownerReason].map(note => (note ? ` ${note}` : '')).join('');
+    const confirmText = `<@${userId}> asked me to ${action} ${target}.${unresolvedNote}${notes} ${ownerMentions}, reply \`${phrase}\` within 10 minutes and I'll do it. Without that, nothing changes.`;
     promptTs = await postGatePrompt(slack, {
       channel: channelId,
       thread_ts: threadTs,
@@ -610,6 +812,18 @@ async function runQuickAction(params: {
     const forSomeoneElse = requesterOf(task) !== task.event.userId;
     if (!task.isOwnerAuthor || forSomeoneElse) {
       const checks = prAction === 'merge' ? mergeChecks : undefined;
+      // A message that is only this merge, of a PR that only changes content,
+      // from someone who could have asked for the change: their word is the
+      // OK (issue #701).
+      const githubToken = ctx.githubToken;
+      const contentMerge =
+        params.action === 'merge' && checkPr && checks && githubToken
+          ? await decideContentMerge({ task, config, pr: checkPr, checks, githubToken, logStep })
+          : undefined;
+      if (contentMerge?.kind === 'merge' && githubToken) {
+        return mergeContentOnlyPr({ task, slack, decision: contentMerge, githubToken, logStep, signal });
+      }
+      if (signal?.aborted) return cancelledResult('IMPLEMENTATION');
       const confirmation = await confirmQuickPrAction({
         task,
         config,
@@ -618,6 +832,7 @@ async function runQuickAction(params: {
         prUrls,
         unresolvedCount: checks?.unresolvedCount,
         protectionNote: checks ? mergeProtectionNote(checks.state) : undefined,
+        ownerReason: contentMerge?.kind === 'owner' ? contentMerge.reason : undefined,
         logStep,
         signal,
       });
