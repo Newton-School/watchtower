@@ -897,3 +897,120 @@ describe('implementationWorkflow — a PR operation needs no planner (#605)', ()
     expect(result.status).toBe('CANCELLED');
   });
 });
+
+// Issue #710: the quick action read its operation from the raw text, so a
+// word inside a link, its label or a mention counted as the instruction.
+describe('implementationWorkflow — words inside links are not the operation (#710)', () => {
+  const ISSUE_LINK = '<https://github.com/Newton-School/newton-web/issues/12|revert notes>';
+
+  beforeEach(() => {
+    vi.mocked(runCodex).mockReset();
+    vi.mocked(runCodex).mockResolvedValue(plannerNoCodeResult());
+    vi.mocked(runAgenticEntry).mockReset();
+    vi.mocked(runAgenticEntry).mockResolvedValue({
+      workflow: 'INFORMATIONAL',
+      status: 'SUCCESS',
+      message: 'answered',
+      notifyDesktop: false,
+      slackPosted: true,
+    });
+  });
+
+  const run = async (text: string, options: { withPr?: boolean } = {}) => {
+    const slack = makeSlack();
+    const result = await runImplementationWorkflow({
+      task: makeTask(text, options),
+      config,
+      slack: slack as unknown as import('@slack/web-api').WebClient,
+    });
+    const posted = slack.chat.postMessage.mock.calls.map(call => String(call[0]?.text ?? ''));
+    return { result, posted };
+  };
+
+  it('answers an ask about a branch whose link says "merge"', async () => {
+    const { result, posted } = await run(
+      '<@UBOT1> what does <https://github.com/Newton-School/newton-web/tree/fix/merge-banner|fix/merge-banner> change?',
+    );
+    expect(runAgenticEntry).toHaveBeenCalledWith(expect.objectContaining({ mode: 'informational' }));
+    expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
+    expect(runCodex).toHaveBeenCalledTimes(1);
+    expect(result.workflow).toBe('INFORMATIONAL');
+    expect(posted.some(text => /asked me to/.test(text))).toBe(false);
+  });
+
+  it('does not close anything for a file link named close-modal', async () => {
+    const { result } = await run(
+      '<@UBOT1> explain <https://github.com/Newton-School/newton-web/blob/master/src/close-modal.tsx|close-modal.tsx>',
+      { withPr: true },
+    );
+    expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
+    expect(result.workflow).toBe('INFORMATIONAL');
+  });
+
+  it('still merges when the words say merge and the message also has a link', async () => {
+    const { posted } = await run(`<@UBOT1> merge <${PR_URL}> once you have read ${ISSUE_LINK}`, { withPr: true });
+    expect(__quickActionConfirm.wait).toHaveBeenCalledWith(expect.objectContaining({ phrase: 'confirm merge' }));
+    expect(posted.some(text => text.includes('asked me to merge'))).toBe(true);
+    // The agent is told the one operation it may perform.
+    expect(vi.mocked(runCodex).mock.calls[1][0].prompt).toContain(
+      'The confirmed operation is `merge`; perform no other pull-request operation.',
+    );
+  });
+
+  it('answers a question whose only "merge" is a link label', async () => {
+    const { result } = await run(
+      '<@UBOT1> what do <https://github.com/Newton-School/newton-web/issues/12|merge notes> say?',
+      { withPr: true },
+    );
+    expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
+    expect(result.workflow).toBe('INFORMATIONAL');
+  });
+
+  it('answers an ask about a typed branch name containing "merge"', async () => {
+    const { result } = await run(`<@UBOT1> what does fix/merge-banner change? see ${ISSUE_LINK}`, { withPr: true });
+    expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
+    expect(result.workflow).toBe('INFORMATIONAL');
+  });
+
+  it('answers an ask about a typed file name containing "close"', async () => {
+    const { result } = await run(`<@UBOT1> explain close-modal.tsx, see ${ISSUE_LINK}`, { withPr: true });
+    expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
+    expect(result.workflow).toBe('INFORMATIONAL');
+  });
+
+  it('still syncs when asked, beside a link', async () => {
+    const { posted } = await run(`<@UBOT1> sync it, see ${ISSUE_LINK}`, { withPr: true });
+    expect(__quickActionConfirm.wait).toHaveBeenCalledWith(expect.objectContaining({ phrase: 'confirm sync' }));
+    expect(posted.some(text => text.includes('asked me to sync'))).toBe(true);
+  });
+
+  it('still re-runs the tests when asked, beside a link', async () => {
+    const { result } = await run(`<@UBOT1> re-run the tests, see ${ISSUE_LINK}`, { withPr: true });
+    expect(runAgenticEntry).not.toHaveBeenCalled();
+    expect(runCodex).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(runCodex).mock.calls[1][0].prompt).not.toContain('The confirmed operation is');
+    expect(result.workflow).toBe('IMPLEMENTATION');
+  });
+
+  it('closes when asked to close, even after a link labelled "revert"', async () => {
+    const { posted } = await run(`<@UBOT1> see ${ISSUE_LINK} then close it`, { withPr: true });
+    expect(__quickActionConfirm.wait).toHaveBeenCalledWith(expect.objectContaining({ phrase: 'confirm close' }));
+    expect(posted.some(text => text.includes('asked me to close'))).toBe(true);
+  });
+
+  it('does not redirect to the deploy command when "deploy" is only inside a link', async () => {
+    const { result, posted } = await run(
+      '<@UBOT1> what changed in <https://github.com/Newton-School/newton-web/tree/release/deploy-fix|release/deploy-fix>?',
+    );
+    expect(posted).not.toContain(QUICK_ACTION_DEPLOY_REDIRECT);
+    expect(result.workflow).toBe('INFORMATIONAL');
+  });
+
+  it('does not refuse an approval that is only a link label', async () => {
+    const { result, posted } = await run(
+      '<@UBOT1> summarize <https://github.com/Newton-School/newton-web/tree/approve-flow|approve-flow>',
+    );
+    expect(posted).not.toContain(QUICK_ACTION_APPROVE_REFUSAL);
+    expect(result.workflow).toBe('INFORMATIONAL');
+  });
+});
