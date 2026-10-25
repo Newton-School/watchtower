@@ -1,7 +1,7 @@
 {
   "name": "watchtower",
   "private": true,
-  "version": "0.6.183",
+  "version": "0.6.184",
   "type": "module",
   "scripts": {
     "dev": "vite --port 1420",
