@@ -136,7 +136,7 @@ export const SEVERITY_RUBRIC = `- Severity — calibrate against this rubric (we
   - medium: a real bug behind a narrower condition or a meaningful gap — edge case mishandled, missing validation on a non-critical field, absent error handling, missing test for new branching logic.
   - low: maintainability nits with little blast radius — minor readability/naming, duplication, a redundant re-render, an inconsistency no user or caller would notice.
   - info: non-actionable observations or style notes that don't require a change.
-  - Medium or low: code that does the wrong thing for some input, state or timing a user or caller can reach is medium or above, however narrow or uncommon the condition — narrowness keeps it below high, it does not make it low. Low is for what changes nothing a user or caller can notice. A missing test for new branching logic is medium even when the rest of the module has no tests. A security weakness on input someone outside can send (SSRF, path traversal, missing authorization, data or secret exposure) is never low.`;
+  - Medium or low: code that does the wrong thing for some input, state or timing a user or caller can reach is medium or above, however narrow or uncommon the condition — narrowness keeps it below high, it does not make it low. Low is for what changes nothing a user or caller can notice. A missing test for new branching logic is medium even when the rest of the module has no tests. A security weakness on input someone outside can send (SSRF, path traversal, missing authorization, data or secret exposure) is never low. New code that nothing calls yet (a module or helper whose caller lands in a later PR) is rated as if it were called.`;
 
 /** Pinned invariant: the agent never posts — submitPrReview is the sole GitHub write path. */
 export const NEVER_POST_RULE =
@@ -510,7 +510,7 @@ Lowering severity:
 - Rate the issue by the rubric, not by how likely you think it is to happen. "Real but narrow", "an uncommon setup", "nice to have" and "the module has no other tests" describe a medium; they are not reasons to go lower.
 - A finding goes below medium (to low or info) only with one of these "severityBasis" values:
   - "no-behaviour-change": nothing a user or caller can notice changes (naming, duplication, readability, style, a redundant re-render).
-  - "not-shipped": the code never runs for real users (a scratch file marked not for merging, a test fixture, a path nothing calls).
+  - "not-shipped": the code is not meant to run for real users (a scratch file marked not for merging, a test fixture or test-only helper). New code that has no caller yet is not "not-shipped": its caller can land in a later PR (a stacked PR, a module added before its use), so rate it as if it were called.
   Any other lowering of a medium-or-above finding stops at medium.
 - For any other lowering (e.g. high to medium), use "severityBasis": "smaller-impact".
 - In "reason", name the rubric line you applied.
