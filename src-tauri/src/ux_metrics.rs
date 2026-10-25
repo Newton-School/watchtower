@@ -30,19 +30,25 @@ const ACK_FALLBACK_STAGES: [&str; 3] = [
     "agentic.pr_review.ack_posted",
     "router.unsupported.replied",
 ];
-/// A person had to answer miniOG: approvals, confirmations, changes asked
-/// for, clarifying questions, answers from the app.
-const INTERVENTION_STAGES: [&str; 9] = [
-    "pipeline.approval.approved",
-    "pipeline.approval.requester_confirmed",
+const APPROVED_STAGE: &str = "pipeline.approval.approved";
+const REQUESTER_CONFIRMED_STAGE: &str = "pipeline.approval.requester_confirmed";
+/// A person had to answer miniOG during a change run: plan approvals and
+/// confirmations, rejections, changes asked for, clarifying questions,
+/// answers from the app. Merge and deploy confirmations happen in later jobs
+/// of their own, so they are not here.
+const INTERVENTION_STAGES: [&str; 7] = [
+    APPROVED_STAGE,
+    REQUESTER_CONFIRMED_STAGE,
     "pipeline.approval.rejected",
     "pipeline.approval.feedback",
-    "implementation.quick_action.confirm.confirmed",
-    "deploy.confirm.confirmed",
     "router.clarify.asked",
     "workflow.repo.clarify",
     "watchtower.run.answer",
 ];
+/// Every quick-action stage starts with this; the loader reads them all so a
+/// merge, close or sync can be told apart from a change run.
+const QUICK_ACTION_PREFIX: &str = "implementation.quick_action";
+const QUICK_ACTION_TOOL: &str = "QUICK_ACTION";
 const CONTENT_MERGE_STAGE: &str = "implementation.quick_action.content_merge";
 const PR_ACTION_STAGE: &str = "implementation.quick_action.pr_action";
 const MARKETING_DEPLOY_DONE: &str = "deploy.marketing.done";
@@ -309,6 +315,41 @@ fn repo_of_pr(url: &str) -> Option<&'static str> {
     }
 }
 
+/// The person and the quoted reply in an approval log line, e.g.
+/// `<@U1> approved the plan: "yes"` → ("U1", "yes").
+fn answer_of(message: &str) -> Option<(&str, &str)> {
+    let start = message.find("<@")? + 2;
+    let end = start + message[start..].find('>')?;
+    let user = message[start..end].split('|').next()?;
+    let quote_start = message.find(": \"")? + 3;
+    let quote_end = message.rfind('"')?;
+    if quote_end < quote_start {
+        return None;
+    }
+    Some((user, &message[quote_start..quote_end]))
+}
+
+/// One key per answer a person gave. A requester who may also approve logs
+/// both an approval and a confirmation for the same reply, so those two
+/// stages share a key built from who answered and what they said.
+fn answer_key(log: &LogRow) -> (String, String) {
+    if log.stage == APPROVED_STAGE || log.stage == REQUESTER_CONFIRMED_STAGE {
+        if let Some((user, quote)) = answer_of(&log.message) {
+            return (format!("plan-answer:{user}"), quote.to_string());
+        }
+    }
+    (log.stage.clone(), log.message.clone())
+}
+
+/// The tool a job ran, telling a merge, close or sync apart from a change
+/// run: both run the implementation workflow, but a quick action posts no plan.
+fn tool_of(job: &JobRow, logs: &[&LogRow], has_plan: bool) -> String {
+    if job.tool == "IMPLEMENTATION" && !has_plan && logs.iter().any(|log| log.stage.starts_with(QUICK_ACTION_PREFIX)) {
+        return QUICK_ACTION_TOOL.to_string();
+    }
+    job.tool.clone()
+}
+
 fn window(input: &MetricsInput, since: DateTime<Utc>, until: DateTime<Utc>) -> UxWindow {
     let since_ms = since.timestamp_millis();
     let until_ms = until.timestamp_millis();
@@ -323,6 +364,15 @@ fn window(input: &MetricsInput, since: DateTime<Utc>, until: DateTime<Utc>) -> U
             .or_default()
             .push(message.ts_ms);
     }
+    // Every loaded job's ask, per thread: a job's messages stop where the
+    // next ask in its thread starts, so two jobs never claim one message.
+    let mut asks_by_thread: HashMap<(&str, &str), Vec<i64>> = HashMap::new();
+    for job in &input.jobs {
+        asks_by_thread
+            .entry((job.channel_id.as_str(), job.thread_ts.as_str()))
+            .or_default()
+            .push(job.ask_ms);
+    }
     let merged = merge_times(&input.jobs, &logs_by_job);
     let deploys = prod_deploys(&input.logs);
 
@@ -334,6 +384,7 @@ fn window(input: &MetricsInput, since: DateTime<Utc>, until: DateTime<Utc>) -> U
 
     let mut first_reply = Vec::new();
     let mut to_plan = Vec::new();
+    let mut approval_wait = Vec::new();
     let mut to_pr = Vec::new();
     let mut to_merge = Vec::new();
     let mut to_prod = Vec::new();
@@ -347,10 +398,17 @@ fn window(input: &MetricsInput, since: DateTime<Utc>, until: DateTime<Utc>) -> U
     for job in &in_window {
         let logs = logs_by_job.get(job.id.as_str()).unwrap_or(&empty);
         let end = job_end_ms(job, logs).max(job.end_ms);
-        *by_tool.entry(job.tool.clone()).or_default() += 1;
+        let thread = (job.channel_id.as_str(), job.thread_ts.as_str());
+        let plan_at = logs
+            .iter()
+            .filter(|log| PLAN_STAGES.contains(&log.stage.as_str()))
+            .map(|log| log.at_ms)
+            .min();
+        let tool = tool_of(job, logs, plan_at.is_some());
+        *by_tool.entry(tool.clone()).or_default() += 1;
         *by_channel.entry(job.channel_id.clone()).or_default() += 1;
-        let outcome = outcomes.entry(job.tool.clone()).or_insert_with(|| ToolOutcomes {
-            tool: job.tool.clone(),
+        let outcome = outcomes.entry(tool.clone()).or_insert_with(|| ToolOutcomes {
+            tool: tool.clone(),
             jobs: 0,
             failed: 0,
             cancelled: 0,
@@ -362,14 +420,19 @@ fn window(input: &MetricsInput, since: DateTime<Utc>, until: DateTime<Utc>) -> U
             outcome.cancelled += 1;
         }
 
-        // miniOG's messages in this thread while the job ran.
+        // miniOG's messages in this thread while the job ran, up to the next
+        // ask in the same thread.
+        let next_ask = asks_by_thread
+            .get(&thread)
+            .and_then(|asks| asks.iter().copied().filter(|ask| *ask > job.ask_ms).min())
+            .unwrap_or(i64::MAX);
         let posted: Vec<i64> = bot_by_thread
-            .get(&(job.channel_id.as_str(), job.thread_ts.as_str()))
+            .get(&thread)
             .map(|times| {
                 times
                     .iter()
                     .copied()
-                    .filter(|ts| *ts > job.ask_ms && *ts <= end + MESSAGE_GRACE_MS)
+                    .filter(|ts| *ts > job.ask_ms && *ts <= end + MESSAGE_GRACE_MS && *ts < next_ask)
                     .collect()
             })
             .unwrap_or_default();
@@ -383,27 +446,27 @@ fn window(input: &MetricsInput, since: DateTime<Utc>, until: DateTime<Utc>) -> U
             first_reply.push((at - job.ask_ms).max(0) as f64);
         }
         if !posted.is_empty() {
-            messages_by_tool
-                .entry(job.tool.clone())
-                .or_default()
-                .push(posted.len() as f64);
+            messages_by_tool.entry(tool.clone()).or_default().push(posted.len() as f64);
         }
 
-        let plan_at = logs
-            .iter()
-            .filter(|log| PLAN_STAGES.contains(&log.stage.as_str()))
-            .map(|log| log.at_ms)
-            .min();
         if let Some(at) = plan_at {
             to_plan.push((at - job.ask_ms).max(0) as f64);
+            let approved_at = logs
+                .iter()
+                .filter(|log| log.stage == APPROVED_STAGE && log.at_ms >= at)
+                .map(|log| log.at_ms)
+                .min();
+            if let Some(approved) = approved_at {
+                approval_wait.push((approved - at) as f64);
+            }
         }
 
         if job.tool == "IMPLEMENTATION" && plan_at.is_some() {
             // Some approval stages are logged on every poll: count each answer once.
-            let distinct: HashSet<(&str, &str)> = logs
+            let distinct: HashSet<(String, String)> = logs
                 .iter()
                 .filter(|log| INTERVENTION_STAGES.contains(&log.stage.as_str()))
-                .map(|log| (log.stage.as_str(), log.message.as_str()))
+                .map(|log| answer_key(log))
                 .collect();
             interventions_per_run.push(distinct.len() as f64);
         }
@@ -475,7 +538,8 @@ fn window(input: &MetricsInput, since: DateTime<Utc>, until: DateTime<Utc>) -> U
         steps: vec![
             step("firstReply", "First reply", first_reply),
             step("plan", "Plan posted", to_plan),
-            step("pr", "PR opened", to_pr),
+            step("approval", "Waiting for approval (from the plan)", approval_wait),
+            step("pr", "PR opened (includes the approval wait)", to_pr),
             step("merge", "Merged by miniOG", to_merge),
             step("prod", "Live in production", to_prod),
         ],
@@ -566,10 +630,19 @@ pub(crate) fn load(connection: &Connection, until: DateTime<Utc>) -> Result<Metr
         };
         let end_ms = parse_iso_ms(&updated).unwrap_or(created_ms);
         let payload: Option<Value> = payload.as_deref().and_then(|text| serde_json::from_str(text).ok());
-        // The Slack message's own time; a replayed or retriggered job keeps
-        // an old one, so anything after the job's creation is the creation.
+        // The Slack message's own time. A catch-up or restart replay keeps the
+        // original message's time, so its numbers include the wait the asker
+        // really had. An ask from the app (a Launchpad request or a re-run of
+        // an old message) is measured from the job's creation instead, and a
+        // time after the creation can only be clock skew.
+        let from_app = payload
+            .as_ref()
+            .and_then(|p| p.get("ingestSource"))
+            .and_then(Value::as_str)
+            == Some("launchpad");
         let ask_ms = payload
             .as_ref()
+            .filter(|_| !from_app)
             .and_then(|p| p.get("eventTs"))
             .and_then(Value::as_str)
             .and_then(slack_ts_ms)
@@ -600,7 +673,7 @@ pub(crate) fn load(connection: &Connection, until: DateTime<Utc>) -> Result<Metr
     let sql = format!(
         "SELECT job_id, stage, message, data_json, created_at FROM job_logs
          WHERE job_id IN (SELECT id FROM jobs WHERE created_at >= ? AND created_at < ?)
-           AND stage IN ({placeholders})"
+           AND (stage IN ({placeholders}) OR stage LIKE '{QUICK_ACTION_PREFIX}%')"
     );
     let mut stmt = connection
         .prepare(&sql)
@@ -743,6 +816,21 @@ mod tests {
         }
     }
 
+    fn answer(job_id: &str, stage: &str, at_ms: i64, user: &str, quote: &str) -> LogRow {
+        let verb = if stage == APPROVED_STAGE {
+            "approved the plan"
+        } else {
+            "confirmed the plan is what they want"
+        };
+        LogRow {
+            job_id: job_id.to_string(),
+            stage: stage.to_string(),
+            message: format!("<@{user}> {verb}: \"{quote}\""),
+            data: None,
+            at_ms,
+        }
+    }
+
     fn bot(job: &JobRow, ts_ms: i64) -> BotMessage {
         BotMessage {
             channel_id: job.channel_id.clone(),
@@ -791,9 +879,9 @@ mod tests {
             logs: vec![
                 log("run", "plan.detail.posted", ask + 2 * MIN, None),
                 log("run", "implementation.approval.waiting", ask + 2 * MIN + 500, None),
-                log("run", "pipeline.approval.approved", ask + 4 * MIN, None),
-                log("run", "pipeline.approval.approved", ask + 4 * MIN + 1, None),
-                log("run", "pipeline.approval.requester_confirmed", ask + 4 * MIN, None),
+                answer("run", APPROVED_STAGE, ask + 4 * MIN, "U1", "yes"),
+                answer("run", APPROVED_STAGE, ask + 4 * MIN + 1, "U1", "yes"),
+                answer("run", REQUESTER_CONFIRMED_STAGE, ask + 4 * MIN, "U1", "yes"),
                 log("run", RESULT_STAGE, ask + 30 * MIN, None),
                 log(
                     "merge",
@@ -815,12 +903,16 @@ mod tests {
         let current = &metrics.current;
         assert_eq!(step_of(current, "firstReply").median_ms, Some(5_000.0));
         assert_eq!(step_of(current, "plan").median_ms, Some((2 * MIN) as f64));
+        assert_eq!(step_of(current, "approval").median_ms, Some((2 * MIN) as f64));
         assert_eq!(step_of(current, "pr").median_ms, Some((30 * MIN) as f64));
         assert_eq!(step_of(current, "merge").median_ms, Some((40 * MIN) as f64));
         assert_eq!(step_of(current, "prod").median_ms, Some((55 * MIN) as f64));
-        // The repeated approval log counts once; the confirmation is a second answer.
+        // The repeated approval log and the requester's confirmation of the
+        // same reply are one answer.
         assert_eq!(current.interventions.change_runs, 1);
-        assert_eq!(current.interventions.total, 2);
+        assert_eq!(current.interventions.total, 1);
+        // The merge posted no plan: it is a quick action, not a change run.
+        assert!(current.by_tool.iter().any(|row| row.key == QUICK_ACTION_TOOL));
         let impl_messages = current
             .messages
             .iter()
@@ -830,6 +922,84 @@ mod tests {
         assert_eq!(impl_messages.mean, 3.0);
         assert_eq!(current.jobs, 3);
         assert_eq!(metrics.previous.jobs, 0);
+    }
+
+    #[test]
+    fn an_admin_approval_and_a_requester_confirmation_are_two_answers() {
+        let ask = at(-4 * HOUR);
+        let run = job("run", "IMPLEMENTATION", "SUCCESS", ask, ask + 20 * MIN);
+        let input = MetricsInput {
+            logs: vec![
+                log("run", "plan.detail.posted", ask + MIN, None),
+                answer("run", APPROVED_STAGE, ask + 3 * MIN, "UADMIN", "go"),
+                answer("run", REQUESTER_CONFIRMED_STAGE, ask + 9 * MIN, "UASKER", "yes please"),
+                log("run", "pipeline.approval.feedback", ask + 2 * MIN, None),
+            ],
+            jobs: vec![run],
+            ..Default::default()
+        };
+        let metrics = compute(&input, until());
+        assert_eq!(metrics.current.interventions.total, 3);
+        assert_eq!(
+            step_of(&metrics.current, "approval").median_ms,
+            Some((2 * MIN) as f64),
+            "the wait ends at the first approval"
+        );
+    }
+
+    #[test]
+    fn answer_of_reads_who_and_what() {
+        assert_eq!(answer_of("<@U087> approved the plan: \"yes\""), Some(("U087", "yes")));
+        assert_eq!(
+            answer_of("<@U1|asha> confirmed the plan is what they want: \"ok \"go\"\""),
+            Some(("U1", "ok \"go\""))
+        );
+        assert_eq!(answer_of("Approved by the owner"), None);
+    }
+
+    #[test]
+    fn a_job_stops_claiming_messages_at_the_next_ask_in_its_thread() {
+        let ask = at(-6 * HOUR);
+        let first = job("first", "INFORMATIONAL", "SUCCESS", ask, ask + 10 * MIN);
+        let mut follow_up = job("next", "INFORMATIONAL", "SUCCESS", ask + 2 * MIN, ask + 4 * MIN);
+        follow_up.thread_ts = first.thread_ts.clone();
+        let input = MetricsInput {
+            bot_messages: vec![bot(&first, ask + 30_000), bot(&first, ask + 3 * MIN)],
+            jobs: vec![first, follow_up],
+            ..Default::default()
+        };
+        let metrics = compute(&input, until());
+        let lookups = metrics
+            .current
+            .messages
+            .iter()
+            .find(|m| m.tool == "INFORMATIONAL")
+            .unwrap();
+        assert_eq!(lookups.runs, 2, "each job claims one message");
+        assert_eq!(lookups.mean, 1.0);
+        let reply = step_of(&metrics.current, "firstReply");
+        assert_eq!(reply.count, 2);
+        assert_eq!(reply.median_ms, Some((30_000 + 60_000) as f64 / 2.0));
+    }
+
+    #[test]
+    fn quick_actions_are_counted_apart_from_change_runs() {
+        let ask = at(-HOUR);
+        let close = job("close", "IMPLEMENTATION", "SUCCESS", ask, ask + MIN);
+        let input = MetricsInput {
+            logs: vec![log(
+                "close",
+                "implementation.quick_action.no_planner",
+                ask + 1_000,
+                None,
+            )],
+            jobs: vec![close],
+            ..Default::default()
+        };
+        let metrics = compute(&input, until());
+        assert_eq!(metrics.current.by_tool[0].key, QUICK_ACTION_TOOL);
+        assert_eq!(metrics.current.outcomes[0].tool, QUICK_ACTION_TOOL);
+        assert_eq!(metrics.current.interventions.change_runs, 0);
     }
 
     #[test]
@@ -856,14 +1026,17 @@ mod tests {
         let merge = step_of(&metrics.current, "merge");
         assert_eq!(merge.count, 0);
         assert_eq!(merge.median_ms, None);
-        let outcomes = metrics
-            .current
-            .outcomes
-            .iter()
-            .find(|o| o.tool == "IMPLEMENTATION")
-            .unwrap();
-        assert_eq!(outcomes.jobs, 2);
-        assert_eq!(outcomes.failed, 1);
+        let outcome = |tool: &str| {
+            metrics
+                .current
+                .outcomes
+                .iter()
+                .find(|o| o.tool == tool)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!((outcome("IMPLEMENTATION").jobs, outcome("IMPLEMENTATION").failed), (1, 0));
+        assert_eq!((outcome(QUICK_ACTION_TOOL).jobs, outcome(QUICK_ACTION_TOOL).failed), (1, 1));
     }
 
     #[test]
@@ -996,6 +1169,36 @@ mod tests {
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         let metrics = ux_metrics(&connection, Utc::now()).unwrap();
         println!("{}", serde_json::to_string_pretty(&metrics).unwrap());
+    }
+
+    #[test]
+    fn load_measures_app_asks_from_the_job_and_reads_quick_action_stages() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE jobs (id TEXT PRIMARY KEY, workflow TEXT NOT NULL, status TEXT NOT NULL,
+                   channel_id TEXT NOT NULL, thread_ts TEXT NOT NULL, payload_json TEXT, result_json TEXT,
+                   created_at TEXT NOT NULL, updated_at TEXT NOT NULL, executed_workflow TEXT);
+                 CREATE TABLE job_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
+                   stage TEXT NOT NULL, message TEXT NOT NULL, data_json TEXT, created_at TEXT NOT NULL);
+                 INSERT INTO jobs VALUES ('app', 'IMPLEMENTATION', 'SUCCESS', 'C1', '1792000000.000100',
+                   '{\"eventTs\":\"1792000000.000100\",\"ingestSource\":\"launchpad\"}', NULL,
+                   '2026-10-25T03:46:41.000Z', '2026-10-25T04:00:00.000Z', NULL);
+                 INSERT INTO jobs VALUES ('replay', 'INFORMATIONAL', 'SUCCESS', 'C1', '1792895000.000100',
+                   '{\"eventTs\":\"1792895000.000100\",\"ingestSource\":\"socket\"}', NULL,
+                   '2026-10-25T03:46:41.000Z', '2026-10-25T04:00:00.000Z', NULL);
+                 INSERT INTO job_logs (job_id, stage, message, data_json, created_at) VALUES
+                   ('app', 'implementation.quick_action.no_planner', 'close', NULL, '2026-10-25T03:47:00.000Z');",
+            )
+            .unwrap();
+        let input = load(&connection, until()).unwrap();
+        let app = input.jobs.iter().find(|job| job.id == "app").unwrap();
+        assert_eq!(app.ask_ms, app.created_ms, "an app ask is measured from the job");
+        let replay = input.jobs.iter().find(|job| job.id == "replay").unwrap();
+        assert_eq!(replay.ask_ms, 1_792_895_000_000, "a replay keeps the message's own time");
+        assert_eq!(input.logs.len(), 1);
+        let metrics = compute(&input, until());
+        assert!(metrics.current.by_tool.iter().any(|row| row.key == QUICK_ACTION_TOOL));
     }
 
     #[test]

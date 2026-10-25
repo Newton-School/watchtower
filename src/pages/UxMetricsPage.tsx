@@ -9,6 +9,7 @@ const TOOL_LABELS: Record<string, string> = {
   INFORMATIONAL: 'Lookup',
   PR_REVIEW: 'PR review',
   IMPLEMENTATION: 'Change run',
+  QUICK_ACTION: 'Quick action (merge, close, sync)',
   INVESTIGATION: 'Investigation',
   CONVERSATIONAL: 'Chat',
   DEPLOY: 'Prod deploy',
@@ -107,7 +108,8 @@ export function UxMetricsPage() {
                 <h2>Time from the ask</h2>
               </div>
               <p className="muted">
-                Median and slowest-10% time from the Slack message to each step, over the runs that reached it.
+                Median and slowest-10% time from the Slack message to each step, over the runs that reached it. The
+                approval wait runs from the plan to the first approval.
               </p>
             </div>
             <div className="performance-range-toggle">
@@ -134,8 +136,8 @@ export function UxMetricsPage() {
                     <th className="num">Median</th>
                     <th className="num">Slowest 10%</th>
                     <th className="num">Runs</th>
-                    <th className="num">Last week</th>
-                    <th className="num">Runs</th>
+                    <th className="num">Previous 7 days</th>
+                    <th className="num">Runs (previous 7 days)</th>
                     <th>Change</th>
                   </tr>
                 </thead>
@@ -170,17 +172,17 @@ export function UxMetricsPage() {
                 </div>
                 <p className="muted">
                   Answers a person had to give: plan approvals and confirmations, changes asked for, clarifying
-                  questions, merge and deploy confirmations.
+                  questions, answers given from the app. Each reply counts once.
                 </p>
               </div>
             </div>
             <div className="detail-grid">
               <div>
-                <span>This week, average</span>
+                <span>Last 7 days, average</span>
                 <strong>{oneDecimal(current.interventions.meanPerRun)}</strong>
               </div>
               <div>
-                <span>This week, median</span>
+                <span>Last 7 days, median</span>
                 <strong>{oneDecimal(current.interventions.medianPerRun)}</strong>
               </div>
               <div>
@@ -188,11 +190,11 @@ export function UxMetricsPage() {
                 <strong>{current.interventions.changeRuns}</strong>
               </div>
               <div>
-                <span>Last week, average</span>
+                <span>Previous 7 days, average</span>
                 <strong>{oneDecimal(previous.interventions.meanPerRun)}</strong>
               </div>
               <div>
-                <span>Last week, change runs</span>
+                <span>Previous 7 days, change runs</span>
                 <strong>{previous.interventions.changeRuns}</strong>
               </div>
             </div>
@@ -241,7 +243,7 @@ export function UxMetricsPage() {
                   <h2>Where people ask</h2>
                   <span className="section-count">{current.jobs}</span>
                 </div>
-                <p className="muted">Requests by channel and by the tool that ran, this week and last.</p>
+                <p className="muted">Requests by channel and by the tool that ran, the last 7 days and the 7 before.</p>
               </div>
             </div>
             <CountsTable
@@ -270,7 +272,7 @@ export function UxMetricsPage() {
 }
 
 function MessagesTable({ current, previous }: { current: UxWindow; previous: UxWindow }) {
-  if (current.messages.length === 0) return <p className="muted">No captured messages this week.</p>;
+  if (current.messages.length === 0) return <p className="muted">No captured messages in the last 7 days.</p>;
   const before = new Map(previous.messages.map(row => [row.tool, row]));
   return (
     <div className="cost-table-scroll">
@@ -281,7 +283,7 @@ function MessagesTable({ current, previous }: { current: UxWindow; previous: UxW
             <th className="num">Average</th>
             <th className="num">Median</th>
             <th className="num">Runs</th>
-            <th className="num">Last week average</th>
+            <th className="num">Previous 7 days average</th>
           </tr>
         </thead>
         <tbody>
@@ -301,7 +303,7 @@ function MessagesTable({ current, previous }: { current: UxWindow; previous: UxW
 }
 
 function OutcomesTable({ current, previous }: { current: UxWindow; previous: UxWindow }) {
-  if (current.outcomes.length === 0) return <p className="muted">No runs this week.</p>;
+  if (current.outcomes.length === 0) return <p className="muted">No runs in the last 7 days.</p>;
   const before = new Map(previous.outcomes.map(row => [row.tool, row]));
   return (
     <div className="cost-table-scroll">
@@ -312,7 +314,7 @@ function OutcomesTable({ current, previous }: { current: UxWindow; previous: UxW
             <th className="num">Runs</th>
             <th className="num">Failed</th>
             <th className="num">Stopped</th>
-            <th className="num">Last week failed</th>
+            <th className="num">Previous 7 days failed</th>
           </tr>
         </thead>
         <tbody>
@@ -353,8 +355,8 @@ function CountsTable({
         <thead>
           <tr>
             <th>{heading}</th>
-            <th className="num">This week</th>
-            <th className="num">Last week</th>
+            <th className="num">Last 7 days</th>
+            <th className="num">Previous 7 days</th>
           </tr>
         </thead>
         <tbody>

@@ -823,8 +823,11 @@ async fn get_ux_metrics(
     let until = chrono::DateTime::parse_from_rfc3339(&until_iso)
         .map_err(|err| format!("invalid until_iso: {err}"))?
         .with_timezone(&Utc);
-    let connection =
-        Connection::open(&*state.db_path).map_err(|err| format!("db open failed: {err}"))?;
+    let connection = Connection::open_with_flags(
+        &*state.db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|err| format!("db open failed: {err}"))?;
     ux_metrics::ux_metrics(&connection, until)
 }
 
