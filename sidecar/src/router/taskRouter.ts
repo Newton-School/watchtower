@@ -27,6 +27,7 @@ import { fetchThreadRepliesSince } from '../slack/threadContext.js';
 import { runDevAssistWorkflow } from '../workflows/devAssistWorkflow.js';
 import { runMiniogDossierWorkflow } from '../workflows/miniogDossierWorkflow.js';
 import { runDeployWorkflow } from '../workflows/deployWorkflow.js';
+import { runStagingDeployWorkflow } from '../workflows/stagingDeployWorkflow.js';
 import { runImplementationWorkflow } from '../workflows/implementationWorkflow.js';
 import { readPrActionAsk } from './prActionAsk.js';
 import { runInvestigationWorkflow } from '../workflows/investigationWorkflow.js';
@@ -47,7 +48,6 @@ import { channelDenialHint } from '../access/denialHint.js';
 import { buildHelpReply, isHelpRequest } from './helpReply.js';
 import { unsupportedReply } from './unsupportedReply.js';
 import { isMarketingStagingDeployAsk, namesStagingAsTarget } from './intentParser.js';
-import { marketingStagingReply } from '../repos/registry.js';
 import { acknowledgementText, pickupDelayMs } from './acknowledgement.js';
 import { RESTART_EVENT_PREFIX } from '../runtime/restartRecovery.js';
 import { looksLikeFixAffirmation } from './resumeIntentParser.js';
@@ -106,8 +106,10 @@ const WORKFLOW_RUNNERS: Partial<Record<WorkflowIntent, (ctx: WorkflowRunnerConte
     runDevAssistWorkflow({ task, config, slack, store, logStep, signal }),
   MINIOG_DOSSIER: ({ task, slack, store, config, logStep, signal }) =>
     runMiniogDossierWorkflow({ task, slack, store, config, logStep, signal }),
-  DEPLOY: ({ task, config, slack, store, logStep, signal }) =>
-    runDeployWorkflow({ task, config, slack, store, logStep, signal }),
+  DEPLOY: ({ task, config, slack, store, jobId, logStep, signal }) =>
+    runDeployWorkflow({ task, config, slack, store, jobId, logStep, signal }),
+  STAGING_DEPLOY: ({ task, config, slack, store, jobId, logStep, signal }) =>
+    runStagingDeployWorkflow({ task, config, slack, store, jobId, logStep, signal }),
 };
 
 function runImplementation({ task, config, slack, store, jobId, logStep, signal }: WorkflowRunnerContext) {
@@ -266,10 +268,9 @@ export async function routeTask(params: {
    */
   const helpRequested = directAsk && isHelpRequest(userMessage);
   /**
-   * A message that is only "deploy marketing to staging": miniOG runs no
-   * staging deploys, so the steps are posted at once, at every tier, with no
-   * model run. Left to the router, it once became a change_code question
-   * ("change something, or only look into it?").
+   * A message that is only "deploy marketing to staging": the staging tool
+   * runs at once, with no model run (issue #702). Left to the router, it once
+   * became a change_code question ("change something, or only look into it?").
    */
   const stagingAsked = directAsk && !helpRequested && isMarketingStagingDeployAsk(userMessage);
   const routerShadow =
@@ -314,10 +315,10 @@ export async function routeTask(params: {
         data: { userMessage },
       });
     } else if (stagingAsked) {
-      resolvedIntent = 'CONVERSATIONAL';
+      resolvedIntent = 'STAGING_DEPLOY';
       logStep?.({
         stage: 'router.staging_gate',
-        message: 'A marketing staging deploy ask — answering with the steps, no model run.',
+        message: 'A marketing staging deploy ask — putting it on staging, no model run.',
         data: { userMessage },
       });
     } else if (
@@ -767,21 +768,6 @@ export async function routeTask(params: {
       workflow: 'UNKNOWN',
       status: 'SKIPPED',
       message: `Asked for something none of the tools do; said so and ran nothing: ${unsupportedText}`,
-      notifyDesktop: false,
-      slackPosted: true,
-    };
-  }
-  if (stagingAsked) {
-    if (signal?.aborted) return cancelledResult('CONVERSATIONAL');
-    await slack.chat.postMessage({
-      channel: task.event.channelId,
-      thread_ts: task.event.threadTs,
-      text: marketingStagingReply(),
-    });
-    return {
-      workflow: 'CONVERSATIONAL',
-      status: 'SUCCESS',
-      message: 'Answered a marketing staging deploy ask with the steps.',
       notifyDesktop: false,
       slackPosted: true,
     };

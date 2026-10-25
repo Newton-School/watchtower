@@ -9,6 +9,7 @@ import {
   __deployTiming,
   __deployConfirm,
   DEPLOY_DRY_RUN_STATE_KEY,
+  STAGING_OR_PROD_REPLY,
 } from '../src/workflows/deployWorkflow.js';
 import { runCodex } from '../src/codex/runCodex.js';
 
@@ -286,7 +287,7 @@ describe('runDeployWorkflow marketing branch', () => {
     expect(runCodex).not.toHaveBeenCalled();
   });
 
-  it('explains that staging is a manual deploy and how to run it', async () => {
+  it('asks staging or production when staging is only context, and runs nothing', async () => {
     const ghExec = vi.fn();
     __ghCli.exec = ghExec;
     const postMessage = vi.fn().mockResolvedValue({ ok: true, ts: '1.0' });
@@ -294,18 +295,16 @@ describe('runDeployWorkflow marketing branch', () => {
     const logStep = vi.fn();
 
     const result = await runDeployWorkflow({
-      task: marketingTask('<@UBOT1> deploy marketing to staging'),
+      task: marketingTask('<@UBOT1> deploy marketing, it looks good on staging'),
       config: marketingConfig,
       slack,
       logStep,
     });
 
     expect(result.status).toBe('SKIPPED');
-    expect(result.message).toMatch(/^I don't run staging deploys\. Staging deploys are manual/);
-    expect(result.message).toContain('gh workflow run deploy-staging.yml --ref YOUR_BRANCH');
-    expect(result.message).toContain('replaces whatever is on staging now');
+    expect(result.message).toBe(STAGING_OR_PROD_REPLY);
+    expect(result.message).toContain('ask me for a testing link');
     expect(result.message).toMatch(/If you meant production, ask again and say prod\.$/);
-    expect(result.message).not.toContain('ships itself');
     // No placeholder in angle brackets, which Slack would read as a link.
     expect(postMessage.mock.calls[0][0].text).toBe(result.message);
     expect(result.message).not.toMatch(/[<>]/);
@@ -315,24 +314,26 @@ describe('runDeployWorkflow marketing branch', () => {
     expect(ghExec).not.toHaveBeenCalled();
   });
 
-  it('gives every phrasing of a marketing staging ask the instructions, never the production prompt', async () => {
-    const ghExec = vi.fn();
+  it('hands an ask that names staging as the target to the staging tool, never the production prompt (#702)', async () => {
+    const ghExec = vi.fn().mockRejectedValue(new Error('HTTP 404'));
     __ghCli.exec = ghExec;
     const postMessage = vi.fn().mockResolvedValue({ ok: true, ts: '1.0' });
     const slack = { chat: { postMessage } } as any;
     for (const text of [
-      '<@UBOT1> deploy marketing staging',
+      '<@UBOT1> deploy marketing to staging',
       '<@UBOT1> deploy marketing branch fix/hero-v2.1 to staging',
       '<@UBOT1> deploy marketing &amp; blog changes to staging',
+      '<@UBOT1> deploy marketing to staging for <https://github.com/Newton-School/newton-marketing-web/pull/12|fix production banner>',
+      '<@UBOT1> deploy marketing to staging, ping <#C123|prod-alerts> when done',
     ]) {
       const result = await runDeployWorkflow({ task: marketingTask(text), config: marketingConfig, slack });
-      expect(result.message, text).toMatch(/^I don't run staging deploys/);
+      expect(result.workflow, text).toBe('STAGING_DEPLOY');
     }
     for (const call of postMessage.mock.calls) expect(call[0].text).not.toContain('to production?');
-    expect(ghExec).not.toHaveBeenCalled();
+    for (const call of ghExec.mock.calls) expect(call[0]).not.toContain('deploy-prod.yml');
   });
 
-  it('answers a marketing staging ask even on a host without the clone', async () => {
+  it('hands a staging ask over even on a host without the clone, which says so', async () => {
     const postMessage = vi.fn().mockResolvedValue({ ok: true, ts: '1.0' });
     const slack = { chat: { postMessage } } as any;
     const result = await runDeployWorkflow({
@@ -340,22 +341,8 @@ describe('runDeployWorkflow marketing branch', () => {
       config,
       slack,
     });
-    expect(result.message).toMatch(/^I don't run staging deploys\./);
-  });
-
-  it('reads a staging ask whose link label says production as staging, and never dispatches prod', async () => {
-    const ghExec = vi.fn();
-    __ghCli.exec = ghExec;
-    const postMessage = vi.fn().mockResolvedValue({ ok: true, ts: '1.0' });
-    const slack = { chat: { postMessage } } as any;
-    for (const text of [
-      '<@UBOT1> deploy marketing to staging for <https://github.com/Newton-School/newton-marketing-web/pull/12|fix production banner>',
-      '<@UBOT1> deploy marketing to staging, ping <#C123|prod-alerts> when done',
-    ]) {
-      const result = await runDeployWorkflow({ task: marketingTask(text), config: marketingConfig, slack });
-      expect(result.message, text).toMatch(/^I don't run staging deploys/);
-    }
-    expect(ghExec).not.toHaveBeenCalled();
+    expect(result.workflow).toBe('STAGING_DEPLOY');
+    expect(result.message).toContain("clone isn't configured");
   });
 
   it('dispatches the GitHub Actions prod deploy and reports the completed run', async () => {

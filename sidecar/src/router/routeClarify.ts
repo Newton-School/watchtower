@@ -24,6 +24,9 @@ export const ROUTE_CLARIFY_TTL_MS = 30 * 60_000;
 export const DEFAULT_CLARIFY_QUESTION = "I'm not sure what you'd like me to do here. What do you need?";
 export const LOW_CONFIDENCE_CHANGE_QUESTION =
   'Do you want me to change something here, or only look into it? Tell me what should change and where.';
+/** Staging is shared: a deploy the router was unsure of would replace someone's test for nothing. */
+export const LOW_CONFIDENCE_STAGING_QUESTION =
+  'Do you want me to put this on the marketing staging site and send you the link? Say which PR or branch if it is not the one here.';
 /** Not a question to answer in the thread: a deploy is never started from a reply. */
 export const DEPLOY_NEEDS_ONE_MESSAGE_REPLY =
   'If you want a production deploy, say which app in one message to me, for example `deploy newton-web to production`. I can deploy newton-web or the marketing site.';
@@ -64,7 +67,10 @@ export type ClarifyReason =
   | 'low_confidence_change'
   | 'floor_hold'
   | 'deploy_without_target'
-  | 'owner_mention_change';
+  | 'owner_mention_change'
+  | 'low_confidence_staging'
+  /** The staging tool could not tell which PR or branch to deploy (issue #702). */
+  | 'staging_target';
 
 /**
  * What to do with a router decision that should not be acted on as given.
@@ -88,7 +94,7 @@ export function decideClarify(params: {
   confidenceFloor: number;
   /** For `deploy`: code agrees a deploy may start. */
   deployAllowed?: boolean;
-  /** The message names staging as where the deploy goes: miniOG runs no staging deploys. */
+  /** The message names staging as where the deploy goes: not a production deploy to ask about. */
   stagingAsk?: boolean;
 }): ClarifyAction {
   const { tool, confidence, addressing, answering, heldByFloor, confidenceFloor } = params;
@@ -99,8 +105,9 @@ export function decideClarify(params: {
 
   let ask: { question: string; reason: ClarifyReason; park?: boolean } | undefined;
   if (tool === 'deploy' && !params.deployAllowed && params.stagingAsk) {
-    // Not a production deploy to ask about: the lookup it falls back to has
-    // the staging steps.
+    // Not a production deploy to ask about. The router has a staging tool for
+    // a marketing staging ask (issue #702); a deploy pick for one falls back to
+    // a lookup, which says how staging works.
     return { kind: 'run' };
   } else if (tool === 'deploy' && !params.deployAllowed) {
     // The model read a deploy ask where code found no target, or in a reply to
@@ -114,6 +121,8 @@ export function decideClarify(params: {
     ask = { question: DEFAULT_CLARIFY_QUESTION, reason: 'silenced_direct_mention' };
   } else if (tool === 'change_code' && confidence < confidenceFloor) {
     ask = { question: LOW_CONFIDENCE_CHANGE_QUESTION, reason: 'low_confidence_change' };
+  } else if (tool === 'deploy_staging' && confidence < confidenceFloor) {
+    ask = { question: LOW_CONFIDENCE_STAGING_QUESTION, reason: 'low_confidence_staging' };
   } else if (heldByFloor) {
     ask = { question: DEFAULT_CLARIFY_QUESTION, reason: 'floor_hold' };
   }

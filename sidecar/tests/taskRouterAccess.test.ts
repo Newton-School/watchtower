@@ -7,6 +7,7 @@ const runImplementationWorkflow = vi.fn();
 const runInvestigationWorkflow = vi.fn();
 const runDevAssistWorkflow = vi.fn();
 const runDeployWorkflow = vi.fn();
+const runStagingDeployWorkflow = vi.fn();
 const runAgenticEntry = vi.fn();
 const runUnknownTaskWorkflow = vi.fn();
 const decideTool = vi.fn();
@@ -31,6 +32,10 @@ vi.mock('../src/workflows/deployWorkflow.js', () => ({
   runDeployWorkflow,
 }));
 
+vi.mock('../src/workflows/stagingDeployWorkflow.js', () => ({
+  runStagingDeployWorkflow,
+}));
+
 vi.mock('../src/agentic/agenticEntry.js', () => ({
   runAgenticEntry,
 }));
@@ -53,6 +58,7 @@ const TOOL_FOR_INTENT = {
   INVESTIGATION: 'investigate',
   INFORMATIONAL: 'answer',
   CONVERSATIONAL: 'chat',
+  STAGING_DEPLOY: 'deploy_staging',
 } as const;
 
 /** Make the router read the message as a request for `intent`. */
@@ -2000,13 +2006,24 @@ describe('the opening line (issue #588)', () => {
   });
 });
 
-describe('a marketing staging deploy ask', () => {
-  it('is answered at once with the steps, at viewer tier, with no router call and no agent', async () => {
+describe('a marketing staging deploy ask (issue #702)', () => {
+  beforeEach(() => {
+    runStagingDeployWorkflow.mockReset();
+    runStagingDeployWorkflow.mockResolvedValue({
+      workflow: 'STAGING_DEPLOY',
+      status: 'SUCCESS',
+      message: 'on staging',
+      notifyDesktop: false,
+      slackPosted: true,
+    });
+  });
+
+  it('runs the staging tool at once for a builder, with no router call', async () => {
     const slack = makeSlack();
     const logStep = vi.fn();
     const task = makeTask({
-      userId: 'UVIEWER',
-      channelId: 'C-VIEW',
+      userId: 'UBUILDER',
+      channelId: 'C-BUILD',
       text: '<@UBOT1> deploy marketing to staging',
       intent: 'IMPLEMENTATION',
     });
@@ -2021,12 +2038,63 @@ describe('a marketing staging deploy ask', () => {
 
     expect(decideTool).not.toHaveBeenCalled();
     expect(runAgenticEntry).not.toHaveBeenCalled();
-    expect(slack.chat.postMessage).toHaveBeenCalledTimes(1);
-    expect(slack.chat.postMessage.mock.calls[0][0].text).toMatch(
-      /^I don't run staging deploys\. Staging deploys are manual/,
-    );
+    expect(runStagingDeployWorkflow).toHaveBeenCalledOnce();
+    expect(runStagingDeployWorkflow.mock.calls[0][0].task.intent).toBe('STAGING_DEPLOY');
     expect(result.status).toBe('SUCCESS');
     expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'router.staging_gate' }));
+  });
+
+  it('tells a viewer it is not for them, and runs nothing', async () => {
+    const slack = makeSlack();
+    const task = makeTask({
+      userId: 'UVIEWER',
+      channelId: 'C-VIEW',
+      text: '<@UBOT1> deploy marketing to staging',
+      intent: 'IMPLEMENTATION',
+    });
+
+    const result = await routeTask({ task, config: makeConfig('enforce'), slack: slack as never, store: {} as never });
+
+    expect(runStagingDeployWorkflow).not.toHaveBeenCalled();
+    expect(result.status).toBe('SKIPPED');
+    expect(slack.chat.postMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs the staging tool when the router picks it for a natural ask', async () => {
+    const slack = makeSlack();
+    routerPicks('STAGING_DEPLOY');
+    const task = makeTask({ userId: 'UBUILDER', channelId: 'C-BUILD', text: '<@UBOT1> can I test this somewhere?' });
+
+    await routeTask({ task, config: makeConfig('enforce'), slack: slack as never, store: {} as never });
+
+    expect(decideTool).toHaveBeenCalled();
+    expect(runStagingDeployWorkflow).toHaveBeenCalledOnce();
+  });
+
+  it('asks first when the router is unsure it is a staging ask', async () => {
+    const slack = makeSlack();
+    routerPicks('STAGING_DEPLOY', 0.6);
+    const task = makeTask({ userId: 'UBUILDER', channelId: 'C-BUILD', text: '<@UBOT1> can I see it?' });
+
+    await routeTask({ task, config: makeConfig('enforce'), slack: slack as never, store: {} as never });
+
+    expect(runStagingDeployWorkflow).not.toHaveBeenCalled();
+    expect(repliesOf(slack).some(text => text.includes('put this on the marketing staging site'))).toBe(true);
+  });
+
+  it('never runs it for an owner mention the router reads as a staging ask', async () => {
+    const slack = makeSlack();
+    routerPicks('STAGING_DEPLOY');
+    const task = makeTask({
+      userId: 'UBUILDER',
+      channelId: 'C-BUILD',
+      text: '<@UOWNER1> can you put my branch on marketing staging?',
+    });
+    task.mentionType = 'owner';
+
+    await routeTask({ task, config: makeConfig('enforce'), slack: slack as never, store: {} as never });
+
+    expect(runStagingDeployWorkflow).not.toHaveBeenCalled();
   });
 
   it('ignores a mention in passing', async () => {
@@ -2041,7 +2109,7 @@ describe('a marketing staging deploy ask', () => {
     passing.mentionReference = true;
     await routeTask({ task: passing, config: makeConfig('enforce'), slack: slack as never, store: {} as never });
     expect(decideTool).toHaveBeenCalled();
-    expect(repliesOf(slack).some(text => text.startsWith("I don't run staging deploys"))).toBe(false);
+    expect(runStagingDeployWorkflow).not.toHaveBeenCalled();
   });
 
   it('runs a lookup, never a deploy or a production question, when the router picks deploy for a staging ask', async () => {
@@ -2079,7 +2147,7 @@ describe('a marketing staging deploy ask', () => {
     await routeTask({ task, config: makeConfig('enforce'), slack: slack as never, store: {} as never });
 
     expect(decideTool).toHaveBeenCalled();
-    expect(repliesOf(slack).some(text => text.startsWith("I don't run staging deploys"))).toBe(false);
+    expect(runStagingDeployWorkflow).not.toHaveBeenCalled();
   });
 
   it('still tells someone who is not on the access list that they are not', async () => {
