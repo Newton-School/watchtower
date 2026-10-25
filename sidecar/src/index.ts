@@ -53,6 +53,7 @@ import { fetchThreadContext } from './slack/threadContext.js';
 import { createThreadStatus, type ThreadStatus } from './slack/threadStatus.js';
 import { isOlderVersion, readSidecarBuild } from './runtime/buildInfo.js';
 import { recoveryFor } from './runtime/restartRecovery.js';
+import { reloadBundlesIfChanged } from './runtime/bundleReload.js';
 import { holdBusyThreadMessage, takeThreadReplays, THREAD_REPLAY_EVENT_PREFIX } from './runtime/busyThreadMessages.js';
 import { closeDeployOfferAfterRestart } from './workflows/marketingDeployOffer.js';
 import { connectorAlertText, connectorsToAlert, onConnectorStatuses } from './runtime/connectorAlerts.js';
@@ -140,7 +141,6 @@ const store = new JobStore(dbPath);
 // D3-derived bundles (config.bundles, populated by mapSettingsToConfig from
 // the legacy AccessControlConfig). After this block, config.bundles always
 // reflects the table.
-let bundlesLoadedAt = new Date().toISOString();
 {
   const storedBundles = store.getBundles();
   if (storedBundles.length > 0) {
@@ -643,6 +643,12 @@ async function enqueueSlackEvent(
   // A stop must not wait in the queue behind the job it is meant to stop.
   if (source !== 'launchpad' && (await tryHandleStopControl(event, client))) {
     return;
+  }
+  // A message for a thread a run holds is kept from the moment it arrives,
+  // even while it waits for a slot, so the run can ask for it once the thread
+  // is free (issue #703). A copy that runs anyway is dropped as a duplicate.
+  if (source !== 'launchpad' && activeJobForThread(event.channelId, event.threadTs)) {
+    holdBusyThreadMessage(event, client);
   }
   const item: (typeof queue)[number] = { event, client };
   const processed = opts.untilProcessed
@@ -1263,14 +1269,8 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
         // D5a — hot-reload bundles if the Tauri UI (or direct SQL) edited
         // them since the last build. Mirrors the readAgentBackend pattern:
         // signal-driven (no polling cost when nothing changed).
-        const signalAt = store.getAccessCacheSignalAt();
-        if (signalAt && signalAt > bundlesLoadedAt) {
-          const reloaded = store.getBundles();
-          if (reloaded.length > 0) {
-            config.bundles = hydrateBundleUserIds(reloaded, config.ownerSlackUserIds);
-            bundlesLoadedAt = signalAt;
-            logger.info({ bundleCount: reloaded.length, signalAt }, 'reloaded bundles after access cache signal');
-          }
+        if (reloadBundlesIfChanged(config, store)) {
+          logger.info({ bundleCount: config.bundles?.length ?? 0 }, 'reloaded bundles after access cache signal');
         }
 
         const workflowResult = await agentCallContext.run({ jobId, store }, () =>
@@ -1443,20 +1443,6 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
           prState: typeof result.result?.prState === 'string' ? result.result.prState : undefined,
         });
         unregisterActiveJob(jobId);
-
-        // A message the run asked to pick up once the thread is free (issue
-        // #703): it came in while the run held the thread, and started nothing.
-        for (const replay of takeThreadReplays(event.channelId, event.threadTs)) {
-          const replayed = { ...replay.event, eventId: `${THREAD_REPLAY_EVENT_PREFIX}${replay.event.eventId}` };
-          logStep({
-            stage: 'job.thread_replay',
-            message: 'Picking up a message that came in while this run held the thread.',
-            data: { eventTs: replay.event.eventTs, userId: replay.event.userId },
-          });
-          void enqueueSlackEvent(replayed, replay.client, 'catchup').catch(err =>
-            logger.warn({ jobId, err: String(err) }, 'could not pick up a message held for a busy thread'),
-          );
-        }
 
         // Swap :eyes: for outcome reaction. PAUSED gets a distinct emoji so a
         // glance at the thread tells you "parked, mention me to resume" rather
@@ -1707,6 +1693,22 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
     // reference to the client and the job for the life of the sidecar.
     await status.clear();
     status.dispose();
+
+    // A message the run asked to pick up once the thread is free (issue
+    // #703): it came in while the run held the thread, and started nothing.
+    // Taken on every way out, so a later run never picks up an old one; after
+    // the status line is cleared, so the new run's own line stays.
+    for (const replay of takeThreadReplays(event.channelId, event.threadTs)) {
+      const replayed = { ...replay.event, eventId: `${THREAD_REPLAY_EVENT_PREFIX}${replay.event.eventId}` };
+      logStep({
+        stage: 'job.thread_replay',
+        message: 'Picking up a message that came in while this run held the thread.',
+        data: { eventTs: replay.event.eventTs, userId: replay.event.userId },
+      });
+      void enqueueSlackEvent(replayed, replay.client, 'catchup').catch(err =>
+        logger.warn({ jobId, err: String(err) }, 'could not pick up a message held for a busy thread'),
+      );
+    }
   }
 }
 

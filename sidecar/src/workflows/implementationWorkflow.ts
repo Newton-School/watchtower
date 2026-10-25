@@ -83,6 +83,7 @@ import { assertThreadParentExists } from '../slack/threadContext.js';
 import { runAgenticEntry } from '../agentic/agenticEntry.js';
 import { offerMarketingProdDeploy } from './marketingDeployOffer.js';
 import type { StagingDeployStore } from './stagingDeployWorkflow.js';
+import { reloadBundlesIfChanged } from '../runtime/bundleReload.js';
 import type { JobStore } from '../state/jobStore.js';
 
 const execFileAsync = promisify(execFile);
@@ -350,6 +351,18 @@ function deployStoreOf(store: ImplementationStore | undefined): StagingDeploySto
   };
 }
 
+/** Reloads access edited in the app since the run started, for a wait that outlasts it (issue #703). */
+function accessRefresherOf(store: ImplementationStore | undefined, config: AppConfig): (() => void) | undefined {
+  const { getAccessCacheSignalAt, getBundles } = store ?? {};
+  if (!store || !getAccessCacheSignalAt || !getBundles) return undefined;
+  return () => {
+    reloadBundlesIfChanged(config, {
+      getAccessCacheSignalAt: () => getAccessCacheSignalAt.call(store),
+      getBundles: () => getBundles.call(store),
+    });
+  };
+}
+
 /** Why an owner still has to confirm a change that is more than content, in one sentence. */
 export function contentOwnerReason(verdict: Exclude<ContentOnlyVerdict, { contentOnly: true }>): string {
   if (verdict.kind === 'unreadable') return "I couldn't check that it only changes text, so an owner has to confirm.";
@@ -604,6 +617,7 @@ async function mergeContentOnlyPr(params: {
       merged: [{ pr, knownMerged: true }],
       startedAtMs,
       lead: contentMergedLead(pr.url, skipsReview),
+      refreshAccess: accessRefresherOf(store, config),
       logStep,
       signal,
     });
@@ -732,6 +746,8 @@ async function confirmQuickPrAction(params: {
 type ImplementationStore = PipelineStore & {
   getState?: (key: string) => string | undefined;
   setState?: (key: string, value: string) => void;
+  getAccessCacheSignalAt?: () => string | undefined;
+  getBundles?: () => import('../types/contracts.js').Bundle[];
   dossierStore?: () => import('../state/dossierStore.js').DossierStore;
   readVaultSettings?: () => { vaultPath: string; vaultEnabled: boolean };
   recentSignalsForUser?: (
@@ -1084,6 +1100,7 @@ Write your response as a ready-to-post Slack message describing what you did.
           githubToken: ctx.githubToken,
           merged: prs.map(pr => ({ pr, knownMerged: false })),
           startedAtMs: quickStartedAtMs,
+          refreshAccess: accessRefresherOf(store, config),
           logStep,
           signal,
         })

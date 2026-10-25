@@ -44,17 +44,25 @@ export function holdBusyThreadMessage(event: SlackEventEnvelope, client: WebClie
 }
 
 /**
- * Asks for a held message to run once its thread is free. False when it was
- * never held here (it has not arrived, or it arrived before this process),
- * so the caller can ask its author to send it again instead.
+ * Asks for a held message to run once its thread is free. `seen` is the
+ * message as the thread shows it now: one edited since it arrived would run
+ * its old words, so it is not run. `not_held` when it never reached this
+ * process (or arrived before it started), so the caller can ask its author
+ * to send it again instead.
  */
-export function replayAfterThreadFrees(channelId: string, threadTs: string, messageTs: string): boolean {
+export function replayAfterThreadFrees(
+  channelId: string,
+  threadTs: string,
+  messageTs: string,
+  seen: { text: string; edited?: boolean },
+): 'replayed' | 'changed' | 'not_held' {
   const entry = held.get(messageKey(channelId, messageTs));
-  if (!entry || entry.event.threadTs !== threadTs) return false;
+  if (!entry || entry.event.threadTs !== threadTs) return 'not_held';
   held.delete(messageKey(channelId, messageTs));
+  if (seen.edited || seen.text.trim() !== (entry.event.text ?? '').trim()) return 'changed';
   const key = threadKey(channelId, threadTs);
   replays.set(key, [...(replays.get(key) ?? []), entry]);
-  return true;
+  return 'replayed';
 }
 
 /** The messages to run now that the thread is free, oldest first. */

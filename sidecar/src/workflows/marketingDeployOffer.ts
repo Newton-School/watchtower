@@ -55,6 +55,15 @@ export const DEPLOY_OFFER_SUPERSEDED_REPLAY =
   "That closes the deploy offer, so I'm picking up your message now. To deploy later, someone from core-dev can ask me to deploy marketing to prod.";
 export const DEPLOY_OFFER_SUPERSEDED =
   "I was holding this thread for the deploy tap, so I didn't pick that up. The offer is closed now: mention me again with it. To deploy later, someone from core-dev can ask me to deploy marketing to prod.";
+export const DEPLOY_OFFER_SUPERSEDED_EDITED =
+  "That message was edited after you sent it, so I haven't run it. The deploy offer is closed now: send it again as a new message. To deploy later, someone from core-dev can ask me to deploy marketing to prod.";
+export const DEPLOY_OFFER_DECLINED_REPLAY =
+  "Okay, not deploying it now, and I'm picking up the rest of your message. When it should go live, someone from core-dev can ask me to deploy marketing to prod.";
+export const DEPLOY_OFFER_DECLINED_EDITED =
+  'Okay, not deploying it now. That message was edited after you sent it, so send the rest again as a new message. When it should go live, someone from core-dev can ask me to deploy marketing to prod.';
+export const DEPLOY_OFFER_DECLINED_RESEND =
+  'Okay, not deploying it now. Mention me again with the rest of your message. When it should go live, someone from core-dev can ask me to deploy marketing to prod.';
+export const DEPLOY_OFFER_STATUS = "Not yet: it's waiting for a tap from core-dev.";
 export const DEPLOY_TAP_QUEUED_FOR_SLOT =
   "Deploy tapped. I'm finishing other work first and will start it as soon as I can.";
 
@@ -103,7 +112,13 @@ const TAP_PHRASES = new Set([
  * broken" must never leave it open for the next tap.
  */
 const HOLD_RE =
-  /^(?:no|nope|nah|cancel|stop|abort|skip|later)$|^(?:no|nope|nah)\b|\b(?:dont|do not|not yet|not now|not today|not ready|hold|wait|pause|cancel|abort|later|tomorrow|after qa|broken)\b/;
+  /^(?:no|nope|nah|cancel|stop|abort|skip|later)$|^(?:no|nope|nah)\b|\b(?:dont|do not|shouldnt|should not|wont|will not|cant|cannot|can not|never ?mind|nvm|not yet|not now|not today|not ready|not until|until|hold|hang on|one sec|one second|one min|wait|pause|stop|cancel|abort|later|tomorrow|after|broken)\b/;
+/** Said before a tap without changing it: "LGTM, deploy it". */
+const LEADING_PLEASANTRY_RE =
+  /^(?:(?:ok|okay|yes|yep|yeah|sure|please|pls|plz|lgtm|looks good|looks great|look good|all good|good to go|great|nice|cool|perfect|awesome|thanks|thank you|thx|approved)\s+)+/;
+/** "is it live yet?", "when will it go live?", "any update on the deploy?" */
+const STATUS_QUESTION_RE =
+  /^(?:is|has|did|when|whats|what is|any|where|how)\b.*\b(?:live|deployed|deploy|prod|production|shipped|out|up|status|update)\b|\b(?:live|deployed|shipped) yet\b|\bstatus\b/;
 const PLEASANTRY_RE =
   /^(?:(?:thanks|thank you|thank u|thx|ty|tysm|cheers|cool|nice|great|awesome|perfect|amazing|sweet|ok|okay|k|kk|got it|noted|sounds good|lgtm|good job|great job|nice work|great work|well done|love it|yay|woohoo|hi|hey|hello)\s*)+(?:so much|a lot|again|man|bro|buddy|team|all|folks)?$/;
 const EMOJI_ONLY_RE = /^(?::[a-z0-9_+'-]+:\s*)+$/;
@@ -136,8 +151,8 @@ function readReply(raw: string, botUserId?: string): ReadReply {
 /** What was typed, without politeness or a trailing "now". */
 function corePhrase(text: string): string {
   return text
-    .replace(/^(?:(?:ok|okay|yes|yep|yeah|sure|please|pls|plz)\s+)+/, '')
-    .replace(/(?:\s+(?:please|pls|plz|now|thanks|thank you|asap))+$/, '')
+    .replace(LEADING_PLEASANTRY_RE, '')
+    .replace(/(?:\s+(?:please|pls|plz|now|thanks|thank you|asap|:[a-z0-9_+'-]+:|\p{Extended_Pictographic}+))+$/u, '')
     .trim();
 }
 
@@ -179,6 +194,13 @@ export interface DeployTapResult {
   outcome: DeployTapOutcome;
   userId?: string;
   replyTs?: string;
+  /** The message as the thread showed it, when it is to run once the thread is free. */
+  replay?: { text: string; edited?: boolean };
+}
+
+/** A hold and nothing else: a message that says more also carries an ask. */
+function isBareHold(text: string): boolean {
+  return corePhrase(text).split(/\s+/).filter(Boolean).length <= 4;
 }
 
 /** May this person deploy to production here, right now; and when not, is it only this channel. */
@@ -264,8 +286,16 @@ async function pollForDeployTap(params: TapWaitParams): Promise<DeployTapResult>
       const who = access(message.user);
       const decides = who.allowed || message.user === requesterId;
 
-      if (decides && HOLD_RE.test(reply.text))
-        return { outcome: 'declined', userId: message.user, replyTs: message.ts };
+      if (decides && HOLD_RE.test(reply.text)) {
+        // "wait, can you also change the footer link?" holds the deploy back and asks for more.
+        const carriesAsk = reply.mentionsBot && !isBareHold(reply.text);
+        return {
+          outcome: 'declined',
+          userId: message.user,
+          replyTs: message.ts,
+          ...(carriesAsk ? { replay: { text: message.text, edited: message.edited } } : {}),
+        };
+      }
 
       if (isDeployTap(message.text, botUserId)) {
         if (!who.allowed) {
@@ -301,8 +331,20 @@ async function pollForDeployTap(params: TapWaitParams): Promise<DeployTapResult>
         return { outcome: 'tapped', userId: message.user, replyTs: message.ts };
       }
 
+      // Asking whether it is live yet is not a new ask: answered, the offer stays.
+      if (reply.mentionsBot && STATUS_QUESTION_RE.test(reply.text)) {
+        sayOnce(`status:${message.ts}`, `<@${message.user}> ${DEPLOY_OFFER_STATUS}`);
+        continue;
+      }
       if (reply.mentionsBot && !isPleasantry(reply.text)) {
-        if (decides) return { outcome: 'superseded', userId: message.user, replyTs: message.ts };
+        if (decides) {
+          return {
+            outcome: 'superseded',
+            userId: message.user,
+            replyTs: message.ts,
+            replay: { text: message.text, edited: message.edited },
+          };
+        }
         sayOnce(
           `busy:${message.user}`,
           `<@${message.user}> I'm holding this thread for a deploy tap, so I can't take new asks here for now. Ask me in a new thread.`,
@@ -471,6 +513,8 @@ export async function offerMarketingProdDeploy(params: {
   startedAtMs: number;
   /** The start of the offer message: the merge reply, when the offer carries it. */
   lead?: string;
+  /** Reloads access when it was edited since it was loaded (`reloadBundlesIfChanged`). */
+  refreshAccess?: () => void;
   logStep?: WorkflowStepLogger;
   signal?: AbortSignal;
 }): Promise<Omit<WorkflowResult, 'workflow'> | undefined> {
@@ -538,6 +582,12 @@ export async function offerMarketingProdDeploy(params: {
   }
 
   const access: DeployAccess = userId => {
+    // Access edited in the app since the run started counts now, not at the next run.
+    try {
+      params.refreshAccess?.();
+    } catch {
+      // The bundles as last loaded still decide.
+    }
     if (userId === config.botUserId) return { allowed: false, elsewhere: false };
     const decision = evaluateCapability({ config, userId, channelId, channelType, capability: 'deploy_prod' });
     return { allowed: decision.allowed, elsewhere: decision.denyReason === 'CHANNEL_NOT_ENABLED' };
@@ -625,22 +675,33 @@ async function actOnTap(params: {
   if (tap.outcome === 'cancelled') {
     return done('Stopped before anyone tapped deploy; nothing was deployed.', false, 'CANCELLED');
   }
+  // The message that closed the offer runs once this run lets the thread go,
+  // unless it was edited: then its old words would run.
+  const replay =
+    tap.replay && tap.replyTs ? replayAfterThreadFrees(channelId, threadTs, tap.replyTs, tap.replay) : undefined;
   if (tap.outcome === 'superseded') {
-    // The message that closed the offer runs once this run lets the thread go.
-    const replayed = tap.replyTs ? replayAfterThreadFrees(channelId, threadTs, tap.replyTs) : false;
-    const text = replayed ? DEPLOY_OFFER_SUPERSEDED_REPLAY : DEPLOY_OFFER_SUPERSEDED;
-    logStep?.({ stage: 'deploy_offer.closed_for_ask', message: text, data: { replayed } });
+    const text =
+      replay === 'replayed'
+        ? DEPLOY_OFFER_SUPERSEDED_REPLAY
+        : replay === 'changed'
+          ? DEPLOY_OFFER_SUPERSEDED_EDITED
+          : DEPLOY_OFFER_SUPERSEDED;
+    logStep?.({ stage: 'deploy_offer.closed_for_ask', message: text, data: { replay: replay ?? null } });
     return done(text, await say(text));
   }
   if (tap.outcome !== 'tapped') {
     // Someone may have deployed main from GitHub meanwhile: then it is live, whatever the offer did.
     const already = await deployed();
+    const declined =
+      replay === 'replayed'
+        ? DEPLOY_OFFER_DECLINED_REPLAY
+        : replay === 'changed'
+          ? DEPLOY_OFFER_DECLINED_EDITED
+          : replay === 'not_held'
+            ? DEPLOY_OFFER_DECLINED_RESEND
+            : DEPLOY_OFFER_DECLINED;
     const text =
-      already?.kind === 'live'
-        ? deployedLine(already)
-        : tap.outcome === 'expired'
-          ? DEPLOY_OFFER_EXPIRED
-          : DEPLOY_OFFER_DECLINED;
+      already?.kind === 'live' ? deployedLine(already) : tap.outcome === 'expired' ? DEPLOY_OFFER_EXPIRED : declined;
     return done(text, await say(text));
   }
 
@@ -673,10 +734,14 @@ async function actOnTap(params: {
       }
       return dispatchMarketingProdDeploy({ repoPath, slack, channelId, threadTs, logStep, signal });
     },
-    () =>
-      say(
-        "Another production deploy of the marketing site is running. I'll check whether it carries this once it's done.",
-      ),
+    {
+      signal,
+      onWait: () =>
+        say(
+          "Another production deploy of the marketing site is running. I'll check whether it carries this once it's done.",
+        ),
+      whenStopped: () => done('Stopped before the deploy started; nothing was deployed.', false, 'CANCELLED'),
+    },
   );
 }
 
@@ -695,7 +760,8 @@ export async function closeDeployOfferAfterRestart(
       oldest: params.promptTs,
       latest: params.promptTs,
       inclusive: true,
-      limit: 1,
+      // Slack may return the thread's first message too: the offer is found by its ts.
+      limit: 10,
     });
     const offer = (found.messages ?? []).find(message => message.ts === params.promptTs);
     if (!offer) return;

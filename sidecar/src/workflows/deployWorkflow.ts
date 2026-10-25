@@ -448,17 +448,29 @@ async function runMarketingDeploy(params: {
         logStep,
         signal,
       }),
-    () =>
-      postDeployReplyBestEffort({
-        slack,
-        channelId: task.event.channelId,
-        threadTs: task.event.threadTs,
-        text: MARKETING_PROD_DEPLOY_QUEUED,
-        logStep,
-      }),
+    {
+      signal,
+      onWait: () =>
+        postDeployReplyBestEffort({
+          slack,
+          channelId: task.event.channelId,
+          threadTs: task.event.threadTs,
+          text: MARKETING_PROD_DEPLOY_QUEUED,
+          logStep,
+        }),
+      whenStopped: () => STOPPED_BEFORE_DEPLOY,
+    },
   );
   return { workflow: 'DEPLOY', ...done };
 }
+
+/** A deploy stopped before anything was dispatched: the stop already said "Stopped.". */
+export const STOPPED_BEFORE_DEPLOY: Omit<WorkflowResult, 'workflow'> = {
+  status: 'CANCELLED',
+  message: 'Stopped before the deploy started; nothing was deployed.',
+  notifyDesktop: false,
+  slackPosted: false,
+};
 
 /** Said when a marketing prod deploy waits for another one to finish first. */
 export const MARKETING_PROD_DEPLOY_QUEUED =
@@ -467,26 +479,48 @@ export const MARKETING_PROD_DEPLOY_QUEUED =
 let marketingProdTail: Promise<void> = Promise.resolve();
 let marketingProdPending = 0;
 
+/** Resolves true when the signal fires first, false once `turn` comes. */
+function stoppedBefore(turn: Promise<void>, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(true);
+  if (!signal) return turn.then(() => false);
+  return new Promise(resolve => {
+    const onAbort = (): void => resolve(true);
+    signal.addEventListener('abort', onAbort, { once: true });
+    void turn.then(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve(signal.aborted);
+    });
+  });
+}
+
 /**
  * One marketing production deploy at a time in this process (issue #703):
  * two taps in two threads, or a tap and a deploy ask, must not both
- * dispatch. A later one waits for the earlier to finish, in order; `onWait`
- * runs when it has to wait.
+ * dispatch. A later one waits for the earlier to finish, in order. A stop
+ * while it waits ends it at once with `whenStopped`, and the one after it
+ * still waits for the one before. `onWait` (said when it has to wait) is
+ * not waited on.
  */
 export async function oneMarketingProdDeployAtATime<T>(
   run: () => Promise<T>,
-  onWait?: () => Promise<unknown> | void,
+  opts: { signal?: AbortSignal; onWait?: () => unknown; whenStopped?: () => T } = {},
 ): Promise<T> {
   const previous = marketingProdTail;
   let release!: () => void;
-  marketingProdTail = new Promise<void>(resolve => {
+  const mine = new Promise<void>(resolve => {
     release = resolve;
   });
+  marketingProdTail = previous.then(() => mine);
   const mustWait = marketingProdPending > 0;
   marketingProdPending += 1;
   try {
-    if (mustWait) await onWait?.();
-    await previous;
+    if (mustWait && !opts.signal?.aborted) {
+      void Promise.resolve()
+        .then(() => opts.onWait?.())
+        .catch(() => {});
+    }
+    // Without `whenStopped`, `run` sees the stop itself.
+    if ((await stoppedBefore(previous, opts.signal)) && opts.whenStopped) return opts.whenStopped();
     return await run();
   } finally {
     marketingProdPending -= 1;
@@ -510,6 +544,8 @@ export async function dispatchMarketingProdDeploy(params: {
   signal?: AbortSignal;
 }): Promise<Omit<WorkflowResult, 'workflow'>> {
   const { repoPath, slack, channelId, threadTs, logStep, signal } = params;
+  // Stopped already: say nothing that reads as starting.
+  if (signal?.aborted) return STOPPED_BEFORE_DEPLOY;
   await slack.chat
     .postMessage({
       channel: channelId,

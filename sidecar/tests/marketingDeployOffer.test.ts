@@ -13,6 +13,10 @@ import {
   DEPLOY_OFFER_LINE,
   DEPLOY_OFFER_SUPERSEDED,
   DEPLOY_OFFER_SUPERSEDED_REPLAY,
+  DEPLOY_OFFER_SUPERSEDED_EDITED,
+  DEPLOY_OFFER_DECLINED_REPLAY,
+  DEPLOY_OFFER_DECLINED_RESEND,
+  DEPLOY_OFFER_STATUS,
   DEPLOY_TAP_QUEUED_FOR_SLOT,
   deployTappers,
   isDeployDecline,
@@ -33,6 +37,7 @@ import {
   takeThreadReplays,
 } from '../src/runtime/busyThreadMessages.js';
 import { jobSlots } from '../src/runtime/jobSlots.js';
+import { dispatchMarketingProdDeploy, oneMarketingProdDeployAtATime } from '../src/workflows/deployWorkflow.js';
 
 // Issue #703: after miniOG merges a marketing PR it offers the prod deploy in
 // the thread, and someone from core-dev taps to deploy (the owner's decision:
@@ -105,7 +110,7 @@ function makeTask(userId = 'UBUILDER', channelType = 'channel', threadTs = '400.
   } as NormalizedTask;
 }
 
-type Reply = { user: string; text: string; ts: string; bot_id?: string; subtype?: string };
+type Reply = { user: string; text: string; ts: string; bot_id?: string; subtype?: string; edited?: { ts: string } };
 
 /** Slack: posts get a ts; the thread's replies after the offer come from `replies`. */
 function fakeSlack(replies: Reply[] | (() => Reply[]) = [], promptTs = PROMPT_TS) {
@@ -285,6 +290,12 @@ describe('reading a tap', () => {
     'ok deploy it now',
     'deploy marketing to prod',
     '_deploy it_',
+    // Pleasantries and emoji around the deploy phrase don't change it.
+    'LGTM, deploy it',
+    'Looks good! Deploy it.',
+    'yes please deploy',
+    'Deploy it 🚀',
+    'deploy it :rocket:',
   ])('reads %j as a tap', text => expect(isDeployTap(text, 'UBOT1')).toBe(true));
 
   it.each([
@@ -302,6 +313,12 @@ describe('reading a tap', () => {
     // Taken back, or quoted.
     '~deploy it~',
     '&gt; deploy it',
+    // Pleasantries alone, or a go-ahead without the deploy phrase.
+    'lgtm',
+    'looks good',
+    'go ahead',
+    'approved',
+    '<!here> deploy it',
   ])('does not read %j as a tap', text => expect(isDeployTap(text, 'UBOT1')).toBe(false));
 
   it.each([
@@ -314,6 +331,16 @@ describe('reading a tap', () => {
     "wait, don't deploy yet, the hero image is broken",
     'no, deploy it',
     '<@UADMIN2> don’t deploy it',
+    "we shouldn't deploy it yet",
+    "won't deploy it till marketing signs off",
+    "can't go live like this",
+    'never mind, the copy is wrong',
+    'nevermind',
+    'not until QA passes',
+    'please stop',
+    'one sec, checking the copy',
+    'hang on, hero image is off',
+    'deploy it after the copy fix',
   ])('reads %j as holding the deploy back', text => expect(isDeployDecline(text, 'UBOT1')).toBe(true));
 });
 
@@ -952,5 +979,181 @@ describe('putting main back on staging after a merge (#703)', () => {
 
     expect(dispatches(calls, 'deploy-staging.yml')).toHaveLength(0);
     expect(posted).toEqual(['Dry run: this is where I would put main back on staging. Nothing was deployed.']);
+  });
+});
+
+describe('round-2 review of the offer (#703)', () => {
+  const heldAsk = (ts: string, text: string) =>
+    holdBusyThreadMessage(
+      { eventId: `Ev${ts}`, channelId: 'C1', threadTs: '400.1', eventTs: ts, userId: 'UBUILDER', text, rawEvent: {} },
+      {} as never,
+    );
+
+  it('does not run a message that was edited after it arrived: its old words would run', async () => {
+    heldAsk('505.0', '<@UBOT1> revert PR 1490, the page is broken');
+    const { posted } = await offer({
+      replies: [{ user: 'UBUILDER', text: '<@UBOT1> also update the hero copy', ts: '505.0', edited: { ts: '506.0' } }],
+    });
+
+    expect(posted.at(-1)).toBe(DEPLOY_OFFER_SUPERSEDED_EDITED);
+    expect(takeThreadReplays('C1', '400.1')).toEqual([]);
+  });
+
+  it('holds the deploy back and still runs the rest of a message that also asks for something', async () => {
+    const text = '<@UBOT1> wait, can you also change the footer link to /apply?';
+    heldAsk('505.0', text);
+    const { posted, calls } = await offer({
+      replies: [say('UBUILDER', text, '505.0'), say('UADMIN', 'deploy it', '506.0')],
+    });
+
+    expect(dispatches(calls, 'deploy-prod.yml')).toHaveLength(0);
+    expect(posted.at(-1)).toBe(DEPLOY_OFFER_DECLINED_REPLAY);
+    expect(takeThreadReplays('C1', '400.1').map(replay => replay.event.text)).toEqual([text]);
+  });
+
+  it('asks for the rest again when that message was not held', async () => {
+    const { posted } = await offer({
+      replies: [say('UBUILDER', '<@UBOT1> wait, can you also change the footer link to /apply?', '505.0')],
+    });
+
+    expect(posted.at(-1)).toBe(DEPLOY_OFFER_DECLINED_RESEND);
+  });
+
+  it('runs nothing for a bare hold that mentions miniOG', async () => {
+    heldAsk('505.0', '<@UBOT1> wait');
+    const { posted } = await offer({ replies: [say('UBUILDER', '<@UBOT1> wait', '505.0')] });
+
+    expect(posted.at(-1)).toBe(DEPLOY_OFFER_DECLINED);
+    expect(takeThreadReplays('C1', '400.1')).toEqual([]);
+  });
+
+  it.each(['<@UBOT1> is it live yet?', '<@UBOT1> when will it go live?', '<@UBOT1> any update on the deploy?'])(
+    'answers %j and keeps the offer open for the tap',
+    async text => {
+      const { posted, calls } = await offer({ replies: [say('UBUILDER', text), say('UADMIN', 'deploy it', '502.0')] });
+
+      expect(posted).toContain(`<@UBUILDER> ${DEPLOY_OFFER_STATUS}`);
+      expect(dispatches(calls, 'deploy-prod.yml')).toHaveLength(1);
+    },
+  );
+
+  it('deploys on a near-tap from core-dev', async () => {
+    const { calls } = await offer({ replies: [say('UADMIN', 'LGTM, deploy it')] });
+
+    expect(dispatches(calls, 'deploy-prod.yml')).toHaveLength(1);
+  });
+
+  it('reloads access when the tap comes: someone added to core-dev during the wait can tap', async () => {
+    const cfg = makeConfig();
+    const refreshAccess = vi.fn(() => {
+      const admin = (cfg.bundles ?? []).find(b => b.name === 'admin');
+      if (admin && !admin.resolvedUserIds.includes('UNEWADMIN')) admin.resolvedUserIds.push('UNEWADMIN');
+    });
+    const { slack } = fakeSlack([say('UNEWADMIN')]);
+    const calls = fakeActions([]);
+
+    await offerMarketingProdDeploy({
+      task: makeTask(),
+      config: cfg,
+      slack,
+      merged: [{ pr: prOf(MARKETING_PR), knownMerged: true }],
+      startedAtMs: MERGED_AT_MS,
+      refreshAccess,
+    });
+
+    expect(refreshAccess).toHaveBeenCalled();
+    expect(dispatches(calls, 'deploy-prod.yml')).toHaveLength(1);
+  });
+});
+
+describe('one marketing prod deploy at a time (#703)', () => {
+  it('ends a deploy stopped while it waits its turn at once, without running it, and keeps the order', async () => {
+    let releaseFirst!: () => void;
+    const order: string[] = [];
+    const first = oneMarketingProdDeployAtATime(
+      () =>
+        new Promise<string>(resolve => {
+          releaseFirst = () => {
+            order.push('first');
+            resolve('first');
+          };
+        }),
+    );
+    const controller = new AbortController();
+    const second = oneMarketingProdDeployAtATime(
+      async () => {
+        order.push('second');
+        return 'second';
+      },
+      { signal: controller.signal, whenStopped: () => 'stopped' },
+    );
+    const third = oneMarketingProdDeployAtATime(async () => {
+      order.push('third');
+      return 'third';
+    });
+
+    controller.abort();
+    expect(await second).toBe('stopped');
+    // The one after the stopped one still waits for the one before it.
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(order).toEqual([]);
+    releaseFirst();
+    expect(await first).toBe('first');
+    expect(await third).toBe('third');
+    expect(order).toEqual(['first', 'third']);
+  });
+
+  it('does not wait on what it says while queued', async () => {
+    let releaseFirst!: () => void;
+    const first = oneMarketingProdDeployAtATime(() => new Promise<void>(resolve => (releaseFirst = resolve)));
+    const second = oneMarketingProdDeployAtATime(async () => 'second', { onWait: () => new Promise(() => {}) });
+
+    // The first starts on the next tick.
+    await vi.waitFor(() => expect(releaseFirst).toBeTypeOf('function'));
+    releaseFirst();
+    await first;
+    expect(await second).toBe('second');
+  });
+
+  it('releases the queue when a deploy throws', async () => {
+    const failed = oneMarketingProdDeployAtATime(async () => {
+      throw new Error('boom');
+    }).catch(error => String(error));
+    const next = oneMarketingProdDeployAtATime(async () => 'next');
+
+    expect(await failed).toContain('boom');
+    expect(await next).toBe('next');
+  });
+
+  it('says nothing that reads as starting when the run was stopped already', async () => {
+    const { slack, posted } = fakeSlack();
+    const calls = fakeActions([]);
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await dispatchMarketingProdDeploy({
+      repoPath: CLONE,
+      slack,
+      channelId: 'C1',
+      threadTs: '400.1',
+      signal: controller.signal,
+    });
+
+    expect(posted).toEqual([]);
+    expect(calls).toEqual([]);
+    expect(result).toMatchObject({ status: 'CANCELLED', slackPosted: false });
+  });
+});
+
+describe('closing the offer after a restart, when Slack returns the thread start too', () => {
+  it('finds the offer by its ts', async () => {
+    const { slack, raw } = fakeSlack([
+      { user: 'UBUILDER', text: 'merge it', ts: '400.1' },
+      { user: 'UBOT1', text: 'offer text', ts: PROMPT_TS },
+    ]);
+
+    await closeDeployOfferAfterRestart(slack, { channelId: 'C1', threadTs: '400.1', promptTs: PROMPT_TS });
+
+    expect(raw.chat.update).toHaveBeenCalledWith(expect.objectContaining({ ts: PROMPT_TS, blocks: [] }));
   });
 });
