@@ -96,8 +96,19 @@ const prOf = (url: string) => {
   return { url, owner, repo, number: Number(number), source: 'thread' as const };
 };
 
-async function run(text: string, options: { userId?: string; byOwner?: boolean; pr?: string } = {}) {
-  const userId = options.byOwner ? 'UOWNER1' : (options.userId ?? 'UBUILDER');
+type RunOptions = {
+  userId?: string;
+  byOwner?: boolean;
+  /** An owner's re-run of someone else's ask, from the app. */
+  requestedFor?: string;
+  pr?: string;
+  channelId?: string;
+  channelType?: string;
+  signal?: AbortSignal;
+};
+
+async function run(text: string, options: RunOptions = {}) {
+  const userId = options.byOwner || options.requestedFor ? 'UOWNER1' : (options.userId ?? 'UBUILDER');
   const pr = prOf(options.pr ?? MARKETING_PR);
   const slack = {
     chat: { postMessage: vi.fn().mockResolvedValue({ ok: true, ts: '123.45' }) },
@@ -105,10 +116,20 @@ async function run(text: string, options: { userId?: string; byOwner?: boolean; 
   };
   const logs: { stage: string; data?: Record<string, unknown> }[] = [];
   const task = {
-    event: { eventId: 'EvMerge', channelId: 'C1', threadTs: '111.22', eventTs: '111.22', userId, text, rawEvent: {} },
+    event: {
+      eventId: 'EvMerge',
+      channelId: options.channelId ?? 'C1',
+      ...(options.channelType ? { channelType: options.channelType } : {}),
+      threadTs: '111.22',
+      eventTs: '111.22',
+      userId,
+      ...(options.requestedFor ? { requestedForUserId: options.requestedFor } : {}),
+      text,
+      rawEvent: {},
+    },
     mentionDetected: true,
     mentionType: 'bot' as const,
-    isOwnerAuthor: Boolean(options.byOwner),
+    isOwnerAuthor: userId === 'UOWNER1',
     isCoreDevAuthor: false,
     intent: 'IMPLEMENTATION' as const,
     prContext: pr,
@@ -119,12 +140,14 @@ async function run(text: string, options: { userId?: string; byOwner?: boolean; 
     config: config as never,
     slack: slack as unknown as import('@slack/web-api').WebClient,
     logStep: entry => logs.push(entry),
+    signal: options.signal,
   });
   const posted = slack.chat.postMessage.mock.calls.map(call => call[0].text as string);
   return { result, posted, logs };
 }
 
 const ghExec = vi.fn();
+const MERGED_PAST_REVIEW = `Merged ${MARKETING_PR}: it only changes text and numbers, so it went in without the usual review. It isn't live yet; someone from core-dev has to deploy it.`;
 
 beforeEach(() => {
   vi.mocked(runCodex)
@@ -145,50 +168,79 @@ beforeEach(() => {
 afterEach(() => vi.clearAllMocks());
 
 const confirmPrompt = (posted: string[]) => posted.find(text => text.includes('confirm merge'));
+const mergeArgs = (...extra: string[]) => [
+  'pr',
+  'merge',
+  '1490',
+  '--repo',
+  'Newton-School/newton-marketing-web',
+  '--squash',
+  // Only the commit the check read: a later push makes GitHub refuse it.
+  '--match-head-commit',
+  'abc123',
+  ...extra,
+];
 
 describe('merging a content-only marketing PR (#701)', () => {
   it.each([
     ['a builder', 'UBUILDER'],
     ['an admin', 'UADMIN'],
-  ])('merges on the word of %s, past the required review, with no owner and no agent', async (_who, userId) => {
+  ])('merges on the word of %s, past the missing review, with no owner and no agent', async (_who, userId) => {
     const { result, posted, logs } = await run('<@UBOT1> merge it', { userId });
 
     expect(ghExec).toHaveBeenCalledTimes(1);
-    expect(ghExec).toHaveBeenCalledWith(
-      [
-        'pr',
-        'merge',
-        '1490',
-        '--repo',
-        'Newton-School/newton-marketing-web',
-        '--squash',
-        // Only the commit the check read: a later push makes GitHub refuse it.
-        '--match-head-commit',
-        'abc123',
-        '--admin',
-      ],
-      'ghs_test',
-    );
+    expect(ghExec).toHaveBeenCalledWith(mergeArgs('--admin'), 'ghs_test');
     expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
     expect(runCodex).not.toHaveBeenCalled();
-    expect(posted).toEqual([
-      `Merged ${MARKETING_PR}: it only changes text, numbers and links. It isn't live yet; someone from core-dev has to deploy it.`,
-    ]);
+    expect(posted).toEqual([MERGED_PAST_REVIEW]);
     const merge = logs.find(entry => entry.stage === 'implementation.quick_action.content_merge');
     expect(merge?.data).toMatchObject({
       requestedBy: userId,
       admin: true,
+      headSha: 'abc123',
       files: ['src/features/agentic-ai-course/content.ts'],
     });
     expect(result).toMatchObject({ workflow: 'IMPLEMENTATION', status: 'SUCCESS' });
   });
 
-  it('merges without admin rights when nothing blocks the merge', async () => {
-    vi.mocked(fetchMergeState).mockResolvedValue({ mergeStateStatus: 'CLEAN', isDraft: false });
+  it('reads the checks of the commit it read, after reading it', async () => {
+    await run('<@UBOT1> merge it');
+
+    expect(fetchChecksState).toHaveBeenCalledWith(expect.objectContaining({ sha: 'abc123' }));
+    const checkedAt = vi.mocked(checkContentOnlyPr).mock.invocationCallOrder[0];
+    expect(vi.mocked(fetchChecksState).mock.invocationCallOrder[0]).toBeGreaterThan(checkedAt);
+  });
+
+  it('merges without admin rights, and says nothing about the review, when nothing blocks the merge', async () => {
+    vi.mocked(fetchMergeState).mockResolvedValue({ reviewDecision: 'APPROVED', mergeStateStatus: 'CLEAN' });
+
+    const { posted } = await run('<@UBOT1> merge it');
+
+    expect(ghExec).toHaveBeenCalledWith(mergeArgs(), 'ghs_test');
+    expect(posted).toEqual([
+      `Merged ${MARKETING_PR}: it only changes text and numbers. It isn't live yet; someone from core-dev has to deploy it.`,
+    ]);
+  });
+
+  it('uses admin rights for a branch behind its base', async () => {
+    vi.mocked(fetchMergeState).mockResolvedValue({ mergeStateStatus: 'BEHIND' });
 
     await run('<@UBOT1> merge it');
 
-    expect(ghExec.mock.calls[0][0]).not.toContain('--admin');
+    expect(ghExec).toHaveBeenCalledWith(mergeArgs('--admin'), 'ghs_test');
+  });
+
+  it.each([
+    ['approved but still blocked', { reviewDecision: 'APPROVED', mergeStateStatus: 'BLOCKED' }],
+    ['blocked with no review asked for', { mergeStateStatus: 'BLOCKED' }],
+  ])('asks the owner for a PR %s, since the block is something other than the review', async (_case, state) => {
+    vi.mocked(fetchMergeState).mockResolvedValue(state);
+
+    const { posted } = await run('<@UBOT1> merge it');
+
+    expect(ghExec).not.toHaveBeenCalled();
+    expect(checkContentOnlyPr).not.toHaveBeenCalled();
+    expect(confirmPrompt(posted)).toBeDefined();
   });
 
   it("asks the owner, saying why, when a builder's PR changes more than text", async () => {
@@ -211,22 +263,46 @@ describe('merging a content-only marketing PR (#701)', () => {
     expect(result.status).toBe('SUCCESS');
   });
 
-  it('asks the owner as before, with no reason, when the requester could not have asked for the change', async () => {
-    const { posted } = await run('<@UBOT1> merge it', { userId: 'UVIEWER' });
+  it('asks the owner for a PR into a branch other than main', async () => {
+    vi.mocked(checkContentOnlyPr).mockResolvedValue({
+      contentOnly: false,
+      kind: 'not_default_base',
+      reason: 'It merges into release, not the default branch main.',
+    });
+
+    const { posted } = await run('<@UBOT1> merge it');
+
+    expect(ghExec).not.toHaveBeenCalled();
+    expect(confirmPrompt(posted)).toContain("It doesn't merge into the main branch, so an owner has to confirm.");
+  });
+
+  it.each([
+    ['a viewer', { userId: 'UVIEWER' }, 'UVIEWER'],
+    ['a builder outside their channels', { channelId: 'C9' }, 'UBUILDER'],
+    ['a builder in a DM', { channelId: 'D1', channelType: 'im' }, 'UBUILDER'],
+  ] as Array<[string, RunOptions, string]>)(
+    'asks the owner as before, with no reason, for %s',
+    async (_who, options, asker) => {
+      const { posted } = await run('<@UBOT1> merge it', options);
+
+      expect(checkContentOnlyPr).not.toHaveBeenCalled();
+      expect(ghExec).not.toHaveBeenCalled();
+      expect(confirmPrompt(posted)).toBe(
+        `<@${asker}> asked me to merge ${MARKETING_PR}. It still needs an approving review, so merging now uses admin rights. <@UOWNER1>, reply \`confirm merge\` within 10 minutes and I'll do it. Without that, nothing changes.`,
+      );
+    },
+  );
+
+  it.each([
+    ['a repo without a content policy', WEB_PR],
+    ['a same-named repo in another org', 'https://github.com/Other-Org/newton-marketing-web/pull/1490'],
+  ])('leaves %s exactly as it was', async (_case, url) => {
+    const { posted } = await run('<@UBOT1> merge it', { pr: url });
 
     expect(checkContentOnlyPr).not.toHaveBeenCalled();
     expect(ghExec).not.toHaveBeenCalled();
     expect(confirmPrompt(posted)).toBe(
-      `<@UVIEWER> asked me to merge ${MARKETING_PR}. It still needs an approving review, so merging now uses admin rights. <@UOWNER1>, reply \`confirm merge\` within 10 minutes and I'll do it. Without that, nothing changes.`,
-    );
-  });
-
-  it('leaves a repo without a content policy exactly as it was', async () => {
-    const { posted } = await run('<@UBOT1> merge it', { pr: WEB_PR });
-
-    expect(checkContentOnlyPr).not.toHaveBeenCalled();
-    expect(confirmPrompt(posted)).toBe(
-      `<@UBUILDER> asked me to merge ${WEB_PR}. It still needs an approving review, so merging now uses admin rights. <@UOWNER1>, reply \`confirm merge\` within 10 minutes and I'll do it. Without that, nothing changes.`,
+      `<@UBUILDER> asked me to merge ${url}. It still needs an approving review, so merging now uses admin rights. <@UOWNER1>, reply \`confirm merge\` within 10 minutes and I'll do it. Without that, nothing changes.`,
     );
   });
 
@@ -238,6 +314,22 @@ describe('merging a content-only marketing PR (#701)', () => {
     expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
     expect(confirmPrompt(posted)).toBeUndefined();
     expect(runCodex).toHaveBeenCalledTimes(1);
+  });
+
+  it("merges an owner's re-run of a builder's ask on the builder's word", async () => {
+    const { posted } = await run('<@UBOT1> merge it', { requestedFor: 'UBUILDER' });
+
+    expect(ghExec).toHaveBeenCalledWith(mergeArgs('--admin'), 'ghs_test');
+    expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
+    expect(posted).toEqual([MERGED_PAST_REVIEW]);
+  });
+
+  it("asks for the owner's phrase on an owner's re-run of a viewer's ask", async () => {
+    const { posted } = await run('<@UBOT1> merge it', { requestedFor: 'UVIEWER' });
+
+    expect(checkContentOnlyPr).not.toHaveBeenCalled();
+    expect(ghExec).not.toHaveBeenCalled();
+    expect(confirmPrompt(posted)).toContain(`<@UVIEWER> asked me to merge ${MARKETING_PR}.`);
   });
 
   it('still refuses a PR with conflicts outright', async () => {
@@ -266,6 +358,13 @@ describe('merging a content-only marketing PR (#701)', () => {
           .mockResolvedValue({ unresolvedCount: 0, totalThreads: 0, failed: true }),
     ],
     [
+      'more review threads than were read',
+      () =>
+        vi
+          .mocked(fetchUnresolvedReviewThreadCount)
+          .mockResolvedValue({ unresolvedCount: 0, totalThreads: 140, incomplete: true }),
+    ],
+    [
       'requested changes',
       () =>
         vi
@@ -278,10 +377,7 @@ describe('merging a content-only marketing PR (#701)', () => {
       () => vi.mocked(fetchMergeState).mockResolvedValue({ mergeStateStatus: 'UNKNOWN' }),
     ],
     ['an unreadable merge state', () => vi.mocked(fetchMergeState).mockResolvedValue(undefined)],
-    ['failing checks', () => vi.mocked(fetchChecksState).mockResolvedValue('FAILURE')],
-    ['checks still running', () => vi.mocked(fetchChecksState).mockResolvedValue('PENDING')],
-    ['checks that could not be read', () => vi.mocked(fetchChecksState).mockResolvedValue(undefined)],
-  ])('asks the owner for a content-only PR with %s', async (_case, arrange) => {
+  ])('asks the owner, before reading the diff, for a PR with %s', async (_case, arrange) => {
     arrange();
 
     const { posted, logs } = await run('<@UBOT1> merge it');
@@ -293,6 +389,19 @@ describe('merging a content-only marketing PR (#701)', () => {
     expect(logs.map(entry => entry.stage)).toContain('implementation.quick_action.content_check');
   });
 
+  it.each([
+    ['failing', 'FAILURE'],
+    ['still running', 'PENDING'],
+    ['unreadable', undefined],
+  ])('asks the owner for a content-only PR whose checks are %s', async (_case, checks) => {
+    vi.mocked(fetchChecksState).mockResolvedValue(checks);
+
+    const { posted } = await run('<@UBOT1> merge it');
+
+    expect(ghExec).not.toHaveBeenCalled();
+    expect(confirmPrompt(posted)).toBeDefined();
+  });
+
   it('does not skip the owner when the ask is more than the merge', async () => {
     const { logs } = await run('<@UBOT1> merge it once the copy is approved');
 
@@ -301,42 +410,83 @@ describe('merging a content-only marketing PR (#701)', () => {
     expect(vi.mocked(__quickActionConfirm.wait).mock.calls[0][0].phrase).toBe('confirm merge');
   });
 
-  it('says nothing was merged when gh fails and the PR is still open', async () => {
-    ghExec.mockReset().mockImplementation(async (args: string[]) => {
-      if (args[1] === 'merge')
-        throw Object.assign(new Error('Command failed'), { stderr: 'GraphQL: Base branch was modified\n' });
-      return 'OPEN\n';
+  it('merges nothing once the run is cancelled, and hands the check the signal', async () => {
+    const controller = new AbortController();
+    vi.mocked(checkContentOnlyPr).mockImplementation(async () => {
+      controller.abort();
+      return { contentOnly: true, files: ['src/features/x/content.ts'], headSha: 'abc123' };
     });
 
-    const { posted, result } = await run('<@UBOT1> merge it');
+    const { result } = await run('<@UBOT1> merge it', { signal: controller.signal });
 
-    expect(posted).toEqual([
-      `I couldn't merge ${MARKETING_PR}: GraphQL: Base branch was modified. Nothing was merged.`,
-    ]);
-    expect(result.status).toBe('FAILED');
+    expect(vi.mocked(checkContentOnlyPr).mock.calls[0][0].signal).toBe(controller.signal);
+    expect(ghExec).not.toHaveBeenCalled();
+    expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
+    expect(result.status).toBe('CANCELLED');
   });
 
-  it('reports the merge when gh fails after GitHub merged it', async () => {
-    ghExec.mockReset().mockImplementation(async (args: string[]) => {
-      if (args[1] === 'merge') throw new Error('Command timed out');
-      return 'MERGED\n';
+  describe('when gh fails', () => {
+    const failMerge = (error: Error, view: () => Promise<string>) =>
+      ghExec.mockReset().mockImplementation(async (args: string[]) => {
+        if (args[1] === 'merge') throw error;
+        return view();
+      });
+
+    it('says nothing was merged when gh refused and the PR is still open', async () => {
+      failMerge(
+        Object.assign(new Error('Command failed'), { stderr: 'GraphQL: Head branch was modified\n' }),
+        async () => 'OPEN\n',
+      );
+
+      const { posted, result } = await run('<@UBOT1> merge it');
+
+      expect(posted).toEqual([
+        `I couldn't merge ${MARKETING_PR}: GraphQL: Head branch was modified. Nothing was merged.`,
+      ]);
+      expect(result.status).toBe('FAILED');
     });
 
-    const { posted, result } = await run('<@UBOT1> merge it');
+    it('says nothing was merged when gh is not installed, without asking it anything else', async () => {
+      failMerge(Object.assign(new Error('spawn gh ENOENT'), { code: 'ENOENT' }), async () => 'OPEN\n');
 
-    expect(posted[0]).toMatch(/^Merged /);
-    expect(result.status).toBe('SUCCESS');
-  });
+      const { posted } = await run('<@UBOT1> merge it');
 
-  it("doesn't claim nothing happened when it can't tell", async () => {
-    ghExec.mockReset().mockRejectedValue(new Error('Command timed out'));
+      expect(ghExec).toHaveBeenCalledTimes(1);
+      expect(posted).toEqual([
+        `I couldn't merge ${MARKETING_PR}: the GitHub command-line tool isn't available here. Nothing was merged.`,
+      ]);
+    });
 
-    const { posted, result } = await run('<@UBOT1> merge it');
+    it("doesn't say nothing was merged when gh was killed for taking too long, even if the PR reads open", async () => {
+      failMerge(Object.assign(new Error('Command failed'), { killed: true, signal: 'SIGTERM' }), async () => 'OPEN\n');
 
-    expect(posted).toEqual([
-      `I couldn't tell whether ${MARKETING_PR} merged: Command timed out. Check the PR before asking again.`,
-    ]);
-    expect(result.status).toBe('FAILED');
+      const { posted, result } = await run('<@UBOT1> merge it');
+
+      expect(posted).toEqual([
+        `I couldn't tell whether ${MARKETING_PR} merged: the merge command timed out. Check the PR before asking again.`,
+      ]);
+      expect(result.status).toBe('FAILED');
+    });
+
+    it('reports the merge when gh fails after GitHub merged it', async () => {
+      failMerge(Object.assign(new Error('Command failed'), { killed: true }), async () => 'MERGED\n');
+
+      const { posted, result } = await run('<@UBOT1> merge it');
+
+      expect(posted).toEqual([MERGED_PAST_REVIEW]);
+      expect(result.status).toBe('SUCCESS');
+    });
+
+    it("doesn't claim nothing happened when it can't read the PR back", async () => {
+      ghExec.mockReset().mockRejectedValue(new Error('Command failed: gh pr merge'));
+
+      const { posted, result } = await run('<@UBOT1> merge it');
+
+      expect(posted).toEqual([
+        `I couldn't tell whether ${MARKETING_PR} merged: Command failed: gh pr merge. Check the PR before asking again.`,
+      ]);
+      expect(result.status).toBe('FAILED');
+    });
   });
 });
 
@@ -351,6 +501,7 @@ describe('contentOwnerReason', () => {
       'It changes more than text (`a.ts`, `b.ts`), so an owner has to confirm.',
     ],
     [{ kind: 'too_many_files', fileCount: 34 }, 'It changes more than text (34 files), so an owner has to confirm.'],
+    [{ kind: 'not_default_base' }, "It doesn't merge into the main branch, so an owner has to confirm."],
     [{ kind: 'unreadable' }, "I couldn't check that it only changes text, so an owner has to confirm."],
   ])('says %j in one sentence', (verdict, sentence) => {
     expect(contentOwnerReason({ contentOnly: false, reason: 'r', ...verdict } as never)).toBe(sentence);

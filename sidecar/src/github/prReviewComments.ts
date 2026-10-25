@@ -3,14 +3,15 @@ import { logger } from '../logging/logger.js';
 /**
  * Fetch the count of unresolved review threads on a GitHub PR using the GraphQL API.
  * Returns { unresolvedCount: 0, totalThreads: 0 } on any failure so merge is never blocked by API errors,
- * marked `failed` for the one merge that needs the count to be known (issue #701).
+ * marked `failed` for the one merge that needs the count to be known (issue #701), and marks a count
+ * from more threads than were read `incomplete`.
  */
 export async function fetchUnresolvedReviewThreadCount(params: {
   owner: string;
   repo: string;
   pullNumber: number;
   githubToken: string;
-}): Promise<{ unresolvedCount: number; totalThreads: number; failed?: true }> {
+}): Promise<{ unresolvedCount: number; totalThreads: number; failed?: true; incomplete?: true }> {
   const { owner, repo, pullNumber, githubToken } = params;
   const fallback = { unresolvedCount: 0, totalThreads: 0, failed: true as const };
 
@@ -57,7 +58,10 @@ export async function fetchUnresolvedReviewThreadCount(params: {
 
     const totalThreads = threads.totalCount ?? threads.nodes.length;
     const unresolvedCount = threads.nodes.filter(t => !t.isResolved).length;
-    return { unresolvedCount, totalThreads };
+    // Only the first 100 threads are read: past that, the count is a floor.
+    return totalThreads > threads.nodes.length
+      ? { unresolvedCount, totalThreads, incomplete: true }
+      : { unresolvedCount, totalThreads };
   } catch (err) {
     logger.warn({ error: String(err), owner, repo, pullNumber }, 'Failed to fetch PR review threads');
     return fallback;
@@ -142,27 +146,26 @@ export async function fetchMergeState(params: {
 }
 
 /**
- * The combined state of the checks on a PR's latest commit: SUCCESS, FAILURE,
- * PENDING, ERROR or EXPECTED; null when it has no checks at all; undefined
- * when it could not be read. Its own query, like the merge state, so a token
- * that may not read checks takes nothing else down with it.
+ * The combined state of the checks on one commit: SUCCESS, FAILURE, PENDING,
+ * ERROR or EXPECTED; null when it has no checks at all; undefined when it
+ * could not be read. Read for the exact commit a merge is pinned to, not the
+ * PR's latest, which may have moved. Its own query, like the merge state, so
+ * a token that may not read checks takes nothing else down with it.
  */
 export async function fetchChecksState(params: {
   owner: string;
   repo: string;
-  pullNumber: number;
+  sha: string;
   githubToken: string;
   /** Test seam. */
   fetcher?: typeof fetch;
 }): Promise<string | null | undefined> {
-  const { owner, repo, pullNumber, githubToken } = params;
+  const { owner, repo, sha, githubToken } = params;
   const fetcher = params.fetcher ?? fetch;
   const query = `
-    query($owner: String!, $repo: String!, $number: Int!) {
+    query($owner: String!, $repo: String!, $oid: GitObjectID!) {
       repository(owner: $owner, name: $repo) {
-        pullRequest(number: $number) {
-          commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
-        }
+        object(oid: $oid) { ... on Commit { statusCheckRollup { state } } }
       }
     }
   `;
@@ -170,29 +173,23 @@ export async function fetchChecksState(params: {
     const response = await fetcher('https://api.github.com/graphql', {
       method: 'POST',
       headers: { Authorization: `Bearer ${githubToken}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query, variables: { owner, repo, number: pullNumber } }),
+      body: JSON.stringify({ query, variables: { owner, repo, oid: sha } }),
       signal: AbortSignal.timeout(15_000),
     });
     if (!response.ok) {
-      logger.warn({ status: response.status, owner, repo, pullNumber }, 'GitHub GraphQL checks request failed');
+      logger.warn({ status: response.status, owner, repo, sha }, 'GitHub GraphQL checks request failed');
       return undefined;
     }
     const json = (await response.json()) as {
       errors?: unknown[];
-      data?: {
-        repository?: {
-          pullRequest?: {
-            commits?: { nodes?: Array<{ commit?: { statusCheckRollup?: { state?: string } | null } }> };
-          } | null;
-        } | null;
-      };
+      data?: { repository?: { object?: { statusCheckRollup?: { state?: string } | null } | null } | null };
     };
-    const commit = json.data?.repository?.pullRequest?.commits?.nodes?.[0]?.commit;
+    const commit = json.data?.repository?.object;
     // A refused field comes back null with an error, which is not the same as no checks.
-    if (!commit || (json.errors && json.errors.length > 0)) return undefined;
+    if (!commit || !('statusCheckRollup' in commit) || (json.errors && json.errors.length > 0)) return undefined;
     return commit.statusCheckRollup?.state ?? null;
   } catch (err) {
-    logger.warn({ error: String(err), owner, repo, pullNumber }, 'Failed to fetch PR checks state');
+    logger.warn({ error: String(err), owner, repo, sha }, 'Failed to fetch commit checks state');
     return undefined;
   }
 }

@@ -285,25 +285,42 @@ export function mergeProtectionNote(state: MergeState | undefined): string {
  */
 async function readMergeChecks(pr: PrContext, githubToken: string): Promise<MergeChecks> {
   const target = { owner: pr.owner, repo: pr.repo, pullNumber: pr.number, githubToken };
+  type Threads = Awaited<ReturnType<typeof fetchUnresolvedReviewThreadCount>>;
   const [threads, state] = await Promise.all([
-    fetchUnresolvedReviewThreadCount(target).catch(() => ({ unresolvedCount: 0, totalThreads: 0, failed: true })),
+    fetchUnresolvedReviewThreadCount(target).catch(
+      (): Threads => ({ unresolvedCount: 0, totalThreads: 0, failed: true }),
+    ),
     fetchMergeState(target).catch(() => undefined),
   ]);
-  return { unresolvedCount: threads.unresolvedCount, threadsKnown: !threads.failed, state };
+  return { unresolvedCount: threads.unresolvedCount, threadsKnown: !threads.failed && !threads.incomplete, state };
 }
 
 type MergeChecks = {
   unresolvedCount: number;
-  /** False when the review threads could not be read, so the count of 0 means nothing. */
+  /** False when the review threads could not all be read, so the count means nothing. */
   threadsKnown: boolean;
   state: MergeState | undefined;
 };
 
-/** Merge states a content-only PR may be merged from without the owner (issue #701). */
-const CONTENT_MERGEABLE_STATES = new Set(['CLEAN', 'HAS_HOOKS', 'BLOCKED', 'BEHIND']);
+/**
+ * Merge states a content-only PR may be merged from without the owner (issue
+ * #701). BLOCKED counts only when the block is the missing review, which is
+ * what the owner decided builders may go past.
+ */
+const CONTENT_MERGEABLE_STATES = new Set(['CLEAN', 'HAS_HOOKS', 'BEHIND']);
 
 type ContentMergeDecision =
-  | { kind: 'merge'; pr: PrContext; policy: ContentPolicy; files: string[]; headSha: string; admin: boolean }
+  | {
+      kind: 'merge';
+      pr: PrContext;
+      policy: ContentPolicy;
+      files: string[];
+      headSha: string;
+      /** Merging needs admin rights: past the missing review, or a branch behind its base. */
+      admin: boolean;
+      /** The merge goes in without the approving review the repo asks for. */
+      skipsReview: boolean;
+    }
   /** `reason` is said in the owner's confirmation; none when what blocks it is said there already. */
   | { kind: 'owner'; reason?: string };
 
@@ -321,6 +338,7 @@ export const __contentMergeGh = {
 /** Why an owner still has to confirm a change that is more than content, in one sentence. */
 export function contentOwnerReason(verdict: Exclude<ContentOnlyVerdict, { contentOnly: true }>): string {
   if (verdict.kind === 'unreadable') return "I couldn't check that it only changes text, so an owner has to confirm.";
+  if (verdict.kind === 'not_default_base') return "It doesn't merge into the main branch, so an owner has to confirm.";
   if (verdict.kind === 'too_many_files' || !verdict.offending?.length) {
     return `It changes more than text (${verdict.fileCount ?? 'many'} files), so an owner has to confirm.`;
   }
@@ -343,8 +361,9 @@ async function decideContentMerge(params: {
   checks: MergeChecks;
   githubToken: string;
   logStep?: WorkflowStepLogger;
+  signal?: AbortSignal;
 }): Promise<ContentMergeDecision | undefined> {
-  const { task, config, pr, checks, githubToken, logStep } = params;
+  const { task, config, pr, checks, githubToken, logStep, signal } = params;
   const repoKey = repoKeyFromGithubRepoName(pr.repo);
   const descriptor = repoKey ? getRepo(repoKey) : undefined;
   const policy = descriptor?.contentPolicy;
@@ -370,32 +389,46 @@ async function decideContentMerge(params: {
   // Whatever of these stands in the way, the confirmation already says it.
   const { state, unresolvedCount, threadsKnown } = checks;
   const status = state?.mergeStateStatus;
-  if (!state || !status || !CONTENT_MERGEABLE_STATES.has(status)) return owner(`merge state ${status ?? 'unknown'}.`);
+  const blockedOnlyByReview = status === 'BLOCKED' && state?.reviewDecision === 'REVIEW_REQUIRED';
+  if (!state || !status || !(CONTENT_MERGEABLE_STATES.has(status) || blockedOnlyByReview)) {
+    return owner(`merge state ${status ?? 'unknown'}, review ${state?.reviewDecision ?? 'unknown'}.`);
+  }
   if (state.isDraft) return owner('it is a draft.');
   if (state.reviewDecision === 'CHANGES_REQUESTED') return owner('a reviewer asked for changes.');
-  if (!threadsKnown) return owner("the review comments couldn't be read.");
+  if (!threadsKnown) return owner("the review comments couldn't all be read.");
   if (unresolvedCount > 0) return owner(`${unresolvedCount} unresolved review comments.`);
-  const target = { owner: pr.owner, repo: pr.repo, pullNumber: pr.number, githubToken };
-  const checksState = await fetchChecksState(target);
-  if (checksState !== null && checksState !== 'SUCCESS') return owner(`checks are ${checksState ?? 'unreadable'}.`);
 
-  const verdict = await checkContentOnlyPr({ owner: pr.owner, repo: pr.repo, number: pr.number, githubToken, policy });
+  const verdict = await checkContentOnlyPr({
+    owner: pr.owner,
+    repo: pr.repo,
+    number: pr.number,
+    githubToken,
+    policy,
+    signal,
+  });
+  if (signal?.aborted) return owner('the run was cancelled.');
   if (!verdict.contentOnly) {
     const files = verdict.offending ? ` (${verdict.offending.join(', ')})` : '';
     return owner(`${verdict.reason}${files}`, contentOwnerReason(verdict));
   }
+  // The checks of the commit the merge is pinned to, read after the files were.
+  const checksState = await fetchChecksState({ owner: pr.owner, repo: pr.repo, sha: verdict.headSha, githubToken });
+  if (checksState !== null && checksState !== 'SUCCESS') return owner(`checks are ${checksState ?? 'unreadable'}.`);
   return {
     kind: 'merge',
     pr,
     policy,
     files: verdict.files,
     headSha: verdict.headSha,
-    admin: status === 'BLOCKED' || status === 'BEHIND',
+    admin: status === 'BEHIND' || blockedOnlyByReview,
+    skipsReview: blockedOnlyByReview,
   };
 }
 
-const CONTENT_MERGED_REPLY = (url: string) =>
-  `Merged ${url}: it only changes text, numbers and links. It isn't live yet; someone from core-dev has to deploy it.`;
+function contentMergedReply(url: string, skipsReview: boolean): string {
+  const how = skipsReview ? ', so it went in without the usual review' : '';
+  return `Merged ${url}: it only changes text and numbers${how}. It isn't live yet; someone from core-dev has to deploy it.`;
+}
 
 /**
  * Merge a content-only PR on the requester's word (issue #701), with `gh`
@@ -412,13 +445,13 @@ async function mergeContentOnlyPr(params: {
   signal?: AbortSignal;
 }): Promise<WorkflowResult> {
   const { task, slack, decision, githubToken, logStep, signal } = params;
-  const { pr, policy, files, headSha, admin } = decision;
+  const { pr, policy, files, headSha, admin, skipsReview } = decision;
   if (signal?.aborted) return cancelledResult('IMPLEMENTATION');
   const requester = requesterOf(task);
   logStep?.({
     stage: 'implementation.quick_action.content_merge',
     message: `Merging ${pr.url} without the owner's confirmation: it only changes content, and <@${requester}> asked.`,
-    data: { prUrl: pr.url, files, requestedBy: requester, admin, mergeMethod: policy.mergeMethod },
+    data: { prUrl: pr.url, files, requestedBy: requester, admin, headSha, mergeMethod: policy.mergeMethod },
   });
   const repoArg = `${pr.owner}/${pr.repo}`;
   // Only the commit that was read: a push after the check makes GitHub refuse the merge.
@@ -430,25 +463,35 @@ async function mergeContentOnlyPr(params: {
   let status: WorkflowResult['status'];
   try {
     await __contentMergeGh.exec(args, githubToken);
-    reply = CONTENT_MERGED_REPLY(pr.url);
+    reply = contentMergedReply(pr.url, skipsReview);
     status = 'SUCCESS';
   } catch (error) {
-    const detail = ghErrorLine(error);
-    // A failed command does not always mean nothing happened (a timeout after GitHub merged it).
-    const prState = await __contentMergeGh
-      .exec(['pr', 'view', String(pr.number), '--repo', repoArg, '--json', 'state', '-q', '.state'], githubToken)
-      .then(out => out.trim())
-      .catch(() => undefined);
+    const failure = error as { code?: unknown; killed?: unknown; signal?: unknown };
+    // gh never ran, so nothing can have happened.
+    const notRun = failure.code === 'ENOENT';
+    // Killed mid-run: GitHub may have merged it anyway, whatever it says a moment later.
+    const timedOut = failure.killed === true || Boolean(failure.signal) || failure.code === 'ETIMEDOUT';
+    const detail = notRun
+      ? "the GitHub command-line tool isn't available here."
+      : timedOut
+        ? 'the merge command timed out.'
+        : ghErrorLine(error);
+    const prState = notRun
+      ? undefined
+      : await __contentMergeGh
+          .exec(['pr', 'view', String(pr.number), '--repo', repoArg, '--json', 'state', '-q', '.state'], githubToken)
+          .then(out => out.trim())
+          .catch(() => undefined);
     logStep?.({
       stage: 'implementation.quick_action.content_merge_failed',
       message: `gh pr merge failed for ${pr.url}: ${detail}`,
       level: prState === 'MERGED' ? 'WARN' : 'ERROR',
-      data: { prUrl: pr.url, prState },
+      data: { prUrl: pr.url, prState, notRun, timedOut },
     });
     if (prState === 'MERGED') {
-      reply = CONTENT_MERGED_REPLY(pr.url);
+      reply = contentMergedReply(pr.url, skipsReview);
       status = 'SUCCESS';
-    } else if (prState) {
+    } else if (notRun || (prState && !timedOut)) {
       reply = `I couldn't merge ${pr.url}: ${detail} Nothing was merged.`;
       status = 'FAILED';
     } else {
@@ -818,7 +861,7 @@ async function runQuickAction(params: {
       const githubToken = ctx.githubToken;
       const contentMerge =
         params.action === 'merge' && checkPr && checks && githubToken
-          ? await decideContentMerge({ task, config, pr: checkPr, checks, githubToken, logStep })
+          ? await decideContentMerge({ task, config, pr: checkPr, checks, githubToken, logStep, signal })
           : undefined;
       if (contentMerge?.kind === 'merge' && githubToken) {
         return mergeContentOnlyPr({ task, slack, decision: contentMerge, githubToken, logStep, signal });
