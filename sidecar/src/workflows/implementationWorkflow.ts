@@ -76,8 +76,14 @@ import {
   extractReplyFromCodexResult,
   type WorkflowContext,
 } from './shared/workflowUtils.js';
-import { readPrActionAsk } from '../router/prActionAsk.js';
-import { guardWords } from '../router/stagingTarget.js';
+import {
+  ANY_OPERATION_WORD,
+  pickPr,
+  quickActionWords,
+  readQuickOperation,
+  readSyncPhrase,
+  type QuickOperation,
+} from '../router/prActionAsk.js';
 import { refreshSharedClones } from '../workspaces/staleCheckout.js';
 import { assertThreadParentExists } from '../slack/threadContext.js';
 import { runAgenticEntry } from '../agentic/agenticEntry.js';
@@ -243,10 +249,49 @@ export const QUICK_ACTION_DEPLOY_REDIRECT =
  * Quick actions that change a pull request and cannot be taken back cheaply.
  * "sync" merges the base branch into the PR branch (issue #603): the daily
  * follow-up offers it when a PR conflicts or is behind. Never a rebase or a
- * force-push: the branch has an open PR.
+ * force-push: the branch has an open PR. Read from the words by
+ * `readQuickOperation` (issue #719).
  */
-const QUICK_ACTION_PR_ACTION_RE = /\b(merge|close|revert|sync)\b/i;
 type QuickPrAction = 'merge' | 'close' | 'revert' | 'sync';
+/** Why a quick action asks instead of acting (issue #719). */
+type QuickActionUnclearReason =
+  | Extract<QuickOperation, { kind: 'unclear' }>['reason']
+  | 'several_prs'
+  | 'no_pr'
+  | 'unnamed';
+
+/**
+ * One question instead of an operation nobody asked for plainly: nothing is
+ * changed, and the job ends. "Tell me" in a DM, "Mention me" in a channel.
+ */
+async function askWhatToDo(params: {
+  task: NormalizedTask;
+  slack: WebClient;
+  logStep?: WorkflowStepLogger;
+  prs: PrContext[];
+  reason: QuickActionUnclearReason;
+}): Promise<WorkflowResult> {
+  const { task, slack, logStep, prs, reason } = params;
+  const again =
+    task.event.channelType === 'im' || task.event.channelType === 'mpim' ? 'Tell me again' : 'Mention me again';
+  const urls = [...new Set(prs.map(pr => pr.url))];
+  const reply =
+    reason === 'several_prs'
+      ? `I wasn't sure which pull request you mean (${urls.join(', ')}), so I haven't changed anything. ${again} with the one pull request and what to do with it.`
+      : urls.length === 1
+        ? `I wasn't sure what to do with ${urls[0]}, so I haven't changed anything. ${again} with just the one you want: merge it, close it, or sync it with its base branch.`
+        : `I wasn't sure what you want me to do, so I haven't changed anything. ${again} with the pull request and the one thing to do with it: merge, close, or sync it with its base branch.`;
+  logStep?.({
+    stage: 'implementation.quick_action.unclear',
+    message: `The words name a pull-request operation but can't be read safely (${reason}) — asking, not acting.`,
+    data: { reason, prUrls: urls },
+  });
+  const posted = await slack.chat
+    .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: reply })
+    .then(() => true)
+    .catch(() => false);
+  return { workflow: 'IMPLEMENTATION', status: 'SKIPPED', message: reply, notifyDesktop: false, slackPosted: posted };
+}
 
 export const QUICK_ACTION_APPROVE_REFUSAL =
   "I don't approve pull requests. Ask me to review one and I'll post comments; the approval is a person's call.";
@@ -663,6 +708,11 @@ async function confirmQuickPrAction(params: {
   protectionNote?: string;
   /** Why the owner has to confirm a merge the requester could otherwise make (issue #701). */
   ownerReason?: string;
+  /**
+   * The requester confirms instead of the owner: a content-only merge they
+   * may make, read by a planner rather than the strict gate (issue #719).
+   */
+  requesterConfirms?: { note: string };
   logStep?: WorkflowStepLogger;
   signal?: AbortSignal;
 }): Promise<{ confirmedBy: string } | { result: WorkflowResult }> {
@@ -670,7 +720,7 @@ async function confirmQuickPrAction(params: {
   const { channelId, threadTs } = task.event;
   const userId = requesterOf(task);
   const phrase = `confirm ${action}`;
-  const owners = config.ownerSlackUserIds;
+  const owners = params.requesterConfirms ? [userId] : config.ownerSlackUserIds;
   const ownerMentions = owners.map(id => `<@${id}>`).join(' or ');
   const stop = (status: WorkflowResult['status'], message: string, slackPosted: boolean) => ({
     result: {
@@ -700,7 +750,9 @@ async function confirmQuickPrAction(params: {
   let promptTs: string | undefined;
   try {
     const notes = [protectionNote, ownerReason].map(note => (note ? ` ${note}` : '')).join('');
-    const confirmText = `<@${userId}> asked me to ${action} ${target}.${unresolvedNote}${notes} ${ownerMentions}, reply \`${phrase}\` within 10 minutes and I'll do it. Without that, nothing changes.`;
+    const confirmText = params.requesterConfirms
+      ? `I read this as: ${action} ${target}. ${params.requesterConfirms.note} <@${userId}>, reply \`${phrase}\` within 10 minutes and I'll do it. Without that, nothing changes.`
+      : `<@${userId}> asked me to ${action} ${target}.${unresolvedNote}${notes} ${ownerMentions}, reply \`${phrase}\` within 10 minutes and I'll do it. Without that, nothing changes.`;
     promptTs = await postGatePrompt(slack, {
       channel: channelId,
       thread_ts: threadTs,
@@ -717,8 +769,10 @@ async function confirmQuickPrAction(params: {
   }
   logStep?.({
     stage: 'implementation.quick_action.confirm.asked',
-    message: `Asked the owner to confirm: ${action} requested by <@${userId}>.`,
-    data: { action, prUrls, requestedBy: userId, promptTs },
+    message: params.requesterConfirms
+      ? `Asked <@${userId}> to confirm the ${action} they asked for.`
+      : `Asked the owner to confirm: ${action} requested by <@${userId}>.`,
+    data: { action, prUrls, requestedBy: userId, promptTs, confirmers: owners },
   });
 
   const confirmation = await __quickActionConfirm.wait({
@@ -740,7 +794,9 @@ async function confirmQuickPrAction(params: {
   const msg =
     confirmation.outcome === 'declined'
       ? 'Okay, leaving it as it is.'
-      : `No \`${phrase}\` from ${ownerMentions} in 10 minutes, so nothing was changed. Ask again when they're around.`;
+      : params.requesterConfirms
+        ? `No \`${phrase}\` in 10 minutes, so nothing was changed. Ask again when you're ready.`
+        : `No \`${phrase}\` from ${ownerMentions} in 10 minutes, so nothing was changed. Ask again when they're around.`;
   return stop('SKIPPED', msg, await say(msg));
 }
 type ImplementationStore = PipelineStore & {
@@ -788,19 +844,51 @@ async function runQuickAction(params: {
   /** The operation, when the message was read as only that; otherwise it is read from the text. */
   action?: QuickPrAction;
 }): Promise<WorkflowResult> {
-  const { task, config, slack, ctx, store, jobId, logStep, signal, plan, prs, checkPr } = params;
+  const { task, config, slack, ctx, store, jobId, logStep, signal, plan } = params;
   // The operation is read from the words alone: a link, its label, a mention,
   // a code span or a typed branch or file name ("fix/merge-banner",
   // "close-modal.tsx") naming "merge", "close" or "deploy" is not an
-  // instruction (#710).
-  const words = guardWords(task.event.text).replace(/\S+\.[a-z0-9]{1,6}\b\S*/g, ' ');
-  const prAction =
-    params.action ?? (QUICK_ACTION_PR_ACTION_RE.exec(words)?.[1].toLowerCase() as QuickPrAction | undefined);
-  const mergeIntent = params.action ? params.action === 'merge' : /\bmerge\b/i.test(words);
+  // instruction (#710). A link to the pull request reads as "this pr", and
+  // code or a typed name leaves a placeholder (issue #719).
+  const rawWords = quickActionWords(task.event.text);
+  // "bring it up to date with master", "merge main into it", "rebase on master":
+  // a sync, never a merge of the PR. "Don't merge it, just sync it", "merge it
+  // with master" or "did you merge it?" name no operation to run (issue #719).
+  const syncPhrase = readSyncPhrase(rawWords);
+  const words = syncPhrase.sync ? syncPhrase.text : rawWords;
+  const operation: QuickOperation = params.action
+    ? { kind: 'operation', action: params.action, rebase: syncPhrase.rebase }
+    : readQuickOperation(rawWords);
+  const prAction: QuickPrAction | undefined = operation.kind === 'operation' ? operation.action : undefined;
+  // Only the strict gate's sentences run unconfirmed for the owner; after a
+  // planner, every merge, close or revert asks for `confirm <op>` (issue #719).
+  const fromGate = Boolean(params.action);
+
+  // After a planner, the pull request acted on is the one the words name: a
+  // number, else the only one linked, else the only one known (issue #719).
+  let prs = params.prs;
+  let checkPr = params.checkPr;
+  let unclear: QuickActionUnclearReason | undefined = operation.kind === 'unclear' ? operation.reason : undefined;
+  if (!fromGate && prAction && !unclear) {
+    const numbers = new Set([...rawWords.matchAll(/\b\d{2,}\b/g)].map(match => Number(match[0])));
+    const byNumber = params.prs.filter(pr => numbers.has(pr.number));
+    // "merge it 9999" names a PR this thread doesn't know: ask, don't act on the one it does.
+    const picked =
+      numbers.size > 0 && byNumber.length === 0
+        ? undefined
+        : pickPr(params.prs, byNumber.length === 1 ? byNumber[0].number : undefined);
+    if (picked) {
+      prs = [picked];
+      checkPr = picked;
+    } else {
+      unclear = params.prs.length === 0 ? 'no_pr' : 'several_prs';
+    }
+  }
+  if (unclear) return askWhatToDo({ task, slack, logStep, prs: params.prs, reason: unclear });
+
+  const mergeIntent = prAction === 'merge';
   const mergeChecks =
-    (mergeIntent || prAction === 'merge') && checkPr && ctx.githubToken
-      ? await readMergeChecks(checkPr, ctx.githubToken)
-      : undefined;
+    mergeIntent && checkPr && ctx.githubToken ? await readMergeChecks(checkPr, ctx.githubToken) : undefined;
 
   // Nobody can merge a PR with conflicts, admin rights or not: a message that
   // is only that merge gets no confirmation to answer and no agent (issue
@@ -821,9 +909,10 @@ async function runQuickAction(params: {
   }
 
   // For merge requests: check for unresolved review comments before proceeding
-  // Asked by someone else, the owner confirmation further down covers it
-  // (and shows the same count), so this check is for the owner's own asks.
-  if (mergeIntent && task.isOwnerAuthor && mergeChecks) {
+  // Asked by someone else, or after a planner, the confirmation further down
+  // covers it (and shows the same count), so this check is for the owner's own
+  // gate asks.
+  if (mergeIntent && fromGate && task.isOwnerAuthor && mergeChecks) {
     const adminUserIds = getAdminUserIds(config);
     const { unresolvedCount } = mergeChecks;
     if (unresolvedCount > 0) {
@@ -906,6 +995,7 @@ async function runQuickAction(params: {
   // INFORMATIONAL path instead. Default to informational — both misroute
   // directions are non-destructive (a misrouted op just gets explained).
   const operationalAction =
+    operation.kind !== 'question' &&
     /\b(merge|close|reopen|revert|sync|restart|rerun|re-run|run (?:the )?tests?|approve|assign)\b/i.test(words);
 
   // Deploys never run from here (issue #407). This path has no deploy
@@ -957,6 +1047,14 @@ async function runQuickAction(params: {
 
   const prUrls = [...new Set(prs.map(pr => pr.url))];
 
+  // The agent below runs with permissions bypassed: it never runs a pull-request
+  // operation nobody confirmed. Words that still name one ("sync up the branch",
+  // a struck-through "merge", "merged master in") without a clear reading are
+  // asked about instead (issue #719).
+  if (!prAction && ANY_OPERATION_WORD.test(rawWords)) {
+    return askWhatToDo({ task, slack, logStep, prs: params.prs, reason: 'unnamed' });
+  }
+
   // An approval from this agent would be submitted under the owner's
   // GitHub identity (issue #429). An approve-only ask is declined; in a
   // mixed ask the prompt below forbids the approving review.
@@ -987,17 +1085,78 @@ async function runQuickAction(params: {
     // A run the owner started or picked up for someone else still needs
     // the phrase: answering their question isn't saying yes to a merge.
     const forSomeoneElse = requesterOf(task) !== task.event.userId;
-    if (!task.isOwnerAuthor || forSomeoneElse) {
+    // A rebase ask runs as a merge of the base branch: even the owner sees that
+    // first. After a planner, so does every merge, close or revert: the prompt
+    // names the PR and the operation, so a misread is seen before it runs (#719).
+    const rebaseAsked = prAction === 'sync' && operation.kind === 'operation' && operation.rebase;
+    const readByPlanner = !fromGate && prAction !== 'sync';
+    if (!task.isOwnerAuthor || forSomeoneElse || rebaseAsked || readByPlanner) {
       const checks = prAction === 'merge' ? mergeChecks : undefined;
-      // A message that is only this merge, of a PR that only changes content,
-      // from someone who could have asked for the change: their word is the
-      // OK (issue #701).
+      // A merge of a PR that only changes content, from someone who could have
+      // asked for the change: their word is the OK (issue #701). A message that
+      // is only that merge merges at once; read by a planner, they confirm it
+      // with `confirm merge` first, which names the PR (issue #719).
       const githubToken = ctx.githubToken;
       const contentMerge =
-        params.action === 'merge' && checkPr && checks && githubToken
+        prAction === 'merge' && checkPr && checks && githubToken
           ? await decideContentMerge({ task, config, pr: checkPr, checks, githubToken, logStep, signal })
           : undefined;
       if (contentMerge?.kind === 'merge' && githubToken) {
+        if (!fromGate) {
+          if (signal?.aborted) return cancelledResult('IMPLEMENTATION');
+          const confirmed = await confirmQuickPrAction({
+            task,
+            config,
+            slack,
+            action: 'merge',
+            prUrls,
+            requesterConfirms: { note: 'It only changes text and numbers, so your word is enough.' },
+            logStep,
+            signal,
+          });
+          if ('result' in confirmed) return confirmed.result;
+          // Up to ten minutes went by: merge only what was checked, and only if it still checks out.
+          const fresh = await readMergeChecks(contentMerge.pr, githubToken);
+          const again = await decideContentMerge({
+            task,
+            config,
+            pr: contentMerge.pr,
+            checks: fresh,
+            githubToken,
+            logStep,
+            signal,
+          });
+          if (again?.kind !== 'merge' || again.headSha !== contentMerge.headSha) {
+            const pushed =
+              Boolean(fresh.state?.headSha && fresh.state.headSha !== contentMerge.headSha) ||
+              (again?.kind === 'merge' && again.headSha !== contentMerge.headSha);
+            const what = pushed
+              ? 'someone pushed to it'
+              : "it can't go in on your word any more (its changes or its state moved on)";
+            const reply = `${contentMerge.pr.url} changed while I waited for your confirmation: ${what}, so I haven't merged it. Ask again and I'll check it afresh.`;
+            logStep?.({
+              stage: 'implementation.quick_action.content_merge.stale',
+              message: reply,
+              data: {
+                prUrl: contentMerge.pr.url,
+                checkedSha: contentMerge.headSha,
+                nowSha: again?.kind === 'merge' ? again.headSha : null,
+              },
+            });
+            const posted = await slack.chat
+              .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: reply })
+              .then(() => true)
+              .catch(() => false);
+            return {
+              workflow: 'IMPLEMENTATION',
+              status: 'SKIPPED',
+              message: reply,
+              notifyDesktop: false,
+              slackPosted: posted,
+            };
+          }
+          return mergeContentOnlyPr({ task, config, slack, store, decision: again, githubToken, logStep, signal });
+        }
         return mergeContentOnlyPr({ task, config, slack, store, decision: contentMerge, githubToken, logStep, signal });
       }
       if (signal?.aborted) return cancelledResult('IMPLEMENTATION');
@@ -1008,7 +1167,11 @@ async function runQuickAction(params: {
         action: prAction,
         prUrls,
         unresolvedCount: checks?.unresolvedCount,
-        protectionNote: checks ? mergeProtectionNote(checks.state) : undefined,
+        protectionNote: checks
+          ? mergeProtectionNote(checks.state)
+          : rebaseAsked
+            ? "I'll merge its base branch into it, a merge commit: I don't rebase or squash a branch with an open pull request."
+            : undefined,
         ownerReason: contentMerge?.kind === 'owner' ? contentMerge.reason : undefined,
         logStep,
         signal,
@@ -1043,7 +1206,15 @@ Never submit an approving review or request changes on a pull request (no \`gh p
     prUrls.length > 0
       ? `\n\nPull requests you may act on: ${prUrls.join(', ')}. Do not merge, close, revert or sync any other pull request.`
       : ''
-  }${prAction ? `\n\nThe confirmed operation is \`${prAction}\`; perform no other pull-request operation.` : ''}
+  }${
+    prAction
+      ? ''
+      : '\n\nNo pull-request operation was confirmed for this request: do not merge, close, revert, sync, reopen or push to any pull request, even if the request asks for it. Do the rest, and say that the person can ask me for that operation on its own.'
+  }${prAction ? `\n\nThe confirmed operation is \`${prAction}\`; perform no other pull-request operation.` : ''}${
+    prAction === 'sync' && operation.kind === 'operation' && operation.rebase
+      ? '\n\nThey asked for a rebase. Merge the base branch in instead, because a branch with an open pull request is never rebased, and say so in one short sentence.'
+      : ''
+  }
 
 Slack thread context:
 ${ctx.threadContext}${ctx.imageContext}
@@ -1889,9 +2060,31 @@ async function runImplementationWorkflowBody(params: {
     }
 
     // "merge the PR" and nothing else needs no plan (issue #605): it goes
-    // straight to the quick action, whose confirmations are the same ones a
-    // planner verdict of "no code needed" reaches.
-    const prActionAsk = readPrActionAsk(task, { botUserId: config.botUserId, ownerUserIds: config.ownerSlackUserIds });
+    // straight to the quick action. Only the router's gate decides that
+    // (issue #719): a task it didn't mark, a resumed "go ahead and merge it"
+    // among them, goes through the planner and its confirmations.
+    let prActionAsk = task.prActionGate;
+    // "merge it into master" runs unplanned only when master is the PR's base.
+    if (prActionAsk?.intoBase) {
+      const base = ctx.githubToken
+        ? (
+            await fetchMergeState({
+              owner: prActionAsk.pr.owner,
+              repo: prActionAsk.pr.repo,
+              pullNumber: prActionAsk.pr.number,
+              githubToken: ctx.githubToken,
+            }).catch(() => undefined)
+          )?.baseRef
+        : undefined;
+      if (base !== prActionAsk.intoBase) {
+        logStep?.({
+          stage: 'implementation.quick_action.base_mismatch',
+          message: `Asked to merge into ${prActionAsk.intoBase}, but the PR's base is ${base ?? 'unknown'} — planning first.`,
+          data: { prUrl: prActionAsk.pr.url, intoBase: prActionAsk.intoBase, base: base ?? null },
+        });
+        prActionAsk = undefined;
+      }
+    }
     if (prActionAsk) {
       logStep?.({
         stage: 'implementation.quick_action.no_planner',

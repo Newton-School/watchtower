@@ -280,6 +280,24 @@ export async function routeTask(params: {
    * became a change_code question ("change something, or only look into it?").
    */
   const stagingAsked = directAsk && !helpRequested && isMarketingStagingDeployAsk(userMessage);
+  /**
+   * A message that is only an operation on one pull request ("merge it",
+   * "sync <PR link>"): the change workflow's fast path runs it with no router
+   * and no planner (issue #605). Left to the router, "sync <PR link>" once read
+   * as a review and got a question instead (issue #719). Owner tags still go
+   * to the router, which reads a merge asked of the owner as a review. A reply
+   * that resumed a paused job without naming miniOG (anyone's "go ahead" after
+   * a usage-limit pause) is not addressed to it: only the message that names
+   * miniOG, a DM, or the answer to miniOG's own question opens this.
+   */
+  const addressedToMiniog =
+    Boolean(task.clarification) ||
+    (!task.resumedPausedJob &&
+      ((task.event.text ?? '').includes(`<@${config.botUserId}`) || task.event.channelType === 'im'));
+  const prActionAsk =
+    directAsk && !helpRequested && !stagingAsked && addressedToMiniog
+      ? readPrActionAsk(task, { botUserId: config.botUserId, ownerUserIds: config.ownerSlackUserIds })
+      : undefined;
   // STAGING_DEPLOY is seeded only by an answer to the staging tool's "which
   // PR or branch?" (pausedResume.ts): nothing for a model to read.
   const routerShadow =
@@ -337,6 +355,14 @@ export async function routeTask(params: {
         stage: 'router.staging_gate',
         message: 'A marketing staging deploy ask — putting it on staging, no model run.',
         data: { userMessage },
+      });
+    } else if (prActionAsk) {
+      // What the router's change_code runs as, so the fast path sees the same task.
+      resolvedIntent = 'IMPLEMENTATION';
+      logStep?.({
+        stage: 'router.pr_action_gate',
+        message: `Only "${prActionAsk.action}" on one pull request — straight to the quick action, no model run.`,
+        data: { userMessage, action: prActionAsk.action, prUrl: prActionAsk.pr.url },
       });
     } else if (
       looksLikeFixAffirmation(userMessage) &&
@@ -540,6 +566,20 @@ export async function routeTask(params: {
     resolvedIntent !== task.intent || toneMode !== task.toneMode || dossierRole !== task.dossierRole
       ? { ...task, intent: resolvedIntent, toneMode, dossierRole }
       : task;
+  // Only the gate's own decision lets the change workflow skip the planner and,
+  // for the owner, the confirmation (issue #719).
+  if (prActionAsk && resolvedIntent === 'IMPLEMENTATION') {
+    routedTask = {
+      ...routedTask,
+      prActionGate: {
+        action: prActionAsk.action,
+        pr: prActionAsk.pr,
+        ...(prActionAsk.intoBase ? { intoBase: prActionAsk.intoBase } : {}),
+      },
+    };
+  } else if (routedTask.prActionGate) {
+    routedTask = { ...routedTask, prActionGate: undefined };
+  }
 
   routerShadow?.compare({
     intent: resolvedIntent,

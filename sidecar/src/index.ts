@@ -967,6 +967,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
       ...task,
       mentionDetected: true,
       mentionType: 'bot',
+      resumedPausedJob: true,
       ...(resumeDecision.forceIntent ? { intent: resumeDecision.forceIntent } : {}),
       // The reply to a question miniOG asked: the router reads the two together (issue #431).
       ...((resumeDecision.reason === 'route_clarify_answer' || resumeDecision.reason === 'watchtower_answer') &&

@@ -400,6 +400,24 @@ export interface NormalizedTask {
    */
   clarification?: { question: string; askedText: string };
   /**
+   * Set only by the router's PR-action gate (issue #719): the message is one of
+   * the gate's exact sentences, addressed to miniOG. The change workflow runs
+   * this operation without a planner, and the owner's own ask unconfirmed; no
+   * other task does.
+   */
+  prActionGate?: {
+    action: 'merge' | 'close' | 'sync';
+    pr: PrContext;
+    /** "merge it into master": only when that is the PR's base branch. */
+    intoBase?: 'master' | 'main';
+  };
+  /**
+   * This message resumed a paused job (a usage-limit "go ahead", a PR link
+   * miniOG asked for, an answer to its question). Only an answer to miniOG's
+   * own question (`clarification`) may open the PR-action gate (issue #719).
+   */
+  resumedPausedJob?: boolean;
+  /**
    * Set by the router when this request runs on an owner's authority: the
    * requester tagged the owner and fails their own access check (issue #398).
    * Only permission checks read it; the requester stays who the work is for.

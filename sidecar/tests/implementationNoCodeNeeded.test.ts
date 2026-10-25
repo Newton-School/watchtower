@@ -18,6 +18,7 @@ import { __connectors, currentConnectors } from '../src/backends/connectors.js';
 import { collectThreadAttachments } from '../src/slack/threadAttachments.js';
 import { resolveGithubTokenForCodex } from '../src/github/githubAuth.js';
 import { fetchMergeState, fetchUnresolvedReviewThreadCount } from '../src/github/prReviewComments.js';
+import { readPrActionAsk } from '../src/router/prActionAsk.js';
 
 // Regression coverage for #348 RC2: when the planner concludes no code changes
 // are needed AND the request is not an operational action, the implementation
@@ -131,6 +132,16 @@ function makeTask(text: string, options: { byOwner?: boolean; withPr?: boolean }
     intent: 'IMPLEMENTATION' as const,
     ...(options.withPr ? { prContext } : {}),
   };
+}
+
+/**
+ * What the router hands the change workflow: its PR-action gate's decision,
+ * when the message is one of the gate's sentences (issue #719). The workflow
+ * skips the planner only for a task the router marked.
+ */
+function routed<T extends Parameters<typeof readPrActionAsk>[0]>(task: T): T {
+  const gate = readPrActionAsk(task, { botUserId: 'UBOT1', ownerUserIds: ['UOWNER1'] });
+  return gate ? { ...task, prActionGate: gate } : task;
 }
 
 // Merge / close / revert asked by someone other than the owner now wait for
@@ -322,7 +333,8 @@ describe('implementationWorkflow — no code needed (#348 RC2)', () => {
     const slack = makeSlack();
 
     const result = await runImplementationWorkflow({
-      task: makeTask('<@UBOT1> merge this PR'),
+      // Not one of the gate's sentences, so the planner reads it first (#719).
+      task: makeTask('<@UBOT1> merge this PR, it is ready', { withPr: true }),
       config,
       slack: slack as unknown as import('@slack/web-api').WebClient,
     });
@@ -343,7 +355,7 @@ describe('implementationWorkflow — quick action never deploys (#407)', () => {
   async function run(text: string) {
     const slack = makeSlack();
     const result = await runImplementationWorkflow({
-      task: makeTask(text),
+      task: makeTask(text, { withPr: true }),
       config,
       slack: slack as unknown as import('@slack/web-api').WebClient,
     });
@@ -382,7 +394,7 @@ describe('implementationWorkflow — quick action never deploys (#407)', () => {
 
   it('carries the same guardrail on a plain merge', async () => {
     await run('<@UBOT1> merge this PR');
-    expect(vi.mocked(runCodex).mock.calls[1][0].prompt).toContain('never run a deploy command, script or skill');
+    expect(vi.mocked(runCodex).mock.calls.at(-1)?.[0].prompt).toContain('never run a deploy command, script or skill');
   });
 
   it('does not treat words that merely contain a deploy verb as a deploy ask', () => {
@@ -401,7 +413,7 @@ describe('implementationWorkflow — quick-action merge needs the owner (#429)',
     const slack = makeSlack();
     const logs: { stage: string; data?: Record<string, unknown> }[] = [];
     const result = await runImplementationWorkflow({
-      task: makeTask(text, options),
+      task: routed(makeTask(text, options)),
       config: { ...config, ...overrides },
       slack: slack as unknown as import('@slack/web-api').WebClient,
       logStep: entry => logs.push(entry),
@@ -472,6 +484,49 @@ describe('implementationWorkflow — quick-action merge needs the owner (#429)',
     expect(runCodex).toHaveBeenCalledTimes(1);
     const audit = logs.find(entry => entry.stage === 'implementation.quick_action.pr_action');
     expect(audit?.data).toMatchObject({ requestedBy: 'UOWNER1', confirmedBy: 'UOWNER1' });
+  });
+
+  // #719 round 3: only the router's gate decision skips the planner and the
+  // owner's confirmation. A task it didn't mark, such as a resumed reply that
+  // reads "go ahead and merge it", goes through the planner and is confirmed.
+  it('plans first, and asks even the owner, for a merge the router did not mark', async () => {
+    const slack = makeSlack();
+    const logs: { stage: string }[] = [];
+    await runImplementationWorkflow({
+      task: makeTask('<@UBOT1> go ahead and merge it', { byOwner: true, withPr: true }),
+      config,
+      slack: slack as unknown as import('@slack/web-api').WebClient,
+      logStep: entry => logs.push(entry),
+    });
+    expect(logs.map(entry => entry.stage)).toContain('pipeline.agent.planner.start');
+    expect(logs.map(entry => entry.stage)).not.toContain('implementation.quick_action.no_planner');
+    expect(__quickActionConfirm.wait).toHaveBeenCalledWith(expect.objectContaining({ phrase: 'confirm merge' }));
+  });
+
+  it.each([
+    ['master', 'master', true],
+    ['master', 'main', false],
+    ['main', undefined, false],
+  ] as const)('runs "merge it into %s" unplanned only when that is the base (base: %s)', async (into, base, fast) => {
+    vi.mocked(resolveGithubTokenForCodex).mockResolvedValue('ghs_test');
+    vi.mocked(fetchMergeState).mockResolvedValue({
+      mergeStateStatus: 'CLEAN',
+      isDraft: false,
+      ...(base ? { baseRef: base } : {}),
+    });
+    const slack = makeSlack();
+    const logs: { stage: string }[] = [];
+    await runImplementationWorkflow({
+      task: routed(makeTask(`<@UBOT1> merge it into ${into}`, { byOwner: true, withPr: true })),
+      config,
+      slack: slack as unknown as import('@slack/web-api').WebClient,
+      logStep: entry => logs.push(entry),
+    });
+    const stages = logs.map(entry => entry.stage);
+    expect(stages.includes('implementation.quick_action.no_planner')).toBe(fast);
+    expect(stages.includes('implementation.quick_action.base_mismatch')).toBe(!fast);
+    vi.mocked(fetchMergeState).mockReset().mockResolvedValue({ mergeStateStatus: 'CLEAN', isDraft: false });
+    vi.mocked(resolveGithubTokenForCodex).mockResolvedValue(undefined);
   });
 
   it('refuses when no owner is configured to confirm', async () => {
@@ -713,7 +768,7 @@ describe('implementationWorkflow — a PR operation needs no planner (#605)', ()
   async function run(text: string, prContexts: ReturnType<typeof target>[], options: { byOwner?: boolean } = {}) {
     const slack = makeSlack();
     const logs: { stage: string; data?: Record<string, unknown> }[] = [];
-    const task = { ...makeTask(text, options), prContexts, prContext: prContexts[0] };
+    const task = routed({ ...makeTask(text, options), prContexts, prContext: prContexts[0] });
     const result = await runImplementationWorkflow({
       task,
       config,
@@ -765,18 +820,33 @@ describe('implementationWorkflow — a PR operation needs no planner (#605)', ()
     expect(vi.mocked(__quickActionConfirm.wait).mock.calls[0][0].phrase).toBe('confirm merge');
   });
 
-  it.each([
-    ['a merge with a change', '<@UBOT1> merge it and fix the typo in the title first', [target(PR_URL, 'thread')]],
-    ['a merge with a condition', '<@UBOT1> merge it once CI is green', [target(PR_URL, 'thread')]],
-    ['two PRs and no way to tell', '<@UBOT1> merge it', [target(PR_URL, 'thread'), target(OTHER_PR, 'thread')]],
-    ['no PR at all', '<@UBOT1> merge it', []],
-  ])('still plans first for %s', async (_case, text, prs) => {
-    const { logs } = await run(text, prs);
+  it('still plans first for a merge with a change', async () => {
+    const { logs } = await run('<@UBOT1> merge it and fix the typo in the title first', [target(PR_URL, 'thread')]);
 
     expect(logs.map(entry => entry.stage)).toContain('pipeline.agent.planner.start');
     expect(logs.map(entry => entry.stage)).not.toContain('implementation.quick_action.no_planner');
     // The planner says no code is needed here, so the quick action follows it.
     expect(runCodex).toHaveBeenCalledTimes(2);
+  });
+
+  // #719: after a planner, a condition, two PRs or no PR is asked about, and nothing runs.
+  it.each([
+    ['a merge with a condition', '<@UBOT1> merge it once CI is green', [target(PR_URL, 'thread')], PR_URL],
+    [
+      'two PRs and no way to tell',
+      '<@UBOT1> merge it',
+      [target(PR_URL, 'thread'), target(OTHER_PR, 'thread')],
+      `which pull request you mean (${PR_URL}, ${OTHER_PR})`,
+    ],
+    ['no PR at all', '<@UBOT1> merge it', [], 'what you want me to do'],
+  ])('plans first, then asks instead of acting, for %s', async (_case, text, prs, said) => {
+    const { logs, posted } = await run(text, prs);
+
+    expect(logs.map(entry => entry.stage)).toContain('pipeline.agent.planner.start');
+    expect(logs.map(entry => entry.stage)).toContain('implementation.quick_action.unclear');
+    expect(runCodex).toHaveBeenCalledTimes(1);
+    expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
+    expect(posted.some(text => text.includes(said))).toBe(true);
   });
 
   it('says in the confirmation when the merge would go past a required review', async () => {
@@ -843,7 +913,7 @@ describe('implementationWorkflow — a PR operation needs no planner (#605)', ()
   it('says a PR has conflicts in the confirmation when a planner read the ask, since it may be more than the merge', async () => {
     github({ unresolvedCount: 0 }, { mergeStateStatus: 'DIRTY', isDraft: false });
 
-    const { posted, logs } = await run('<@UBOT1> merge it once CI is green', [target(PR_URL, 'thread')]);
+    const { posted, logs } = await run('<@UBOT1> merge it, CI is green', [target(PR_URL, 'thread')]);
 
     expect(logs.map(entry => entry.stage)).toContain('pipeline.agent.planner.start');
     expect(confirmPrompt(posted)).toContain(
@@ -865,7 +935,7 @@ describe('implementationWorkflow — a PR operation needs no planner (#605)', ()
       return { ok: true, ts: '123.45' };
     });
     const result = await runImplementationWorkflow({
-      task: { ...makeTask('<@UBOT1> merge it', { byOwner: true }), prContexts: [target(PR_URL, 'thread')] },
+      task: routed({ ...makeTask('<@UBOT1> merge it', { byOwner: true }), prContexts: [target(PR_URL, 'thread')] }),
       config,
       slack: slack as unknown as import('@slack/web-api').WebClient,
       signal: controller.signal,
@@ -916,7 +986,7 @@ describe('implementationWorkflow — words inside links are not the operation (#
     });
   });
 
-  const run = async (text: string, options: { withPr?: boolean } = {}) => {
+  const run = async (text: string, options: { withPr?: boolean; byOwner?: boolean } = {}) => {
     const slack = makeSlack();
     const result = await runImplementationWorkflow({
       task: makeTask(text, options),
@@ -948,7 +1018,7 @@ describe('implementationWorkflow — words inside links are not the operation (#
   });
 
   it('still merges when the words say merge and the message also has a link', async () => {
-    const { posted } = await run(`<@UBOT1> merge <${PR_URL}> once you have read ${ISSUE_LINK}`, { withPr: true });
+    const { posted } = await run(`<@UBOT1> merge <${PR_URL}>, see ${ISSUE_LINK}`, { withPr: true });
     expect(__quickActionConfirm.wait).toHaveBeenCalledWith(expect.objectContaining({ phrase: 'confirm merge' }));
     expect(posted.some(text => text.includes('asked me to merge'))).toBe(true);
     // The agent is told the one operation it may perform.
@@ -1011,6 +1081,143 @@ describe('implementationWorkflow — words inside links are not the operation (#
       '<@UBOT1> summarize <https://github.com/Newton-School/newton-web/tree/approve-flow|approve-flow>',
     );
     expect(posted).not.toContain(QUICK_ACTION_APPROVE_REFUSAL);
+    expect(result.workflow).toBe('INFORMATIONAL');
+  });
+
+  // Issue #719: "bring that PR's branch up to date with master" was answered
+  // with "I can't update the branch", because only the word "sync" counted.
+  it("syncs when asked to bring the PR's branch up to date with master", async () => {
+    const { result, posted } = await run(`<@UBOT1> bring that PR's branch up to date with master, see ${ISSUE_LINK}`, {
+      withPr: true,
+    });
+    expect(runAgenticEntry).not.toHaveBeenCalled();
+    expect(__quickActionConfirm.wait).toHaveBeenCalledWith(expect.objectContaining({ phrase: 'confirm sync' }));
+    expect(posted.some(text => text.includes('asked me to sync'))).toBe(true);
+    expect(vi.mocked(runCodex).mock.calls[1][0].prompt).toContain('The confirmed operation is `sync`');
+    expect(result.workflow).toBe('IMPLEMENTATION');
+  });
+
+  it('reads "merge master into it" as a sync, never as merging the PR', async () => {
+    const { posted } = await run(`<@UBOT1> merge master into it, see ${ISSUE_LINK}`, { withPr: true });
+    expect(__quickActionConfirm.wait).toHaveBeenCalledWith(expect.objectContaining({ phrase: 'confirm sync' }));
+    expect(posted.some(text => text.includes('asked me to merge'))).toBe(false);
+  });
+
+  it('syncs on a rebase ask and tells the agent to say it merged instead', async () => {
+    await run(`<@UBOT1> rebase it on main, see ${ISSUE_LINK}`, { withPr: true });
+    expect(__quickActionConfirm.wait).toHaveBeenCalledWith(expect.objectContaining({ phrase: 'confirm sync' }));
+    expect(vi.mocked(runCodex).mock.calls[1][0].prompt).toContain('They asked for a rebase.');
+  });
+
+  // #719 review: after a planner, "merge master into <PR link>" and the like
+  // merged the PR itself, with no confirmation when the owner asked.
+  it.each([
+    `<@UBOT1> merge master into <${PR_URL}>, see ${ISSUE_LINK}`,
+    `<@UBOT1> merge origin/master into <${PR_URL}|newton-web#9300>, see ${ISSUE_LINK}`,
+    `<@UBOT1> merge master to <${PR_URL}>, see ${ISSUE_LINK}`,
+    `<@UBOT1> update the branch of <${PR_URL}> with master, see ${ISSUE_LINK}`,
+  ])('syncs, never merges, for the owner: %s', async text => {
+    const { posted } = await run(text, { withPr: true, byOwner: true });
+    const agentPrompts = vi
+      .mocked(runCodex)
+      .mock.calls.slice(1)
+      .map(call => String(call[0].prompt));
+    expect(agentPrompts.some(prompt => prompt.includes('The confirmed operation is `sync`'))).toBe(true);
+    expect(agentPrompts.some(prompt => prompt.includes('The confirmed operation is `merge`'))).toBe(false);
+    expect(posted.some(text => /unresolved review comment/.test(text))).toBe(false);
+  });
+
+  it.each([
+    `<@UBOT1> merge main, see ${ISSUE_LINK}`,
+    `<@UBOT1> merge it with master, see ${ISSUE_LINK}`,
+    `<@UBOT1> don't merge it, just bring it up to date with master, see ${ISSUE_LINK}`,
+    `<@UBOT1> no rush, merge master into it, see ${ISSUE_LINK}`,
+    `<@UBOT1> master ko merge mat karo, see ${ISSUE_LINK}`,
+    `<@UBOT1> sync it and merge it, see ${ISSUE_LINK}`,
+  ])('asks which operation, and runs nothing, for the owner: %s', async text => {
+    const { result, posted } = await run(text, { withPr: true, byOwner: true });
+    expect(runCodex).toHaveBeenCalledTimes(1);
+    expect(result.status).toBe('SKIPPED');
+    expect(posted.some(text => text.includes("I wasn't sure what to do with"))).toBe(true);
+    expect(posted.some(text => /unresolved review comment/.test(text))).toBe(false);
+  });
+
+  // #719 round 2: after a planner, a merge, close or revert is always confirmed,
+  // the owner's own included; only the strict gate's sentences skip that.
+  it.each([
+    [`<@UBOT1> merge it, it is ready, see ${ISSUE_LINK}`, 'merge'],
+    [`<@UBOT1> close it, we went another way, see ${ISSUE_LINK}`, 'close'],
+    [`<@UBOT1> revert it, see ${ISSUE_LINK}`, 'revert'],
+  ])('asks even the owner to confirm what a planner read: %s', async (text, action) => {
+    const { posted } = await run(text, { withPr: true, byOwner: true });
+    expect(__quickActionConfirm.wait).toHaveBeenCalledWith(expect.objectContaining({ phrase: `confirm ${action}` }));
+    expect(posted.some(said => said.includes(`asked me to ${action} ${PR_URL}`))).toBe(true);
+  });
+
+  it("lets the owner's plain sync after a planner run without a confirmation", async () => {
+    await run(`<@UBOT1> sync it, see ${ISSUE_LINK}`, { withPr: true, byOwner: true });
+    expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
+    expect(vi.mocked(runCodex).mock.calls[1][0].prompt).toContain('The confirmed operation is `sync`');
+  });
+
+  it('asks which PR when the words name one the thread does not know', async () => {
+    const { posted, result } = await run(`<@UBOT1> merge it 9999, see ${ISSUE_LINK}`, { withPr: true, byOwner: true });
+    expect(result.status).toBe('SKIPPED');
+    expect(posted.some(said => said.includes('which pull request you mean'))).toBe(true);
+    expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
+  });
+
+  it('never lets the agent run an operation nobody confirmed', async () => {
+    const { posted, result } = await run(`<@UBOT1> sync up the PR branch, see ${ISSUE_LINK}`, {
+      withPr: true,
+      byOwner: true,
+    });
+    expect(runCodex).toHaveBeenCalledTimes(1);
+    expect(result.status).toBe('SKIPPED');
+    expect(posted.some(said => said.includes("I wasn't sure what to do with"))).toBe(true);
+  });
+
+  // #719 round 3: with no confirmed operation, the agent may touch no pull request at all.
+  it.each([
+    `<@UBOT1> rerun the failed checks and land it, see ${ISSUE_LINK}`,
+    `<@UBOT1> restart CI then get it in, see ${ISSUE_LINK}`,
+    `<@UBOT1> reopen #9300 and land it, see ${ISSUE_LINK}`,
+  ])('forbids every pull-request operation when none was confirmed: %s', async text => {
+    await run(text, { withPr: true, byOwner: true });
+    const prompt = String(vi.mocked(runCodex).mock.calls.at(-1)?.[0].prompt);
+    expect(prompt).toContain(
+      'No pull-request operation was confirmed for this request: do not merge, close, revert, sync, reopen or push to any pull request',
+    );
+    expect(prompt).not.toContain('The confirmed operation is');
+  });
+
+  it('says "Tell me again" in a DM', async () => {
+    const slack = makeSlack();
+    const task = makeTask(`<@UBOT1> merge main, see ${ISSUE_LINK}`, { withPr: true, byOwner: true });
+    await runImplementationWorkflow({
+      task: { ...task, event: { ...task.event, channelId: 'D1', channelType: 'im' } },
+      config,
+      slack: slack as unknown as import('@slack/web-api').WebClient,
+    });
+    const posted = slack.chat.postMessage.mock.calls.map(call => String(call[0]?.text ?? ''));
+    expect(posted.some(said => said.includes('Tell me again with just the one you want'))).toBe(true);
+  });
+
+  it('answers a yes/no question about the PR instead of acting on it', async () => {
+    const { result } = await run(`<@UBOT1> you merged it? see ${ISSUE_LINK}`, { withPr: true, byOwner: true });
+    expect(runAgenticEntry).toHaveBeenCalledWith(expect.objectContaining({ mode: 'informational' }));
+    expect(result.workflow).toBe('INFORMATIONAL');
+  });
+
+  it('asks even the owner to confirm a rebase ask, since it runs as a merge of the base branch', async () => {
+    const { posted } = await run(`<@UBOT1> rebase it on main, see ${ISSUE_LINK}`, { withPr: true, byOwner: true });
+    expect(__quickActionConfirm.wait).toHaveBeenCalledWith(expect.objectContaining({ phrase: 'confirm sync' }));
+    expect(posted.some(text => text.includes("I don't rebase or squash"))).toBe(true);
+  });
+
+  it('still answers an ask to update the copy', async () => {
+    const { result } = await run(`<@UBOT1> what would updating the copy change? see ${ISSUE_LINK}`, { withPr: true });
+    expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
     expect(result.workflow).toBe('INFORMATIONAL');
   });
 });
