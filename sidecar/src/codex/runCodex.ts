@@ -11,6 +11,7 @@ import type {
 } from '../types/contracts.js';
 import type { AgentBackend, AgentBackendId } from '../backends/types.js';
 import { getBackend } from '../backends/registry.js';
+import { claudePermissionMode } from '../backends/claudeCodeBackend.js';
 import { currentConnectors } from '../backends/connectors.js';
 import { agentBaseEnv } from '../backends/launchEnv.js';
 import { computeCostUsd } from '../pricing/modelPrices.js';
@@ -335,6 +336,8 @@ export async function runAgent(rawRequest: CodexRunRequest, backend: AgentBacken
       model: request.model ?? 'default',
       reasoningEffort: request.reasoningEffort ?? 'default',
       githubTokenInjected: Boolean(request.githubToken),
+      // Codex always runs in its own workspace-write sandbox.
+      permissions: backend.id === 'claude-code' ? claudePermissionMode(request) : 'full-auto',
       executable,
       ...(request.noTools ? {} : { connectors: Object.keys(request.mcpServers ?? {}) }),
     },

@@ -182,6 +182,9 @@ Return strict JSON with keys:
 
   const request: CodexRunRequest = {
     cwd: process.cwd(),
+    // It only writes a one-line reply: nothing to read or run, so no tools
+    // and no bypassed permissions (issues #443, #695).
+    noTools: true,
     prompt,
     outputSchemaPath: path.resolve(process.cwd(), 'schemas/unknown-task-result.schema.json'),
     ...lightweightProfile(getActiveBackendId()),

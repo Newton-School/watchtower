@@ -1896,6 +1896,9 @@ async function runImplementationWorkflowBody(params: {
         outputSchemaPath: plannerPlanMode ? undefined : plannerSchemaPath,
         githubToken: ctx.githubToken,
         planMode: plannerPlanMode,
+        // Plan mode wins where it applies; read-only covers the rest, so no
+        // planner call runs with permissions bypassed (issue #695).
+        readOnly: true,
         // The thread's screenshots and PDFs: a plan written without them
         // shipped the wrong PDF to production (issue #595).
         imagePaths: plannerCtx.imagePaths,
@@ -2081,6 +2084,11 @@ async function runImplementationWorkflowBody(params: {
           outputSchemaPath: plannerSchemaPath,
           githubToken: ctx.githubToken,
           imagePaths: plannerCtx.imagePaths,
+          // Planning only reads, before anyone approved a change; this call
+          // used to run with every permission bypassed (issue #695). It asks
+          // for the JSON contract, so it runs read-only rather than in plan
+          // mode, like the plan revision.
+          readOnly: true,
           ...plannerProfile,
           // No per-agent timeoutMs — see investigationWorkflow.ts for rationale.
           // Outer abort signal remains the safety net.

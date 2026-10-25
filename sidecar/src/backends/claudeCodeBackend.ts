@@ -215,6 +215,21 @@ export const READ_ONLY_ALLOW_RULES = [
   'Bash(gh run view:*)',
 ];
 
+/**
+ * How a run's permissions are set, in the order `buildArgs` applies them:
+ * no tools at all, plan mode, read-only (allow-list, no bypass), or every
+ * permission bypassed. Logged with each run so a call that should only read
+ * can be checked from its job log (issue #695).
+ */
+export function claudePermissionMode(
+  request: Pick<AgentRunRequest, 'noTools' | 'planMode' | 'readOnly'>,
+): 'no-tools' | 'plan' | 'read-only' | 'bypass' {
+  if (request.noTools) return 'no-tools';
+  if (request.planMode) return 'plan';
+  if (request.readOnly) return 'read-only';
+  return 'bypass';
+}
+
 /** The allow-list for a read-only run: the fixed rules, plus each of its connectors by server name. */
 export function readOnlyAllowRules(mcpServers: AgentRunRequest['mcpServers']): string[] {
   return [...READ_ONLY_ALLOW_RULES, ...Object.keys(mcpServers ?? {}).map(name => `mcp__${name}`)];
@@ -299,7 +314,8 @@ export const claudeCodeBackend: AgentBackend = {
     // `--dangerously-skip-permissions` is equivalent to `--permission-mode bypassPermissions`
     // and silently wins over `--permission-mode plan`, so passing both leaves the model
     // without the ExitPlanMode tool. Choose one or the other.
-    if (request.noTools) {
+    const permissions = claudePermissionMode(request);
+    if (permissions === 'no-tools') {
       // A call that only returns text gets nothing to act with (issue #443).
       // Each flag removes what the others leave in: `--tools ""` the built-in
       // tools; strict MCP with an empty config every MCP server, the account's
@@ -308,9 +324,9 @@ export const claudeCodeBackend: AgentBackend = {
       // nothing left to permit. Measured on CLI 2.1.296: 441 tools, 18 MCP
       // servers and 76 skills become 0, 0 and 0.
       args.push(...NO_TOOLS_ARGS);
-    } else if (request.planMode) {
+    } else if (permissions === 'plan') {
       args.push('--permission-mode', 'plan');
-    } else if (request.readOnly) {
+    } else if (permissions === 'read-only') {
       // A run that only reads gets what it needs to read, and no bypass
       // (issue #443). Deny rules below still apply on top of the allow-list.
       args.push('--permission-mode', 'dontAsk', '--allowedTools', ...readOnlyAllowRules(request.mcpServers));
