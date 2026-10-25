@@ -236,6 +236,12 @@ export interface PrDiffResult {
   status?: number;
   /** True when the diff was reconstructed via the /pulls/<n>/files paginated endpoint. */
   viaFilesFallback?: boolean;
+  /**
+   * The whole diff, when `diff` was cut to the prompt budget. A finding's line
+   * is checked against this, not the cut copy: the agents read the code in the
+   * worktree, so a finding past the cut is still on a real diff line.
+   */
+  fullDiff?: string;
 }
 
 /** Prompt budget for the embedded diff. Raised from the original 100k for the
@@ -292,6 +298,7 @@ export async function fetchPrDiff(params: {
           diff: `${diff.slice(0, maxChars)}\n\n... [diff truncated — too large for full review]`,
           truncated: true,
           reason: 'ok',
+          fullDiff: diff,
         };
       }
       return { diff, truncated: false, reason: 'ok' };

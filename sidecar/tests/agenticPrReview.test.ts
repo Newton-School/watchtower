@@ -597,6 +597,48 @@ describe('agenticPrReview', () => {
     );
   });
 
+  it('checks a finding past a cut diff against the whole diff, so it is not dropped as outside it', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const cut = 'diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,1 +1,2 @@\n line\n+added';
+    const whole = `${cut}\ndiff --git a/src/z.ts b/src/z.ts\n--- a/src/z.ts\n+++ b/src/z.ts\n@@ -1,1 +1,2 @@\n line\n+late`;
+    const deps = makeDeps({
+      fetchDiff: vi.fn().mockResolvedValue({ diff: cut, truncated: true, reason: 'ok', fullDiff: whole }),
+      runAgent: vi.fn().mockResolvedValue(
+        agentOk([
+          {
+            role: 'security',
+            severity: 'high',
+            category: 'authz',
+            message: 'new endpoint has no authorization check',
+            file: 'src/z.ts',
+            line: 2, // in the whole diff, past the cut
+          },
+        ]),
+      ),
+    });
+    const logStep = vi.fn();
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+      logStep,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    expect((result.result as any).outcomes[0].totalFindings).toBe(1);
+    expect(logStep).not.toHaveBeenCalledWith(
+      expect.objectContaining({ stage: 'agentic.pr_review.pr.changed_code_downgraded' }),
+    );
+    expect(deps.submitReview).toHaveBeenCalledWith(expect.objectContaining({ prDiff: whole }));
+    // The agents still get the cut diff: the prompt budget is unchanged.
+    const prompts = (deps.runAgent as any).mock.calls.map((c: any[]) => c[0].prompt as string);
+    expect(prompts.some((p: string) => p.includes('+added'))).toBe(true);
+    expect(prompts.some((p: string) => p.includes('+late'))).toBe(false);
+  });
+
   it('a lens recovers at medium reasoning without collapsing the whole review', async () => {
     const slack = makeSlack([`review ${WEB_PR}`]);
     // Security lens fails its tier-1 (non-medium) run, recovers at medium.
