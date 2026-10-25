@@ -187,7 +187,7 @@ Return strict JSON:
     { "file": string, "line": number, "snippet": string, "why": string }
   ],
   "recommendedFix": string,                 // conceptual fix sketch (not code) — what should change
-  "fixLocation": "repo" | "outside" | "none", // "repo": a code change in one of these repositories. "outside": the fix is somewhere else (a Metabase question or dashboard, an admin setting, data, another service) — say where in recommendedFix, and who can make it. "none": nothing needs fixing
+  "fixLocation": "repo" | "outside" | "none", // "repo": a code change in one of these repositories, sketched in recommendedFix. "outside": the fix is somewhere else (a Metabase question or dashboard, an admin setting, data, another service) — say where in recommendedFix, and who can make it. "none": nothing needs fixing — it works as intended, it is already fixed on the default branch, or whether to change it is a product call for a person, not a bug; say which in summary
   "confidence": "low" | "medium" | "high",
   "requiresMoreInfo": string | null,        // null if the hypothesis stands on its own; otherwise a specific ask
   "summary": string                         // one-line Slack summary of what you found
@@ -331,9 +331,7 @@ Return strict JSON:
   };
 
   const message = formatInvestigationMessage(findings);
-  // Only a fix in the code is offered: anything else, if accepted, went into
-  // the change pipeline with no repo to change (issue #432).
-  const fixOutsideRepos = findings.fixLocation === 'outside';
+  const nextStep = investigationNextStep(findings);
 
   await slack.chat
     .postMessage({
@@ -344,7 +342,7 @@ Return strict JSON:
     .catch(() => {});
 
   let promptMessageTs: string | undefined;
-  if (fixOutsideRepos && !findings.requiresMoreInfo) {
+  if (nextStep === 'fix_outside_repos') {
     logStep?.({
       stage: 'investigation.fix_outside_repos',
       message: 'The recommended fix is outside the repositories; not offering to make it.',
@@ -356,7 +354,27 @@ Return strict JSON:
         text: 'This fix is not a code change, so I can’t make it from here: see *Recommended fix* for where it lives and who can change it.',
       })
       .catch(() => undefined);
-  } else if (findings.requiresMoreInfo) {
+  } else if (nextStep === 'nothing_to_fix') {
+    logStep?.({
+      stage: 'investigation.nothing_to_fix',
+      message: 'The investigation found nothing that needs fixing; not offering a fix.',
+    });
+    await slack.chat
+      .postMessage({
+        channel: task.event.channelId,
+        thread_ts: task.event.threadTs,
+        text: NOTHING_TO_FIX_REPLY,
+      })
+      .catch(() => undefined);
+  } else if (nextStep === 'no_offer') {
+    // A diagnosis that names no fix in the code, or no verdict at all: the
+    // findings stand on their own and nothing is offered (issue #624).
+    logStep?.({
+      stage: 'investigation.no_fix_offer',
+      message: `No code fix identified (fixLocation: ${findings.fixLocation ?? 'missing'}); not offering a fix.`,
+      level: findings.fixLocation === undefined ? 'WARN' : 'INFO',
+    });
+  } else if (nextStep === 'ask_for_more') {
     const ack = await slack.chat
       .postMessage({
         channel: task.event.channelId,
@@ -383,9 +401,11 @@ Return strict JSON:
     promptMessageTs = typeof ack?.ts === 'string' ? ack.ts : undefined;
   }
 
-  // Not saved when the fix is outside the repositories: a saved investigation
-  // is what turns "yes, fix it" into the change pipeline.
-  if (investigationStore && jobId && !fixOutsideRepos) {
+  // Saved only when a reply can continue it: a saved investigation is what
+  // turns "yes, fix it" (or ✅ on the prompt) into the change pipeline, so
+  // findings with no fix in the code are not kept (issues #432, #624).
+  const resumable = nextStep === 'offer_fix' || (nextStep === 'ask_for_more' && findings.fixLocation !== 'outside');
+  if (investigationStore && jobId && resumable) {
     try {
       investigationStore.save({
         threadTs: task.event.threadTs,
@@ -418,6 +438,29 @@ Return strict JSON:
     notifyDesktop: false,
     slackPosted: true,
   };
+}
+
+export const NOTHING_TO_FIX_REPLY = 'Nothing here needs a code change, so there’s nothing for me to fix.';
+
+export type InvestigationNextStep = 'ask_for_more' | 'fix_outside_repos' | 'nothing_to_fix' | 'offer_fix' | 'no_offer';
+
+/**
+ * What follows the findings, from the investigator's own verdict. Only a fix
+ * in the code is offered: a fix elsewhere, if accepted, went into the change
+ * pipeline with no repo to change (issue #432), and "Want me to fix this?"
+ * after concluding the behaviour is intended reads as a contradiction (issue
+ * #624). A missing or unknown verdict offers nothing.
+ */
+export function investigationNextStep(findings: {
+  fixLocation?: string;
+  recommendedFix?: string;
+  requiresMoreInfo?: string | null;
+}): InvestigationNextStep {
+  if (findings.fixLocation === 'outside' && !findings.requiresMoreInfo) return 'fix_outside_repos';
+  if (findings.requiresMoreInfo) return 'ask_for_more';
+  if (findings.fixLocation === 'none') return 'nothing_to_fix';
+  if (findings.fixLocation === 'repo' && findings.recommendedFix?.trim()) return 'offer_fix';
+  return 'no_offer';
 }
 
 function scopeAckText(scope: InvestigationScope, useMetabase: boolean): string {

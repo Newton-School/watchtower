@@ -23,7 +23,8 @@ vi.mock('../src/slack/threadContext.js', () => ({
   fetchThreadContext: vi.fn().mockResolvedValue([]),
 }));
 
-const { runInvestigationWorkflow } = await import('../src/workflows/investigationWorkflow.js');
+const { runInvestigationWorkflow, investigationNextStep, NOTHING_TO_FIX_REPLY } =
+  await import('../src/workflows/investigationWorkflow.js');
 const { __infraRetry, connectionLostReply } = await import('../src/codex/infraRetry.js');
 
 const config: any = {
@@ -124,6 +125,10 @@ describe('runInvestigationWorkflow thread images', () => {
   });
 
   it('still offers a fix in the code', async () => {
+    runCodex.mockReset().mockResolvedValue({
+      ...investigatorOk(),
+      parsedJson: { ...investigatorOk().parsedJson, fixLocation: 'repo' },
+    });
     const slack = slackStub();
     const investigationStore = { save: vi.fn() } as any;
 
@@ -137,6 +142,91 @@ describe('runInvestigationWorkflow thread images', () => {
 
     const texts = slack.chat.postMessage.mock.calls.map((call: any[]) => call[0].text as string);
     expect(texts.some(text => text.startsWith('Want me to fix this?'))).toBe(true);
+    expect(investigationStore.save).toHaveBeenCalledTimes(1);
+  });
+
+  async function investigateWith(parsedJson: Record<string, unknown>) {
+    runCodex.mockReset().mockResolvedValue({ ok: true, exitCode: 0, parsedJson });
+    const slack = slackStub();
+    const investigationStore = { save: vi.fn() } as any;
+    const logStep = vi.fn();
+    await runInvestigationWorkflow({
+      task: makeTask('the form submits on its own'),
+      config,
+      slack: slack as any,
+      investigationStore,
+      jobId: 'job-1',
+      logStep,
+    });
+    const texts = slack.chat.postMessage.mock.calls.map((call: any[]) => call[0].text as string);
+    return { texts, investigationStore, logStep };
+  }
+
+  it('does not offer a fix when it concluded nothing needs fixing, and keeps nothing to resume (issue #624)', async () => {
+    const { texts, investigationStore, logStep } = await investigateWith({
+      rootCauseHypothesis: 'The form auto-submits on purpose once the OTP is complete.',
+      evidence: [],
+      recommendedFix: 'No change needed.',
+      fixLocation: 'none',
+      confidence: 'high',
+      summary: 'This is intended: the form submits itself when the OTP is filled in.',
+    });
+
+    expect(texts.some(text => text.includes('Want me to fix this?'))).toBe(false);
+    expect(texts).toContain(NOTHING_TO_FIX_REPLY);
+    expect(texts.some(text => text.includes('This is intended'))).toBe(true);
+    expect(investigationStore.save).not.toHaveBeenCalled();
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'investigation.nothing_to_fix' }));
+  });
+
+  it('offers nothing when the investigator gives no verdict on where the fix is (issue #624)', async () => {
+    const { texts, investigationStore, logStep } = await investigateWith({
+      rootCauseHypothesis: 'x',
+      evidence: [],
+      recommendedFix: 'y',
+      confidence: 'medium',
+      summary: 's',
+    });
+
+    expect(texts.some(text => text.includes('Want me to fix this?'))).toBe(false);
+    expect(texts).not.toContain(NOTHING_TO_FIX_REPLY);
+    // The scope acknowledgement and the findings, nothing after them.
+    expect(texts).toHaveLength(2);
+    expect(texts[1]).toContain('*s*');
+    expect(investigationStore.save).not.toHaveBeenCalled();
+    expect(logStep).toHaveBeenCalledWith(
+      expect.objectContaining({ stage: 'investigation.no_fix_offer', level: 'WARN' }),
+    );
+  });
+
+  it('offers nothing for a fix in the code that it could not describe', async () => {
+    const { texts, investigationStore } = await investigateWith({
+      rootCauseHypothesis: '',
+      evidence: [],
+      recommendedFix: '  ',
+      fixLocation: 'repo',
+      confidence: 'low',
+      summary: 'I could not pin this down.',
+    });
+
+    expect(texts.some(text => text.includes('Want me to fix this?'))).toBe(false);
+    expect(investigationStore.save).not.toHaveBeenCalled();
+  });
+
+  it('still asks for more context when it needs it, whatever the verdict', async () => {
+    const { texts, investigationStore } = await investigateWith({
+      rootCauseHypothesis: '',
+      evidence: [],
+      recommendedFix: '',
+      fixLocation: 'none',
+      confidence: 'low',
+      requiresMoreInfo: 'Which page were you on?',
+      summary: 'Not enough to go on.',
+    });
+
+    expect(texts.some(text => text.includes('Which page were you on?'))).toBe(true);
+    expect(texts).not.toContain(NOTHING_TO_FIX_REPLY);
+    expect(texts.some(text => text.includes('Want me to fix this?'))).toBe(false);
     expect(investigationStore.save).toHaveBeenCalledTimes(1);
   });
 
@@ -536,5 +626,36 @@ describe('the usage limit (issue #592)', () => {
       "I've hit my usage limit, so I can't investigate this right now. It resets 4:50pm (Asia/Calcutta); ask me again after that.",
     );
     expect(posted.some(t => t.includes('share more context'))).toBe(false);
+  });
+});
+
+describe('investigationNextStep (issues #432, #624)', () => {
+  it('offers a fix only for a described fix in the code', () => {
+    expect(investigationNextStep({ fixLocation: 'repo', recommendedFix: 'Guard the null.' })).toBe('offer_fix');
+    expect(investigationNextStep({ fixLocation: 'repo', recommendedFix: '' })).toBe('no_offer');
+    expect(investigationNextStep({ fixLocation: 'repo' })).toBe('no_offer');
+  });
+
+  it('says there is nothing to fix for "none"', () => {
+    expect(investigationNextStep({ fixLocation: 'none', recommendedFix: 'No change needed.' })).toBe('nothing_to_fix');
+  });
+
+  it('points elsewhere for "outside"', () => {
+    expect(investigationNextStep({ fixLocation: 'outside', recommendedFix: 'Edit the Metabase card.' })).toBe(
+      'fix_outside_repos',
+    );
+  });
+
+  it('asks for more before anything else, except a fix that is outside the code', () => {
+    expect(investigationNextStep({ fixLocation: 'none', requiresMoreInfo: 'Which page?' })).toBe('ask_for_more');
+    expect(investigationNextStep({ fixLocation: 'repo', recommendedFix: 'x', requiresMoreInfo: 'Which page?' })).toBe(
+      'ask_for_more',
+    );
+    expect(investigationNextStep({ requiresMoreInfo: 'Which page?' })).toBe('ask_for_more');
+  });
+
+  it('offers nothing for a missing or unknown verdict', () => {
+    expect(investigationNextStep({ recommendedFix: 'x' })).toBe('no_offer');
+    expect(investigationNextStep({ fixLocation: 'maybe', recommendedFix: 'x' })).toBe('no_offer');
   });
 });
