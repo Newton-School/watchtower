@@ -270,9 +270,9 @@ export interface SetAsideChanges {
   /** The stash message. */
   label: string;
   /**
-   * A `--binary` patch of the same changes, as a second copy. Refs and
-   * patches are kept for `AUTOSTASH_KEEP_MS` (30 days), then pruned the next
-   * time something is set aside in that clone.
+   * A `--binary` patch of the same changes, as a second copy. Patches are
+   * never deleted automatically (they're tiny). The ref is pruned after
+   * `AUTOSTASH_KEEP_MS` (30 days), and only when its patch exists.
    */
   patch?: string;
 }
@@ -444,9 +444,10 @@ const fileExists =
     fs.existsSync(path.join(repoPath, file));
 
 /**
- * Set-aside refs and patch copies are kept this long, then pruned the next
- * time a change is set aside in that clone. They are the only copy of what
- * was moved, so they are never pruned sooner.
+ * Set-aside refs are kept this long, then pruned the next time a change is
+ * set aside in that clone, but only when the patch copy for that id exists.
+ * The patch files under ~/.watchtower/autostash are never deleted
+ * automatically, so the work always has a copy.
  */
 export const AUTOSTASH_KEEP_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -469,24 +470,24 @@ function autostashIdTime(id: string): number {
   return match ? Date.parse(`${match[1]}T${match[2]}:${match[3]}:${match[4]}.${match[5]}Z`) : Number.NaN;
 }
 
-/** Drops set-aside refs and patch copies older than `AUTOSTASH_KEEP_MS`. Best-effort. */
+/**
+ * Drops set-aside refs older than `AUTOSTASH_KEEP_MS` whose patch copy
+ * exists, so the work still has a copy. Patch files are never deleted.
+ * Best-effort.
+ */
 async function pruneOldAutostashes(repoPath: string, now: number): Promise<void> {
   const prefix = 'refs/miniog/autostash/';
   try {
+    const dir = path.join(autostashDir(), path.basename(fs.realpathSync(repoPath)));
     const refs = (await git(['for-each-ref', '--format=%(refname)', prefix], { cwd: repoPath, timeoutMs: 10_000 }))
       .split('\n')
       .filter(Boolean);
     for (const ref of refs) {
-      const time = autostashIdTime(ref.slice(prefix.length));
-      if (Number.isFinite(time) && now - time > AUTOSTASH_KEEP_MS) {
+      const id = ref.slice(prefix.length);
+      const time = autostashIdTime(id);
+      const patchKept = fs.existsSync(path.join(dir, `${id}.patch`));
+      if (patchKept && Number.isFinite(time) && now - time > AUTOSTASH_KEEP_MS) {
         await git(['update-ref', '-d', ref], { cwd: repoPath, timeoutMs: 10_000 });
-      }
-    }
-    const dir = path.join(autostashDir(), path.basename(fs.realpathSync(repoPath)));
-    for (const name of fs.existsSync(dir) ? fs.readdirSync(dir) : []) {
-      const time = autostashIdTime(name);
-      if (name.endsWith('.patch') && Number.isFinite(time) && now - time > AUTOSTASH_KEEP_MS) {
-        fs.rmSync(path.join(dir, name), { force: true });
       }
     }
   } catch (error) {

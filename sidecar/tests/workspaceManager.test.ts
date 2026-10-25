@@ -806,12 +806,14 @@ describe('refreshSharedRepoToDefaultBranch', () => {
       expect(await autostashRefs()).toEqual([]);
     });
 
-    it('prunes set-aside refs and patches older than 30 days, and keeps newer ones', async () => {
+    it('prunes refs older than 30 days only when their patch exists, and never deletes a patch', async () => {
       const head = await git(repo, ['rev-parse', 'HEAD']);
       const oldId = '2026-01-01T00-00-00-000Z';
+      const oldNoPatchId = '2026-01-02T00-00-00-000Z';
       const recentId = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString().replace(/[:.]/g, '-');
-      await git(repo, ['update-ref', `refs/miniog/autostash/${oldId}`, head]);
-      await git(repo, ['update-ref', `refs/miniog/autostash/${recentId}`, head]);
+      for (const id of [oldId, oldNoPatchId, recentId]) {
+        await git(repo, ['update-ref', `refs/miniog/autostash/${id}`, head]);
+      }
       const patchDir = path.join(TEST_HOME, '.watchtower', 'autostash', path.basename(fs.realpathSync(repo)));
       fs.mkdirSync(patchDir, { recursive: true });
       fs.writeFileSync(path.join(patchDir, `${oldId}.patch`), 'old');
@@ -823,11 +825,14 @@ describe('refreshSharedRepoToDefaultBranch', () => {
       const state = await refreshSharedRepoToDefaultBranch(repo, { setAsideStrayChanges: true });
 
       const refs = await autostashRefs();
+      // Old with a patch: the ref goes, the patch stays as the copy.
       expect(refs).not.toContain(`refs/miniog/autostash/${oldId}`);
+      expect(fs.existsSync(path.join(patchDir, `${oldId}.patch`))).toBe(true);
+      // Old with no patch: the ref is the only copy, so it stays.
+      expect(refs).toContain(`refs/miniog/autostash/${oldNoPatchId}`);
       expect(refs).toContain(`refs/miniog/autostash/${recentId}`);
-      expect(refs).toContain(state!.setAside!.ref);
-      expect(fs.existsSync(path.join(patchDir, `${oldId}.patch`))).toBe(false);
       expect(fs.existsSync(path.join(patchDir, `${recentId}.patch`))).toBe(true);
+      expect(refs).toContain(state!.setAside!.ref);
     });
 
     it('shares one refresh between runs that start together, so the changes are set aside once', async () => {
