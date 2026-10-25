@@ -132,7 +132,7 @@ export const REPO_REGISTRY: Record<RepoKey, RepoDescriptor> = {
       'Images live on the CloudFront CDN (uploaded via the Django admin), never in `/public`. Always set explicit width/height on images — CLS must stay 0.',
       'This repo has NO test suite — do not add or run jest/vitest. Verification is `npm run typecheck` + `npm run lint` + `npm run build` (which must emit `out/`).',
       'Never run `npm run build` while a dev server is running — they share `.next` and corrupt each other.',
-      "Never dispatch a GitHub Actions workflow (`deploy-staging.yml`, `deploy-prod.yml` or any other): a staging deploy replaces what a teammate may be testing, and deploys are a person's to run. If staging was asked for, say in the report how to deploy it.",
+      "Never dispatch a GitHub Actions workflow (`deploy-staging.yml`, `deploy-prod.yml` or any other): a staging deploy replaces what a teammate may be testing, so it runs only when someone asks miniOG for one, and production deploys are a person's call. If staging was asked for, say in the report that they can ask me for a testing link once the PR is open.",
     ],
     qaCaveats: [
       'Static-export site: there are no server routes; every page is pre-rendered HTML hydrated client-side.',
@@ -145,10 +145,11 @@ export const REPO_REGISTRY: Record<RepoKey, RepoDescriptor> = {
     deploy: {
       method: 'github-actions',
       // Manual since early Oct 2026: deploy-staging.yml is workflow_dispatch only and
-      // takes any branch; staging keeps whatever was dispatched last.
+      // takes any branch; staging keeps whatever was dispatched last. miniOG runs it
+      // when someone asks for a testing link (issue #702).
       stagingHost: 'staging-marketing-web.newtonschool.co',
       stagingNote:
-        'Staging deploys are manual: run *Deploy → staging* in GitHub Actions on your branch (`gh workflow run deploy-staging.yml --ref YOUR_BRANCH`). It replaces whatever is on staging now, so check nobody is testing there, and deploy `main` again when you are done.',
+        'Staging is shared and shows whichever branch was deployed there last. Ask miniOG for a testing link and it puts the PR branch on staging and posts the link; developers can also run *Deploy → staging* in GitHub Actions on a branch (`gh workflow run deploy-staging.yml --ref YOUR_BRANCH`). Either way it replaces what is on staging now, so deploy `main` again when you are done.',
       prodCommand: 'gh workflow run deploy-prod.yml --ref main -f confirm=deploy',
     },
     contentPolicy: {
@@ -338,20 +339,9 @@ export function qaCaveatBlockFor(key: RepoKey): string {
 }
 
 /**
- * What miniOG says to a marketing staging deploy ask, from the router's gate
- * or the deploy workflow: it runs none, and this is how. Plain text.
- */
-export function marketingStagingReply(): string {
-  const deploy = REPO_REGISTRY['newton-marketing-web'].deploy;
-  const note = deploy.method === 'github-actions' ? deploy.stagingNote : '';
-  return ["I don't run staging deploys.", note].filter(Boolean).join(' ');
-}
-
-/**
  * One line per enabled repo, for prompts that enumerate the known repos. A
- * repo deployed through GitHub Actions also says how its staging works, in
- * the words the deploy workflow uses, so a lookup asked about it (where the
- * router sends staging deploy asks) answers from that rather than guessing.
+ * repo deployed through GitHub Actions also says how its staging works, so a
+ * lookup asked about it answers from that rather than guessing.
  */
 export function describeEnabledRepos(config: AppConfig): string {
   return enabledRepoKeys(config)
@@ -360,7 +350,7 @@ export function describeEnabledRepos(config: AppConfig): string {
       const deploy = repo.deploy;
       const staging =
         deploy.method === 'github-actions'
-          ? ` Staging (${deploy.stagingHost}): ${deploy.stagingNote} Point people to that workflow; never dispatch it yourself.`
+          ? ` Staging (${deploy.stagingHost}): ${deploy.stagingNote} In this answer, never dispatch it yourself: point people to asking miniOG for a testing link.`
           : '';
       return `- ${key}: ${repo.description}${staging}`;
     })

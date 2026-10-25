@@ -27,6 +27,7 @@ import { fetchThreadRepliesSince } from '../slack/threadContext.js';
 import { runDevAssistWorkflow } from '../workflows/devAssistWorkflow.js';
 import { runMiniogDossierWorkflow } from '../workflows/miniogDossierWorkflow.js';
 import { runDeployWorkflow } from '../workflows/deployWorkflow.js';
+import { runStagingDeployWorkflow } from '../workflows/stagingDeployWorkflow.js';
 import { runImplementationWorkflow } from '../workflows/implementationWorkflow.js';
 import { readPrActionAsk } from './prActionAsk.js';
 import { runInvestigationWorkflow } from '../workflows/investigationWorkflow.js';
@@ -40,14 +41,20 @@ import {
   type LegacyDecidedBy,
   type RouterClassification,
 } from './routerShadow.js';
-import { askRequester, decideClarify, giveUpOnClarify, type ClarifyAction } from './routeClarify.js';
+import {
+  LOW_CONFIDENCE_STAGING_QUESTION,
+  askRequester,
+  decideClarify,
+  giveUpOnClarify,
+  type ClarifyAction,
+} from './routeClarify.js';
 import { cancelledResult } from '../workflows/shared/cancelState.js';
 import { cleanResetText, usageLimitReply } from '../codex/infraRetry.js';
 import { channelDenialHint } from '../access/denialHint.js';
 import { buildHelpReply, isHelpRequest } from './helpReply.js';
 import { unsupportedReply } from './unsupportedReply.js';
 import { isMarketingStagingDeployAsk, namesStagingAsTarget } from './intentParser.js';
-import { marketingStagingReply } from '../repos/registry.js';
+import { isMarketingStagingAsk } from './stagingTarget.js';
 import { acknowledgementText, pickupDelayMs } from './acknowledgement.js';
 import { RESTART_EVENT_PREFIX } from '../runtime/restartRecovery.js';
 import { looksLikeFixAffirmation } from './resumeIntentParser.js';
@@ -106,8 +113,10 @@ const WORKFLOW_RUNNERS: Partial<Record<WorkflowIntent, (ctx: WorkflowRunnerConte
     runDevAssistWorkflow({ task, config, slack, store, logStep, signal }),
   MINIOG_DOSSIER: ({ task, slack, store, config, logStep, signal }) =>
     runMiniogDossierWorkflow({ task, slack, store, config, logStep, signal }),
-  DEPLOY: ({ task, config, slack, store, logStep, signal }) =>
-    runDeployWorkflow({ task, config, slack, store, logStep, signal }),
+  DEPLOY: ({ task, config, slack, store, jobId, logStep, signal }) =>
+    runDeployWorkflow({ task, config, slack, store, jobId, logStep, signal }),
+  STAGING_DEPLOY: ({ task, config, slack, store, jobId, logStep, signal }) =>
+    runStagingDeployWorkflow({ task, config, slack, store, jobId, logStep, signal }),
 };
 
 function runImplementation({ task, config, slack, store, jobId, logStep, signal }: WorkflowRunnerContext) {
@@ -259,21 +268,22 @@ export async function routeTask(params: {
   const directAsk =
     task.mentionType === 'bot' &&
     !task.mentionReference &&
-    !['DEV_ASSIST', 'MINIOG_DOSSIER', 'PR_REVIEW', 'WEBAPP_QA'].includes(task.intent);
+    !['DEV_ASSIST', 'MINIOG_DOSSIER', 'PR_REVIEW', 'WEBAPP_QA', 'STAGING_DEPLOY'].includes(task.intent);
   /**
    * A bare "help": answered at once, for this person in this channel, with no
    * model run. A mention in passing ("<@owner> cc <@miniOG> help") is not one.
    */
   const helpRequested = directAsk && isHelpRequest(userMessage);
   /**
-   * A message that is only "deploy marketing to staging": miniOG runs no
-   * staging deploys, so the steps are posted at once, at every tier, with no
-   * model run. Left to the router, it once became a change_code question
-   * ("change something, or only look into it?").
+   * A message that is only "deploy marketing to staging": the staging tool
+   * runs at once, with no model run (issue #702). Left to the router, it once
+   * became a change_code question ("change something, or only look into it?").
    */
   const stagingAsked = directAsk && !helpRequested && isMarketingStagingDeployAsk(userMessage);
+  // STAGING_DEPLOY is seeded only by an answer to the staging tool's "which
+  // PR or branch?" (pausedResume.ts): nothing for a model to read.
   const routerShadow =
-    helpRequested || stagingAsked
+    helpRequested || stagingAsked || task.intent === 'STAGING_DEPLOY'
       ? undefined
       : startRouterShadow({ task, userMessage, reviewedPrInThread, logStep, signal });
   let legacyDecidedBy: LegacyDecidedBy = 'gate';
@@ -288,6 +298,13 @@ export async function routeTask(params: {
   // (isPrReviewRequest in intentParser.ts). It does not wait for the router,
   // so a "review <PR URL>" message routes identically whether the model CLI
   // is healthy or down (issue #334, bug B).
+  if (task.intent === 'STAGING_DEPLOY') {
+    logStep?.({
+      stage: 'router.staging.answer',
+      message: 'An answer to "which PR or branch?" — back to the staging tool, no model run.',
+      data: { userMessage },
+    });
+  }
   if (task.intent === 'PR_REVIEW') {
     logStep?.({
       stage: 'router.pr_review.deterministic',
@@ -302,7 +319,8 @@ export async function routeTask(params: {
     task.intent !== 'DEV_ASSIST' &&
     task.intent !== 'MINIOG_DOSSIER' &&
     task.intent !== 'PR_REVIEW' &&
-    task.intent !== 'WEBAPP_QA'
+    task.intent !== 'WEBAPP_QA' &&
+    task.intent !== 'STAGING_DEPLOY'
   ) {
     if (isPresencePing(userMessage)) {
       resolvedIntent = 'CONVERSATIONAL';
@@ -314,10 +332,10 @@ export async function routeTask(params: {
         data: { userMessage },
       });
     } else if (stagingAsked) {
-      resolvedIntent = 'CONVERSATIONAL';
+      resolvedIntent = 'STAGING_DEPLOY';
       logStep?.({
         stage: 'router.staging_gate',
-        message: 'A marketing staging deploy ask — answering with the steps, no model run.',
+        message: 'A marketing staging deploy ask — putting it on staging, no model run.',
         data: { userMessage },
       });
     } else if (
@@ -386,6 +404,11 @@ export async function routeTask(params: {
 
       // A decision that should not be acted on as given becomes one question
       // to the requester, instead of the keyword seed or a guess (issue #431).
+      // The marketing site's staging ask: a `deploy` pick on it is the staging tool's (issue #702).
+      // So is a reply to the router's own staging question ("yes" read as `deploy`).
+      const marketingStagingAsk =
+        isMarketingStagingAsk(task, config.allowedPrOrg) ||
+        task.clarification?.question === LOW_CONFIDENCE_STAGING_QUESTION;
       if (classification.tool && !classification.failed) {
         clarify = decideClarify({
           tool: classification.tool,
@@ -397,6 +420,7 @@ export async function routeTask(params: {
           confidenceFloor: CLASSIFIER_CONFIDENCE_FLOOR,
           deployAllowed: classification.deployAllowed,
           stagingAsk: namesStagingAsTarget(task.event.text ?? ''),
+          marketingStagingAsk,
         });
       }
 
@@ -452,6 +476,21 @@ export async function routeTask(params: {
           },
         });
         resolvedIntent = 'INFORMATIONAL';
+      } else if (
+        classification.tool === 'deploy' &&
+        !classification.deployAllowed &&
+        addressingOf(task) === 'direct' &&
+        marketingStagingAsk
+      ) {
+        // The router read a marketing staging ask as a production deploy. Code
+        // found no production target in it, and a lookup would only say "ask
+        // me for a testing link": it is the staging tool's (issue #702).
+        logStep?.({
+          stage: 'router.deploy_to_staging',
+          message: 'Router picked deploy for a marketing staging ask — running the staging tool instead.',
+          data: { confidence: classification.confidence, reasoning: classification.reasoning },
+        });
+        resolvedIntent = 'STAGING_DEPLOY';
       } else if (holdOverride) {
         // The router was unsure and the message was not addressed to miniOG (a
         // direct address became a question above). The floor used to keep the
@@ -767,21 +806,6 @@ export async function routeTask(params: {
       workflow: 'UNKNOWN',
       status: 'SKIPPED',
       message: `Asked for something none of the tools do; said so and ran nothing: ${unsupportedText}`,
-      notifyDesktop: false,
-      slackPosted: true,
-    };
-  }
-  if (stagingAsked) {
-    if (signal?.aborted) return cancelledResult('CONVERSATIONAL');
-    await slack.chat.postMessage({
-      channel: task.event.channelId,
-      thread_ts: task.event.threadTs,
-      text: marketingStagingReply(),
-    });
-    return {
-      workflow: 'CONVERSATIONAL',
-      status: 'SUCCESS',
-      message: 'Answered a marketing staging deploy ask with the steps.',
       notifyDesktop: false,
       slackPosted: true,
     };

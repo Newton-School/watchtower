@@ -12,6 +12,7 @@ import {
   ROUTE_CLARIFY_TTL_MS,
   askRequester,
   decideClarify,
+  LOW_CONFIDENCE_STAGING_QUESTION,
   giveUpOnClarify,
   isRouteAnswer,
   isRouteQuestionExpired,
@@ -38,6 +39,35 @@ describe('decideClarify', () => {
     for (const tool of ['answer', 'chat', 'investigate', 'review_pr', 'change_code', 'unsupported'] as const) {
       expect(decide({ tool })).toEqual({ kind: 'run' });
     }
+  });
+
+  it('asks before a staging deploy the router is unsure of, and runs a confident one (issue #702)', () => {
+    expect(decide({ tool: 'deploy_staging' })).toEqual({ kind: 'run' });
+    expect(decide({ tool: 'deploy_staging', confidence: 0.6 })).toEqual({
+      kind: 'ask',
+      question: LOW_CONFIDENCE_STAGING_QUESTION,
+      reason: 'low_confidence_staging',
+    });
+    expect(decide({ tool: 'deploy_staging', confidence: 0.6, answering: true })).toEqual({
+      kind: 'give_up',
+      reason: 'low_confidence_staging',
+    });
+  });
+
+  it('holds a deploy pick on a marketing staging ask to the staging floor (round 2)', () => {
+    const pick = { tool: 'deploy' as const, deployAllowed: false, stagingAsk: true, marketingStagingAsk: true };
+    expect(decide({ ...pick, confidence: 0.4 })).toEqual({
+      kind: 'ask',
+      question: LOW_CONFIDENCE_STAGING_QUESTION,
+      reason: 'low_confidence_staging',
+    });
+    expect(decide({ ...pick, confidence: 0.4, answering: true })).toEqual({
+      kind: 'give_up',
+      reason: 'low_confidence_staging',
+    });
+    expect(decide({ ...pick, confidence: 0.9 })).toEqual({ kind: 'run' });
+    // Any other staging ask falls back to a read-only lookup, at any confidence.
+    expect(decide({ ...pick, marketingStagingAsk: false, confidence: 0.4 })).toEqual({ kind: 'run' });
   });
 
   it("asks the router's question when the router says it cannot tell", () => {

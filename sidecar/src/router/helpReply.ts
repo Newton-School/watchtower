@@ -53,6 +53,10 @@ const TOOL_LINES: Partial<Record<ToolId, ToolLine>> = {
     what: 'Look into a problem and report the cause',
     example: 'this student is marked eligible but cannot apply to roles',
   },
+  deploy_staging: {
+    what: 'Put a marketing-site PR on staging and send you the link to test it',
+    example: 'give me a testing link for this PR',
+  },
   review_pr: { what: 'Review a pull request and post the findings on it', example: 'review <PR link>' },
   qa_webapp: {
     what: 'Test a PR or a running page in a browser and report what I find',
@@ -68,7 +72,15 @@ const CHANGE_WITHOUT_MARKETING: ToolLine = {
 };
 
 /** The default order, and the tool each kind of reader sees first. */
-const DEFAULT_ORDER: ToolId[] = ['answer', 'change_code', 'investigate', 'review_pr', 'qa_webapp', 'deploy'];
+const DEFAULT_ORDER: ToolId[] = [
+  'answer',
+  'change_code',
+  'deploy_staging',
+  'investigate',
+  'review_pr',
+  'qa_webapp',
+  'deploy',
+];
 const LEAD_BY_ROLE: Partial<Record<DossierRole, ToolId[]>> = {
   pm: ['change_code', 'answer', 'investigate'],
   designer: ['change_code', 'review_pr', 'answer'],
@@ -106,6 +118,8 @@ export function buildHelpReply(params: {
   const elsewhere: ToolId[] = [];
   const byLevel = new Map<AccessLevel, ToolId[]>();
   for (const id of orderFor(role)) {
+    // Staging links are for the marketing site only.
+    if (id === 'deploy_staging' && !marketing) continue;
     const tool = TOOLS.find(entry => entry.id === id);
     if (!tool) continue;
     const decision = evaluateCapability({ config, userId, channelId, channelType, capability: tool.capability });
@@ -155,6 +169,8 @@ function shortName(id: ToolId): string {
       return 'browser QA';
     case 'deploy':
       return 'deploys';
+    case 'deploy_staging':
+      return 'staging links';
     default:
       return id;
   }

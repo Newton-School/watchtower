@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { decidePausedResume } from '../src/router/pausedResume.js';
+import { STAGING_TARGET_QUESTION } from '../src/router/routeClarify.js';
 
 describe('decidePausedResume', () => {
   describe('no paused job', () => {
@@ -204,6 +205,54 @@ describe('decidePausedResume for a parked question (issue #431)', () => {
 
   it('never forces an intent: the router reads the reply with the question', () => {
     expect(decide('UREQ', 1_060_000).forceIntent).toBeUndefined();
+  });
+
+  it('sends an answer-shaped reply to the staging question straight back to the staging tool (issue #702)', () => {
+    const staging = { ...routeQuestion, question: STAGING_TARGET_QUESTION, askedText: 'give me a testing link' };
+    const decideStaging = (eventText: string, answeredFromApp = false) =>
+      decidePausedResume({
+        pausedJob: paused,
+        pauseSignal: 'route_clarify',
+        eventText,
+        routeQuestion: staging,
+        senderId: 'UREQ',
+        nowMs: 1_060_000,
+        answeredFromApp,
+      });
+    for (const reply of [
+      'feat/hero',
+      '1484',
+      '#1484',
+      'PR 1484',
+      'PR1484',
+      'main',
+      '<@UBOT1> fix-hero-banner',
+      'https://github.com/Newton-School/newton-marketing-web/pull/1484',
+      '<https://github.com/Newton-School/newton-marketing-web/pull/1484|this one>',
+    ]) {
+      expect(decideStaging(reply), reply).toMatchObject({ resume: true, forceIntent: 'STAGING_DEPLOY' });
+    }
+    expect(decideStaging('1484', true)).toMatchObject({ reason: 'watchtower_answer', forceIntent: 'STAGING_DEPLOY' });
+    for (const reply of [
+      'never mind, review https://github.com/Newton-School/newton-web/pull/9040',
+      'review PR 1484',
+      'the hero one',
+      'yes',
+      'never mind',
+      // Plain words go to the router: "help" still gets the help reply, "stop" still stops.
+      'help',
+      'stop',
+      'cancel',
+      'nvm',
+      'yup',
+      'both',
+      'latest',
+      'try again',
+    ]) {
+      const decision = decideStaging(reply);
+      expect(decision.resume, reply).toBe(true);
+      expect(decision.forceIntent, reply).toBeUndefined();
+    }
   });
 });
 

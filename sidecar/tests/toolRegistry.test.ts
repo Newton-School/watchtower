@@ -13,6 +13,8 @@ const BEFORE: Record<WorkflowIntent, [capability: string, level: string, sideEff
   WEBAPP_QA: ['start_implementation', 'builder', 'answer'],
   INVESTIGATION: ['investigate', 'viewer', 'answer'],
   DEPLOY: ['deploy_prod', 'admin', 'mutating'],
+  // Added with the staging tool (issue #702): what a change run needs.
+  STAGING_DEPLOY: ['start_implementation', 'builder', 'mutating'],
   DEV_ASSIST: ['dev_assist', 'admin', 'answer'],
   INFORMATIONAL: ['query_codebase', 'viewer', 'answer'],
   CONVERSATIONAL: ['chat', 'viewer', 'chat'],
@@ -55,7 +57,16 @@ describe('tool registry', () => {
 
   it('never lets the model pick a tool reached by exact syntax or by its own gate', () => {
     const selectable = TOOLS.filter(tool => tool.routerSelectable).map(tool => tool.id);
-    expect(selectable).toEqual(['review_pr', 'change_code', 'investigate', 'answer', 'chat', 'deploy', 'stay_silent']);
+    expect(selectable).toEqual([
+      'review_pr',
+      'change_code',
+      'investigate',
+      'answer',
+      'chat',
+      'deploy',
+      'deploy_staging',
+      'stay_silent',
+    ]);
     // The model may name the deploy; whether it starts is decided in code (mayDeploy, issue #428).
     expect(TOOLS.filter(tool => tool.irreversible && tool.routerSelectable).map(tool => tool.id)).toEqual(['deploy']);
   });
@@ -72,6 +83,7 @@ describe('tool registry', () => {
         'MINIOG_DOSSIER',
         'OWNER_AUTOPILOT',
         'PR_REVIEW',
+        'STAGING_DEPLOY',
         'WEBAPP_QA',
       ].sort(),
     );

@@ -895,6 +895,8 @@ function intentToHumanLabel(intent: string): string | null {
       return '`wt` commands';
     case 'DEPLOY':
       return 'deploys';
+    case 'STAGING_DEPLOY':
+      return 'staging links';
     default:
       return null;
   }

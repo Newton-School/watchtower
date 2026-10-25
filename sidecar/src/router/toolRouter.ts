@@ -101,7 +101,7 @@ const RULES = `Rules:
 - Metabase cannot be edited from here. A question about a dashboard or query (a Metabase link) is answer; a request to fix or change one is investigate.
 - A request to merge, close or create a pull request, with no review asked for, is change_code when it is addressed to you directly.
 - deploy only when this message itself tells you to deploy to production now. Words like "deploy", "release" or "ship" in a description, a plan, a question or a link are not that.
-- A message addressed to you that asks only for a staging deploy is answer, not deploy or change_code: miniOG does not run staging deploys, and the answer says how to do one. A staging deploy asked for together with a change, a fix or a merge is that change. Asked of the owner instead of you, a staging deploy is for the owner to do: stay_silent.
+- deploy_staging: the person asks you for a link to test or preview a change to the marketing site (newtonschool.co pages, newton-marketing-web), or to put a marketing branch or pull request on staging ("give me a testing link", "can I test this somewhere?", "deploy this to staging"). A staging deploy asked for together with a change, a fix or a merge is that change. A question about staging (what is on it, why a staging deploy failed or looks wrong) is answer or investigate, not deploy_staging. A staging deploy of anything else (newton-web, the API) is answer: miniOG does not run those. Asked of the owner instead of you, a staging deploy is for the owner to do: stay_silent.
 - qa_webapp only when the person asks you to test or QA a running app or a pull request in a browser.
 - unsupported is only for an action in a system these tools do not reach: grant access or permissions, enrol or move someone, change records or accounts in a live system, file a ticket, schedule a meeting, set a reminder, send an email. change_code changes code and content in a repository, not live data. A bug in that code is change_code or investigate even when it is about access or enrolment. A message is unsupported only when nothing in it is something these tools can do; when part of it is, route that part.
 - A question is never unsupported, and a message that asks for an action these tools do not reach and also asks a question is answer.
@@ -249,6 +249,9 @@ export function outcomeToLegacyIntent(
     case 'deploy':
       // The model naming `deploy` is never enough by itself: see `mayDeploy`.
       return options.allowDeploy ? 'DEPLOY' : fallback;
+    case 'deploy_staging':
+      // Only for someone who asked miniOG: a staging deploy asked of the owner is the owner's.
+      return addressing === 'direct' ? 'STAGING_DEPLOY' : fallback;
     case 'review_pr':
       return 'PR_REVIEW';
     case 'change_code':

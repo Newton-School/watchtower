@@ -86,7 +86,7 @@ describe('buildHelpReply', () => {
     expect(lines[1]).toContain('Review a pull request');
     expect(lines[1]).toContain('review &lt;PR link&gt;');
     expect(text).not.toContain('Make a change and open a PR');
-    expect(text).toContain('Builders: changes, browser QA.');
+    expect(text).toContain('Builders: changes, staging links, browser QA.');
     expect(text).toContain('Admins only: deploys.');
     expect(text).not.toContain('<PR link>');
   });
@@ -96,7 +96,7 @@ describe('buildHelpReply', () => {
     const text = buildHelpReply({ config: makeConfig(), userId: 'UBOTH', channelId: 'C-PM' });
     expect(text).toContain('Answer questions about the product');
     expect(text).toContain('Not in this channel, but enabled for you elsewhere: PR reviews.');
-    expect(text).toContain('Builders: changes, browser QA.');
+    expect(text).toContain('Builders: changes, staging links, browser QA.');
   });
 
   it('tells someone who is not enabled here that an admin can enable them', () => {

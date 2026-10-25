@@ -43,10 +43,10 @@ const AMBIGUOUS_DEPLOY_TARGET_RE = /\b(landing([- ]?pages?)?|homepage|newton[- ]
 
 /**
  * Whether a deploy ask mentions staging and never prod or production. Such an
- * ask gets the staging instructions instead of a production deploy offer: if
- * staging was only context, the cost is one re-ask that says prod; if it was
- * the target, a production prompt would be in front of someone who wanted
- * staging. Links, link labels, channel references and mentions are removed
+ * ask is asked "staging or production?" instead of getting a production
+ * deploy offer: if staging was only context, the cost is one re-ask that says
+ * prod; if it was the target, a production prompt would be in front of
+ * someone who wanted staging. Links, link labels, channel references and mentions are removed
  * first, so their words never decide it, and "stage" does not count.
  */
 export function mentionsStagingNotProd(text: string): boolean {
@@ -73,7 +73,12 @@ export function namesStagingAsTarget(text: string): boolean {
   if (/\b(prod|production)\b/.test(plain)) return false;
   return (
     /\b(?:to|onto) (?:the )?(?:[\w-]+ ){0,2}?(?:staging|stg)\b/.test(plain) ||
-    /\b(?:staging|stg) (?:deploy|deployment|release)\b/.test(plain)
+    /\b(?:staging|stg) (?:deploy|deployment|release)\b/.test(plain) ||
+    // "put main back on staging", "put PR #12 on marketing staging": led by the verb,
+    // so "deploy marketing, it looks good on staging" is still only context.
+    /\b(?:put|deploy|push|ship|get|bring)\s+(?:[^\s,.;!?]+\s+){0,3}?(?:back\s+)?on\s+(?:the\s+)?(?:[\w-]+\s+)?(?:staging|stg)\b/.test(
+      plain,
+    )
   );
 }
 
@@ -95,9 +100,9 @@ const MARKETING_STAGING_ASK_RE = new RegExp(
 /**
  * A message that is only an ask to deploy the marketing site to staging:
  * "deploy marketing to staging", "please deploy my branch fix/hero to
- * marketing stg". miniOG runs no staging deploys, so this has a fixed answer
- * and is settled before the router. Anything more ("…to staging failed, can
- * you check?", "…and test the hero") is not this.
+ * marketing stg". It starts the staging tool before the router, with no model
+ * run (issue #702). Anything more ("…to staging failed, can you check?",
+ * "…and test the hero") is not this.
  */
 export function isMarketingStagingDeployAsk(text: string): boolean {
   const plain = text
