@@ -9,6 +9,7 @@ import {
   MAX_INLINE_COMMENTS,
   planReviewPosting,
   fetchDiffSince,
+  fetchPrDiff,
 } from '../src/github/prReviewSupport.js';
 import type { SubmitPrReviewResult } from '../src/github/submitPrReview.js';
 import type { CodexRunResult } from '../src/types/contracts.js';
@@ -517,6 +518,34 @@ describe('follow-up review support (issue #451)', () => {
 
     expect(body.startsWith(`${line}\n\n`)).toBe(true);
     expect(body).toContain('no actionable findings');
+  });
+});
+
+describe('a diff past the prompt budget keeps the whole diff for line checks', () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+  const pr = { url: 'https://github.com/o/r/pull/7', owner: 'o', repo: 'r', number: 7 };
+  const whole = `diff --git a/a.ts b/a.ts\n${'+x\n'.repeat(20_000)}diff --git a/z.ts b/z.ts\n@@ -1,1 +1,2 @@\n line\n+late`;
+
+  it('cuts the diff for the prompt and returns the whole diff beside it', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(whole)) as never;
+
+    const result = await fetchPrDiff({ prContext: pr, maxChars: 10_000 });
+
+    expect(result.truncated).toBe(true);
+    expect(result.diff).not.toContain('z.ts');
+    expect(result.fullDiff).toBe(whole);
+  });
+
+  it('returns no second copy when the diff fits', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response('diff --git a/x b/x')) as never;
+
+    const result = await fetchPrDiff({ prContext: pr, maxChars: 10_000 });
+
+    expect(result.truncated).toBe(false);
+    expect(result.fullDiff).toBeUndefined();
   });
 });
 

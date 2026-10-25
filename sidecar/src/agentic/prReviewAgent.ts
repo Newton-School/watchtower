@@ -1505,9 +1505,14 @@ export async function reviewSinglePr(params: {
 
   // 3. Diff fetch (TS-side: the same bytes feed the agent prompt AND the
   //    submitPrReview hunk validator, eliminating agent/validator drift).
+  //    A diff past the prompt budget is cut for the prompt only: a finding's
+  //    line is checked against the whole diff, or every finding past the cut
+  //    is dropped as "outside the diff" (newton-marketing-web#1477 lost all 3
+  //    of its inline comments that way).
   const prMeta = await deps.fetchMetadata({ prContext, githubToken, logStep });
   const prHeadSha = currentPrHeadSha ?? prMeta.headSha;
   const diffResult: PrDiffResult = await deps.fetchDiff({ prContext, githubToken });
+  const anchorDiff = diffResult.fullDiff ?? diffResult.diff;
   if (!diffResult.diff) {
     logStep?.({
       stage: 'agentic.pr_review.pr.diff_empty',
@@ -1751,7 +1756,7 @@ export async function reviewSinglePr(params: {
     return failedOutcome(prContext, 'Review produced no output.', prHeadSha);
   }
 
-  enforceChangedCodeGate(normalizedOutputs, diffResult.diff, prContext.url, logStep);
+  enforceChangedCodeGate(normalizedOutputs, anchorDiff, prContext.url, logStep);
 
   // 6b. A second review of the same PR follows up on the first (issue #451):
   //     what became of its findings, and what is new in the code changed since.
@@ -1818,7 +1823,7 @@ export async function reviewSinglePr(params: {
       findingsInBody: allFindings.length - postingPlan.toSubmit.reduce((sum, r) => sum + r.findings.length, 0),
       summary: buildGithubReviewSummary(normalizedOutputs, appliedSkills, postingPlan, followUpLine),
       githubToken,
-      prDiff: diffResult.diff,
+      prDiff: anchorDiff,
       logStep,
     });
 
