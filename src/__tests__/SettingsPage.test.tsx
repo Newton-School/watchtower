@@ -1,7 +1,24 @@
-import { describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+
+const invoke = vi.fn();
+vi.mock('@tauri-apps/api/core', () => ({ invoke: (...args: unknown[]) => invoke(...args) }));
+
 import { SettingsPage } from '../pages/SettingsPage';
-import type { AppSettings } from '../types';
+import type { AppSettings, Bundle } from '../types';
+
+// Settings → Access edits capability bundles, read from and saved to the store (#320).
+const bundle = (name: string, allowIm = false): Bundle => ({
+  name,
+  manualUserIds: '',
+  resolvedUserIds: [],
+  capabilities: ['query_codebase'],
+  allowedChannelIds: [],
+  allowIm,
+  allowMpim: false,
+  updatedAt: 'v1',
+});
+const STORED_BUNDLES = [bundle('viewer'), bundle('reviewer'), bundle('builder'), bundle('admin', true)];
 
 function makeSettings(): AppSettings {
   return {
@@ -89,15 +106,28 @@ function renderAndNavigateToAccess(onSettingsChange = vi.fn()) {
   return onSettingsChange;
 }
 
+const bundleCard = async (name: string) =>
+  (await screen.findByText(name, { selector: 'strong' })).closest('article') as HTMLElement;
+
 describe('SettingsPage', () => {
-  it('renders the access-control section and role tabs when navigated to', () => {
+  beforeEach(() => {
+    invoke.mockReset();
+    invoke.mockImplementation((command: string) => {
+      if (command === 'get_bundles') return Promise.resolve(STORED_BUNDLES.map(row => ({ ...row })));
+      if (command === 'get_slack_directory') return Promise.resolve({ people: [], groups: [] });
+      return Promise.resolve(undefined);
+    });
+  });
+
+  it('renders ownership, the access mode and a card per capability bundle when navigated to', async () => {
     renderAndNavigateToAccess();
 
-    expect(screen.getAllByText('Access Control').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('Viewer').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('Reviewer').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('Builder').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('Admin').length).toBeGreaterThan(0);
+    expect(screen.getByText('Owner Slack User IDs')).toBeTruthy();
+    expect(screen.getAllByText('Access Mode').length).toBeGreaterThan(0);
+    expect(screen.getByText('Capability Bundles')).toBeTruthy();
+    for (const name of ['viewer', 'reviewer', 'builder', 'admin']) {
+      expect(await bundleCard(name)).toBeTruthy();
+    }
   });
 
   it('maps access mode change into onSettingsChange', () => {
@@ -114,26 +144,20 @@ describe('SettingsPage', () => {
     );
   });
 
-  it('maps DM toggle for a selected role into onSettingsChange', () => {
+  it('saves a bundle with DMs allowed when its Allow DM is ticked, without touching the page settings', async () => {
     const onSettingsChange = renderAndNavigateToAccess();
-
-    // Default active role is admin — switch to reviewer
-    fireEvent.click(screen.getByText('Reviewer'));
+    const reviewer = await bundleCard('reviewer');
     onSettingsChange.mockClear();
 
-    const allowDmToggle = screen.getByLabelText('Allow DM');
-    fireEvent.click(allowDmToggle);
-    expect(onSettingsChange).toHaveBeenCalledWith(
-      expect.objectContaining({
-        accessControl: expect.objectContaining({
-          groups: expect.objectContaining({
-            reviewer: expect.objectContaining({
-              allowIm: true,
-            }),
-          }),
-        }),
+    fireEvent.click(within(reviewer).getByLabelText('Allow DM'));
+    fireEvent.click(within(reviewer).getByRole('button', { name: 'Save' }));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith('save_bundle', {
+        bundle: expect.objectContaining({ name: 'reviewer', allowIm: true }),
       }),
     );
+    expect(onSettingsChange).not.toHaveBeenCalled();
   });
 
   it('maps the optional newton-marketing-web path into onSettingsChange', () => {

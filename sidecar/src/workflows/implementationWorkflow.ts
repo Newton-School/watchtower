@@ -1552,6 +1552,23 @@ Reply with the complete revised plan as markdown and nothing else, in the same f
 }
 
 /**
+ * The planner's follow-up after a clarifying answer, on Claude Code, where
+ * plans are markdown. Asking it for the JSON contract got markdown or JSON
+ * without `requiresCodeChanges` back, which read as "no code changes" and
+ * sent a change request to the quick action with no approval (issue #695).
+ */
+export function clarifiedPromptMarkdown(question: string, answer: string, previousPlan: string): string {
+  const draft = previousPlan.trim() ? `\n\nYour plan so far:\n\n${previousPlan.trim()}` : '';
+  return `You asked the requester: "${question}"
+
+They answered: "${answer}"${draft}
+
+Now write the final plan with that answer in mind. Read the code again where you need to.
+
+Reply with the complete plan as markdown and nothing else, in the same format as before: the "## For the approver" block with all its lines, the intent, the "## Files to change" section, the steps, and the "Scope:" and "Requires code changes:" tags.`;
+}
+
+/**
  * Who can decide a plan besides the admins: the requester, and anyone who
  * could have asked for the change in this channel themselves. Waiting on an
  * admin for every plan was friction. Without enforced access, anyone. The
@@ -1900,6 +1917,9 @@ async function runImplementationWorkflowBody(params: {
         outputSchemaPath: plannerPlanMode ? undefined : plannerSchemaPath,
         githubToken: ctx.githubToken,
         planMode: plannerPlanMode,
+        // Plan mode wins where it applies; read-only covers the rest, so no
+        // planner call runs with permissions bypassed (issue #695).
+        readOnly: true,
         // The thread's screenshots and PDFs: a plan written without them
         // shipped the wrong PDF to production (issue #595).
         imagePaths: plannerCtx.imagePaths,
@@ -2073,18 +2093,32 @@ async function runImplementationWorkflowBody(params: {
       const answer = outcome.answer;
       clarificationHistory.push({ question, answer });
 
-      const followUpPrompt = plannerSessionId
-        ? `The user answered your clarifying question ("${question}") with:\n\n"${answer}"\n\nNow produce the final plan. Return the same JSON schema with \`clarificationNeeded\` set to null.`
-        : `You previously asked: "${question}"\nThe user answered: "${answer}"\n\nOriginal plan so far:\n${JSON.stringify(plannerOutput, null, 2)}\n\nNow produce the final plan. Return the same JSON schema with \`clarificationNeeded\` set to null.`;
+      // On Claude Code plans are markdown, so the follow-up asks for markdown
+      // too: the JSON contract came back as markdown or without
+      // `requiresCodeChanges`, which read as "no code changes" (issue #695).
+      const followUpPrompt = plannerPlanMode
+        ? clarifiedPromptMarkdown(
+            question,
+            answer,
+            typeof plannerOutput.planMarkdown === 'string' ? plannerOutput.planMarkdown : '',
+          )
+        : plannerSessionId
+          ? `The user answered your clarifying question ("${question}") with:\n\n"${answer}"\n\nNow produce the final plan. Return the same JSON schema with \`clarificationNeeded\` set to null.`
+          : `You previously asked: "${question}"\nThe user answered: "${answer}"\n\nOriginal plan so far:\n${JSON.stringify(plannerOutput, null, 2)}\n\nNow produce the final plan. Return the same JSON schema with \`clarificationNeeded\` set to null.`;
 
       plannerRunResult = await runWithInfraRetry(
         {
           cwd: ctx.cwd,
           prompt: followUpPrompt,
           ...(plannerSessionId ? { resumeSessionId: plannerSessionId } : {}),
-          outputSchemaPath: plannerSchemaPath,
+          outputSchemaPath: plannerPlanMode ? undefined : plannerSchemaPath,
           githubToken: ctx.githubToken,
           imagePaths: plannerCtx.imagePaths,
+          // Planning only reads, before anyone approved a change; this call
+          // used to run with every permission bypassed (issue #695). Like the
+          // plan revision it runs read-only rather than in plan mode, and its
+          // final message is the plan.
+          readOnly: true,
           ...plannerProfile,
           // No per-agent timeoutMs — see investigationWorkflow.ts for rationale.
           // Outer abort signal remains the safety net.
@@ -2097,14 +2131,37 @@ async function runImplementationWorkflowBody(params: {
         return cancelledResult('IMPLEMENTATION');
       }
       plannerSessionId = plannerRunResult.sessionId ?? plannerSessionId;
-      if (plannerRunResult.ok && plannerRunResult.parsedJson) {
-        plannerOutput = plannerRunResult.parsedJson;
-      } else {
+      // Read the answer's plan the way the first plan is read. One that can't
+      // be read as a plan keeps the earlier one, which goes to approval; it is
+      // never taken as "no code changes" (issue #695).
+      const followUpPlan =
+        plannerRunResult.ok && plannerRunResult.parsedJson
+          ? normalizePlannerOutput(plannerRunResult.parsedJson, plannerBackend)
+          : undefined;
+      if (!followUpPlan || (plannerPlanMode && !followUpPlan.planMarkdown)) {
+        logStep?.({
+          stage: 'implementation.planner.clarification.unreadable',
+          message: 'The planner did not return a readable plan after the answer; the earlier plan goes to approval.',
+          level: 'WARN',
+          data: { ok: plannerRunResult.ok, hasParsedJson: Boolean(plannerRunResult.parsedJson) },
+        });
+        plannerOutput = { ...plannerOutput, requiresCodeChanges: true, clarificationNeeded: null };
         break;
       }
+      plannerOutput = {
+        ...plannerRunResult.parsedJson,
+        planMarkdown: followUpPlan.planMarkdown,
+        scope: followUpPlan.scope,
+        affectedFiles: followUpPlan.affectedFiles,
+        requiresCodeChanges: followUpPlan.requiresCodeChanges,
+        clarificationNeeded: followUpPlan.clarificationNeeded,
+      };
     }
 
-    const plannerRequiresCodeChanges = Boolean(plannerOutput.requiresCodeChanges);
+    // Read through the same normalisation, so a plan with no
+    // `requiresCodeChanges` counts as a change (the safe direction), never as
+    // a quick action with no approval (issue #695).
+    const plannerRequiresCodeChanges = normalizePlannerOutput(plannerOutput, plannerBackend).requiresCodeChanges;
 
     // Quick-action fast path: if the planner says no code changes are needed
     // (e.g., "merge this PR", "close PR", "deploy", "run tests"), skip the full

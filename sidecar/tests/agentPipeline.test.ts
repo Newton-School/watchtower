@@ -1246,6 +1246,33 @@ describe("the pipeline's agents see the thread's attachments (issue #595)", () =
   });
 });
 
+describe("the pipeline's planner only reads (issue #695)", () => {
+  it('runs the planner read-only and leaves the other roles as they were', async () => {
+    const ok = (parsedJson: Record<string, unknown>) =>
+      ({ ok: true, exitCode: 0, timedOut: false, stdout: '', stderr: '', lastMessage: '', parsedJson }) as any;
+    vi.mocked(runCodex)
+      .mockReset()
+      .mockResolvedValueOnce(
+        ok({ plan: ['Add the banner'], affectedFiles: ['src/a.ts'], scope: 'small', requiresCodeChanges: true }),
+      )
+      .mockResolvedValueOnce(ok({ status: 'done', summary: 'Added the banner.', prUrl: '' }));
+    const ctx = makeContext({
+      workflowIntent: 'IMPLEMENTATION',
+      pipelineConfig: makePipelineConfig({ agents: ['planner', 'coder'] }),
+    });
+
+    await runAgentPipeline({
+      ctx,
+      slack: { chat: { postMessage: vi.fn().mockResolvedValue({ ts: '1' }), update: vi.fn() } } as any,
+      logStep: vi.fn(),
+    });
+
+    const [planner, coder] = vi.mocked(runCodex).mock.calls.map(call => call[0]);
+    expect(planner.readOnly).toBe(true);
+    expect(coder.readOnly).toBe(false);
+  });
+});
+
 describe('formatExecutedPlanEdit: the plan message once the coder is done (issue #623)', () => {
   const FILES = ['/ws/newton-web/1-1/src/a.ts'];
   const REPO = '/ws/newton-web/1-1';
