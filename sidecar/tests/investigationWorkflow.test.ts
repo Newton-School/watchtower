@@ -23,7 +23,7 @@ vi.mock('../src/slack/threadContext.js', () => ({
   fetchThreadContext: vi.fn().mockResolvedValue([]),
 }));
 
-const { runInvestigationWorkflow, investigationNextStep, NOTHING_TO_FIX_REPLY } =
+const { runInvestigationWorkflow, investigationNextStep, NOTHING_TO_FIX_REPLY, FIX_LOCATION_RULE } =
   await import('../src/workflows/investigationWorkflow.js');
 const { __infraRetry, connectionLostReply } = await import('../src/codex/infraRetry.js');
 
@@ -106,7 +106,7 @@ describe('runInvestigationWorkflow thread images', () => {
       },
     });
     const slack = slackStub();
-    const investigationStore = { save: vi.fn() } as any;
+    const investigationStore = { save: vi.fn(), clear: vi.fn() } as any;
 
     await runInvestigationWorkflow({
       task: makeTask('the recording coverage dashboard counts the wrong classes'),
@@ -130,7 +130,7 @@ describe('runInvestigationWorkflow thread images', () => {
       parsedJson: { ...investigatorOk().parsedJson, fixLocation: 'repo' },
     });
     const slack = slackStub();
-    const investigationStore = { save: vi.fn() } as any;
+    const investigationStore = { save: vi.fn(), clear: vi.fn() } as any;
 
     await runInvestigationWorkflow({
       task: makeTask('button is misaligned'),
@@ -145,10 +145,10 @@ describe('runInvestigationWorkflow thread images', () => {
     expect(investigationStore.save).toHaveBeenCalledTimes(1);
   });
 
-  async function investigateWith(parsedJson: Record<string, unknown>) {
+  async function investigateWith(parsedJson: Record<string, unknown>, investigationStore: any = undefined) {
     runCodex.mockReset().mockResolvedValue({ ok: true, exitCode: 0, parsedJson });
     const slack = slackStub();
-    const investigationStore = { save: vi.fn() } as any;
+    investigationStore ??= { save: vi.fn(), clear: vi.fn() };
     const logStep = vi.fn();
     await runInvestigationWorkflow({
       task: makeTask('the form submits on its own'),
@@ -176,7 +176,39 @@ describe('runInvestigationWorkflow thread images', () => {
     expect(texts).toContain(NOTHING_TO_FIX_REPLY);
     expect(texts.some(text => text.includes('This is intended'))).toBe(true);
     expect(investigationStore.save).not.toHaveBeenCalled();
+    expect(investigationStore.clear).toHaveBeenCalledWith('1.1');
     expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'investigation.nothing_to_fix' }));
+  });
+
+  it('drops an earlier investigation in the thread when this one finds nothing to fix', async () => {
+    const rows = new Map<string, any>([['1.1', { threadTs: '1.1', summary: 'an older diagnosis' }]]);
+    const investigationStore = {
+      save: vi.fn((row: any) => rows.set(row.threadTs, row)),
+      getForThread: (threadTs: string) => rows.get(threadTs),
+      clear: vi.fn((threadTs: string) => rows.delete(threadTs)),
+    };
+
+    await investigateWith(
+      { rootCauseHypothesis: 'Intended.', evidence: [], recommendedFix: '', fixLocation: 'none', summary: 'Intended.' },
+      investigationStore,
+    );
+
+    expect(investigationStore.getForThread('1.1')).toBeUndefined();
+  });
+
+  it('tells the investigator to use "none" when the fix only lists options (issue #624)', async () => {
+    await investigateWith({
+      rootCauseHypothesis: 'x',
+      evidence: [],
+      recommendedFix: 'y',
+      fixLocation: 'repo',
+      summary: 's',
+    });
+
+    const prompt = runCodex.mock.calls[0][0].prompt as string;
+    expect(prompt).toContain(FIX_LOCATION_RULE);
+    expect(FIX_LOCATION_RULE).toContain('Use "none", not "repo", when nothing is broken');
+    expect(FIX_LOCATION_RULE).toContain('use "repo" for that defect');
   });
 
   it('offers nothing when the investigator gives no verdict on where the fix is (issue #624)', async () => {
@@ -199,6 +231,21 @@ describe('runInvestigationWorkflow thread images', () => {
     );
   });
 
+  it('warns about a verdict that is not one of the three', async () => {
+    const { texts, logStep } = await investigateWith({
+      rootCauseHypothesis: 'x',
+      evidence: [],
+      recommendedFix: 'y',
+      fixLocation: 'maybe',
+      summary: 's',
+    });
+
+    expect(texts.some(text => text.includes('Want me to fix this?'))).toBe(false);
+    expect(logStep).toHaveBeenCalledWith(
+      expect.objectContaining({ stage: 'investigation.no_fix_offer', level: 'WARN' }),
+    );
+  });
+
   it('offers nothing for a fix in the code that it could not describe', async () => {
     const { texts, investigationStore } = await investigateWith({
       rootCauseHypothesis: '',
@@ -210,6 +257,9 @@ describe('runInvestigationWorkflow thread images', () => {
     });
 
     expect(texts.some(text => text.includes('Want me to fix this?'))).toBe(false);
+    // The scope acknowledgement and the findings, nothing after them.
+    expect(texts).toHaveLength(2);
+    expect(texts[1]).toContain('I could not pin this down.');
     expect(investigationStore.save).not.toHaveBeenCalled();
   });
 
@@ -228,6 +278,8 @@ describe('runInvestigationWorkflow thread images', () => {
     expect(texts).not.toContain(NOTHING_TO_FIX_REPLY);
     expect(texts.some(text => text.includes('Want me to fix this?'))).toBe(false);
     expect(investigationStore.save).toHaveBeenCalledTimes(1);
+    // A ✅ on the question is not a "yes, fix it": no prompt is kept for the reaction path.
+    expect(investigationStore.save.mock.calls[0][0].promptMessageTs).toBeUndefined();
   });
 
   it('investigates read-only, and tells the investigator so (issue #443)', async () => {

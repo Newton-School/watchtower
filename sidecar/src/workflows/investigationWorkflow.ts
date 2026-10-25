@@ -187,7 +187,7 @@ Return strict JSON:
     { "file": string, "line": number, "snippet": string, "why": string }
   ],
   "recommendedFix": string,                 // conceptual fix sketch (not code) — what should change
-  "fixLocation": "repo" | "outside" | "none", // "repo": a code change in one of these repositories, sketched in recommendedFix. "outside": the fix is somewhere else (a Metabase question or dashboard, an admin setting, data, another service) — say where in recommendedFix, and who can make it. "none": nothing needs fixing — it works as intended, it is already fixed on the default branch, or whether to change it is a product call for a person, not a bug; say which in summary
+  "fixLocation": "repo" | "outside" | "none", // "repo": a code change in one of these repositories, sketched in recommendedFix. "outside": the fix is somewhere else (a Metabase question or dashboard, an admin setting, data, another service) — say where in recommendedFix, and who can make it. "none": nothing needs fixing — it works as intended, it is already fixed on the default branch, or whether to change it is a product call for a person, not a bug; say which in summary. ${FIX_LOCATION_RULE}
   "confidence": "low" | "medium" | "high",
   "requiresMoreInfo": string | null,        // null if the hypothesis stands on its own; otherwise a specific ask
   "summary": string                         // one-line Slack summary of what you found
@@ -372,17 +372,17 @@ Return strict JSON:
     logStep?.({
       stage: 'investigation.no_fix_offer',
       message: `No code fix identified (fixLocation: ${findings.fixLocation ?? 'missing'}); not offering a fix.`,
-      level: findings.fixLocation === undefined ? 'WARN' : 'INFO',
+      level: FIX_LOCATIONS.has(findings.fixLocation ?? '') ? 'INFO' : 'WARN',
     });
   } else if (nextStep === 'ask_for_more') {
-    const ack = await slack.chat
+    await slack.chat
       .postMessage({
         channel: task.event.channelId,
         thread_ts: task.event.threadTs,
         text: `_${findings.requiresMoreInfo}_\n\nReply here with more context and tag me again to continue.`,
       })
       .catch(() => undefined);
-    promptMessageTs = typeof ack?.ts === 'string' ? ack.ts : undefined;
+    // Not kept as the prompt: a ✅ on this question is not a "yes, fix it".
   } else {
     // Two confirmation paths. The ✅ reaction is the primary, frictionless
     // path — the reaction_added handler matches the reacted message ts back
@@ -405,6 +405,19 @@ Return strict JSON:
   // turns "yes, fix it" (or ✅ on the prompt) into the change pipeline, so
   // findings with no fix in the code are not kept (issues #432, #624).
   const resumable = nextStep === 'offer_fix' || (nextStep === 'ask_for_more' && findings.fixLocation !== 'outside');
+  if (investigationStore && !resumable) {
+    // An earlier investigation in this thread is superseded by this one: a
+    // later "ok" or change ask must not continue the old findings.
+    try {
+      investigationStore.clear(task.event.threadTs);
+    } catch (err) {
+      logStep?.({
+        stage: 'investigation.clear_failed',
+        message: `Failed to clear earlier investigation findings: ${err instanceof Error ? err.message : String(err)}`,
+        level: 'WARN',
+      });
+    }
+  }
   if (investigationStore && jobId && resumable) {
     try {
       investigationStore.save({
@@ -440,7 +453,18 @@ Return strict JSON:
   };
 }
 
-export const NOTHING_TO_FIX_REPLY = 'Nothing here needs a code change, so there’s nothing for me to fix.';
+export const NOTHING_TO_FIX_REPLY =
+  'Nothing here is broken, so I’m not offering a fix. If you want it changed anyway, tag me with what to change.';
+
+/**
+ * How to pick between "repo" and "none" when the fix section lists options:
+ * both runs in issue #624 came back "repo" because the fix sketched choices
+ * someone could make, though nothing was broken.
+ */
+export const FIX_LOCATION_RULE =
+  'Use "none", not "repo", when nothing is broken and recommendedFix only lists options someone could choose (a product call). If the reported symptom is already fixed but you found another real defect, use "repo" for that defect.';
+
+const FIX_LOCATIONS = new Set(['repo', 'outside', 'none']);
 
 export type InvestigationNextStep = 'ask_for_more' | 'fix_outside_repos' | 'nothing_to_fix' | 'offer_fix' | 'no_offer';
 
