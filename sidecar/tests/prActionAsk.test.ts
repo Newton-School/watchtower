@@ -275,8 +275,7 @@ describe('readQuickOperation', () => {
     ['merge it with master', 'base_branch_merge'],
     ['merge main into release', 'base_branch_merge'],
     ['merge master into and then merge it', 'base_branch_merge'],
-    ["don't rebase it, merge master in", 'negation'],
-    ['no rush, merge master into it', 'negation'],
+    ["don't rebase it, merge master in", 'base_branch_merge'],
     ["don't merge it, just bring it up to date with master", 'negation'],
     ['master ko merge mat karo', 'negation'],
     ['bring it up to date with master and merge it', 'several'],
@@ -284,6 +283,50 @@ describe('readQuickOperation', () => {
   ])('asks instead of acting on %s', (words, reason) => {
     expect(readQuickOperation(words)).toEqual({ kind: 'unclear', reason });
   });
+
+  // A negation counts only when it governs the verb (fix/quick-op-negation-scope): these are syncs.
+  it.each(['no rush, merge master into it', "don't rebase it, merge master into it"])('reads %s as a sync', words => {
+    expect(readQuickOperation(words)).toMatchObject({ kind: 'operation', action: 'sync' });
+  });
+
+  // Live test on 0.6.185: the owner's polite close was asked about instead of confirmed.
+  it.each([
+    "thanks. We don't need this one anymore, the change went in another way. Please close the PR.",
+    "We don't need this anymore, close it",
+    'not needed, close it',
+    'no longer needed, please close the PR',
+    "it doesn't work, close it",
+    "we can't use it, the design changed. close this pr",
+    'nobody needs this anymore, close it',
+  ])('reads %s as a close', words => {
+    expect(readQuickOperation(words)).toMatchObject({ kind: 'operation', action: 'close' });
+  });
+
+  it.each([
+    ["don't close it", 'negation'],
+    ['do not merge it', 'negation'],
+    ['never merge this', 'negation'],
+    ['not merge yet', 'negation'],
+    ['no need to close it', 'negation'],
+    ["you shouldn't merge it", 'negation'],
+    ['please dont close the pr', 'negation'],
+    ['merge mat karo', 'negation'],
+    ['close na karo', 'negation'],
+    ['merge nahi', 'negation'],
+    ['merge it after QA', 'condition'],
+    ['close it once the new one is live', 'condition'],
+    ['once approved, merge it', 'condition'],
+    ['merge it by eod', 'condition'],
+  ])('still blocks %s (%s)', (words, reason) => {
+    expect(readQuickOperation(words)).toEqual({ kind: 'unclear', reason });
+  });
+
+  it.each(['cancel the merge', 'skip the merge for now', 'hold off on the merge'])(
+    'reads no operation in %s',
+    words => {
+      expect(readQuickOperation(words).kind).not.toBe('operation');
+    },
+  );
 
   // #719 round 2 probes: none of these is ever read as a merge of the PR.
   it.each([

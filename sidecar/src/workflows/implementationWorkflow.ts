@@ -713,6 +713,11 @@ async function confirmQuickPrAction(params: {
    * may make, read by a planner rather than the strict gate (issue #719).
    */
   requesterConfirms?: { note: string };
+  /**
+   * A planner read the ask: the opening line promised a plan, and there is
+   * none to approve. The prompt says so first.
+   */
+  afterPlanner?: boolean;
   logStep?: WorkflowStepLogger;
   signal?: AbortSignal;
 }): Promise<{ confirmedBy: string } | { result: WorkflowResult }> {
@@ -750,9 +755,10 @@ async function confirmQuickPrAction(params: {
   let promptTs: string | undefined;
   try {
     const notes = [protectionNote, ownerReason].map(note => (note ? ` ${note}` : '')).join('');
+    const noPlan = params.afterPlanner ? 'No code change is needed, so there is no plan to approve. ' : '';
     const confirmText = params.requesterConfirms
-      ? `I read this as: ${action} ${target}. ${params.requesterConfirms.note} <@${userId}>, reply \`${phrase}\` within 10 minutes and I'll do it. Without that, nothing changes.`
-      : `<@${userId}> asked me to ${action} ${target}.${unresolvedNote}${notes} ${ownerMentions}, reply \`${phrase}\` within 10 minutes and I'll do it. Without that, nothing changes.`;
+      ? `${noPlan}I read this as: ${action} ${target}. ${params.requesterConfirms.note} <@${userId}>, reply \`${phrase}\` within 10 minutes and I'll do it. Without that, nothing changes.`
+      : `${noPlan}<@${userId}> asked me to ${action} ${target}.${unresolvedNote}${notes} ${ownerMentions}, reply \`${phrase}\` within 10 minutes and I'll do it. Without that, nothing changes.`;
     promptTs = await postGatePrompt(slack, {
       channel: channelId,
       thread_ts: threadTs,
@@ -1111,6 +1117,7 @@ async function runQuickAction(params: {
             action: 'merge',
             prUrls,
             requesterConfirms: { note: 'It only changes text and numbers, so your word is enough.' },
+            afterPlanner: true,
             logStep,
             signal,
           });
@@ -1173,6 +1180,7 @@ async function runQuickAction(params: {
             ? "I'll merge its base branch into it, a merge commit: I don't rebase or squash a branch with an open pull request."
             : undefined,
         ownerReason: contentMerge?.kind === 'owner' ? contentMerge.reason : undefined,
+        afterPlanner: !fromGate,
         logStep,
         signal,
       });

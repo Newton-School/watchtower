@@ -553,7 +553,7 @@ describe('merging a content-only marketing PR (#701)', () => {
       allowedUserIds: ['UBUILDER'],
     });
     expect(posted).toContainEqual(
-      `I read this as: merge ${MARKETING_PR}. It only changes text and numbers, so your word is enough. <@UBUILDER>, reply \`confirm merge\` within 10 minutes and I'll do it. Without that, nothing changes.`,
+      `No code change is needed, so there is no plan to approve. I read this as: merge ${MARKETING_PR}. It only changes text and numbers, so your word is enough. <@UBUILDER>, reply \`confirm merge\` within 10 minutes and I'll do it. Without that, nothing changes.`,
     );
     expect(ghExec).toHaveBeenCalledWith(mergeArgs('--admin'), 'ghs_test');
   });
