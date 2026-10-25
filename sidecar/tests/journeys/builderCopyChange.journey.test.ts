@@ -140,12 +140,10 @@ describe('journey 1: a builder takes a copy change from staging to live', () => 
     }
   });
 
-  // A natural way to say it right after testing: "looks good on staging, merge it". It isn't
-  // read as only a merge (#605's fast path), so it goes through the planner, and the planner path
-  // never takes the content-only merge (#701): the owner has to confirm a copy change a builder
-  // may merge. See the report: `runQuickAction` only runs `decideContentMerge` when
-  // `params.action === 'merge'` (implementationWorkflow.ts), i.e. on the fast path.
-  it.fails('merges on the builder’s word when they say "looks good on staging, merge it"', async () => {
+  // A natural way to say it right after testing: "looks good on staging, merge it". The gate
+  // takes a short approval before one of its sentences (#719), so it is only a merge and takes
+  // the content-only merge (#701) on the builder's word, with no planner and no owner.
+  it('merges on the builder’s word when they say "looks good on staging, merge it"', async () => {
     const { world } = journey;
     // The planner, asked about a merge, finds no code to change.
     edge.runCodex.mockResolvedValue({
@@ -160,11 +158,10 @@ describe('journey 1: a builder takes a copy change from staging to live', () => 
     expect(world.prs.get(PR)?.merged).toBe(true);
   });
 
-  // The same ask's first line promises a plan ("I'll post a plan for approval in a few
-  // minutes") that never comes: the planner finds nothing to change and it becomes a quick
-  // action. The opening line reads the message with `readPrActionAsk`, which doesn't see
-  // "looks good on staging, merge it" as a merge (taskRouter.ts, `acknowledgementText`).
-  it.fails('does not promise a plan for "looks good on staging, merge it"', async () => {
+  // The same ask's first line must not promise a plan ("I'll post a plan for approval in a few
+  // minutes"): the opening line reads the message with `readPrActionAsk`, which now sees it as
+  // a merge (#719).
+  it('does not promise a plan for "looks good on staging, merge it"', async () => {
     edge.runCodex.mockResolvedValue({
       ok: true,
       exitCode: 0,

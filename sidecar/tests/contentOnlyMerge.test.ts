@@ -530,12 +530,29 @@ describe('merging a content-only marketing PR (#701)', () => {
     expect(confirmPrompt(posted)).toContain(reason);
   });
 
-  it('does not skip the owner when the ask is more than the merge', async () => {
+  it('asks, and merges nothing, when the merge has a condition', async () => {
     const { logs } = await run('<@UBOT1> merge it once the copy is approved');
 
     expect(logs.map(entry => entry.stage)).not.toContain('implementation.quick_action.no_planner');
+    expect(logs.map(entry => entry.stage)).toContain('implementation.quick_action.unclear');
     expect(ghExec).not.toHaveBeenCalled();
-    expect(vi.mocked(__quickActionConfirm.wait).mock.calls[0][0].phrase).toBe('confirm merge');
+    expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
+  });
+
+  // #719: read by a planner rather than the strict gate, a content-only merge
+  // the requester may make waits for their own `confirm merge`, not the owner's.
+  it('asks the requester, not the owner, to confirm a content-only merge a planner read', async () => {
+    const { logs, posted } = await run('<@UBOT1> merge it, the copy got approved by marketing');
+
+    expect(logs.map(entry => entry.stage)).not.toContain('implementation.quick_action.no_planner');
+    expect(vi.mocked(__quickActionConfirm.wait).mock.calls[0][0]).toMatchObject({
+      phrase: 'confirm merge',
+      allowedUserIds: ['UBUILDER'],
+    });
+    expect(posted).toContainEqual(
+      `I read this as: merge ${MARKETING_PR}. It only changes text and numbers, so your word is enough. <@UBUILDER>, reply \`confirm merge\` within 10 minutes and I'll do it. Without that, nothing changes.`,
+    );
+    expect(ghExec).toHaveBeenCalledWith(mergeArgs('--admin'), 'ghs_test');
   });
 
   it('merges nothing once the run is cancelled, and hands the check the signal', async () => {

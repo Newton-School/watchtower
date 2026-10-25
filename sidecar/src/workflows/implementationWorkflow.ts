@@ -709,6 +709,11 @@ async function confirmQuickPrAction(params: {
   protectionNote?: string;
   /** Why the owner has to confirm a merge the requester could otherwise make (issue #701). */
   ownerReason?: string;
+  /**
+   * The requester confirms instead of the owner: a content-only merge they
+   * may make, read by a planner rather than the strict gate (issue #719).
+   */
+  requesterConfirms?: { note: string };
   logStep?: WorkflowStepLogger;
   signal?: AbortSignal;
 }): Promise<{ confirmedBy: string } | { result: WorkflowResult }> {
@@ -716,7 +721,7 @@ async function confirmQuickPrAction(params: {
   const { channelId, threadTs } = task.event;
   const userId = requesterOf(task);
   const phrase = `confirm ${action}`;
-  const owners = config.ownerSlackUserIds;
+  const owners = params.requesterConfirms ? [userId] : config.ownerSlackUserIds;
   const ownerMentions = owners.map(id => `<@${id}>`).join(' or ');
   const stop = (status: WorkflowResult['status'], message: string, slackPosted: boolean) => ({
     result: {
@@ -746,7 +751,9 @@ async function confirmQuickPrAction(params: {
   let promptTs: string | undefined;
   try {
     const notes = [protectionNote, ownerReason].map(note => (note ? ` ${note}` : '')).join('');
-    const confirmText = `<@${userId}> asked me to ${action} ${target}.${unresolvedNote}${notes} ${ownerMentions}, reply \`${phrase}\` within 10 minutes and I'll do it. Without that, nothing changes.`;
+    const confirmText = params.requesterConfirms
+      ? `I read this as: ${action} ${target}. ${params.requesterConfirms.note} <@${userId}>, reply \`${phrase}\` within 10 minutes and I'll do it. Without that, nothing changes.`
+      : `<@${userId}> asked me to ${action} ${target}.${unresolvedNote}${notes} ${ownerMentions}, reply \`${phrase}\` within 10 minutes and I'll do it. Without that, nothing changes.`;
     promptTs = await postGatePrompt(slack, {
       channel: channelId,
       thread_ts: threadTs,
@@ -763,8 +770,10 @@ async function confirmQuickPrAction(params: {
   }
   logStep?.({
     stage: 'implementation.quick_action.confirm.asked',
-    message: `Asked the owner to confirm: ${action} requested by <@${userId}>.`,
-    data: { action, prUrls, requestedBy: userId, promptTs },
+    message: params.requesterConfirms
+      ? `Asked <@${userId}> to confirm the ${action} they asked for.`
+      : `Asked the owner to confirm: ${action} requested by <@${userId}>.`,
+    data: { action, prUrls, requestedBy: userId, promptTs, confirmers: owners },
   });
 
   const confirmation = await __quickActionConfirm.wait({
@@ -786,7 +795,9 @@ async function confirmQuickPrAction(params: {
   const msg =
     confirmation.outcome === 'declined'
       ? 'Okay, leaving it as it is.'
-      : `No \`${phrase}\` from ${ownerMentions} in 10 minutes, so nothing was changed. Ask again when they're around.`;
+      : params.requesterConfirms
+        ? `No \`${phrase}\` in 10 minutes, so nothing was changed. Ask again when you're ready.`
+        : `No \`${phrase}\` from ${ownerMentions} in 10 minutes, so nothing was changed. Ask again when they're around.`;
   return stop('SKIPPED', msg, await say(msg));
 }
 type ImplementationStore = PipelineStore & {
@@ -862,7 +873,11 @@ async function runQuickAction(params: {
   if (!fromGate && prAction && !unclear) {
     const numbers = new Set([...rawWords.matchAll(/\b\d{2,}\b/g)].map(match => Number(match[0])));
     const byNumber = params.prs.filter(pr => numbers.has(pr.number));
-    const picked = pickPr(params.prs, byNumber.length === 1 ? byNumber[0].number : undefined);
+    // "merge it 9999" names a PR this thread doesn't know: ask, don't act on the one it does.
+    const picked =
+      numbers.size > 0 && byNumber.length === 0
+        ? undefined
+        : pickPr(params.prs, byNumber.length === 1 ? byNumber[0].number : undefined);
     if (picked) {
       prs = [picked];
       checkPr = picked;
@@ -1078,15 +1093,30 @@ async function runQuickAction(params: {
     const readByPlanner = !fromGate && prAction !== 'sync';
     if (!task.isOwnerAuthor || forSomeoneElse || rebaseAsked || readByPlanner) {
       const checks = prAction === 'merge' ? mergeChecks : undefined;
-      // A message that is only this merge, of a PR that only changes content,
-      // from someone who could have asked for the change: their word is the
-      // OK (issue #701).
+      // A merge of a PR that only changes content, from someone who could have
+      // asked for the change: their word is the OK (issue #701). A message that
+      // is only that merge merges at once; read by a planner, they confirm it
+      // with `confirm merge` first, which names the PR (issue #719).
       const githubToken = ctx.githubToken;
       const contentMerge =
-        params.action === 'merge' && checkPr && checks && githubToken
+        prAction === 'merge' && checkPr && checks && githubToken
           ? await decideContentMerge({ task, config, pr: checkPr, checks, githubToken, logStep, signal })
           : undefined;
       if (contentMerge?.kind === 'merge' && githubToken) {
+        if (!fromGate) {
+          if (signal?.aborted) return cancelledResult('IMPLEMENTATION');
+          const confirmed = await confirmQuickPrAction({
+            task,
+            config,
+            slack,
+            action: 'merge',
+            prUrls,
+            requesterConfirms: { note: 'It only changes text and numbers, so your word is enough.' },
+            logStep,
+            signal,
+          });
+          if ('result' in confirmed) return confirmed.result;
+        }
         return mergeContentOnlyPr({ task, config, slack, store, decision: contentMerge, githubToken, logStep, signal });
       }
       if (signal?.aborted) return cancelledResult('IMPLEMENTATION');

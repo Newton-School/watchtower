@@ -37,10 +37,12 @@ describe('readPrActionAsk', () => {
     ['<@UBOT1> merge the pr', 'merge'],
     ['<@UBOT1> can you merge this PR please?', 'merge'],
     ['<@UBOT1> could u merge it', 'merge'],
-    ['<@UBOT1> lgtm, squash and merge it 🙏', 'merge'],
-    ['<@UBOT1> merge it :pray:', 'merge'],
+    ['<@UBOT1> lgtm, squash and merge it', 'merge'],
     ['<@UBOT1> go ahead and merge it into main, thanks!', 'merge'],
-    ['<@UBOT1> merge it for me', 'merge'],
+    // #719: a short approval at the start, then exactly one of the gate's sentences.
+    ['<@UBOT1> looks good on staging, merge it', 'merge'],
+    ['<@UBOT1> perfect, go ahead and merge it', 'merge'],
+    ['<@UBOT1> great, merge it', 'merge'],
     ['<@UBOT1> sync it', 'sync'],
     ['<@UBOT1> sync the branch with master', 'sync'],
     ['<@UBOT1> sync it with the base branch', 'sync'],
@@ -155,19 +157,18 @@ describe('readPrActionAsk', () => {
   it.each([
     "<@UBOT1> bring that PR's branch up to date with master",
     '<@UBOT1> bring it up to date with main',
-    '<@UBOT1> get the branch up to date',
     '<@UBOT1> please update the branch',
     '<@UBOT1> update this PR with master',
     '<@UBOT1> merge master into it',
     '<@UBOT1> merge main into the branch please',
-    '<@UBOT1> catch it up with master',
   ])('reads %s as a sync', text => {
     expect(ask(text)).toEqual({ action: 'sync', pr: expect.objectContaining({ number: 1404 }) });
   });
 
-  it('reads a rebase as a sync', () => {
-    expect(ask('<@UBOT1> rebase it on master')).toMatchObject({ action: 'sync' });
-    expect(ask('<@UBOT1> rebase onto main')).toMatchObject({ action: 'sync' });
+  // A rebase runs as a merge of the base branch: the router and planner read it, and it is confirmed.
+  it('leaves a rebase to the router', () => {
+    expect(ask('<@UBOT1> rebase it on master')).toBeUndefined();
+    expect(ask('<@UBOT1> rebase onto main')).toBeUndefined();
   });
 
   it('reads the sync phrasings with the PR linked in the message', () => {
@@ -179,7 +180,6 @@ describe('readPrActionAsk', () => {
       `<@UBOT1> update the branch of ${link} with master`,
       `<@UBOT1> update the branch on ${link}`,
       `<@UBOT1> update ${link} with master`,
-      `<@UBOT1> pull master into ${linked.url}`,
     ]) {
       expect(ask(text, [linked]), text).toEqual({ action: 'sync', pr: expect.objectContaining({ number: 9437 }) });
     }
@@ -199,6 +199,25 @@ describe('readPrActionAsk', () => {
     '<@UBOT1> bring up to date thanks',
     '<@UBOT1> ~merge it~',
     '<@UBOT1> ~close~ merge it',
+    // #719 round 2: anything that isn't one of the gate's exact sentences.
+    '<@UBOT1> merge it :pray:',
+    '<@UBOT1> lgtm, squash and merge it 🙏',
+    '<@UBOT1> merge it for me',
+    '<@UBOT1> get the branch up to date',
+    '<@UBOT1> catch it up with master',
+    '<@UBOT1> thanks, the merge looks good',
+    '<@UBOT1> the merge looks good',
+    '<@UBOT1> merge request lgtm',
+    '<@UBOT1> the close looks good',
+    '<@UBOT1> ok the sync looks good',
+    '<@UBOT1> merge ok',
+    '<@UBOT1> merge?',
+    '<@UBOT1> "merge it"',
+    '<@UBOT1> `merge it`',
+    '<@UBOT1> merge it & close the ticket',
+    '<@UBOT1> merge it after QA',
+    '<@UBOT1> merge kar do',
+    '<@UBOT1> update this pr',
   ])('leaves %s to the router', text => {
     expect(ask(text)).toBeUndefined();
   });
@@ -254,6 +273,73 @@ describe('readQuickOperation', () => {
     ['sync it then close it', 'several'],
   ])('asks instead of acting on %s', (words, reason) => {
     expect(readQuickOperation(words)).toEqual({ kind: 'unclear', reason });
+  });
+
+  // #719 round 2 probes: none of these is ever read as a merge of the PR.
+  it.each([
+    'merge the latest changes from main into it',
+    'merge changes from master into this pr',
+    'merge codeword into this pr',
+    'merge origin slashword into it',
+    'merge upstream into it',
+    'merge develop into it',
+    'merge staging into this pr',
+    'merge slashword into this pr',
+    'merge the main branch into this pr',
+    'merge master in this pr',
+    'isme master merge kar do',
+    'master ko isme merge karo',
+    'main se merge kar do',
+    'master merge into it',
+    'merge the target branch into this pr',
+    'merge in the latest from master',
+    'merge it with the latest main',
+    'merge master changes',
+    'merge the base in',
+    'merge into it',
+  ])('never reads %s as a merge of the PR', words => {
+    expect(readQuickOperation(words)).not.toMatchObject({ kind: 'operation', action: 'merge' });
+  });
+
+  it.each([
+    'merge it after qa',
+    'merge once approved',
+    'merge it if ci is green',
+    'merge it later',
+    'merge it tomorrow',
+    'close it if its stale',
+    'merge baad mein karna',
+    'merge na karo abhi',
+    'abhi merge mat kar',
+    'you shouldnt merge it yet',
+    'we cant merge this until qa passes',
+    'cancel the merge',
+    'skip the merge for now',
+    'rather than merge, sync it',
+    "I'll merge it myself",
+    'Gaurav will merge it',
+    'Shiv said merge it',
+    'someone should merge it',
+    '&gt; merge it this is what he said',
+    '"merge it" is what the bot said earlier',
+    'ye pr merge मत करो',
+    'is it safe to merge',
+    'should i merge it',
+    'what does close do',
+  ])('does not pick an operation from %s', words => {
+    expect(readQuickOperation(words).kind).not.toBe('operation');
+  });
+
+  it.each(['thanks, the merge looks good', 'merge request lgtm', 'the close looks good', 'ok the sync looks good'])(
+    'reads no operation in the report %s',
+    words => {
+      expect(readQuickOperation(words)).toEqual({ kind: 'none' });
+    },
+  );
+
+  it('keeps "not needed" after close a close', () => {
+    expect(readQuickOperation('close this pr, not needed')).toMatchObject({ kind: 'operation', action: 'close' });
+    expect(readQuickOperation('close this pr, no longer needed')).toMatchObject({ kind: 'operation', action: 'close' });
   });
 
   it.each(['did you merge it?', 'u merge it?', 'you close it?'])('reads %s as a question', words => {

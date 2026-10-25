@@ -36,7 +36,9 @@ const REMOTE_BASE_RE = /\b(?:origin|upstream)\/(master|main)\b/gi;
  * "origin master". Other links are left to the caller.
  */
 export function prPlaceholders(text: string): string {
-  return text.replace(PR_URL_IN_TEXT_RE, ' this pr ').replace(REMOTE_BASE_RE, (_match, branch: string) => `origin ${branch}`);
+  return text
+    .replace(PR_URL_IN_TEXT_RE, ' this pr ')
+    .replace(REMOTE_BASE_RE, (_match, branch: string) => `origin ${branch}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -64,9 +66,13 @@ const GATE_TEMPLATES: Array<{ re: RegExp; action?: PrActionVerb }> = [
     action: 'sync',
   },
 ];
-/** Politeness taken off the start: thanks, please, and a request put to miniOG ("can you …"). */
+/**
+ * Taken off the start: a short approval ("looks good on staging, merge it",
+ * "perfect, go ahead and merge it"), please, and a request put to miniOG
+ * ("can you …"). Only at the start: "the merge looks good" is a report.
+ */
 const GATE_LEAD =
-  /^(?:(?:thanks|thank you|thx|ty) )?(?:(?:please|pls|plz|kindly) )?(?:((?:can|could|would|will) (?:you|u)) )?(?:(?:please|pls|plz|kindly) )?/;
+  /^(?:(?:looks good(?: on staging)?|lgtm|great|perfect|nice|awesome|ok|okay|cool|thanks|thank you|thx|ty) )?(?:(?:please|pls|plz|kindly) )?(?:go ahead and )?(?:((?:can|could|would|will) (?:you|u)) )?(?:(?:please|pls|plz|kindly) )?/;
 const GATE_TAIL = /(?: (?:please|pls|plz|thanks|thank you|thx|ty|now|asap))+$/;
 /**
  * Anything that may change what the words mean sends the message to the
@@ -115,7 +121,10 @@ export function readPrActionAsk(task: AskTask, addressees: PrActionAddressees): 
   const lead = GATE_LEAD.exec(core);
   // A question is a request only when it is put to miniOG: "can you merge it?", not "merge it?".
   if (question && !lead?.[1]) return undefined;
-  core = core.slice(lead?.[0].length ?? 0).replace(GATE_TAIL, '').trim();
+  core = core
+    .slice(lead?.[0].length ?? 0)
+    .replace(GATE_TAIL, '')
+    .trim();
 
   for (const template of GATE_TEMPLATES) {
     const match = template.re.exec(core);
@@ -246,8 +255,20 @@ const CONDITION =
   /\b(?:later|yet|until|till|after|once|if|unless|before|when|whenever|tomorrow|tonight|eod|baad|pehle|kal|ruk|ruko)\b/;
 /** "close it, it's not needed" negates the PR, not the verb. */
 const NOT_NEEDED = /\b(?:(?:it is|its|is|isnt|is not) )?(?:not|no longer) needed(?: anymore)?\b/g;
-/** Nouns, not orders: "the merge request looks good", "fix the merge conflict". */
-const OPERATION_NOUNS = /\b(?:(?:merge|pull) requests?|merge (?:conflicts?|button|queue|commit))\b/g;
+/** Nouns, not orders: "the merge request looks good", "fix the merge conflict", "thanks for the merge". */
+const OPERATION_NOUNS = [
+  /\b(?:(?:merge|pull) requests?|merge (?:conflicts?|button|queue|commit))\b/g,
+  /\b(?:the|that|this|a) (?:merge|sync|close)\b/g,
+  /\b(?:merge|sync|close) (?=(?:looks?|is|was|failed|fails|worked|works|went|button)\b)/g,
+];
+/** "is it safe to merge", "should I merge it", "what does close do": a question, with or without the mark. */
+const QUESTION_START =
+  /^(?:is|are|was|were|should|can we|could we|what|why|how|when|where|does|do|did|has|have|which|who)\b/;
+/** "I'll merge it myself", "Shiv said merge it", "someone should merge it": a report, not an order to miniOG. */
+const REPORT_SUBJECT =
+  /\b(?:i|ill|im|ive|we|well|he|she|they|someone|somebody|let me|said|says|asked|will|should|would|wants|wanted)\b/;
+/** "> merge it", "\"merge it\" is what the bot said": quoted words are someone else's. */
+const QUOTED = /&gt;|^\s*>|["“”]/;
 
 export interface SyncPhrase {
   /** The text with each sync phrasing replaced by "sync it". */
@@ -292,7 +313,10 @@ export type QuickOperation =
   /** The words name no pull-request operation. */
   | { kind: 'none' }
   /** They name one but can't be read safely. */
-  | { kind: 'unclear'; reason: 'negation' | 'condition' | 'several' | 'base_branch_merge' | 'other_script' }
+  | {
+      kind: 'unclear';
+      reason: 'negation' | 'condition' | 'several' | 'base_branch_merge' | 'other_script' | 'quoted' | 'report';
+    }
   /** A question about the pull request, not a request ("did you merge it?"). */
   | { kind: 'question' };
 
@@ -300,9 +324,14 @@ const OPERATION_WORDS = /\b(merge|close|revert|sync)\b/g;
 /** Whatever "merge" is followed by, only these are the pull request itself. */
 const MERGE_OF_THE_PR =
   /^merge(?: (?:it|this|this pr|the pr|that pr|this pull request|the pull request))?(?: (?:into|to) (?:master|main))?(?: (?:please|pls|now|thanks|thank you))*$/;
+/** A branch or source other than the pull request: "merge master", "master merge kar do", "merge `main`". */
+const BASE_WORDS =
+  /\b(?:master|main|develop|dev|staging|upstream|release|origin|latest|base|target|default|codeword|slashword)\b/;
 /** Something other than the pull request stands next to "merge": another branch, code, a source. */
-const MERGE_SOURCE =
-  /\bmerge\b.*\b(?:master|main|develop|dev|staging|upstream|release|origin|latest|changes|base|target|default|head|codeword|slashword|from|in)\b/;
+const MERGE_SOURCE = new RegExp(
+  `${BASE_WORDS.source}|\\bmerge (?:(?:it|this|this pr|the pr) )?(?:in|from)\\b|\\bchanges from\\b`,
+);
+const OPERATION_WORD = /\b(?:merge|close|revert|sync)\b/;
 /** "can you merge it?": a question put to miniOG is a request. */
 const REQUEST_QUESTION = /\b(?:can|could|would|will) (?:you|u)\b/;
 const QUESTION_MARK = /[?？؟¿]/;
@@ -319,25 +348,42 @@ export function readQuickOperation(words: string): QuickOperation {
   }
   // Struck-through words were taken back.
   const kept = words.replace(/~[^~]+~/g, ' ');
-  const cleaned = normalizeControlText(kept).replace(OPERATION_NOUNS, ' ').replace(NOT_NEEDED, ' ');
+  if (QUOTED.test(kept) && ANY_OPERATION_WORD.test(kept)) return { kind: 'unclear', reason: 'quoted' };
+  let cleaned = normalizeControlText(kept).replace(NOT_NEEDED, ' ');
+  for (const noun of OPERATION_NOUNS) cleaned = cleaned.replace(noun, ' ').replace(/\s+/g, ' ').trim();
   const sync = readSyncPhrase(cleaned);
   const plain = sync.text;
   const named = new Set([...plain.matchAll(OPERATION_WORDS)].map(match => match[1] as PrActionVerb | 'revert'));
-  // "sync up with me" is a meeting.
-  if (!sync.sync && /\bsync up\b/.test(plain)) named.delete('sync');
+  // "sync up with me" is a meeting; "sync the copy with the doc" is about the page.
+  if (
+    !sync.sync &&
+    /\bsync (?:up\b|(?!(?:it|this|that|the pr|this pr|that pr|the branch|this branch|its branch|branch|with|to|please|pls|now|thanks)\b)\w)/.test(
+      plain,
+    )
+  ) {
+    named.delete('sync');
+  }
   if (named.size === 0) return { kind: 'none' };
-  if (QUESTION_MARK.test(kept) && !REQUEST_QUESTION.test(plain)) return { kind: 'question' };
+  if ((QUESTION_MARK.test(kept) || QUESTION_START.test(plain)) && !REQUEST_QUESTION.test(plain)) {
+    return { kind: 'question' };
+  }
   if (NEGATION.test(plain)) return { kind: 'unclear', reason: 'negation' };
   if (CONDITION.test(plain)) return { kind: 'unclear', reason: 'condition' };
   if (named.size > 1) return { kind: 'unclear', reason: 'several' };
+  const verbAt = plain.search(OPERATION_WORD);
+  if (REPORT_SUBJECT.test(plain.slice(0, verbAt).replace(REQUEST_QUESTION, ' '))) {
+    return { kind: 'unclear', reason: 'report' };
+  }
   if (named.has('merge')) {
     const fromMerge = plain.slice(plain.search(/\bmerge\b/)).trim();
-    if (!MERGE_OF_THE_PR.test(fromMerge) && MERGE_SOURCE.test(fromMerge)) {
-      return { kind: 'unclear', reason: 'base_branch_merge' };
-    }
-    // "merge <something> into it": whatever it is, it goes into the PR, not the PR into its base.
-    const into = /\bmerge (.+?) (?:into|in to|to) /.exec(fromMerge);
-    if (into && !/^(?:it|this|this pr|the pr|that pr)$/.test(into[1])) {
+    const ofThePr = MERGE_OF_THE_PR.test(fromMerge) && !BASE_WORDS.test(plain.slice(0, verbAt));
+    if (!ofThePr && MERGE_SOURCE.test(plain)) return { kind: 'unclear', reason: 'base_branch_merge' };
+    // "merge <something> into it", "merge into it": it goes into the PR, not the PR into its base.
+    const into =
+      /\bmerge (?:(.+?) )?(?:into|in to|to) (?:it|this|this pr|the pr|that pr|the branch|this branch)\b/.exec(
+        fromMerge,
+      );
+    if (into && !/^(?:it|this|this pr|the pr|that pr)$/.test(into[1] ?? '')) {
       return { kind: 'unclear', reason: 'base_branch_merge' };
     }
   }
