@@ -951,10 +951,49 @@ describe('implementationWorkflow — words inside links are not the operation (#
     const { posted } = await run(`<@UBOT1> merge <${PR_URL}> once you have read ${ISSUE_LINK}`, { withPr: true });
     expect(__quickActionConfirm.wait).toHaveBeenCalledWith(expect.objectContaining({ phrase: 'confirm merge' }));
     expect(posted.some(text => text.includes('asked me to merge'))).toBe(true);
+    // The agent is told the one operation it may perform.
+    expect(vi.mocked(runCodex).mock.calls[1][0].prompt).toContain(
+      'The confirmed operation is `merge`; perform no other pull-request operation.',
+    );
   });
 
-  it('closes when asked to close, even beside a link labelled "revert"', async () => {
-    const { posted } = await run(`<@UBOT1> close it, see ${ISSUE_LINK}`, { withPr: true });
+  it('answers a question whose only "merge" is a link label', async () => {
+    const { result } = await run(
+      '<@UBOT1> what do <https://github.com/Newton-School/newton-web/issues/12|merge notes> say?',
+      { withPr: true },
+    );
+    expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
+    expect(result.workflow).toBe('INFORMATIONAL');
+  });
+
+  it('answers an ask about a typed branch name containing "merge"', async () => {
+    const { result } = await run(`<@UBOT1> what does fix/merge-banner change? see ${ISSUE_LINK}`, { withPr: true });
+    expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
+    expect(result.workflow).toBe('INFORMATIONAL');
+  });
+
+  it('answers an ask about a typed file name containing "close"', async () => {
+    const { result } = await run(`<@UBOT1> explain close-modal.tsx, see ${ISSUE_LINK}`, { withPr: true });
+    expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
+    expect(result.workflow).toBe('INFORMATIONAL');
+  });
+
+  it('still syncs when asked, beside a link', async () => {
+    const { posted } = await run(`<@UBOT1> sync it, see ${ISSUE_LINK}`, { withPr: true });
+    expect(__quickActionConfirm.wait).toHaveBeenCalledWith(expect.objectContaining({ phrase: 'confirm sync' }));
+    expect(posted.some(text => text.includes('asked me to sync'))).toBe(true);
+  });
+
+  it('still re-runs the tests when asked, beside a link', async () => {
+    const { result } = await run(`<@UBOT1> re-run the tests, see ${ISSUE_LINK}`, { withPr: true });
+    expect(runAgenticEntry).not.toHaveBeenCalled();
+    expect(runCodex).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(runCodex).mock.calls[1][0].prompt).not.toContain('The confirmed operation is');
+    expect(result.workflow).toBe('IMPLEMENTATION');
+  });
+
+  it('closes when asked to close, even after a link labelled "revert"', async () => {
+    const { posted } = await run(`<@UBOT1> see ${ISSUE_LINK} then close it`, { withPr: true });
     expect(__quickActionConfirm.wait).toHaveBeenCalledWith(expect.objectContaining({ phrase: 'confirm close' }));
     expect(posted.some(text => text.includes('asked me to close'))).toBe(true);
   });

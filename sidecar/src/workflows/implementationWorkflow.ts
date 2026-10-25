@@ -77,7 +77,7 @@ import {
   type WorkflowContext,
 } from './shared/workflowUtils.js';
 import { readPrActionAsk } from '../router/prActionAsk.js';
-import { stagingPlainText } from '../router/stagingTarget.js';
+import { guardWords } from '../router/stagingTarget.js';
 import { refreshSharedClones } from '../workspaces/staleCheckout.js';
 import { assertThreadParentExists } from '../slack/threadContext.js';
 import { runAgenticEntry } from '../agentic/agenticEntry.js';
@@ -733,9 +733,11 @@ async function runQuickAction(params: {
   action?: QuickPrAction;
 }): Promise<WorkflowResult> {
   const { task, config, slack, ctx, store, jobId, logStep, signal, plan, prs, checkPr } = params;
-  // The operation is read from the words alone: a link, its label or a
-  // mention naming "merge", "close" or "deploy" is not an instruction (#710).
-  const words = stagingPlainText(task.event.text);
+  // The operation is read from the words alone: a link, its label, a mention,
+  // a code span or a typed branch or file name ("fix/merge-banner",
+  // "close-modal.tsx") naming "merge", "close" or "deploy" is not an
+  // instruction (#710).
+  const words = guardWords(task.event.text).replace(/\S+\.[a-z0-9]{1,6}\b\S*/g, ' ');
   const prAction =
     params.action ?? (QUICK_ACTION_PR_ACTION_RE.exec(words)?.[1].toLowerCase() as QuickPrAction | undefined);
   const mergeIntent = params.action ? params.action === 'merge' : /\bmerge\b/i.test(words);
@@ -985,7 +987,7 @@ Never submit an approving review or request changes on a pull request (no \`gh p
     prUrls.length > 0
       ? `\n\nPull requests you may act on: ${prUrls.join(', ')}. Do not merge, close, revert or sync any other pull request.`
       : ''
-  }
+  }${prAction ? `\n\nThe confirmed operation is \`${prAction}\`; perform no other pull-request operation.` : ''}
 
 Slack thread context:
 ${ctx.threadContext}${ctx.imageContext}

@@ -72,7 +72,7 @@ export function stagingPlainText(text: string): string {
 }
 
 /** The words a guard reads: no links, and no ref-shaped tokens (`fix/prod-banner`, `` `x` ``). */
-function guardWords(text: string): string {
+export function guardWords(text: string): string {
   return stagingPlainText(text)
     .replace(/`[^`]*`/g, ' ')
     .replace(/\S*\/\S*/g, ' ')
