@@ -237,7 +237,7 @@ const KNOB_WORDS = new Set(
     'patterns selector selectors attr attrs attribute attributes token tokens secret secrets webhook webhooks offset ' +
     'offsets cutoff hour hours minute minutes limit limits max min type types slug slugs path paths route routes ' +
     'identifier identifiers verification verifications host hosts domain domains iframe iframes embed embeds action ' +
-    'actions source sources mode modes kind kinds redirect redirects callback callbacks'
+    'actions source sources mode modes kind kinds redirect redirects callback callbacks ab'
   ).split(' '),
 );
 /** The first word of a name that makes it a knob: `maxSeats`, `utmPageIdentifier`, `MIN_AGE`. */
@@ -401,9 +401,38 @@ const NUMBER_COPY_WORDS = new Set([
   'end',
 ]);
 
+/** Words that make a number logic whatever else the name says: `retryCount`, `percentRollout`, `statRadius`. */
+const NUMBER_KNOB_WORDS = new Set([
+  ...KNOB_WORDS,
+  'retry',
+  'retries',
+  'rollout',
+  'index',
+  'idx',
+  'attempt',
+  'attempts',
+  'split',
+  'weight',
+  'weights',
+  'bucket',
+  'buckets',
+  'offset',
+  'radius',
+  'size',
+  'width',
+  'height',
+  'step',
+  'steps',
+  'x',
+  'y',
+  'z',
+]);
+
+/** A number copy shows: `rating`, `studentCount`, `ratingStars`, `feeAmount`; not `seatsLeft` or `retryCount`. */
 function isNumberCopyKey(key: string): boolean {
+  if (isCopyKey(key)) return true;
   const words = nameWords(key);
-  return isCopyKey(key) || NUMBER_COPY_WORDS.has(words[0] ?? '') || endsWithWord(words, NUMBER_COPY_WORDS);
+  return NUMBER_COPY_WORDS.has(words[words.length - 1] ?? '') && !words.some(word => NUMBER_KNOB_WORDS.has(word));
 }
 
 /** Keys whose values are links or assets: `href`, `ctaHref`, `src`, `link`, `heroImage`, `videoUrl`. */
@@ -416,10 +445,18 @@ function isNavigationKey(key: string): boolean {
   return /(?:^|[a-z0-9])(?:href|link)$/i.test(key);
 }
 
-/** The host of an absolute link, lower-cased; undefined for a relative one. */
-function hostOf(value: string): string | undefined {
-  return /^(?:https?:)?\/\/([^/?#:]+)/i.exec(value.trim())?.[1]?.toLowerCase();
+/** The hosts of every absolute link in a value (`srcSet` lists several), lower-cased. */
+function hostsOf(value: string): string[] {
+  return [...value.matchAll(/(?:^|[\s,(])(?:https?:)?\/\/([^/?#:\s,)]+)/gi)].map(match => match[1].toLowerCase());
 }
+
+/** A key whose value is loaded into the page (an image, a PDF in a frame, a script), not followed. */
+function isLoadKey(keys: string[]): boolean {
+  return keys.some(isLinkKey) && !keys.some(isNavigationKey);
+}
+
+/** SVG elements whose `href` loads a resource rather than being a link: `<image href>`. */
+const SVG_LOADING_ELEMENTS = new Set(['image', 'use', 'feImage']);
 
 /** A one-word value shaped like an identifier under any key: `hero_contact_us`, `nav-request-callback`, `heroCta`. */
 const IDENTIFIER_SHAPE = /_|^[a-z][a-z0-9]*(?:-[a-z0-9]+)+$|^[a-z]+[A-Z][A-Za-z0-9]*$/;
@@ -546,6 +583,8 @@ function changedValueProblem(
   const nearest = after.keys[0] ?? '';
   const under = `under \`${nearest || '(no key)'}\``;
   if (after.kind === 'number') return isNumberCopyKey(nearest) ? undefined : `is a number ${under}`;
+  // A built link that loads something can't be checked for its host, so it never passes.
+  if (after.kind === 'template' && isLoadKey(after.keys)) return `is a built link ${under}`;
   if (after.kind !== 'string') return undefined;
   if (after.inArray && !isCopyKey(nearest) && !isListCopyKey(nearest)) return `is a list entry ${under}`;
   for (const { text } of [before, after]) {
@@ -565,12 +604,15 @@ function changedValueProblem(
     }
   }
   // A link that loads something (an image, a PDF in a frame) stays on its
-  // host or moves to one the site serves assets from. One you follow may go anywhere.
-  if (LINK_VALUE.test(after.text.trim()) && !after.keys.some(isNavigationKey)) {
-    const from = hostOf(before.text);
-    const to = hostOf(after.text);
-    if (to !== from && !(to && rules.assetHosts.includes(to)))
-      return `moves an asset to ${to ?? 'a path on this site'}`;
+  // hosts or moves to one the site serves assets from, every link in the
+  // value counted. One you follow may go anywhere.
+  if (isLoadKey(after.keys)) {
+    const from = new Set(hostsOf(before.text));
+    const moved = hostsOf(after.text).find(host => !from.has(host) && !rules.assetHosts.includes(host));
+    if (moved) return `moves an asset to ${moved}`;
+    if (LINK_VALUE.test(after.text.trim()) && from.size > 0 && hostsOf(after.text).length === 0) {
+      return 'moves an asset to a path on this site';
+    }
   }
   return undefined;
 }
@@ -596,6 +638,13 @@ function siblingAttributeText(ts: Ts, attribute: JsxAttribute, wanted: string): 
     return other.initializer && ts.isStringLiteral(other.initializer) ? other.initializer.text : undefined;
   }
   return undefined;
+}
+
+/** The key an attribute's value is held under; an SVG `<image href>` loads, so it is a `src`. */
+function attributeKey(ts: Ts, attribute: JsxAttribute): string {
+  const name = nameText(ts, attribute.name) ?? '';
+  const tag = tagNameOf(ts, attribute.parent.parent) ?? '';
+  return /^(?:href|xlinkHref|xlink:href)$/.test(name) && SVG_LOADING_ELEMENTS.has(tag) ? 'src' : name;
 }
 
 /**
@@ -653,13 +702,11 @@ function contentKeys(ts: Ts, node: Node, template = false): string[] | undefined
       // Up to the object literal holding this property.
       parent = parent.parent;
     } else if (ts.isJsxAttribute(parent)) {
-      return parent.initializer === child && isCopyAttribute(ts, parent)
-        ? [nameText(ts, parent.name) ?? '']
-        : undefined;
+      return parent.initializer === child && isCopyAttribute(ts, parent) ? [attributeKey(ts, parent)] : undefined;
     } else if (ts.isJsxExpression(parent)) {
       if (inContainer) return undefined;
       const holder = parent.parent;
-      if (ts.isJsxAttribute(holder)) return isCopyAttribute(ts, holder) ? [nameText(ts, holder.name) ?? ''] : undefined;
+      if (ts.isJsxAttribute(holder)) return isCopyAttribute(ts, holder) ? [attributeKey(ts, holder)] : undefined;
       if (ts.isJsxFragment(holder)) return ['text'];
       return ts.isJsxElement(holder) && !CODE_ELEMENTS.has(tagNameOf(ts, holder) ?? '') ? ['text'] : undefined;
     } else if (ts.isVariableDeclaration(parent)) {

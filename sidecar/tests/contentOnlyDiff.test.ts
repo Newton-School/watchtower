@@ -349,6 +349,37 @@ describe('differsOnlyInContent: copy by allow list', () => {
       data("widgetSrc: 'https://widget.example/embed.js'"),
       data("widgetSrc: 'https://evil.example/x.js'"),
     ],
+    // Final review: built links, every link in a value, and SVG images.
+    [
+      'a built image link moved off the CDN',
+      'export const A = ({ x }: { x: string }) => <img src={`' + CDN + '/${x}.webp`} alt="" />;',
+      'export const A = ({ x }: { x: string }) => <img src={`https://evil.example/${x}.webp`} alt="" />;',
+    ],
+    [
+      'a built image link that keeps its host',
+      'export const A = ({ x }: { x: string }) => <img src={`' + CDN + '/${x}.webp`} alt="" />;',
+      'export const A = ({ x }: { x: string }) => <img src={`' + CDN + '/v2/${x}.webp`} alt="" />;',
+    ],
+    [
+      'a built PDF link on a component',
+      'export const R = ({ id }: { id: string }) => <ReportViewer src={`' + CDN + '/${id}.pdf`} />;',
+      'export const R = ({ id }: { id: string }) => <ReportViewer src={`https://evil.example/${id}`} />;',
+    ],
+    [
+      'a second srcSet candidate moved off the CDN',
+      `export const A = () => <img srcSet="${CDN}/a.png 1x, ${CDN}/b.png 2x" alt="" />;`,
+      `export const A = () => <img srcSet="${CDN}/a.png 1x, https://evil.example/b.png 2x" alt="" />;`,
+    ],
+    [
+      'a srcSet that starts with a path',
+      `export const A = () => <img srcSet="/a.png 1x, ${CDN}/b.png 2x" alt="" />;`,
+      'export const A = () => <img srcSet="/a.png 1x, https://evil.example/b.png 2x" alt="" />;',
+    ],
+    [
+      'an SVG image moved off the CDN',
+      `export const A = () => <svg><image href="${CDN}/a.png" /></svg>;`,
+      'export const A = () => <svg><image href="https://evil.example/a.png" /></svg>;',
+    ],
   ])('turns down %s (item 2)', async (_case, before, after) => {
     expect(await change(before, after, 'a.tsx')).toBe(false);
   });
@@ -374,6 +405,16 @@ describe('differsOnlyInContent: copy by allow list', () => {
       'a link under `…Link`, to another site',
       data("caseStudyLink: 'https://a.example/x'"),
       data("caseStudyLink: 'https://b.example/y'"),
+    ],
+    [
+      'a srcSet whose candidates stay on the CDN',
+      `export const A = () => <img srcSet="${CDN}/a.png 1x, ${CDN}/b.png 2x" alt="" />;`,
+      `export const A = () => <img srcSet="${CDN}/a2.png 1x, ${CDN}/b2.png 2x" alt="" />;`,
+    ],
+    [
+      'a built link the reader follows',
+      'export const A = ({ x }: { x: string }) => <a href={`/courses/${x}`}>Go</a>;',
+      'export const A = ({ x }: { x: string }) => <a href={`/programs/${x}`}>Go</a>;',
     ],
   ])('keeps %s (item 2)', async (_case, before, after) => {
     expect(await change(before, after, 'a.tsx')).toBe(true);
@@ -457,15 +498,27 @@ describe('differsOnlyInContent: copy by allow list', () => {
       'export const X = { cohorts: { a: 0, b: 100 } };',
     ],
     ['a number in a list', 'export const X = { weights: [1, 2, 3] };', 'export const X = { weights: [1, 2, 9] };'],
+    // Final review: only the last word says a number is copy, and no word may be a knob.
+    ['a number whose first word only reads as copy', data('seatsLeft: 12'), data('seatsLeft: 0')],
+    ['a retry count', 'export const NET = { retryCount: 3 };', 'export const NET = { retryCount: 0 };'],
+    [
+      'a rollout percentage',
+      'export const FLAGS = { percentRollout: 10 };',
+      'export const FLAGS = { percentRollout: 100 };',
+    ],
+    ['an end index', 'export const LIST = { endIndex: 3 };', 'export const LIST = { endIndex: 30 };'],
+    ['a chart radius', 'export const CHART = { statRadius: 40 };', 'export const CHART = { statRadius: 4 };'],
+    ['a count in an A/B object', 'const HERO_AB = { percent: 50 };', 'const HERO_AB = { percent: 100 };'],
   ])('turns down %s (item 4)', async (_case, before, after) => {
     expect(await change(before, after)).toBe(false);
   });
 
   it.each([
     ['a rating', data('rating: 4.7'), data('rating: 4.8')],
-    ['a seat count', data('seatsLeft: 12'), data('seatsLeft: 8')],
+    ['a student count', data('studentCount: 12000'), data('studentCount: 15000')],
+    ['a star rating', data('ratingStars: 4'), data('ratingStars: 5')],
+    ['a fee amount', data('feeAmount: 150000'), data('feeAmount: 175000')],
     ['a fee', data('fee: 150000'), data('fee: 175000')],
-    ['years of experience', data('yearsOfExperience: 5'), data('yearsOfExperience: 6')],
     ['a count-up end', data("end: 93, suffix: '%'"), data("end: 98.3, suffix: '%'")],
     ['a number under a copy key', data('heading: 2026'), data('heading: 2027')],
   ])('keeps %s (item 4)', async (_case, before, after) => {
