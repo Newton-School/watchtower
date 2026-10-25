@@ -2332,3 +2332,99 @@ describe('a bare help request (suggestion 13)', () => {
     expect(slack.chat.postMessage.mock.calls[0][0].text).toContain("you're not on the access list");
   });
 });
+
+describe('a message that is only an operation on one pull request (issue #719)', () => {
+  const PR_URL = 'https://github.com/Newton-School/newton-web/pull/9437';
+  const PR_LINK = `<${PR_URL}|github.com/Newton-School/newton-web/pull/9437>`;
+  const pr = { url: PR_URL, owner: 'Newton-School', repo: 'newton-web', number: 9437 };
+
+  function prTask(
+    text: string,
+    source: 'trigger' | 'thread',
+    overrides: Partial<NormalizedTask> = {},
+    userId = 'UBUILDER',
+    channelId = 'C-BUILD',
+  ): NormalizedTask {
+    const task = makeTask({ userId, channelId, text, intent: 'IMPLEMENTATION' });
+    task.prContext = pr;
+    task.prContexts = [{ ...pr, source }];
+    return { ...task, ...overrides };
+  }
+
+  async function route(task: NormalizedTask, slack = makeSlack()) {
+    const logStep = vi.fn();
+    const result = await routeTask({
+      task,
+      config: makeConfig('enforce'),
+      slack: slack as never,
+      store: {} as never,
+      logStep,
+    });
+    const gate = logStep.mock.calls.map(call => call[0]).find(step => step.stage === 'router.pr_action_gate');
+    return { result, gate, slack };
+  }
+
+  it('runs "sync <PR link>" as the quick action, with no router call', async () => {
+    const { gate } = await route(prTask(`<@UBOT1> sync ${PR_LINK}`, 'trigger'));
+
+    expect(decideTool).not.toHaveBeenCalled();
+    expect(runAgenticPrReview).not.toHaveBeenCalled();
+    expect(runImplementationWorkflow).toHaveBeenCalledOnce();
+    expect(runImplementationWorkflow.mock.calls[0][0].task.intent).toBe('IMPLEMENTATION');
+    expect(gate?.data).toMatchObject({ action: 'sync', prUrl: PR_URL });
+  });
+
+  it.each([
+    ['<@UBOT1> merge it', 'thread', 'merge'],
+    [`<@UBOT1> close ${PR_LINK} please`, 'trigger', 'close'],
+    [`<@UBOT1> bring ${PR_LINK} up to date with master`, 'trigger', 'sync'],
+    ['<@UBOT1> update the branch', 'thread', 'sync'],
+    ['<@UBOT1> merge master into it', 'thread', 'sync'],
+  ] as const)('runs %s as %s straight away', async (text, source, action) => {
+    const { gate } = await route(prTask(text, source));
+    expect(decideTool).not.toHaveBeenCalled();
+    expect(runImplementationWorkflow).toHaveBeenCalledOnce();
+    expect(gate?.data).toMatchObject({ action });
+  });
+
+  it('takes an answer to its question that is only the operation the same way', async () => {
+    const answer = prTask("bring that PR's branch up to date with master", 'thread', {
+      clarification: { question: "I'm not sure what you'd like me to do here. What do you need?", askedText: '' },
+    });
+    const { gate, slack } = await route(answer);
+    expect(decideTool).not.toHaveBeenCalled();
+    expect(gate?.data).toMatchObject({ action: 'sync' });
+    // A quick action opens with no "I'll post a plan" line.
+    expect(slack.chat.postMessage.mock.calls.map(call => (call[0] as { text: string }).text)).not.toContainEqual(
+      expect.stringContaining('plan'),
+    );
+  });
+
+  it.each([
+    // A question about the pull request, not a request.
+    [`<@UBOT1> is ${PR_LINK} in sync with master?`, {}],
+    // A review is asked for: the router's review_pr.
+    [`<@UBOT1> review and merge ${PR_LINK}`, {}],
+    // More than the operation.
+    [`<@UBOT1> merge ${PR_LINK} and fix the typo in the footer`, {}],
+    // A change to the page, not to the branch.
+    [`<@UBOT1> update the copy on ${PR_LINK}`, {}],
+    // Addressed to the owner: the router reads a merge asked of the owner as a review.
+    [`<@UOWNER1> merge ${PR_LINK}`, { mentionType: 'owner' }],
+    // miniOG named in passing.
+    [`<@UOWNER1> can you sync ${PR_LINK}? cc <@UBOT1>`, { mentionReference: true }],
+  ] as Array<[string, Partial<NormalizedTask>]>)('leaves %s to the router', async (text, overrides) => {
+    const { gate } = await route(prTask(text, 'trigger', overrides));
+    expect(decideTool).toHaveBeenCalled();
+    expect(gate).toBeUndefined();
+  });
+
+  it('still tells someone without change rights that they cannot, and runs nothing', async () => {
+    const { result, slack } = await route(prTask(`<@UBOT1> sync ${PR_LINK}`, 'trigger', {}, 'UVIEWER', 'C-VIEW'));
+
+    expect(decideTool).not.toHaveBeenCalled();
+    expect(runImplementationWorkflow).not.toHaveBeenCalled();
+    expect(result.status).toBe('SKIPPED');
+    expect(slack.chat.postMessage).toHaveBeenCalledTimes(1);
+  });
+});

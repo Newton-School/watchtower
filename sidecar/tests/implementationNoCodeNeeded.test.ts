@@ -1013,4 +1013,35 @@ describe('implementationWorkflow — words inside links are not the operation (#
     expect(posted).not.toContain(QUICK_ACTION_APPROVE_REFUSAL);
     expect(result.workflow).toBe('INFORMATIONAL');
   });
+
+  // Issue #719: "bring that PR's branch up to date with master" was answered
+  // with "I can't update the branch", because only the word "sync" counted.
+  it("syncs when asked to bring the PR's branch up to date with master", async () => {
+    const { result, posted } = await run(`<@UBOT1> bring that PR's branch up to date with master, see ${ISSUE_LINK}`, {
+      withPr: true,
+    });
+    expect(runAgenticEntry).not.toHaveBeenCalled();
+    expect(__quickActionConfirm.wait).toHaveBeenCalledWith(expect.objectContaining({ phrase: 'confirm sync' }));
+    expect(posted.some(text => text.includes('asked me to sync'))).toBe(true);
+    expect(vi.mocked(runCodex).mock.calls[1][0].prompt).toContain('The confirmed operation is `sync`');
+    expect(result.workflow).toBe('IMPLEMENTATION');
+  });
+
+  it('reads "merge master into it" as a sync, never as merging the PR', async () => {
+    const { posted } = await run(`<@UBOT1> merge master into it, see ${ISSUE_LINK}`, { withPr: true });
+    expect(__quickActionConfirm.wait).toHaveBeenCalledWith(expect.objectContaining({ phrase: 'confirm sync' }));
+    expect(posted.some(text => text.includes('asked me to merge'))).toBe(false);
+  });
+
+  it('syncs on a rebase ask and tells the agent to say it merged instead', async () => {
+    await run(`<@UBOT1> rebase it on main, see ${ISSUE_LINK}`, { withPr: true });
+    expect(__quickActionConfirm.wait).toHaveBeenCalledWith(expect.objectContaining({ phrase: 'confirm sync' }));
+    expect(vi.mocked(runCodex).mock.calls[1][0].prompt).toContain('They asked for a rebase.');
+  });
+
+  it('still answers an ask to update the copy', async () => {
+    const { result } = await run(`<@UBOT1> what would updating the copy change? see ${ISSUE_LINK}`, { withPr: true });
+    expect(__quickActionConfirm.wait).not.toHaveBeenCalled();
+    expect(result.workflow).toBe('INFORMATIONAL');
+  });
 });

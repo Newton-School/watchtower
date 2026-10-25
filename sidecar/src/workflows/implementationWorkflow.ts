@@ -76,7 +76,7 @@ import {
   extractReplyFromCodexResult,
   type WorkflowContext,
 } from './shared/workflowUtils.js';
-import { readPrActionAsk } from '../router/prActionAsk.js';
+import { readPrActionAsk, readSyncPhrase } from '../router/prActionAsk.js';
 import { guardWords } from '../router/stagingTarget.js';
 import { refreshSharedClones } from '../workspaces/staleCheckout.js';
 import { assertThreadParentExists } from '../slack/threadContext.js';
@@ -737,7 +737,11 @@ async function runQuickAction(params: {
   // a code span or a typed branch or file name ("fix/merge-banner",
   // "close-modal.tsx") naming "merge", "close" or "deploy" is not an
   // instruction (#710).
-  const words = guardWords(task.event.text).replace(/\S+\.[a-z0-9]{1,6}\b\S*/g, ' ');
+  const linkFreeWords = guardWords(task.event.text).replace(/\S+\.[a-z0-9]{1,6}\b\S*/g, ' ');
+  // "bring it up to date with master", "merge main into it", "rebase on master":
+  // a sync, never a merge of the PR (issue #719).
+  const syncPhrase = readSyncPhrase(linkFreeWords);
+  const words = syncPhrase.sync ? syncPhrase.text : linkFreeWords;
   const prAction =
     params.action ?? (QUICK_ACTION_PR_ACTION_RE.exec(words)?.[1].toLowerCase() as QuickPrAction | undefined);
   const mergeIntent = params.action ? params.action === 'merge' : /\bmerge\b/i.test(words);
@@ -987,7 +991,11 @@ Never submit an approving review or request changes on a pull request (no \`gh p
     prUrls.length > 0
       ? `\n\nPull requests you may act on: ${prUrls.join(', ')}. Do not merge, close, revert or sync any other pull request.`
       : ''
-  }${prAction ? `\n\nThe confirmed operation is \`${prAction}\`; perform no other pull-request operation.` : ''}
+  }${prAction ? `\n\nThe confirmed operation is \`${prAction}\`; perform no other pull-request operation.` : ''}${
+    prAction === 'sync' && syncPhrase.rebase
+      ? '\n\nThey asked for a rebase. Merge the base branch in instead, because a branch with an open pull request is never rebased, and say so in one short sentence.'
+      : ''
+  }
 
 Slack thread context:
 ${ctx.threadContext}${ctx.imageContext}

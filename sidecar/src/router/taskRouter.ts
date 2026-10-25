@@ -280,10 +280,21 @@ export async function routeTask(params: {
    * became a change_code question ("change something, or only look into it?").
    */
   const stagingAsked = directAsk && !helpRequested && isMarketingStagingDeployAsk(userMessage);
+  /**
+   * A message that is only an operation on one pull request ("merge it",
+   * "sync <PR link>"): the change workflow's fast path runs it with no router
+   * and no planner (issue #605). Left to the router, "sync <PR link>" once read
+   * as a review and got a question instead (issue #719). Owner tags still go
+   * to the router, which reads a merge asked of the owner as a review.
+   */
+  const prActionAsk =
+    directAsk && !helpRequested && !stagingAsked
+      ? readPrActionAsk(task, { botUserId: config.botUserId, ownerUserIds: config.ownerSlackUserIds })
+      : undefined;
   // STAGING_DEPLOY is seeded only by an answer to the staging tool's "which
   // PR or branch?" (pausedResume.ts): nothing for a model to read.
   const routerShadow =
-    helpRequested || stagingAsked || task.intent === 'STAGING_DEPLOY'
+    helpRequested || stagingAsked || prActionAsk || task.intent === 'STAGING_DEPLOY'
       ? undefined
       : startRouterShadow({ task, userMessage, reviewedPrInThread, logStep, signal });
   let legacyDecidedBy: LegacyDecidedBy = 'gate';
@@ -337,6 +348,14 @@ export async function routeTask(params: {
         stage: 'router.staging_gate',
         message: 'A marketing staging deploy ask — putting it on staging, no model run.',
         data: { userMessage },
+      });
+    } else if (prActionAsk) {
+      // What the router's change_code runs as, so the fast path sees the same task.
+      resolvedIntent = 'IMPLEMENTATION';
+      logStep?.({
+        stage: 'router.pr_action_gate',
+        message: `Only "${prActionAsk.action}" on one pull request — straight to the quick action, no model run.`,
+        data: { userMessage, action: prActionAsk.action, prUrl: prActionAsk.pr.url },
       });
     } else if (
       looksLikeFixAffirmation(userMessage) &&

@@ -72,7 +72,58 @@ const BENEFICIARIES = new Set(['me', 'us']);
 
 const PR_URL_RE = /^https?:\/\/(?:www\.)?github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/(\d+)(?:[/?#][^\s]*)?$/i;
 
-export type PrActionAsk = { action: PrActionVerb; pr: PrContext };
+// The other ways people ask for a sync (issue #719), read on normalizeControlText's
+// output: "bring that PR's branch up to date with master" arrives as "bring that prs
+// branch up to date with master". Each object is the pull request or its branch, so
+// "update the copy" or "get the docs up to date" is never a sync.
+const DET = '(?:the|this|that|its|my|our|your)';
+const PR_NOUN = '(?:prs|pr|pull requests|pull request)';
+const SYNC_OBJECT = `(?:it|this|that|${DET} ${PR_NOUN} branch|${DET} branch|${DET} ${PR_NOUN}|${PR_NOUN} branch|branch)`;
+const BASE_BRANCH = '(?:(?:the )?base(?: branch)?|master|main|latest)';
+/** Where a branch-shaped "update" has to stop, so "update the branch name" is not a sync. */
+const PHRASE_END = '(?=$| please| pls| now| thanks| thank you)';
+const SYNC_PHRASES = [
+  new RegExp(`\\b(?:bring|get)(?: ${SYNC_OBJECT})? up to date(?: with ${BASE_BRANCH})?\\b`, 'g'),
+  new RegExp(`\\bupdate (?:${DET} )?(?:${PR_NOUN} )?branch with ${BASE_BRANCH}\\b`, 'g'),
+  new RegExp(`\\bupdate (?:${DET} )?(?:${PR_NOUN} )?branch${PHRASE_END}`, 'g'),
+  new RegExp(`\\bupdate (?:it|this|that|${DET} ${PR_NOUN}|${PR_NOUN}) with ${BASE_BRANCH}\\b`, 'g'),
+  new RegExp(`\\bmerge (?:in )?${BASE_BRANCH} (?:into|in to) ${SYNC_OBJECT}\\b`, 'g'),
+  new RegExp(`\\bmerge (?:in ${BASE_BRANCH}|${BASE_BRANCH} in)${PHRASE_END}`, 'g'),
+  new RegExp(`\\bcatch(?: ${SYNC_OBJECT})? up with ${BASE_BRANCH}\\b`, 'g'),
+];
+/** miniOG merges the base in and never rebases a branch with an open PR: a rebase ask is a sync. */
+const REBASE_PHRASES = [
+  new RegExp(`\\brebase(?: ${SYNC_OBJECT})? (?:on|onto|with|against) ${BASE_BRANCH}\\b`, 'g'),
+  new RegExp(`\\brebase ${SYNC_OBJECT}\\b`, 'g'),
+  new RegExp(`\\brebase${PHRASE_END}`, 'g'),
+];
+const NEGATION = /\b(?:dont|do not|never|not|no|without)\b/;
+
+export interface SyncPhrase {
+  /** The text with each sync phrasing replaced by "sync it". */
+  text: string;
+  sync: boolean;
+  /** The person asked for a rebase; the sync merges the base in instead. */
+  rebase: boolean;
+}
+
+/**
+ * Reads "bring it up to date with master", "update the branch", "merge main
+ * into it", "catch up with master" and "rebase on master" as a sync. Anything
+ * with a negation is left as it is: "don't rebase, merge it" is not a sync.
+ */
+export function readSyncPhrase(text: string): SyncPhrase {
+  const normalized = normalizeControlText(text);
+  if (NEGATION.test(normalized)) return { text: normalized, sync: false, rebase: false };
+  let rewritten = normalized;
+  for (const phrase of SYNC_PHRASES) rewritten = rewritten.replace(phrase, 'sync it');
+  const beforeRebase = rewritten;
+  for (const phrase of REBASE_PHRASES) rewritten = rewritten.replace(phrase, 'sync it');
+  const rebase = rewritten !== beforeRebase;
+  return { text: rewritten, sync: rewritten !== normalized, rebase };
+}
+
+export type PrActionAsk = { action: PrActionVerb; pr: PrContext; rebase?: boolean };
 
 /** Who the message may mention: miniOG, and the owner when tagging the owner is how the ask reached it. */
 export type PrActionAddressees = { botUserId: string; ownerUserIds: string[] };
@@ -90,7 +141,9 @@ export function readPrActionAsk(task: AskTask, addressees: PrActionAddressees): 
   if (text === undefined) return undefined;
   // "merge मत करो" is "don't merge"; normalizeControlText would keep only "merge".
   if (/[^\P{L}a-zA-Z]/u.test(text)) return undefined;
-  const words = normalizeControlText(text).split(' ').filter(Boolean);
+  // "bring it up to date with master" and the like are a sync (issue #719).
+  const syncPhrase = readSyncPhrase(text);
+  const words = syncPhrase.text.split(' ').filter(Boolean);
   // "merge?", "can it merge?": a question, unless it is put to miniOG ("can you merge it?").
   if (/[?？]/.test(text) && !words.some(word => ADDRESSEE.has(word))) return undefined;
 
@@ -120,7 +173,9 @@ export function readPrActionAsk(task: AskTask, addressees: PrActionAddressees): 
   }
   if (actions.size !== 1 || numbers.size > 1) return undefined;
   const pr = targetPr(task, numbers.size === 1 ? [...numbers][0] : undefined);
-  return pr ? { action: [...actions][0], pr } : undefined;
+  if (!pr) return undefined;
+  const action = [...actions][0];
+  return action === 'sync' && syncPhrase.rebase ? { action, pr, rebase: true } : { action, pr };
 }
 
 /**

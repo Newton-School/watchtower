@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { readPrActionAsk } from '../src/router/prActionAsk.js';
+import { readPrActionAsk, readSyncPhrase } from '../src/router/prActionAsk.js';
 import { mergeProtectionNote } from '../src/workflows/implementationWorkflow.js';
 import { fetchChecksState, fetchMergeState, fetchUnresolvedReviewThreadCount } from '../src/github/prReviewComments.js';
 import type { NormalizedTask, PrTarget } from '../src/types/contracts.js';
@@ -68,7 +68,7 @@ describe('readPrActionAsk', () => {
     '<@UBOT1> approve and merge',
     '<@UBOT1> revert this PR',
     '<@UBOT1> close the issue',
-    '<@UBOT1> merge main into it',
+    // "merge main into it" is a sync now (#719), never a merge of the PR.
     '<@UBOT1> merge constructor',
     '<@UBOT1> merge toString',
     '<@UBOT1> thanks!',
@@ -149,6 +149,55 @@ describe('readPrActionAsk', () => {
     expect(ask(`<@UBOT1> merge <${syncTool.url}|sync-tool#3>`, [syncTool])).toMatchObject({ action: 'merge' });
     expect(ask(`<@UBOT1> merge ${syncTool.url}`, [syncTool])).toMatchObject({ action: 'merge' });
     expect(ask('merge it\n*Sent using* <@UOTHER>')).toMatchObject({ action: 'merge' });
+  });
+
+  // Issue #719: "bring that PR's branch up to date with master" got "I can't update the branch".
+  it.each([
+    "<@UBOT1> bring that PR's branch up to date with master",
+    '<@UBOT1> bring it up to date with main',
+    '<@UBOT1> get the branch up to date',
+    '<@UBOT1> please update the branch',
+    '<@UBOT1> update this PR with master',
+    '<@UBOT1> merge master into it',
+    '<@UBOT1> merge main into the branch please',
+    '<@UBOT1> catch it up with master',
+  ])('reads %s as a sync', text => {
+    expect(ask(text)).toEqual({ action: 'sync', pr: expect.objectContaining({ number: 1404 }) });
+  });
+
+  it('reads a rebase as a sync, and says it was a rebase', () => {
+    expect(ask('<@UBOT1> rebase it on master')).toMatchObject({ action: 'sync', rebase: true });
+    expect(ask('<@UBOT1> rebase onto main')).toMatchObject({ action: 'sync', rebase: true });
+  });
+
+  it.each([
+    // The page, not the branch.
+    '<@UBOT1> update the copy',
+    '<@UBOT1> get the docs up to date',
+    // More than the sync.
+    '<@UBOT1> update the branch name to fix/hero',
+    // A negation is the planner's to read.
+    "<@UBOT1> don't rebase it, merge master in",
+    // Merging the PR into master is a merge, not a sync.
+  ])('does not read %s as a sync', text => {
+    expect(ask(text)?.action).not.toBe('sync');
+  });
+
+  it('keeps "merge it into master" a merge of the PR', () => {
+    expect(ask('<@UBOT1> merge it into master')).toMatchObject({ action: 'merge' });
+  });
+});
+
+describe('readSyncPhrase', () => {
+  it('rewrites each phrasing to "sync it" and leaves other text alone', () => {
+    expect(readSyncPhrase('Can you bring the branch up to date with master?')).toEqual({
+      text: 'can you sync it',
+      sync: true,
+      rebase: false,
+    });
+    expect(readSyncPhrase('please re-run the tests')).toMatchObject({ sync: false, rebase: false });
+    expect(readSyncPhrase('rebase it')).toMatchObject({ sync: true, rebase: true });
+    expect(readSyncPhrase('never rebase it')).toMatchObject({ sync: false, rebase: false });
   });
 });
 
