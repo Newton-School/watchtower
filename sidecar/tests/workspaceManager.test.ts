@@ -417,24 +417,53 @@ describe('refreshSharedRepoToDefaultBranch', () => {
     expect(state?.headDate).toMatch(/^\d{4}-\d{2}-\d{2}$/);
   });
 
+  it('records when the clone last fetched, from FETCH_HEAD', async () => {
+    const state = await refreshSharedRepoToDefaultBranch(repo);
+    expect(state?.lastFetched).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+  });
+
+  it('retries a fetch that fails once, so a fetch racing another one is not reported as failed', async () => {
+    const good = await git(repo, ['remote', 'get-url', 'origin']);
+    await git(repo, ['remote', 'set-url', 'origin', path.join(os.tmpdir(), 'wt-no-such-remote')]);
+    const refreshing = refreshSharedRepoToDefaultBranch(repo, { fetchRetryMs: 400 });
+    // The first try fails at once; the remote is back before the retry.
+    await new Promise(resolve => setTimeout(resolve, 150));
+    await git(repo, ['remote', 'set-url', 'origin', good]);
+
+    const state = await refreshing;
+
+    expect(state?.staleReason).toBeUndefined();
+    expect(state).toMatchObject({ behind: 0 });
+  });
+
   // Issue #709: an agent's leftover package.json edit held newton-web's clone
   // on a May commit, 783 commits behind, until someone stashed it by hand.
   describe('sets aside stray changes in the way (issue #709)', () => {
     const HOUR_AGO = (Date.now() - 60 * 60 * 1000) / 1000;
     const age = (file: string) => fs.utimesSync(path.join(repo, file), HOUR_AGO, HOUR_AGO);
-    const advanceOrigin = async (files: Record<string, string>) => {
+    const advanceOrigin = async (files: Record<string, string>, remove: string[] = []) => {
       for (const [name, content] of Object.entries(files)) {
         fs.mkdirSync(path.dirname(path.join(seed, name)), { recursive: true });
         await writeFile(path.join(seed, name), content);
       }
+      if (remove.length > 0) await git(seed, ['rm', '-q', ...remove]);
       await git(seed, ['add', '.']);
       await git(seed, ['commit', '-qm', 'origin moves on']);
       await git(seed, ['push', '-q', 'origin', 'main']);
       return git(seed, ['rev-parse', 'HEAD']);
     };
     const stashList = async () => (await git(repo, ['stash', 'list', '--format=%H %gs'])).split('\n').filter(Boolean);
+    const autostashRefs = async () =>
+      (await git(repo, ['for-each-ref', '--format=%(refname)', 'refs/miniog/autostash'])).split('\n').filter(Boolean);
+    const caseInsensitiveFs = (() => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wt-case-'));
+      fs.writeFileSync(path.join(dir, 'A'), '');
+      const insensitive = fs.existsSync(path.join(dir, 'a'));
+      fs.rmSync(dir, { recursive: true, force: true });
+      return insensitive;
+    })();
 
-    it('stashes an old uncommitted edit, updates, and says where the edit went', async () => {
+    it('sets aside an old uncommitted edit under a private ref and a patch, updates, and says where it went', async () => {
       await writeFile(path.join(repo, 'file.txt'), 'agent leftover\n');
       age('file.txt');
       const latest = await advanceOrigin({ 'file.txt': 'B\n' });
@@ -445,19 +474,45 @@ describe('refreshSharedRepoToDefaultBranch', () => {
       expect(fs.readFileSync(path.join(repo, 'file.txt'), 'utf8')).toBe('B\n');
       expect(state).toMatchObject({ branch: 'main', behind: 0 });
       expect(state?.staleReason).toBeUndefined();
-      expect(state?.setAside?.files).toEqual(['file.txt']);
-      expect(state?.setAside?.label).toMatch(
-        /^miniog-autostash .* \(#709\): 1 file in the way of the update: file\.txt$/,
+      const setAside = state!.setAside!;
+      expect(setAside.files).toEqual(['file.txt']);
+      expect(setAside.label).toMatch(
+        /^miniog-autostash \S+ \(#709\): 1 uncommitted file set aside so the clone could update: file\.txt$/,
       );
-      // Nothing is lost: the edit is in the stash under that label.
-      const entries = await stashList();
-      expect(entries).toHaveLength(1);
-      expect(entries[0]).toContain(state!.setAside!.stash);
-      expect(entries[0]).toContain('miniog-autostash');
-      expect(await git(repo, ['show', `${state!.setAside!.stash}:file.txt`])).toBe('agent leftover');
+      // Kept under a private ref, out of the stash list the clone's worktrees share.
+      expect(setAside.ref).toMatch(/^refs\/miniog\/autostash\//);
+      expect(await git(repo, ['rev-parse', setAside.ref])).toBe(setAside.stash);
+      expect(await stashList()).toEqual([]);
+      expect(await git(repo, ['show', `${setAside.ref}:file.txt`])).toBe('agent leftover');
+      // And a patch copy under ~/.watchtower/autostash/<repo>/.
+      expect(setAside.patch).toContain(path.join(TEST_HOME, '.watchtower', 'autostash'));
+      expect(fs.readFileSync(setAside.patch!, 'utf8')).toContain('+agent leftover');
+      // `git stash show -p <ref>` shows what was set aside.
+      expect(await git(repo, ['stash', 'show', '-p', setAside.ref])).toContain('+agent leftover');
     });
 
-    it('stashes an untracked file the update would add, and leaves other untracked files alone', async () => {
+    it("never hands the set-aside changes to a worktree's `git stash pop`", async () => {
+      // Job worktrees are made from these clones and share their stash list.
+      const wt = await mkdtemp(path.join(os.tmpdir(), 'wt-job-'));
+      fs.rmSync(wt, { recursive: true, force: true });
+      await git(repo, ['worktree', 'add', '-q', '-b', 'job', wt]);
+      try {
+        await writeFile(path.join(repo, 'file.txt'), 'agent leftover\n');
+        age('file.txt');
+        await advanceOrigin({ 'file.txt': 'B\n' });
+
+        const state = await refreshSharedRepoToDefaultBranch(repo, { setAsideStrayChanges: true });
+
+        expect(state?.setAside).toBeDefined();
+        expect(await git(wt, ['stash', 'list'])).toBe('');
+        await expect(git(wt, ['stash', 'pop'])).rejects.toThrow();
+        expect(fs.readFileSync(path.join(wt, 'file.txt'), 'utf8')).toBe('A\n');
+      } finally {
+        await git(repo, ['worktree', 'remove', '--force', wt]).catch(() => undefined);
+      }
+    });
+
+    it('sets aside an untracked file the update would add, and leaves other untracked files alone', async () => {
       await writeFile(path.join(repo, 'new.txt'), 'local copy\n');
       await writeFile(path.join(repo, 'notes.txt'), 'unrelated scratch\n');
       age('new.txt');
@@ -470,8 +525,65 @@ describe('refreshSharedRepoToDefaultBranch', () => {
       expect(state?.setAside?.files).toEqual(['new.txt']);
       expect(fs.readFileSync(path.join(repo, 'new.txt'), 'utf8')).toBe('from origin\n');
       expect(fs.readFileSync(path.join(repo, 'notes.txt'), 'utf8')).toBe('unrelated scratch\n');
-      // An untracked file is kept in the stash's third parent.
-      expect(await git(repo, ['show', `${state!.setAside!.stash}^3:new.txt`])).toBe('local copy');
+      // An untracked file is kept in the stash commit's third parent, and in the patch.
+      expect(await git(repo, ['show', `${state!.setAside!.ref}^3:new.txt`])).toBe('local copy');
+      expect(fs.readFileSync(state!.setAside!.patch!, 'utf8')).toContain('+local copy');
+    });
+
+    it('only moves edits to files the update changes; the rest stay and are named', async () => {
+      await writeFile(path.join(repo, 'other.txt'), 'O\n');
+      await git(repo, ['add', 'other.txt']);
+      await git(repo, ['commit', '-qm', 'other']);
+      await git(repo, ['push', '-q', 'origin', 'main']);
+      await git(seed, ['pull', '-q', 'origin', 'main']);
+      await writeFile(path.join(repo, 'file.txt'), 'in the way\n');
+      await writeFile(path.join(repo, 'other.txt'), 'not in the way\n');
+      age('file.txt');
+      age('other.txt');
+      const latest = await advanceOrigin({ 'file.txt': 'B\n' });
+
+      const state = await refreshSharedRepoToDefaultBranch(repo, { setAsideStrayChanges: true });
+
+      expect(await git(repo, ['rev-parse', 'HEAD'])).toBe(latest);
+      expect(state?.setAside?.files).toEqual(['file.txt']);
+      expect(fs.readFileSync(path.join(repo, 'other.txt'), 'utf8')).toBe('not in the way\n');
+      expect(state).toMatchObject({ leftInPlace: ['other.txt'], leftInPlaceCount: 1 });
+    });
+
+    it('handles a staged deletion of a file the update changes', async () => {
+      await git(repo, ['rm', '-q', 'file.txt']);
+      const latest = await advanceOrigin({ 'file.txt': 'B\n' });
+
+      const state = await refreshSharedRepoToDefaultBranch(repo, { setAsideStrayChanges: true });
+
+      expect(await git(repo, ['rev-parse', 'HEAD'])).toBe(latest);
+      expect(fs.readFileSync(path.join(repo, 'file.txt'), 'utf8')).toBe('B\n');
+      expect(state?.setAside?.files).toEqual(['file.txt']);
+      // The deletion is what was saved.
+      await expect(git(repo, ['show', `${state!.setAside!.ref}:file.txt`])).rejects.toThrow();
+    });
+
+    it('sees a file origin renamed into place as in the way', async () => {
+      await writeFile(path.join(repo, 'moved.txt'), 'local file with the new name\n');
+      age('moved.txt');
+      await git(seed, ['mv', 'file.txt', 'moved.txt']);
+      const latest = await advanceOrigin({});
+
+      const state = await refreshSharedRepoToDefaultBranch(repo, { setAsideStrayChanges: true });
+
+      expect(await git(repo, ['rev-parse', 'HEAD'])).toBe(latest);
+      expect(state?.setAside?.files).toEqual(['moved.txt']);
+    });
+
+    it.skipIf(!caseInsensitiveFs)('matches paths without case on a case-insensitive disk', async () => {
+      await writeFile(path.join(repo, 'New.txt'), 'local, different case\n');
+      age('New.txt');
+      const latest = await advanceOrigin({ 'new.txt': 'from origin\n' });
+
+      const state = await refreshSharedRepoToDefaultBranch(repo, { setAsideStrayChanges: true });
+
+      expect(await git(repo, ['rev-parse', 'HEAD'])).toBe(latest);
+      expect(state?.setAside?.files).toEqual(['New.txt']);
     });
 
     it('leaves a change made in the last 15 minutes where it is', async () => {
@@ -485,6 +597,37 @@ describe('refreshSharedRepoToDefaultBranch', () => {
       expect(fs.readFileSync(path.join(repo, 'file.txt'), 'utf8')).toBe('someone is editing this right now\n');
       expect(state).toMatchObject({ staleReason: 'dirty_tree', setAsideSkipped: 'recent_edits', behind: 1 });
       expect(await stashList()).toEqual([]);
+      expect(await autostashRefs()).toEqual([]);
+    });
+
+    it('names a recently added untracked file that is in the way', async () => {
+      await writeFile(path.join(repo, 'new.txt'), 'just written\n');
+      await advanceOrigin({ 'new.txt': 'from origin\n' });
+
+      const state = await refreshSharedRepoToDefaultBranch(repo, { setAsideStrayChanges: true });
+
+      expect(state).toMatchObject({
+        staleReason: 'dirty_tree',
+        dirtyFiles: ['new.txt'],
+        setAsideSkipped: 'recent_edits',
+      });
+      expect(fs.readFileSync(path.join(repo, 'new.txt'), 'utf8')).toBe('just written\n');
+    });
+
+    it('leaves the clone alone while a git command holds its index', async () => {
+      await writeFile(path.join(repo, 'file.txt'), 'leftover\n');
+      age('file.txt');
+      await advanceOrigin({ 'file.txt': 'B\n' });
+      fs.writeFileSync(path.join(repo, '.git', 'index.lock'), '');
+      try {
+        const state = await refreshSharedRepoToDefaultBranch(repo, { setAsideStrayChanges: true });
+
+        expect(state).toMatchObject({ staleReason: 'dirty_tree', setAsideSkipped: 'busy' });
+        expect(fs.readFileSync(path.join(repo, 'file.txt'), 'utf8')).toBe('leftover\n');
+        expect(await autostashRefs()).toEqual([]);
+      } finally {
+        fs.rmSync(path.join(repo, '.git', 'index.lock'), { force: true });
+      }
     });
 
     it('never touches a clone with local commits', async () => {
@@ -501,7 +644,7 @@ describe('refreshSharedRepoToDefaultBranch', () => {
       expect(await git(repo, ['rev-parse', 'HEAD'])).toBe(local);
       expect(fs.readFileSync(path.join(repo, 'file.txt'), 'utf8')).toBe('and an edit\n');
       expect(state?.setAside).toBeUndefined();
-      expect(await stashList()).toEqual([]);
+      expect(await autostashRefs()).toEqual([]);
     });
 
     it('never touches a clone checked out on another branch', async () => {
@@ -514,7 +657,7 @@ describe('refreshSharedRepoToDefaultBranch', () => {
 
       expect(state).toMatchObject({ branch: 'feature/x', staleReason: 'other_branch' });
       expect(fs.readFileSync(path.join(repo, 'file.txt'), 'utf8')).toBe('wip\n');
-      expect(await stashList()).toEqual([]);
+      expect(await autostashRefs()).toEqual([]);
     });
 
     it('only acts on the clone itself, not on a folder inside it', async () => {
@@ -527,7 +670,7 @@ describe('refreshSharedRepoToDefaultBranch', () => {
 
       expect(state?.setAside).toBeUndefined();
       expect(fs.readFileSync(path.join(repo, 'file.txt'), 'utf8')).toBe('leftover\n');
-      expect(await stashList()).toEqual([]);
+      expect(await autostashRefs()).toEqual([]);
     });
 
     it('does nothing unless asked: other callers keep the old report', async () => {
@@ -542,10 +685,11 @@ describe('refreshSharedRepoToDefaultBranch', () => {
       expect(await stashList()).toEqual([]);
     });
 
-    it('puts the changes back when the update still fails after setting them aside', async () => {
+    it('puts the changes back, staged work still staged, when the update still fails', async () => {
       // A local untracked FILE named `dir` blocks origin's new `dir/x.txt`; that
       // file/folder clash isn't one it sets aside, so the retry fails too.
-      await writeFile(path.join(repo, 'file.txt'), 'leftover\n');
+      await writeFile(path.join(repo, 'file.txt'), 'staged leftover\n');
+      await git(repo, ['add', 'file.txt']);
       await writeFile(path.join(repo, 'dir'), 'a file where origin has a folder\n');
       age('file.txt');
       age('dir');
@@ -555,27 +699,34 @@ describe('refreshSharedRepoToDefaultBranch', () => {
       const state = await refreshSharedRepoToDefaultBranch(repo, { setAsideStrayChanges: true });
 
       expect(await git(repo, ['rev-parse', 'HEAD'])).toBe(before);
-      expect(fs.readFileSync(path.join(repo, 'file.txt'), 'utf8')).toBe('leftover\n');
-      expect(state).toMatchObject({ staleReason: 'dirty_tree', setAsideSkipped: 'failed' });
+      expect(fs.readFileSync(path.join(repo, 'file.txt'), 'utf8')).toBe('staged leftover\n');
+      expect(await git(repo, ['diff', '--cached', '--name-only'])).toBe('file.txt');
+      expect(state).toMatchObject({ staleReason: 'dirty_tree', setAsideSkipped: 'failed', dirtyFiles: ['file.txt'] });
       expect(state?.setAside).toBeUndefined();
+      expect(state?.setAsideKept).toBeUndefined();
+      // Fully restored, so nothing is left saved.
       expect(await stashList()).toEqual([]);
+      expect(await autostashRefs()).toEqual([]);
     });
 
-    it('runs one refresh per clone at a time, so two runs starting together stash once', async () => {
+    it('shares one refresh between runs that start together, so the changes are set aside once', async () => {
       await writeFile(path.join(repo, 'file.txt'), 'leftover\n');
       age('file.txt');
       const latest = await advanceOrigin({ 'file.txt': 'B\n' });
 
-      const [a, b] = await Promise.all([
+      const [a, b, c] = await Promise.all([
         refreshSharedRepoToDefaultBranch(repo, { setAsideStrayChanges: true }),
         refreshSharedRepoToDefaultBranch(repo, { setAsideStrayChanges: true }),
+        // A plain caller shares a run that sets aside, too.
+        refreshSharedRepoToDefaultBranch(repo),
       ]);
 
       expect(await git(repo, ['rev-parse', 'HEAD'])).toBe(latest);
-      expect([a?.setAside, b?.setAside].filter(Boolean)).toHaveLength(1);
+      expect(b).toBe(a);
+      expect(c).toBe(a);
       expect(a).toMatchObject({ behind: 0 });
-      expect(b).toMatchObject({ behind: 0 });
-      expect(await stashList()).toHaveLength(1);
+      expect(await autostashRefs()).toHaveLength(1);
+      expect(await stashList()).toEqual([]);
     });
   });
 });

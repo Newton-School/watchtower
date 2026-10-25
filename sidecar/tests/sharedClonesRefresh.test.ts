@@ -62,7 +62,9 @@ describe('refreshSharedClones', () => {
     vi.mocked(refreshSharedRepoToDefaultBranch).mockRejectedValue(new Error('git exploded'));
     const logStep = vi.fn();
 
-    await expect(refreshSharedClones({ config, stage: 's', logStep })).resolves.toBeUndefined();
+    // The run goes on, told the files may be out of date (issue #709).
+    const block = await refreshSharedClones({ config, stage: 's', logStep });
+    expect(block).toContain('- newton-web: the update check failed, so the files may be out of date.');
     expect(logStep).toHaveBeenCalledTimes(2);
   });
 });

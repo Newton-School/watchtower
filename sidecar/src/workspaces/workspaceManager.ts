@@ -255,12 +255,30 @@ export type SharedRepoStaleReason =
 
 /** Uncommitted changes moved out of a shared clone's way so it could be updated (issue #709). */
 export interface SetAsideChanges {
-  /** The files that were in the way: tracked edits, and untracked files the update adds. */
+  /** The files that were moved: tracked edits to files the update changes, and untracked files it adds. */
   files: string[];
-  /** The stash commit holding them: `git stash apply <stash>` in the clone brings them back. */
+  /**
+   * A private ref holding the stash commit. Kept out of the stash list, which
+   * every worktree made from the clone shares: an agent's `git stash pop` in
+   * a job's worktree must never pick these changes up. `git stash show -p
+   * --include-untracked <ref>` in the clone shows them, and `git stash apply
+   * <ref>` re-applies them (with conflicts where origin changed the same lines).
+   */
+  ref: string;
+  /** The stash commit itself. */
   stash: string;
-  /** The stash message, so the entry can be found in `git stash list`. */
+  /** The stash message. */
   label: string;
+  /** A `--binary` patch of the same changes, as a second copy. */
+  patch?: string;
+}
+
+/** Where set-aside changes are kept when they could not be put back cleanly after a failed update. */
+export interface SetAsideKept {
+  ref: string;
+  patch?: string;
+  /** `unstaged`: back in the working tree, but what was staged is now unstaged. `no`: not back at all. */
+  restored: 'unstaged' | 'no';
 }
 
 /** Where a shared clone stands after a refresh attempt. */
@@ -269,6 +287,8 @@ export interface SharedRepoState {
   head: string;
   /** The HEAD commit's date (YYYY-MM-DD): how old the files on disk are. */
   headDate?: string;
+  /** When the clone last fetched from GitHub successfully (YYYY-MM-DD, from FETCH_HEAD). */
+  lastFetched?: string;
   /** origin's default branch, e.g. "origin/master". */
   upstream?: string;
   /** Commits the working tree is behind `upstream`. 0 when current; absent when it could not be counted. */
@@ -279,8 +299,18 @@ export interface SharedRepoState {
   dirtyFiles?: string[];
   /** Set when uncommitted changes were set aside so the clone could be updated. */
   setAside?: SetAsideChanges;
-  /** For `dirty_tree`: why the changes in the way were left where they are. */
-  setAsideSkipped?: 'recent_edits' | 'failed';
+  /** Uncommitted files the update didn't touch, so they stayed where they are (the first few). */
+  leftInPlace?: string[];
+  /** How many such files there were in all. */
+  leftInPlaceCount?: number;
+  /**
+   * Why the changes in the way were not set aside: changed in the last 15
+   * minutes, a git command was running in the clone, or setting them aside
+   * did not work.
+   */
+  setAsideSkipped?: 'recent_edits' | 'busy' | 'failed';
+  /** Set when changes were set aside, the update still failed, and they could not all be put back. */
+  setAsideKept?: SetAsideKept;
 }
 
 /** A change in the way is only set aside once nothing has touched it for this long. */
@@ -288,32 +318,31 @@ export const SET_ASIDE_QUIET_MS = 15 * 60 * 1000;
 
 export interface SharedRepoRefreshOptions {
   /**
-   * Move uncommitted changes that block the update into a stash, then
-   * update. Only for miniOG's own shared clones (the configured repo paths):
-   * the changes are kept, but they leave the working tree.
+   * Move uncommitted changes that block the update aside, then update. Only
+   * for miniOG's own shared clones (the configured repo paths): the changes
+   * are kept, but they leave the working tree.
    */
   setAsideStrayChanges?: boolean;
   /** Test seam: how long a change must sit untouched before it is set aside. */
   quietMs?: number;
   /** Test seam for the clock. */
   now?: () => number;
+  /** Test seam: the wait before retrying a failed fetch. */
+  fetchRetryMs?: number;
 }
 
-/** One refresh per clone at a time: two runs starting together would race on the index and the stash. */
-const refreshLocks = new Map<string, Promise<unknown>>();
-
-async function withRefreshLock<T>(repoPath: string, fn: () => Promise<T>): Promise<T> {
-  const key = path.resolve(repoPath);
-  const previous = refreshLocks.get(key) ?? Promise.resolve();
-  const run = previous.catch(() => undefined).then(fn);
-  const settled = run.catch(() => undefined);
-  refreshLocks.set(key, settled);
-  try {
-    return await run;
-  } finally {
-    if (refreshLocks.get(key) === settled) refreshLocks.delete(key);
-  }
+/** Where the patch copies of set-aside changes go. Read at call time, so tests can point HOME elsewhere. */
+function autostashDir(): string {
+  return path.join(os.homedir(), '.watchtower', 'autostash');
 }
+
+/**
+ * One refresh per clone at a time, and a caller that arrives while one is
+ * running shares its result instead of queueing another full run: two runs
+ * starting together used to race on the index, the fetch and the stash. A
+ * caller that wants stray changes set aside only shares a run that does too.
+ */
+const inFlightRefreshes = new Map<string, { promise: Promise<SharedRepoState | null>; setAside: boolean }>();
 
 async function tryFastForward(repoPath: string, upstream: string): Promise<boolean> {
   try {
@@ -324,80 +353,130 @@ async function tryFastForward(repoPath: string, upstream: string): Promise<boole
   }
 }
 
+/**
+ * Fetches origin, once more after a short wait if the first try fails:
+ * lookups and new worktrees fetch the same clones, and two fetches at once
+ * fail on git's ref locks, which used to read as "fetch failed".
+ */
+async function fetchOrigin(repoPath: string, retryMs: number): Promise<boolean> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await git(['fetch', 'origin', '--quiet'], { cwd: repoPath, timeoutMs: 30_000 });
+      return true;
+    } catch (error) {
+      if (attempt === 1) {
+        logger.warn(
+          { repoPath, error: String(error) },
+          'git fetch failed before agent read; answering against local repo state',
+        );
+      } else {
+        await new Promise(resolve => setTimeout(resolve, retryMs + Math.floor(Math.random() * retryMs)));
+      }
+    }
+  }
+  return false;
+}
+
 /** Splits `-z` output into paths, dropping empties. */
 function nulList(out: string): string[] {
   return out.split('\0').filter(Boolean);
 }
 
-/** Tracked files with uncommitted changes, staged or not (`git status -z`; a rename lists both names). */
-async function trackedChanges(repoPath: string): Promise<string[]> {
-  const out = await git(['status', '--porcelain=v1', '-z', '--untracked-files=no'], {
+/** "2026-10-26": a local calendar date. */
+function localDate(ms: number): string {
+  const d = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+/** When the clone last fetched successfully, from FETCH_HEAD's modification time. */
+async function lastFetchedDate(repoPath: string): Promise<string | undefined> {
+  try {
+    const rel = await git(['rev-parse', '--git-path', 'FETCH_HEAD'], { cwd: repoPath, timeoutMs: 10_000 });
+    return localDate(fs.statSync(path.resolve(repoPath, rel)).mtimeMs);
+  } catch {
+    return undefined;
+  }
+}
+
+interface TrackedChange {
+  path: string;
+  /** The index column says deleted: a staged deletion, which `git stash push -- <path>` can't name. */
+  stagedDeletion: boolean;
+}
+
+/** Tracked files with uncommitted changes, staged or not. Renames are listed as a delete and an add. */
+async function trackedChanges(repoPath: string): Promise<TrackedChange[]> {
+  const out = await git(['status', '--porcelain=v1', '-z', '--no-renames', '--untracked-files=no'], {
     cwd: repoPath,
     timeoutMs: 10_000,
     raw: true,
   });
-  const entries = out.split('\0');
-  const files: string[] = [];
-  for (let i = 0; i < entries.length; i++) {
-    const entry = entries[i];
-    if (entry.length < 4) continue;
-    files.push(entry.slice(3));
-    // "R  new\0old": the original name follows as its own entry.
-    if (entry[0] === 'R' || entry[0] === 'C') {
-      const original = entries[i + 1];
-      if (original) files.push(original);
-      i += 1;
-    }
-  }
-  return files;
+  // Entries are "XY path": X is the index column, Y the working tree's.
+  return nulList(out)
+    .filter(entry => entry.length >= 4)
+    .map(entry => ({ path: entry.slice(3), stagedDeletion: entry[0] === 'D' }));
+}
+
+const fileExists =
+  (repoPath: string) =>
+  (file: string): boolean =>
+    fs.existsSync(path.join(repoPath, file));
+
+interface SetAsideOutcome {
+  setAside?: SetAsideChanges;
+  skipped?: 'recent_edits' | 'busy' | 'failed';
+  /** The files in the way, whether or not they were moved. */
+  inTheWay?: string[];
+  /** Uncommitted files the update doesn't touch: they stay. */
+  leftInPlace?: string[];
 }
 
 /**
- * Moves the uncommitted changes that stop a shared clone from updating into
- * a named stash (issue #709). On 2026-10-24 an agent's leftover edit to
+ * Moves the uncommitted changes that stop a shared clone from updating out
+ * of the way (issue #709). On 2026-10-24 an agent's leftover edit to
  * newton-web's package.json had held that clone on a May commit, 783 commits
  * behind, and every lookup read five-month-old code.
  *
  * Only on the default branch with no local commits; only the files in the
- * way (tracked edits, and untracked files the update would add); and only
- * once none of them has been touched for `quietMs`, so a change someone is
- * making right now is left alone. Nothing is deleted: `git stash apply
- * <stash>` in the clone brings it back.
+ * way (uncommitted edits to files the update changes, and untracked files it
+ * adds); only once none of them has been touched for `quietMs`, so a change
+ * someone is making right now is left alone; and never while a git command
+ * holds the clone's index. Nothing is deleted: the changes are stashed, the
+ * stash commit is kept under a private ref (out of the stash list that the
+ * clone's worktrees share) and written out as a patch.
  */
 async function setAsideStrayChanges(
   repoPath: string,
   upstream: string,
   opts: SharedRepoRefreshOptions,
-): Promise<{ setAside?: SetAsideChanges; skipped?: 'recent_edits' | 'failed' }> {
+): Promise<SetAsideOutcome> {
+  const run = (args: string[], raw = false) => git(args, { cwd: repoPath, timeoutMs: 30_000, raw });
   try {
     // The configured path must be the clone itself, not a folder inside some other repo.
-    const top = await git(['rev-parse', '--show-toplevel'], { cwd: repoPath, timeoutMs: 10_000 });
-    if (fs.realpathSync(top) !== fs.realpathSync(repoPath)) return {};
-    const branch = await git(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repoPath, timeoutMs: 10_000 });
-    if (branch !== upstream.replace(/^origin\//, '')) return {};
-    const ahead = await git(['rev-list', '--count', `${upstream}..HEAD`], { cwd: repoPath, timeoutMs: 10_000 });
-    if (Number.parseInt(ahead, 10) !== 0) return {};
+    if (fs.realpathSync(await run(['rev-parse', '--show-toplevel'])) !== fs.realpathSync(repoPath)) return {};
+    if ((await run(['rev-parse', '--abbrev-ref', 'HEAD'])) !== upstream.replace(/^origin\//, '')) return {};
+    if (Number.parseInt(await run(['rev-list', '--count', `${upstream}..HEAD`]), 10) !== 0) return {};
 
-    const tracked = await trackedChanges(repoPath);
-    const untracked = new Set(
-      nulList(
-        await git(['ls-files', '--others', '--exclude-standard', '-z'], {
-          cwd: repoPath,
-          timeoutMs: 10_000,
-          raw: true,
-        }),
+    // macOS clones ignore case: a local "New.txt" is in the way of origin's "new.txt".
+    const ignoreCase = (await run(['config', '--get', 'core.ignorecase']).catch(() => '')) === 'true';
+    const norm = (file: string) => (ignoreCase ? file.toLowerCase() : file);
+    const touched = new Set(
+      nulList(await run(['diff', '--name-only', '-z', '--no-renames', 'HEAD', upstream], true)).map(norm),
+    );
+    const added = new Set(
+      nulList(await run(['diff', '--name-only', '-z', '--no-renames', '--diff-filter=A', 'HEAD', upstream], true)).map(
+        norm,
       ),
     );
-    const incoming = nulList(
-      await git(['diff', '--name-only', '-z', '--diff-filter=A', 'HEAD', upstream], {
-        cwd: repoPath,
-        timeoutMs: 10_000,
-        raw: true,
-      }),
+    const tracked = await trackedChanges(repoPath);
+    const trackedInTheWay = tracked.filter(change => touched.has(norm(change.path)));
+    const leftInPlace = tracked.filter(change => !touched.has(norm(change.path))).map(change => change.path);
+    const untrackedInTheWay = nulList(await run(['ls-files', '--others', '--exclude-standard', '-z'], true)).filter(
+      file => added.has(norm(file)),
     );
-    const blockingUntracked = incoming.filter(file => untracked.has(file));
-    const files = [...new Set([...tracked, ...blockingUntracked])];
-    if (files.length === 0) return {};
+    const files = [...new Set([...trackedInTheWay.map(change => change.path), ...untrackedInTheWay])];
+    if (files.length === 0) return { leftInPlace };
 
     const now = (opts.now ?? Date.now)();
     const quietMs = opts.quietMs ?? SET_ASIDE_QUIET_MS;
@@ -408,52 +487,105 @@ async function setAsideStrayChanges(
         return false; // a deleted file has no mtime; its deletion is what is in the way
       }
     });
-    if (recent) return { skipped: 'recent_edits' };
+    if (recent) return { skipped: 'recent_edits', inTheWay: files, leftInPlace };
+    // A git command is running in the clone (an agent or a person at work): leave it be.
+    const indexLock = path.resolve(repoPath, await run(['rev-parse', '--git-path', 'index.lock']));
+    if (fs.existsSync(indexLock)) return { skipped: 'busy', inTheWay: files, leftInPlace };
 
+    // `stash push -- <path>` can't name a path that is only in HEAD; unstaging
+    // the deletion makes it a working-tree deletion it can (the file stays deleted).
+    const stagedDeletions = trackedInTheWay.filter(change => change.stagedDeletion).map(change => change.path);
+    if (stagedDeletions.length > 0) await run(['--literal-pathspecs', 'reset', '-q', '--', ...stagedDeletions]);
+
+    const id = new Date(now).toISOString().replace(/[:.]/g, '-');
     const shown = files.slice(0, 5).join(', ') + (files.length > 5 ? ` and ${files.length - 5} more` : '');
-    const label = `miniog-autostash ${new Date(now).toISOString()} (#709): ${files.length} file${
+    const label = `miniog-autostash ${id} (#709): ${files.length} uncommitted file${
       files.length === 1 ? '' : 's'
-    } in the way of the update: ${shown}`;
-    const before = await git(['rev-parse', '--quiet', '--verify', 'refs/stash'], {
-      cwd: repoPath,
-      timeoutMs: 10_000,
-    }).catch(() => '');
-    await git(
-      [
-        '--literal-pathspecs',
-        'stash',
-        'push',
-        ...(blockingUntracked.length > 0 ? ['--include-untracked'] : []),
-        '-m',
-        label,
-        '--',
-        ...files,
-      ],
-      { cwd: repoPath, timeoutMs: 30_000 },
-    );
-    const stash = await git(['rev-parse', '--verify', 'refs/stash'], { cwd: repoPath, timeoutMs: 10_000 });
-    const subject = await git(['log', '-1', '--format=%s', stash], { cwd: repoPath, timeoutMs: 10_000 });
-    if (stash === before || !subject.includes(label)) return { skipped: 'failed' };
-    return { setAside: { files, stash, label } };
+    } set aside so the clone could update: ${shown}`;
+    await run([
+      '--literal-pathspecs',
+      'stash',
+      'push',
+      ...(untrackedInTheWay.length > 0 ? ['--include-untracked'] : []),
+      '-m',
+      label,
+      '--',
+      ...files,
+    ]);
+
+    // Find the entry by its label, not by position: another process may have stashed meanwhile.
+    const findEntry = async (): Promise<{ sha: string; index: number } | undefined> => {
+      const lines = (await run(['stash', 'list', '--format=%H %gs'])).split('\n').filter(Boolean);
+      const index = lines.findIndex(line => line.includes(label));
+      return index >= 0 ? { sha: lines[index].split(' ')[0], index } : undefined;
+    };
+    const entry = await findEntry();
+    if (!entry) {
+      // Nothing was stashed (or it is already gone): say whether the files are still where they were.
+      const stillThere = (await trackedChanges(repoPath)).length > 0 || untrackedInTheWay.some(fileExists(repoPath));
+      logger.warn({ repoPath, label, stillThere }, 'stash push left no entry for the set-aside changes');
+      return { skipped: 'failed', inTheWay: files, leftInPlace };
+    }
+
+    const ref = `refs/miniog/autostash/${id}`;
+    await run(['update-ref', ref, entry.sha]);
+    let patch: string | undefined;
+    try {
+      const dir = path.join(autostashDir(), path.basename(fs.realpathSync(repoPath)));
+      fs.mkdirSync(dir, { recursive: true });
+      const parts = [await run(['diff', '--binary', `${entry.sha}^1`, entry.sha], true)];
+      if (untrackedInTheWay.length > 0)
+        parts.push(await run(['show', '--binary', '--format=', `${entry.sha}^3`], true));
+      patch = path.join(dir, `${id}.patch`);
+      fs.writeFileSync(patch, parts.join('\n'));
+    } catch (error) {
+      patch = undefined;
+      logger.warn({ repoPath, ref, error: String(error) }, 'could not write the patch copy of set-aside changes');
+    }
+    // Out of the shared stash list, dropped by identity: check the position still holds our entry.
+    try {
+      const again = await findEntry();
+      if (again && (await run(['rev-parse', `stash@{${again.index}}`])) === entry.sha) {
+        await run(['stash', 'drop', '-q', `stash@{${again.index}}`]);
+      }
+    } catch (error) {
+      logger.warn({ repoPath, ref, error: String(error) }, 'could not drop the autostash entry from the stash list');
+    }
+    return {
+      setAside: { files, ref, stash: entry.sha, label, ...(patch ? { patch } : {}) },
+      inTheWay: files,
+      leftInPlace,
+    };
   } catch (error) {
     logger.warn({ repoPath, error: String(error) }, 'could not set aside the changes blocking a shared clone update');
     return { skipped: 'failed' };
   }
 }
 
-/** Puts set-aside changes back when the update still failed, so the clone is left as it was found. */
-async function restoreSetAside(repoPath: string, setAside: SetAsideChanges): Promise<void> {
+/**
+ * Puts set-aside changes back when the update still failed, so the clone is
+ * left as it was found: staged work stays staged (`--index`). If that can't
+ * be done, a plain apply brings the changes back unstaged and the private
+ * ref is kept; if neither works, the ref and the patch are where they are.
+ */
+async function restoreSetAside(repoPath: string, setAside: SetAsideChanges): Promise<'full' | 'unstaged' | 'no'> {
+  const run = (args: string[]) => git(args, { cwd: repoPath, timeoutMs: 30_000 });
   try {
-    await git(['stash', 'apply', setAside.stash], { cwd: repoPath, timeoutMs: 30_000 });
-    const entries = (await git(['stash', 'list', '--format=%H'], { cwd: repoPath, timeoutMs: 10_000 })).split('\n');
-    const index = entries.indexOf(setAside.stash);
-    if (index >= 0) await git(['stash', 'drop', `stash@{${index}}`], { cwd: repoPath, timeoutMs: 10_000 });
-  } catch (error) {
-    // The changes are still in the stash under their label; nothing is lost.
-    logger.warn(
-      { repoPath, stash: setAside.stash, error: String(error) },
-      'could not put set-aside changes back after a failed update',
-    );
+    await run(['stash', 'apply', '--index', setAside.stash]);
+    await run(['update-ref', '-d', setAside.ref]).catch(() => undefined);
+    if (setAside.patch) fs.rmSync(setAside.patch, { force: true });
+    return 'full';
+  } catch {
+    try {
+      await run(['stash', 'apply', setAside.stash]);
+      return 'unstaged';
+    } catch (error) {
+      logger.warn(
+        { repoPath, ref: setAside.ref, error: String(error) },
+        'could not put set-aside changes back after a failed update',
+      );
+      return 'no';
+    }
   }
 }
 
@@ -470,44 +602,61 @@ async function restoreSetAside(repoPath: string, setAside: SetAsideChanges): Pro
  * commits are never clobbered. The `reset --hard` used for the throwaway
  * worktrees in `resolveWorkspace` would NOT be safe on a shared clone. With
  * `setAsideStrayChanges` (miniOG's own clones only), uncommitted changes that
- * block the update are moved into a named stash first, and put back if the
- * update still fails.
+ * block the update are moved aside first, and put back if the update still
+ * fails.
  *
  * Best-effort: returns where the checkout ended up, including how far behind
  * origin it still is and why, or null if the repo couldn't be inspected.
  * Never throws.
  */
-export async function refreshSharedRepoToDefaultBranch(
+export function refreshSharedRepoToDefaultBranch(
   repoPath: string,
   opts: SharedRepoRefreshOptions = {},
 ): Promise<SharedRepoState | null> {
-  return withRefreshLock(repoPath, () => refreshSharedRepo(repoPath, opts));
+  const key = path.resolve(repoPath);
+  const setAside = Boolean(opts.setAsideStrayChanges);
+  const current = inFlightRefreshes.get(key);
+  if (current && (current.setAside || !setAside)) return current.promise;
+  const promise = (current?.promise ?? Promise.resolve(null))
+    .catch(() => null)
+    .then(() => refreshSharedRepo(repoPath, opts));
+  const entry = { promise, setAside };
+  inFlightRefreshes.set(key, entry);
+  void promise
+    .catch(() => null)
+    .finally(() => {
+      if (inFlightRefreshes.get(key) === entry) inFlightRefreshes.delete(key);
+    });
+  return promise;
 }
 
 async function refreshSharedRepo(repoPath: string, opts: SharedRepoRefreshOptions): Promise<SharedRepoState | null> {
-  let fetchFailed = false;
-  try {
-    await git(['fetch', 'origin', '--quiet'], { cwd: repoPath, timeoutMs: 30_000 });
-  } catch (error) {
-    fetchFailed = true;
-    logger.warn(
-      { repoPath, error: String(error) },
-      'git fetch failed before agent read; answering against local repo state',
-    );
-  }
+  const fetchFailed = !(await fetchOrigin(repoPath, opts.fetchRetryMs ?? 1_500));
   const upstream = await resolveDefaultRemoteBranch(repoPath);
   let setAside: SetAsideChanges | undefined;
   let setAsideSkipped: SharedRepoState['setAsideSkipped'];
+  let setAsideKept: SetAsideKept | undefined;
+  let inTheWay: string[] = [];
+  let leftInPlace: string[] = [];
   if (!fetchFailed && !(await tryFastForward(repoPath, upstream))) {
     if (opts.setAsideStrayChanges) {
       const outcome = await setAsideStrayChanges(repoPath, upstream, opts);
       setAsideSkipped = outcome.skipped;
+      inTheWay = outcome.inTheWay ?? [];
+      leftInPlace = outcome.leftInPlace ?? [];
       if (outcome.setAside) {
         if (await tryFastForward(repoPath, upstream)) {
           setAside = outcome.setAside;
         } else {
-          await restoreSetAside(repoPath, outcome.setAside);
+          const restored = await restoreSetAside(repoPath, outcome.setAside);
           setAsideSkipped = 'failed';
+          if (restored !== 'full') {
+            setAsideKept = {
+              ref: outcome.setAside.ref,
+              ...(outcome.setAside.patch ? { patch: outcome.setAside.patch } : {}),
+              restored,
+            };
+          }
         }
       }
     }
@@ -530,6 +679,7 @@ async function refreshSharedRepo(repoPath: string, opts: SharedRepoRefreshOption
   const headDate = await git(['log', '-1', '--format=%cs', 'HEAD'], { cwd: repoPath, timeoutMs: 10_000 }).catch(
     () => undefined,
   );
+  const lastFetched = await lastFetchedDate(repoPath);
 
   // The truth about where that leaves the checkout. This used to return the
   // head and nothing else, and the caller logged "Refreshed" over a clone
@@ -548,9 +698,14 @@ async function refreshSharedRepo(repoPath: string, opts: SharedRepoRefreshOption
     branch,
     head,
     ...(headDate ? { headDate } : {}),
+    ...(lastFetched ? { lastFetched } : {}),
     upstream,
     behind,
     ...(setAside ? { setAside } : {}),
+    ...(setAside && leftInPlace.length > 0
+      ? { leftInPlace: leftInPlace.slice(0, 5), leftInPlaceCount: leftInPlace.length }
+      : {}),
+    ...(setAsideKept ? { setAsideKept } : {}),
   };
   if (fetchFailed) {
     return { ...state, staleReason: 'fetch_failed' };
@@ -575,11 +730,13 @@ async function refreshSharedRepo(repoPath: string, opts: SharedRepoRefreshOption
       .split('\n')
       .map(line => line.trim().replace(/^\S+\s+/, ''))
       .filter(Boolean);
-    if (dirtyFiles.length > 0) {
+    // Name exactly what is in the way when that is known, untracked files included.
+    const named = inTheWay.length > 0 ? inTheWay : dirtyFiles;
+    if (named.length > 0) {
       return {
         ...state,
         staleReason: 'dirty_tree',
-        dirtyFiles: dirtyFiles.slice(0, 5),
+        dirtyFiles: named.slice(0, 5),
         ...(setAsideSkipped ? { setAsideSkipped } : {}),
       };
     }

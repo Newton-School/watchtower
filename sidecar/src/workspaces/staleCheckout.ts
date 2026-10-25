@@ -35,7 +35,7 @@ export function staleReasonText(state: SharedRepoState): string {
     case 'fetch_failed':
       return 'git fetch failed, so this is as of the last successful fetch';
     case 'unverified':
-      return 'how far behind origin it is could not be worked out';
+      return "I couldn't tell how far it is behind GitHub";
     default:
       return 'git would not fast-forward it';
   }
@@ -43,26 +43,46 @@ export function staleReasonText(state: SharedRepoState): string {
 
 const commits = (count: number): string => `${count} commit${count === 1 ? '' : 's'}`;
 
-/** A clone whose files may be old but can't be read from origin instead: the fetch failed, or how far behind it is is unknown. */
-function isUnconfirmedCheckout(state: SharedRepoState | null): state is SharedRepoState {
-  return Boolean(
-    state && !isStaleCheckout(state) && (state.staleReason === 'fetch_failed' || state.staleReason === 'unverified'),
-  );
+/**
+ * A clone whose files may be old with no newer tree to read instead: the
+ * fetch failed, how far behind it is is unknown, or the refresh failed
+ * outright (null).
+ */
+function isUnconfirmedCheckout(state: SharedRepoState | null): boolean {
+  if (!state) return true;
+  return !isStaleCheckout(state) && (state.staleReason === 'fetch_failed' || state.staleReason === 'unverified');
 }
 
 /** " as of 2026-05-26", or nothing when the HEAD date is unknown. */
 const asOf = (state: SharedRepoState): string => (state.headDate ? ` as of ${state.headDate}` : '');
 
-/** Why the changes in the way were left in place, as a sentence, or nothing. */
+/** Where set-aside changes are saved: the private ref, and the patch copy when there is one. */
+const savedAt = (kept: { ref: string; patch?: string }): string =>
+  `${kept.ref}${kept.patch ? ` (patch copy: ${kept.patch})` : ''}`;
+
+/** What happened to the changes in the way when they were not set aside, as a sentence, or nothing. */
 function setAsideSkippedText(state: SharedRepoState): string {
   if (state.setAsideSkipped === 'recent_edits') {
     return ' They changed in the last 15 minutes, so they were left in place.';
   }
+  if (state.setAsideSkipped === 'busy') {
+    return ' A git command was running in the clone, so they were left in place.';
+  }
   if (state.setAsideSkipped === 'failed') {
+    const kept = state.setAsideKept;
+    if (kept?.restored === 'no') {
+      return ` They were set aside but the update still failed, and putting them back failed too: they are NOT in the working tree, they are saved at ${savedAt(kept)}.`;
+    }
+    if (kept?.restored === 'unstaged') {
+      return ` They were set aside but the update still failed; they are back in the working tree, unstaged, and a copy is saved at ${savedAt(kept)}.`;
+    }
     return ' Setting them aside did not work, so they were left in place.';
   }
   return '';
 }
+
+/** "2 files", "1 file". */
+const files = (count: number): string => `${count} file${count === 1 ? '' : 's'}`;
 
 /** The job-log line for one clone after a refresh attempt. `level` is WARN whenever it is not known to be current. */
 export function describeRepoRefresh(
@@ -80,7 +100,7 @@ export function describeRepoRefresh(
   }
   if (state.staleReason === 'fetch_failed') {
     return {
-      message: `Could not fetch ${repoName}; answering from ${state.branch} @ ${state.head}${state.headDate ? ` (${state.headDate})` : ''} as of the last fetch.`,
+      message: `Could not fetch ${repoName}; answering from ${state.branch} @ ${state.head}${state.headDate ? ` (${state.headDate})` : ''} as of the last fetch${state.lastFetched ? ` (${state.lastFetched})` : ''}.`,
       level: 'WARN',
     };
   }
@@ -91,10 +111,13 @@ export function describeRepoRefresh(
     };
   }
   if (state.setAside) {
-    const { files, label } = state.setAside;
-    const shown = files.slice(0, 5).join(', ') + (files.length > 5 ? ` and ${files.length - 5} more` : '');
+    const set = state.setAside;
+    const shown = set.files.slice(0, 5).join(', ') + (set.files.length > 5 ? ` and ${set.files.length - 5} more` : '');
+    const others = state.leftInPlaceCount
+      ? ` ${files(state.leftInPlaceCount)} the update didn't touch stayed as they were (${(state.leftInPlace ?? []).join(', ')}${state.leftInPlaceCount > (state.leftInPlace ?? []).length ? ', …' : ''}).`
+      : '';
     return {
-      message: `Refreshed ${repoName} to ${state.branch} @ ${state.head} after setting aside ${files.length} uncommitted file${files.length === 1 ? '' : 's'} that blocked the update (${shown}). They are kept in the clone's stash as "${label}".`,
+      message: `Refreshed ${repoName} to ${state.branch} @ ${state.head} after setting aside ${files(set.files.length)} with uncommitted changes in the way (${shown}). They are saved at ${savedAt(set)}; \`git stash show -p --include-untracked ${set.ref}\` in the clone shows them.${others}`,
       level: 'WARN',
     };
   }
@@ -107,16 +130,18 @@ export function buildStaleCheckoutBlock(repos: Array<{ name: string; state: Shar
     isStaleCheckout(repo.state),
   );
   // No newer tree to point at: the agent reads the files on disk and says they may be old.
-  const unconfirmed = repos.filter((repo): repo is { name: string; state: SharedRepoState } =>
-    isUnconfirmedCheckout(repo.state),
-  );
+  const unconfirmed = repos.filter(repo => isUnconfirmedCheckout(repo.state));
+  const unconfirmedLine = (name: string, state: SharedRepoState | null): string => {
+    if (!state) return `- ${name}: the update check failed, so the files may be out of date.`;
+    const files = `the files are from ${state.head}${state.headDate ? ` (${state.headDate})` : ''}`;
+    return state.staleReason === 'fetch_failed'
+      ? `- ${name}: git fetch failed${state.lastFetched ? `; it last fetched on ${state.lastFetched}` : ''}, and ${files}.`
+      : `- ${name}: I couldn't tell how far it is behind GitHub; ${files}.`;
+  };
   const unconfirmedBlock = unconfirmed.length
     ? [
         'POSSIBLY OUT OF DATE — these repos could not be checked against GitHub just now:',
-        ...unconfirmed.map(
-          ({ name, state }) =>
-            `- ${name}: ${state.staleReason === 'fetch_failed' ? 'git fetch failed' : 'its distance from origin is unknown'}; the files are from ${state.head}${asOf(state)}.`,
-        ),
+        ...unconfirmed.map(({ name, state }) => unconfirmedLine(name, state)),
         'If your answer depends on recent changes in them, say the code you read may be out of date.',
       ].join('\n')
     : '';
@@ -184,8 +209,11 @@ export async function refreshSharedClones(params: {
         staleReason: state?.staleReason,
         dirtyFiles: state?.dirtyFiles,
         headDate: state?.headDate,
+        lastFetched: state?.lastFetched,
         setAside: state?.setAside,
         setAsideSkipped: state?.setAsideSkipped,
+        setAsideKept: state?.setAsideKept,
+        leftInPlace: state?.leftInPlace,
       },
     });
   }
