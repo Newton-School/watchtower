@@ -414,6 +414,12 @@ async function decideContentMerge(params: {
       'Someone pushed to it while I was checking, so an owner has to confirm.',
     );
   }
+  if (fresh.state?.baseRef !== verdict.baseRef) {
+    return owner(
+      `the base moved from ${verdict.baseRef} to ${fresh.state?.baseRef ?? 'unknown'} while checking.`,
+      'Its base branch changed while I was checking, so an owner has to confirm.',
+    );
+  }
   const checksState = await fetchChecksState({ owner: pr.owner, repo: pr.repo, sha: verdict.headSha, githubToken });
   const checksProblem = checksReason(checksState);
   if (checksProblem) return owner(`checks are ${checksState ?? 'unreadable'}.`, checksProblem);

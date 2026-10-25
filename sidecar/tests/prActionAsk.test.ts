@@ -300,8 +300,8 @@ describe('fetchChecksState', () => {
   });
 });
 
-describe('fetchMergeState: the head commit', () => {
-  it('says which commit the state describes, so a merge can be pinned to the one that was read', async () => {
+describe('fetchMergeState: the head commit and base branch', () => {
+  it('says which commit and base the state describes, so a merge can be pinned to what was read', async () => {
     const fetcher = vi.fn().mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -312,6 +312,7 @@ describe('fetchMergeState: the head commit', () => {
                 mergeStateStatus: 'BLOCKED',
                 isDraft: false,
                 headRefOid: 'abc123',
+                baseRefName: 'main',
               },
             },
           },
@@ -333,8 +334,11 @@ describe('fetchMergeState: the head commit', () => {
       mergeStateStatus: 'BLOCKED',
       isDraft: false,
       headSha: 'abc123',
+      baseRef: 'main',
     });
-    expect(JSON.parse(fetcher.mock.calls[0][1].body).query).toContain('headRefOid');
+    const query = JSON.parse(fetcher.mock.calls[0][1].body).query;
+    expect(query).toContain('headRefOid');
+    expect(query).toContain('baseRefName');
   });
 });
 

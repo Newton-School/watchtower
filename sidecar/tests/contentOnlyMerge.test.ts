@@ -162,11 +162,17 @@ beforeEach(() => {
     mergeStateStatus: 'BLOCKED',
     isDraft: false,
     headSha: 'abc123',
+    baseRef: 'main',
   });
   vi.mocked(fetchChecksState).mockReset().mockResolvedValue(null);
   vi.mocked(checkContentOnlyPr)
     .mockReset()
-    .mockResolvedValue({ contentOnly: true, files: ['src/features/agentic-ai-course/content.ts'], headSha: 'abc123' });
+    .mockResolvedValue({
+      contentOnly: true,
+      files: ['src/features/agentic-ai-course/content.ts'],
+      headSha: 'abc123',
+      baseRef: 'main',
+    });
 });
 afterEach(() => vi.clearAllMocks());
 
@@ -233,6 +239,29 @@ describe('merging a content-only marketing PR (#701)', () => {
     expect(confirmPrompt(posted)).toContain('Someone pushed to it while I was checking, so an owner has to confirm.');
   });
 
+  it('asks the owner when the base branch changed while the files were being read', async () => {
+    vi.mocked(fetchMergeState)
+      .mockResolvedValueOnce({
+        reviewDecision: 'REVIEW_REQUIRED',
+        mergeStateStatus: 'BLOCKED',
+        headSha: 'abc123',
+        baseRef: 'main',
+      })
+      .mockResolvedValueOnce({
+        reviewDecision: 'REVIEW_REQUIRED',
+        mergeStateStatus: 'BLOCKED',
+        headSha: 'abc123',
+        baseRef: 'release',
+      });
+
+    const { posted } = await run('<@UBOT1> merge it');
+
+    expect(ghExec).not.toHaveBeenCalled();
+    expect(confirmPrompt(posted)).toContain(
+      'Its base branch changed while I was checking, so an owner has to confirm.',
+    );
+  });
+
   it('asks the owner when a review comment arrived while the files were being read', async () => {
     vi.mocked(fetchUnresolvedReviewThreadCount)
       .mockResolvedValueOnce({ unresolvedCount: 0, totalThreads: 0 })
@@ -249,6 +278,7 @@ describe('merging a content-only marketing PR (#701)', () => {
       reviewDecision: 'APPROVED',
       mergeStateStatus: 'CLEAN',
       headSha: 'abc123',
+      baseRef: 'main',
     });
 
     const { posted } = await run('<@UBOT1> merge it');
@@ -263,7 +293,12 @@ describe('merging a content-only marketing PR (#701)', () => {
     ['with no review asked for, says nothing about the review', undefined, false],
     ['still needing its review, says it went in without it', 'REVIEW_REQUIRED', true],
   ])('uses admin rights for a branch behind its base and, %s', async (_case, reviewDecision, skipsReview) => {
-    vi.mocked(fetchMergeState).mockResolvedValue({ mergeStateStatus: 'BEHIND', reviewDecision, headSha: 'abc123' });
+    vi.mocked(fetchMergeState).mockResolvedValue({
+      mergeStateStatus: 'BEHIND',
+      reviewDecision,
+      headSha: 'abc123',
+      baseRef: 'main',
+    });
 
     const { posted } = await run('<@UBOT1> merge it');
 
@@ -482,7 +517,7 @@ describe('merging a content-only marketing PR (#701)', () => {
     const controller = new AbortController();
     vi.mocked(checkContentOnlyPr).mockImplementation(async () => {
       controller.abort();
-      return { contentOnly: true, files: ['src/features/x/content.ts'], headSha: 'abc123' };
+      return { contentOnly: true, files: ['src/features/x/content.ts'], headSha: 'abc123', baseRef: 'main' };
     });
 
     const { result } = await run('<@UBOT1> merge it', { signal: controller.signal });

@@ -17,8 +17,11 @@ import type { ContentPolicy } from '../repos/registry.js';
  * neither words nor links, and nothing the repo's own lint forbids.
  */
 export type ContentOnlyVerdict =
-  /** `headSha` is the commit that was read: a merge must be of that commit and no later one. */
-  | { contentOnly: true; files: string[]; headSha: string }
+  /**
+   * `headSha` is the commit that was read: a merge must be of that commit and
+   * no later one, into `baseRef`.
+   */
+  | { contentOnly: true; files: string[]; headSha: string; baseRef: string }
   | {
       contentOnly: false;
       /** For the logs. */
@@ -81,7 +84,8 @@ const AGENT_INSTRUCTIONS = /claude|agents|gemini|copilot|cursor|^skill\.md$/i;
 
 /**
  * Whether a path is a Markdown note that never ships and that no agent
- * reads as instructions, which a content-only change may edit unread.
+ * reads as instructions, which a content-only change may edit unread: a
+ * README the policy names, outside the deny list.
  */
 export function isNotePath(filePath: string, policy: ContentPolicy): boolean {
   if (!/\.md$/i.test(filePath) || /(?:^|\/)\.(?:claude|agents)\//i.test(filePath)) return false;
@@ -122,14 +126,13 @@ const COMPONENT_COPY_PROPS = new Set([
   'text',
   'description',
   'caption',
-  'cta',
   'alt',
   'href',
   'src',
   'image',
   'placeholder',
 ]);
-const COMPONENT_COPY_SUFFIX = /[a-z0-9](?:Text|Label|Title|Heading|Subtitle|Description|Caption|Copy|Alt|Cta)$/;
+const COMPONENT_COPY_SUFFIX = /[a-z0-9](?:Text|Label|Title|Heading|Subtitle|Description|Caption|Copy|Alt)$/;
 /** <meta> tags whose `content` is words on the page or in a preview. */
 const DESCRIBING_META =
   /^(?:description|keywords|title|og:title|og:description|og:image|og:image:alt|twitter:title|twitter:description|twitter:image)$/i;
@@ -224,25 +227,47 @@ const KNOB_NAMES = new Set([
   'preferredregion',
   'maxduration',
 ]);
-const KNOB_WORDS =
-  'ids?|keys?|events?|arms?|variants?|endpoints?|apis?|ms|delay|timeout|interval|duration|seconds|secs|threshold|urls?|uris?|cookies?|media|class|classes|classname|storage|scripts?|html|css|styles?|configs?|settings|flags?|tests?|experiments?|params?|query|regexp?|pattern|selector|attr|attribute|tokens?|secrets?|webhooks?|offset|cutoff|hours?|minutes?|limit|max|min|types?|slugs?|paths?|routes?|identifiers?|verifications?|hosts?|domains?|iframes?|embeds?|actions?|sources?|modes?|kinds?|redirects?|callbacks?';
-/** `FORM_ID`, `lead_url`, `ENDPOINTS`: the last word of a snake or kebab name. */
-const KNOB_SUFFIX_SNAKE = new RegExp(`(?:^|[_-])(?:${KNOB_WORDS})$`, 'i');
-/** `formId`, `submitUrl`, `courseType`: the last word of a camel-case name. */
-const KNOB_SUFFIX_CAMEL = new RegExp(
-  `[a-z0-9](?:${KNOB_WORDS.split('|')
-    .map(word => word[0].toUpperCase() + word.slice(1))
-    .join('|')})$`,
+/** The last word of a name that makes it a knob: `formId`, `FORM_ID`, `submitUrl`, `labelClassName`, `ENDPOINTS`. */
+const KNOB_WORDS = new Set(
+  (
+    'id ids key keys event events arm arms variant variants endpoint endpoints api apis ms delay delays timeout ' +
+    'timeouts interval intervals duration durations seconds secs threshold thresholds url urls uri uris cookie ' +
+    'cookies media class classes classname classnames storage script scripts html css style styles config configs ' +
+    'settings setting flag flags test tests experiment experiments param params query queries regex regexp pattern ' +
+    'patterns selector selectors attr attrs attribute attributes token tokens secret secrets webhook webhooks offset ' +
+    'offsets cutoff hour hours minute minutes limit limits max min type types slug slugs path paths route routes ' +
+    'identifier identifiers verification verifications host hosts domain domains iframe iframes embed embeds action ' +
+    'actions source sources mode modes kind kinds redirect redirects callback callbacks'
+  ).split(' '),
 );
-/** `maxSeats`, `utmPageIdentifier`, `MIN_AGE`: the first word says it. */
-const KNOB_PREFIX = /^(?:max|min|limit|threshold|timeout|delay|utm)(?:[A-Z_-]|$)/;
+/** The first word of a name that makes it a knob: `maxSeats`, `utmPageIdentifier`, `MIN_AGE`. */
+const KNOB_FIRST_WORDS = new Set(['max', 'min', 'limit', 'threshold', 'timeout', 'delay', 'utm']);
 /** A link to an image or document is an asset, not where data goes. */
 const ASSET_URL_NAME = /(?:image|img|photo|logo|icon|thumb|banner|video|poster|avatar|brochure|pdf)/i;
 
+/** The words of a camel, snake or kebab name, lower-cased: `labelClassName` → label, class, name. */
+function nameWords(name: string): string[] {
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .split(/[\s_\-:.]+/)
+    .filter(Boolean)
+    .map(word => word.toLowerCase());
+}
+
+/** Whether the last word, or the last two run together (`class`+`name`), is in a set. */
+function endsWithWord(words: string[], set: Set<string>): boolean {
+  const last = words[words.length - 1] ?? '';
+  const lastTwo = words.slice(-2).join('');
+  return set.has(last) || (words.length > 1 && set.has(lastTwo));
+}
+
 function isKnobName(name: string | undefined): boolean {
   if (!name) return true;
-  if (KNOB_NAMES.has(name.toLowerCase()) || name.startsWith('data-') || KNOB_PREFIX.test(name)) return true;
-  if (!KNOB_SUFFIX_SNAKE.test(name) && !KNOB_SUFFIX_CAMEL.test(name)) return false;
+  if (KNOB_NAMES.has(name.toLowerCase()) || name.startsWith('data-')) return true;
+  const words = nameWords(name);
+  if (words.length > 1 && KNOB_FIRST_WORDS.has(words[0])) return true;
+  if (!endsWithWord(words, KNOB_WORDS)) return false;
   // `heroImageUrl`, `brochureUrl`: an asset link, which is content.
   return !(/ur[li]s?$/i.test(name) && ASSET_URL_NAME.test(name));
 }
@@ -263,7 +288,6 @@ const COPY_KEYS = new Set([
   'label',
   'description',
   'caption',
-  'cta',
   'button',
   'alt',
   'placeholder',
@@ -273,6 +297,7 @@ const COPY_KEYS = new Set([
   'author',
   'designation',
   'badge',
+  'bio',
   'city',
   'location',
   'college',
@@ -283,22 +308,140 @@ const COPY_KEYS = new Set([
   'summary',
   'unit',
   'content',
+]);
+/** The last word of a copy key: `heroTitle`, `ctaText`, `HERO_HEADING`, `buttonLabel`. */
+const COPY_WORDS = new Set([
+  'text',
+  'label',
+  'title',
+  'heading',
+  'subtitle',
+  'subheading',
+  'description',
+  'caption',
+  'copy',
+  'alt',
+  'button',
+]);
+/** Text a screen reader says: the only aria attributes that are copy. */
+const ARIA_COPY = /^aria-(?:label|description|roledescription|valuetext|placeholder)$/;
+
+function isCopyKey(key: string): boolean {
+  return COPY_KEYS.has(key) || ARIA_COPY.test(key) || endsWithWord(nameWords(key), COPY_WORDS);
+}
+
+/**
+ * Lists whose entries are copy: table rows and cells, bullets, lessons. Any
+ * other list may be form options or a lookup (categories, states, degrees),
+ * so an entry of one is compared as written.
+ */
+const LIST_COPY_WORDS = new Set([
+  'items',
+  'bullets',
+  'points',
+  'rows',
+  'cells',
+  'lines',
+  'paragraphs',
+  'chips',
+  'lessons',
+  'checklist',
+  'notes',
+  'features',
+  'deliverables',
+  'values',
+  'head',
+  'terms',
+  'highlights',
+  'benefits',
   'skills',
   'tools',
   'topics',
-  'highlights',
-  'benefits',
   'technologies',
 ]);
-const COPY_KEY_SUFFIX = /[a-z0-9](?:Text|Label|Title|Heading|Subtitle|Description|Caption|Copy|Alt|Cta|Button)$/;
 
-function isCopyKey(key: string): boolean {
-  return COPY_KEYS.has(key) || COPY_KEY_SUFFIX.test(key) || key.startsWith('aria-');
+function isListCopyKey(key: string): boolean {
+  return endsWithWord(nameWords(key), LIST_COPY_WORDS);
+}
+
+/**
+ * Numbers copy shows: counts, ratings, years, seats, prices, fees, salaries.
+ * Any other number in data may be a step, a delay, a threshold or a split.
+ */
+const NUMBER_COPY_WORDS = new Set([
+  'count',
+  'counts',
+  'number',
+  'numbers',
+  'stat',
+  'stats',
+  'rating',
+  'ratings',
+  'star',
+  'stars',
+  'year',
+  'years',
+  'month',
+  'months',
+  'alumni',
+  'students',
+  'learners',
+  'seats',
+  'percent',
+  'percentage',
+  'price',
+  'prices',
+  'fee',
+  'fees',
+  'amount',
+  'salary',
+  'ctc',
+  'lpa',
+  'hike',
+  'end',
+]);
+
+function isNumberCopyKey(key: string): boolean {
+  const words = nameWords(key);
+  return isCopyKey(key) || NUMBER_COPY_WORDS.has(words[0] ?? '') || endsWithWord(words, NUMBER_COPY_WORDS);
 }
 
 /** Keys whose values are links or assets: `href`, `ctaHref`, `src`, `link`, `heroImage`, `videoUrl`. */
 function isLinkKey(key: string): boolean {
   return /(?:^|[a-z0-9])(?:href|link|src|srcset|poster)$/i.test(key) || ASSET_URL_NAME.test(key);
+}
+
+/** Keys that send the reader somewhere rather than load something into the page. */
+function isNavigationKey(key: string): boolean {
+  return /(?:^|[a-z0-9])(?:href|link)$/i.test(key);
+}
+
+/** The host of an absolute link, lower-cased; undefined for a relative one. */
+function hostOf(value: string): string | undefined {
+  return /^(?:https?:)?\/\/([^/?#:]+)/i.exec(value.trim())?.[1]?.toLowerCase();
+}
+
+/** A one-word value shaped like an identifier under any key: `hero_contact_us`, `nav-request-callback`, `heroCta`. */
+const IDENTIFIER_SHAPE = /_|^[a-z][a-z0-9]*(?:-[a-z0-9]+)+$|^[a-z]+[A-Z][A-Za-z0-9]*$/;
+
+/**
+ * A class list or CSS: a token with an arbitrary value (`bg-[#fff]`) or a
+ * variant prefix (`md:flex`), a CSS function, or nothing but utility-shaped
+ * tokens.
+ */
+function looksLikeStyling(value: string): boolean {
+  const tokens = value.trim().split(/\s+/).filter(Boolean);
+  const styled = (token: string) =>
+    /\[[^\]]*\]/.test(token) ||
+    /^!?(?:[a-z0-9-]+(?:\[[^\]]*\])?(?:\/[a-z0-9-]+)?:)+\S/.test(token) ||
+    /(?:^|[^a-z])(?:url|linear-gradient|radial-gradient|conic-gradient|rgba?|hsla?|var|calc)\(/i.test(token);
+  if (tokens.some(styled)) return true;
+  const utility = (token: string) =>
+    /^-?[a-z]+(?:-[a-z0-9./%#]+)+$/.test(token) ||
+    /^(?:flex|grid|block|hidden|inline|contents|relative|absolute|fixed|sticky|truncate|italic|underline|uppercase|lowercase|capitalize|invisible|visible)$/.test(
+      token,
+    );
+  return tokens.length > 1 && tokens.every(utility);
 }
 
 /** A link or path: `https://…`, `//…`, `/apply`, `#faq`. */
@@ -350,11 +493,15 @@ export function isActiveUrl(text: string): boolean {
 
 /**
  * A changed value that reads like code or markup is not a copy edit. A
- * character reference (`&rsquo;`) is text React shows as it is, so it never
- * counts; a semicolon alone is punctuation.
+ * character reference like `&rsquo;` is text React shows as it is, so it
+ * never counts; a semicolon alone is punctuation.
  */
 export function looksLikeCode(text: string): boolean {
-  const plain = text.replace(/&(?:[a-z][a-z0-9]*|#\d+|#x[0-9a-f]+);/gi, ' ');
+  // JSX decodes `&lt;` and `&gt;` (`&lt;/script&gt;` is a real tag); other references are just text.
+  const plain = text
+    .replace(/&lt;|&#0*60;|&#x0*3c;/gi, '<')
+    .replace(/&gt;|&#0*62;|&#x0*3e;/gi, '>')
+    .replace(/&(?:[a-z][a-z0-9]*|#\d+|#x[0-9a-f]+);/gi, ' ');
   return (
     /<\/?[a-z!]|[{}]|=>|\bfunction\s*\(/i.test(plain) ||
     // A property read (`document.cookie`), not a sentence ending in the word.
@@ -379,29 +526,51 @@ type MaskedValue = {
   keys: string[];
   kind: 'text' | 'string' | 'number' | 'template';
   text: string;
+  /** A direct entry of an array, which counts only in a list of copy. */
+  inArray?: boolean;
 };
 
-/** What a changed masked value may not be, beyond reading like code; undefined when it is fine. */
-function changedValueProblem(before: MaskedValue, after: MaskedValue, forbidden: RegExp[]): string | undefined {
+/**
+ * Why a changed masked value is not a copy edit; undefined when it is one.
+ * Words change freely; anything else only under a key that says it holds
+ * that: numbers under number or copy keys, one-word values under copy keys,
+ * links under link keys, list entries in lists of copy.
+ */
+function changedValueProblem(
+  before: MaskedValue,
+  after: MaskedValue,
+  rules: Required<ContentRules>,
+): string | undefined {
   if (looksLikeCode(before.text) || looksLikeCode(after.text)) return 'reads like code or markup';
-  if (forbidden.some(pattern => pattern.test(after.text))) return "has something the repo's lint forbids";
-  if (after.kind !== 'string') return undefined;
+  if (rules.lintForbidden.some(pattern => pattern.test(after.text))) return "has something the repo's lint forbids";
   const nearest = after.keys[0] ?? '';
+  const under = `under \`${nearest || '(no key)'}\``;
+  if (after.kind === 'number') return isNumberCopyKey(nearest) ? undefined : `is a number ${under}`;
+  if (after.kind !== 'string') return undefined;
+  if (after.inArray && !isCopyKey(nearest) && !isListCopyKey(nearest)) return `is a list entry ${under}`;
   for (const { text } of [before, after]) {
     const value = text.trim();
+    if (value === '' || /^(?:tel|mailto):/i.test(value)) continue;
     if (LINK_VALUE.test(value)) {
       // `href`, or a list of links: `images: { hero: … }`.
-      if (!after.keys.some(isLinkKey)) return `is a link under \`${nearest || '(no key)'}\``;
-    } else if (
-      value !== '' &&
-      !/\s/.test(value) &&
-      !NUMBER_VALUE.test(value) &&
-      !DATE_VALUE.test(value) &&
-      !/^(?:tel|mailto):/i.test(value) &&
-      !isCopyKey(nearest)
-    ) {
-      return `is one word under \`${nearest || '(no key)'}\`, so reads as an identifier`;
+      if (!after.keys.some(isLinkKey)) return `is a link ${under}`;
+      continue;
     }
+    if (looksLikeStyling(value)) return 'reads like a class list or CSS';
+    if (/\s/.test(value) || NUMBER_VALUE.test(value) || DATE_VALUE.test(value)) continue;
+    if (IDENTIFIER_SHAPE.test(value)) return 'reads as an identifier';
+    // A chip in a list of skills or a cell in a table may be one word.
+    if (!isCopyKey(nearest) && !(after.inArray && isListCopyKey(nearest))) {
+      return `is one word ${under}, so reads as an identifier`;
+    }
+  }
+  // A link that loads something (an image, a PDF in a frame) stays on its
+  // host or moves to one the site serves assets from. One you follow may go anywhere.
+  if (LINK_VALUE.test(after.text.trim()) && !after.keys.some(isNavigationKey)) {
+    const from = hostOf(before.text);
+    const to = hostOf(after.text);
+    if (to !== from && !(to && rules.assetHosts.includes(to)))
+      return `moves an asset to ${to ?? 'a path on this site'}`;
   }
   return undefined;
 }
@@ -438,7 +607,7 @@ function isCopyAttribute(ts: Ts, attribute: JsxAttribute): boolean {
   const name = nameText(ts, attribute.name);
   const tag = tagNameOf(ts, attribute.parent.parent);
   if (!name || !tag || CODE_ELEMENTS.has(tag)) return false;
-  if (name.startsWith('aria-')) return true;
+  if (ARIA_COPY.test(name)) return true;
   const plainElement = /^[a-z]/.test(tag) && !tag.includes('.');
   if (!plainElement) return COMPONENT_COPY_PROPS.has(name) || COMPONENT_COPY_SUFFIX.test(name);
   if (HTML_COPY_ATTRIBUTES.has(name)) return true;
@@ -546,6 +715,21 @@ export async function contentMasked(
     tokens.push(token);
     slots.push(value);
   };
+  /** Whether a literal is an entry of an array itself, not a value in an object inside one. */
+  const inArray = (node: Node): boolean => {
+    let parent: Node | undefined = node.parent;
+    while (
+      parent &&
+      (ts.isParenthesizedExpression(parent) ||
+        ts.isAsExpression(parent) ||
+        ts.isSatisfiesExpression(parent) ||
+        ts.isConditionalExpression(parent) ||
+        ts.isPrefixUnaryExpression(parent))
+    ) {
+      parent = parent.parent;
+    }
+    return parent !== undefined && ts.isArrayLiteralExpression(parent);
+  };
   /** Comments sit in the trivia before a token; JSX text has none of its own. */
   const noteComments = (node: Node) => {
     ts.forEachLeadingCommentRange(source, node.getFullStart(), (pos, end) => {
@@ -582,7 +766,7 @@ export async function contentMasked(
       const keys = isActiveUrl(node.text) ? undefined : contentKeys(ts, node);
       if (keys) {
         noteComments(node);
-        mask('<string>', { keys, kind: 'string', text: node.text });
+        mask('<string>', { keys, kind: 'string', text: node.text, inArray: inArray(node) });
         return;
       }
     } else if (ts.isNumericLiteral(node) || ts.isBigIntLiteral(node)) {
@@ -590,14 +774,14 @@ export async function contentMasked(
       const keys = isSignedNumber(ts, node.parent) ? undefined : contentKeys(ts, node);
       if (keys) {
         noteComments(node);
-        mask('<number>', { keys, kind: 'number', text: node.getText(file) });
+        mask('<number>', { keys, kind: 'number', text: node.getText(file), inArray: inArray(node) });
         return;
       }
     } else if (isSignedNumber(ts, node)) {
       const keys = contentKeys(ts, node);
       if (keys) {
         noteComments(node);
-        mask('<number>', { keys, kind: 'number', text: node.getText(file) });
+        mask('<number>', { keys, kind: 'number', text: node.getText(file), inArray: inArray(node) });
         return;
       }
     } else if (ts.isTemplateExpression(node)) {
@@ -638,7 +822,7 @@ export async function contentMasked(
 }
 
 /** What the repo's policy adds to the check of a changed value. */
-export type ContentRules = Pick<ContentPolicy, 'lintForbidden'>;
+export type ContentRules = Partial<Pick<ContentPolicy, 'lintForbidden' | 'assetHosts'>>;
 
 /**
  * Whether two versions of a file differ only in content: the same program
@@ -657,10 +841,10 @@ export async function differsOnlyInContent(
   if (RAW_HTML_OR_SCRIPT.test(before.code) || RAW_HTML_OR_SCRIPT.test(after.code)) return false;
   if (before.tokens.length !== after.tokens.length) return false;
   if (!before.tokens.every((token, index) => token === after.tokens[index])) return false;
-  const forbidden = rules?.lintForbidden ?? [];
+  const resolved = { lintForbidden: rules?.lintForbidden ?? [], assetHosts: rules?.assetHosts ?? [] };
   return before.slots.every((slot, index) => {
     const next = after.slots[index];
-    return slot.text === next.text || changedValueProblem(slot, next, forbidden) === undefined;
+    return slot.text === next.text || changedValueProblem(slot, next, resolved) === undefined;
   });
 }
 
@@ -781,7 +965,7 @@ export async function checkContentOnlyPr(params: {
         fileCount: files.length,
       };
     }
-    return { contentOnly: true, files: names, headSha };
+    return { contentOnly: true, files: names, headSha, baseRef };
   } catch (error) {
     if (signal?.aborted) return unreadable('The run was cancelled.');
     return unreadable(`Couldn't read the diff: ${error instanceof Error ? error.message : String(error)}`);

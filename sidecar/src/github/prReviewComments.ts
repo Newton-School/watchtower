@@ -77,6 +77,8 @@ export interface MergeState {
   isDraft?: boolean;
   /** The commit the PR's head is at, which the rest describes. */
   headSha?: string;
+  /** The branch it merges into. */
+  baseRef?: string;
 }
 
 /** GitHub computes mergeability lazily: the first read after a push says UNKNOWN. */
@@ -107,6 +109,7 @@ export async function fetchMergeState(params: {
           mergeStateStatus
           isDraft
           headRefOid
+          baseRefName
         }
       }
     }
@@ -130,6 +133,7 @@ export async function fetchMergeState(params: {
             mergeStateStatus?: string | null;
             isDraft?: boolean;
             headRefOid?: string | null;
+            baseRefName?: string | null;
           } | null;
         } | null;
       };
@@ -141,6 +145,7 @@ export async function fetchMergeState(params: {
       ...(pr.mergeStateStatus ? { mergeStateStatus: pr.mergeStateStatus } : {}),
       ...(typeof pr.isDraft === 'boolean' ? { isDraft: pr.isDraft } : {}),
       ...(pr.headRefOid ? { headSha: pr.headRefOid } : {}),
+      ...(pr.baseRefName ? { baseRef: pr.baseRefName } : {}),
     };
   };
   try {

@@ -23,12 +23,19 @@ export interface ContentPolicy {
   /** Globs it never touches, even inside `allow`. */
   deny: string[];
   /**
-   * Markdown notes that never ship to the site (a feature's README.md or
-   * design notes): a content-only PR may edit them, unread. Only `.md` files
-   * matching these globs and not `deny`, and never agent instructions
-   * (CLAUDE.md, AGENTS.md, skills), which later runs would read as orders.
+   * Markdown notes that never ship to the site and that no agent is pointed
+   * at (a feature's README.md): a content-only PR may edit them, unread. Only
+   * `.md` files matching these globs and not `deny`, and never agent
+   * instructions (CLAUDE.md, AGENTS.md, skills), which later runs would read
+   * as orders.
    */
   notes: string[];
+  /**
+   * Hosts the site serves images and documents from. A changed link that
+   * loads something (not one the reader follows) keeps its host or moves to
+   * one of these.
+   */
+  assetHosts: string[];
   /**
    * What the repo's own lint forbids in string literals. The repo has no CI
    * to catch it, so a changed value matching one would only fail at deploy.
@@ -146,8 +153,17 @@ export const REPO_REGISTRY: Record<RepoKey, RepoDescriptor> = {
     },
     contentPolicy: {
       allow: ['src/features/**', 'src/app/**', 'src/components/**'],
-      // A coder often updates the feature's own notes alongside a copy edit.
-      notes: ['src/features/**'],
+      // A coder often updates the feature's README alongside a copy edit. Design
+      // notes (`_design/`) steer agents, so they are not notes.
+      notes: ['src/features/**/README.md'],
+      // The CloudFront CDN images and PDFs are uploaded to, Webflow's legacy CDN, YouTube.
+      assetHosts: [
+        'd3dyfaf3iutrxo.cloudfront.net',
+        'cdn.prod.website-files.com',
+        'www.youtube.com',
+        'youtube.com',
+        'www.youtube-nocookie.com',
+      ],
       // eslint.config.mjs: no hardcoded site-host URLs in literals or templates.
       lintForbidden: [/newtonschool\.co/],
       deny: [
@@ -247,6 +263,7 @@ export const REPO_REGISTRY: Record<RepoKey, RepoDescriptor> = {
         'src/app/**/robots.ts',
         'src/app/**/opengraph-image*',
         'src/app/**/twitter-image*',
+        '**/_design/**',
         '**/*.test.*',
         '**/*.spec.*',
       ],

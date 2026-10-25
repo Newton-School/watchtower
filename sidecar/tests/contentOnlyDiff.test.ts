@@ -86,7 +86,6 @@ describe('differsOnlyInContent: copy edits', () => {
     ['a phone number and its link (marketing #1484)', CONTENT.replace(/8792019038/g, '6366275707')],
     ['a fee in words (marketing #1483)', CONTENT.replace('₹ 1.3L*', '₹ 1.5L*')],
     ['a number in a data object', CONTENT.replace('150000', '175000')],
-    ['a negative number', CONTENT.replace('delta: -1', 'delta: -2')],
     ['an amount in rupees', CONTENT.replace('₹ 5,000', '₹ 6,500')],
     ['dates with an en dash', CONTENT.replace('12 Jan – 15 Feb 2027', '19 Jan – 22 Feb 2027')],
     [
@@ -145,6 +144,7 @@ describe('differsOnlyInContent: changes of behaviour', () => {
     ['an id-like key', CONTENT.replace("'rcb-1'", "'rcb-2'")],
     ['a number turned into text', CONTENT.replace('fee: 150000', "fee: '₹1.5L'")],
     ['a reference in place of a literal', CONTENT.replace("'2027-01-15'", 'NEXT_DEADLINE')],
+    ['a number under a key that says nothing about numbers', CONTENT.replace('delta: -1', 'delta: -2')],
     ["a constant's whole value", CONTENT.replace("'2027-01-15'", "'2027-01-20'")],
   ])('does not count a change of %s as content', async (_case, after) => {
     expect(await same(CONTENT, after, 'content.ts')).toBe(false);
@@ -297,6 +297,259 @@ describe('differsOnlyInContent: changes of behaviour', () => {
 // Round 2 of the review of PR #704: values in data objects that are
 // identifiers, links or knobs passed because their keys were not on the
 // knob list. Each case is shaped like a real file in the marketing repo.
+// Round 3 of the review of PR #704: values in data now count as copy by an
+// allow list. Each case is shaped like a real file in the marketing repo.
+describe('differsOnlyInContent: copy by allow list', () => {
+  const data = (fields: string) => `export const X = { ${fields} };`;
+  const change = async (before: string, after: string, file = 'content.ts') => same(before, after, file);
+
+  it.each([
+    [
+      'a snake-case id under a copy prop',
+      'export const A = () => <Card cta="hero_contact_us" />;',
+      'export const A = () => <Card cta="nav_request_callback" />;',
+    ],
+    ['a snake-case id under a copy key', data("label: 'hero_cta'"), data("label: 'nav_cta'")],
+    ['a kebab-case id under a copy key', data("heading: 'hero-apply'"), data("heading: 'nav-apply'")],
+    ['a camel-case id under a copy key', data("title: 'heroCta'"), data("title: 'navCta'")],
+    [
+      'an id under `cta`, which is not a copy key',
+      data("cta: 'training_corporate_get_in_touch'"),
+      data("cta: 'training_agentic_get_in_touch'"),
+    ],
+    [
+      'words under a `…Cta` prop, which is not a copy prop',
+      'export const A = () => <Hero primaryCta="Apply now" />;',
+      'export const A = () => <Hero primaryCta="Enroll now" />;',
+    ],
+  ])('turns down %s (item 1)', async (_case, before, after) => {
+    expect(await change(before, after, 'a.tsx')).toBe(false);
+  });
+
+  const CDN = 'https://d3dyfaf3iutrxo.cloudfront.net/general/upload';
+  it.each([
+    ['a PDF moved off the CDN', data(`pdf: '${CDN}/a.pdf'`), data("pdf: 'https://evil.example/sign-in'")],
+    [
+      'a brochure moved off the CDN',
+      `export const IMAGES = { brochurePdf: '${CDN}/b.pdf' };`,
+      "export const IMAGES = { brochurePdf: 'https://evil.example/b' };",
+    ],
+    [
+      'a site image moved to another host',
+      data("heroImage: '/images/hero.png'"),
+      data("heroImage: 'https://evil.example/hero.png'"),
+    ],
+    [
+      'an image source moved off the CDN',
+      `export const A = () => <img src="${CDN}/a.png" alt="x" />;`,
+      'export const A = () => <img src="https://evil.example/a.png" alt="x" />;',
+    ],
+    [
+      'a script moved to another host',
+      data("widgetSrc: 'https://widget.example/embed.js'"),
+      data("widgetSrc: 'https://evil.example/x.js'"),
+    ],
+  ])('turns down %s (item 2)', async (_case, before, after) => {
+    expect(await change(before, after, 'a.tsx')).toBe(false);
+  });
+
+  it.each([
+    ['a PDF swapped for another on the CDN', data(`pdf: '${CDN}/a.pdf'`), data(`pdf: '${CDN}/b.pdf'`)],
+    [
+      'a legacy Webflow image moved to the CDN',
+      data("heroImage: 'https://cdn.prod.website-files.com/a.png'"),
+      data(`heroImage: '${CDN}/a.png'`),
+    ],
+    [
+      'a video swapped on YouTube',
+      data("videoUrl: 'https://www.youtube.com/embed/abc'"),
+      data("videoUrl: 'https://www.youtube.com/embed/def'"),
+    ],
+    [
+      'a link the reader follows, to another site',
+      data("href: 'https://yourstory.com/a'"),
+      data("href: 'https://www.thehindu.com/b'"),
+    ],
+    [
+      'a link under `…Link`, to another site',
+      data("caseStudyLink: 'https://a.example/x'"),
+      data("caseStudyLink: 'https://b.example/y'"),
+    ],
+  ])('keeps %s (item 2)', async (_case, before, after) => {
+    expect(await change(before, after, 'a.tsx')).toBe(true);
+  });
+
+  it.each([
+    [
+      'a predictor category sent with a query',
+      "export const PREDICTOR = { categories: ['General (PwD)', 'OBC'] };",
+      "export const PREDICTOR = { categories: ['General (Divyang)', 'OBC'] };",
+    ],
+    [
+      'a domicile state',
+      "export const PREDICTOR = { domicileStates: ['Andhra Pradesh'] };",
+      "export const PREDICTOR = { domicileStates: ['Andhra Pradesh State'] };",
+    ],
+    [
+      'a degree a filter matches on',
+      "export const DEGREE_GROUPS = [{ name: 'BTech', degrees: ['Bachelor of Technology'] }];",
+      "export const DEGREE_GROUPS = [{ name: 'BTech', degrees: ['Bachelor of Tech'] }];",
+    ],
+    [
+      'a trusted sender list',
+      "export const TRUSTED_SENDERS = ['Newton School', 'NST Admissions'];",
+      "export const TRUSTED_SENDERS = ['Evil Corp', 'NST Admissions'];",
+    ],
+  ])('turns down a list entry that may be a lookup: %s (item 3)', async (_case, before, after) => {
+    expect(await change(before, after)).toBe(false);
+  });
+
+  it.each([
+    [
+      'a curriculum item',
+      "export const MODULE = { items: ['Python proficiency and basics'] };",
+      "export const MODULE = { items: ['Python proficiency and fundamentals'] };",
+    ],
+    [
+      'a table cell',
+      "export const ROWS = [['Abhishek Kunwar', 'Google']];",
+      "export const ROWS = [['Abhishek Kunwar', 'Microsoft']];",
+    ],
+    [
+      'a heading line',
+      "export const HERO = { titleLines: ['Learn AI', 'in 6 months'] };",
+      "export const HERO = { titleLines: ['Learn GenAI', 'in 6 months'] };",
+    ],
+    [
+      'a fee feature',
+      "export const FEE_FEATURES = ['Easy EMI available'];",
+      "export const FEE_FEATURES = ['Easy EMI from ₹7,950'];",
+    ],
+    [
+      'a skill chip',
+      "export const ROLE = { skills: ['SQL', 'Python'] };",
+      "export const ROLE = { skills: ['SQL', 'Tableau'] };",
+    ],
+  ])('keeps a list entry in a list of copy: %s (item 3)', async (_case, before, after) => {
+    expect(await change(before, after)).toBe(true);
+  });
+
+  it.each([
+    [
+      'a bitmask',
+      'export const SKILL_BIT = { python: 1, excel: 2 };',
+      'export const SKILL_BIT = { python: 1, excel: 1 };',
+    ],
+    [
+      'a slider step',
+      'export const RANGE_SPEC = { yoe: { step: 1 } };',
+      'export const RANGE_SPEC = { yoe: { step: 0 } };',
+    ],
+    [
+      'a days threshold',
+      "export const AVAILABILITY = [{ label: 'In 15 days', days: 15 }];",
+      "export const AVAILABILITY = [{ label: 'In 15 days', days: 90 }];",
+    ],
+    ['an autoplay timing', data("title: 'a', autoAdvance: 5000"), data("title: 'a', autoAdvance: 1")],
+    [
+      'a cohort split',
+      'export const X = { cohorts: { a: 50, b: 50 } };',
+      'export const X = { cohorts: { a: 0, b: 100 } };',
+    ],
+    ['a number in a list', 'export const X = { weights: [1, 2, 3] };', 'export const X = { weights: [1, 2, 9] };'],
+  ])('turns down %s (item 4)', async (_case, before, after) => {
+    expect(await change(before, after)).toBe(false);
+  });
+
+  it.each([
+    ['a rating', data('rating: 4.7'), data('rating: 4.8')],
+    ['a seat count', data('seatsLeft: 12'), data('seatsLeft: 8')],
+    ['a fee', data('fee: 150000'), data('fee: 175000')],
+    ['years of experience', data('yearsOfExperience: 5'), data('yearsOfExperience: 6')],
+    ['a count-up end', data("end: 93, suffix: '%'"), data("end: 98.3, suffix: '%'")],
+    ['a number under a copy key', data('heading: 2026'), data('heading: 2027')],
+  ])('keeps %s (item 4)', async (_case, before, after) => {
+    expect(await change(before, after)).toBe(true);
+  });
+
+  it.each([
+    [
+      'a class list under a `…ClassName` key',
+      data("labelClassName: 'text-ds-ink font-medium'"),
+      data("labelClassName: 'hidden font-medium'"),
+    ],
+    ['a class list under `rowClassName`', data("rowClassName: 'flex gap-2'"), data("rowClassName: 'hidden gap-2'")],
+    [
+      'a class list under a copy key',
+      data("title: 'flex items-center gap-2'"),
+      data("title: 'hidden items-center gap-2'"),
+    ],
+    [
+      'a variant-prefixed class',
+      "export const CARD_OFF_AT = ['group-data-[step=2]/hiw:pointer-events-none'];",
+      "export const CARD_OFF_AT = ['group-data-[step=2]/hiw:pointer-events-auto'];",
+    ],
+    [
+      'an arbitrary background',
+      data("chip: 'bg-white border-[#edeff3]'"),
+      data("chip: 'bg-[url(https://evil.example/p.png)] border-[#edeff3]'"),
+    ],
+    [
+      'a CSS gradient',
+      data("gradient: 'linear-gradient(90deg, #fff, #000)'"),
+      data("gradient: 'url(https://evil.example/x.png) center'"),
+    ],
+  ])('turns down %s (item 5)', async (_case, before, after) => {
+    expect(await change(before, after)).toBe(false);
+  });
+
+  it.each([
+    [
+      'aria-controls',
+      'export const A = () => <button aria-controls="faq-panel">x</button>;',
+      'export const A = () => <button aria-controls="other-panel">x</button>;',
+      false,
+    ],
+    [
+      'aria-labelledby',
+      'export const A = () => <div aria-labelledby="h1">x</div>;',
+      'export const A = () => <div aria-labelledby="h2">x</div>;',
+      false,
+    ],
+    [
+      'aria-label',
+      'export const A = () => <button aria-label="Next slide">x</button>;',
+      'export const A = () => <button aria-label="Next story">x</button>;',
+      true,
+    ],
+  ])('treats %s as copy or not (item 6)', async (_case, before, after, expected) => {
+    expect(await change(before, after, 'a.tsx')).toBe(expected);
+  });
+
+  it.each([
+    [
+      'an escaped closing script tag',
+      'export const A = () => <Faq answer="Yes we do." />;',
+      'export const A = () => <Faq answer="Yes&lt;/script&gt;&lt;script&gt;alert(1)" />;',
+      false,
+    ],
+    [
+      'a numeric escape of a tag',
+      'export const A = () => <Faq answer="Yes we do." />;',
+      'export const A = () => <Faq answer="Yes&#60;/script&#62;" />;',
+      false,
+    ],
+    [
+      'a curly apostrophe',
+      'export const A = () => <Card title="Industry&rsquo;s top" />;',
+      'export const A = () => <Card title="Industry&rsquo;s best" />;',
+      true,
+    ],
+  ])('reads %s in a JSX value (item 7)', async (_case, before, after, expected) => {
+    expect(await change(before, after, 'a.tsx')).toBe(expected);
+  });
+});
+
 describe('differsOnlyInContent: values that are not words', () => {
   const object = (fields: string) => `export const DS_APPLY = { ${fields} } as const;`;
 
@@ -574,9 +827,12 @@ describe('isContentPath', () => {
   // A feature's own notes never ship to the site. Agent instructions do not
   // count: a later run would read them as orders.
   it.each([
-    ['src/features/nst-apply/_design/REHOST-CAMPUS-AMENITIES.md', true],
     ['src/features/x/README.md', true],
-    ['src/features/x/notes.MD', true],
+    ['src/features/x/sections/Readme.md', true],
+    ['src/features/nst-apply/_design/REHOST-CAMPUS-AMENITIES.md', false],
+    ['src/features/x/_design/README.md', false],
+    ['src/features/x/notes.MD', false],
+    ['src/features/x/CHANGELOG.md', false],
     ['src/features/nst-home/CLAUDE.md', false],
     ['src/features/nst-shell/PAGES-CLAUDE.md', false],
     ['src/features/data-science-ns-v5/_design/reference/hero-sequence/AGENTS.md', false],
@@ -640,7 +896,7 @@ describe('checkContentOnlyPr', () => {
   it('passes a copy edit, comparing the head with where it left the base branch', async () => {
     const fetcher = github(copyEdit());
 
-    expect(await check(fetcher)).toEqual({ contentOnly: true, files: [PATH], headSha: 'HEAD' });
+    expect(await check(fetcher)).toEqual({ contentOnly: true, files: [PATH], headSha: 'HEAD', baseRef: 'main' });
     const headers = (fetcher.mock.calls[0] as unknown as [string, RequestInit])[1].headers as Record<string, string>;
     expect(headers.Authorization).toBe('Bearer ghs_test');
   });
@@ -761,7 +1017,7 @@ describe('checkContentOnlyPr', () => {
       [`${api}/compare/main...HEAD`]: compare([PATH, 'modified'], [note, 'modified']),
     });
 
-    expect(await check(fetcher)).toEqual({ contentOnly: true, files: [PATH, note], headSha: 'HEAD' });
+    expect(await check(fetcher)).toEqual({ contentOnly: true, files: [PATH, note], headSha: 'HEAD', baseRef: 'main' });
     expect(fetcher.mock.calls.some(call => String(call[0]).includes('README.md'))).toBe(false);
   });
 
@@ -789,6 +1045,6 @@ describe('checkContentOnlyPr', () => {
       [`${api}/contents/${encoded}?ref=HEAD`]: raw(HERO.replace('Apply now', 'Apply today')),
     });
 
-    expect(await check(fetcher)).toEqual({ contentOnly: true, files: [path], headSha: 'HEAD' });
+    expect(await check(fetcher)).toEqual({ contentOnly: true, files: [path], headSha: 'HEAD', baseRef: 'main' });
   });
 });
