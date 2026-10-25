@@ -13,6 +13,8 @@ export const MARKETING_REPO = 'newton-marketing-web';
 const NOT_BRANCHES = new Set([
   ...['to', 'on', 'onto', 'in', 'of', 'the', 'that', 'this', 'it', 'for', 'is', 'was', 'has', 'name', 'please', 'pls'],
   ...['yes', 'yeah', 'yep', 'ok', 'okay', 'sure', 'no', 'nope', 'go', 'thanks', 'staging', 'stg', 'a', 'an', 'and'],
+  // "the branch looks good": a verb after "branch" says something about it, it doesn't name it.
+  ...['looks', 'seems', 'works', 'should', 'needs', 'got', 'now', 'still', 'passes', 'builds', 'can', 'will'],
 ]);
 const SLASH_WORDS = new Set(['and/or', 'either/or', 'w/o', 'n/a', 'i/o', 'on/off', 'yes/no', 'he/she', 'his/her']);
 const BRANCH_TOKEN = String.raw`[A-Za-z0-9][A-Za-z0-9._/-]*[A-Za-z0-9]|[A-Za-z0-9]`;
@@ -44,10 +46,20 @@ const MAIN_TARGET_RES = [
   new RegExp(String.raw`\b(?:reset|restore|switch|revert|put|bring)\s+${STAGING}\s+(?:back\s+)?to\s+(?:main|master)\b`),
   new RegExp(String.raw`^(?:main|master)\s+(?:back\s+)?(?:to|on|onto)\s+${STAGING}(?:\s+(?:please|pls|now))?$`),
 ];
-/** main asked for later, not now ("switch staging back to main tomorrow"). */
-const LATER_RE = /^[^,;.]*\b(?:tomorrow|later|afterwards?|after|once|when|tonight|next|eod|then)\b/;
-/** The message asks for a link to test something: main is then a side remark, not the ask. */
+/**
+ * A time for later in the same clause: main is asked for then, not now
+ * ("switch staging back to main tomorrow"). Only real times: "when you get a
+ * chance", "then" or "the next person" are now.
+ */
+const LATER_RE =
+  /\b(?:tomorrow|tonight|later|eod|end of (?:the )?day|this evening|next (?:week|month|sprint|monday|tuesday|wednesday|thursday|friday)|on (?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|after (?:lunch|the demo|the meeting|the call|qa)|once qa is (?:done|over|finished))\b/;
+
+/** The message asks for a link to test something now ("give me a testing link"). */
 const LINK_ASK_RE = /\b(?:testing|test|preview|staging)\s+(?:link|url)s?\b/;
+
+export function asksForTestingLink(text: string): boolean {
+  return LINK_ASK_RE.test(stagingPlainText(text).toLowerCase());
+}
 
 /** The message as words: no mentions, links, channel references or "Sent using" footer. */
 export function stagingPlainText(text: string): string {
@@ -72,6 +84,8 @@ export interface StagingAsk {
   explicitBranch?: string;
   /** main is what should go on staging. */
   main: boolean;
+  /** main is asked for at a later time ("tomorrow"): nothing to deploy now. */
+  mainLater?: boolean;
   /**
    * Names that may be words ("UI/UX", "the branch is ready"): each is checked
    * on GitHub, in order, and one that doesn't exist is passed over in silence.
@@ -93,7 +107,10 @@ const emptyAsk = (): StagingAsk => ({ main: false, looseBranches: [], prNumbers:
 function readAnswerOnly(plain: string): StagingAsk | undefined {
   const text = plain.replace(/[.!]+$/, '').trim();
   const ask = emptyAsk();
-  const number = /^(?:(?:pr|pull request)\s*)?#?\s*(\d{1,6})$/i.exec(text);
+  const number =
+    /^(?:(?:use|it'?s|its|try|the)\s+)?(?:(?:pr|pull request)[\s-]*)?#?\s*(\d{1,6})(?:\s+(?:please|pls|one))?$/i.exec(
+      text,
+    );
   if (number) {
     ask.prNumbers.push(Number(number[1]));
     return ask;
@@ -105,27 +122,31 @@ function readAnswerOnly(plain: string): StagingAsk | undefined {
   const afterBranch = /^(?:(?:use|try)\s+)?(?:the\s+)?branch\s*:?\s+[`'"]?([A-Za-z0-9][A-Za-z0-9._/-]*)[`'"]?$/i.exec(
     text,
   );
-  if (afterBranch && !NOT_BRANCHES.has(afterBranch[1].toLowerCase())) {
+  if (afterBranch && !NOT_BRANCHES.has(afterBranch[1].toLowerCase()) && !/^\d+$/.test(afterBranch[1])) {
     if (MAIN_WORD_RE.test(afterBranch[1])) ask.main = true;
     else ask.explicitBranch = afterBranch[1];
     return ask;
   }
   const only = /^(?:(?:use|it'?s|its|try)\s+)?([`'"]?)([A-Za-z0-9][A-Za-z0-9._/-]*)\1$/i.exec(text);
-  if (only && (only[1] === '`' || REF_SIGNAL_RE.test(only[2]))) {
+  if (only && !/^\d+$/.test(only[2]) && (only[1] === '`' || REF_SIGNAL_RE.test(only[2]))) {
     ask.explicitBranch = only[2];
     return ask;
   }
   return undefined;
 }
 
-/** Whether the message's ask is to put main on staging now. */
-function asksForMain(lower: string): boolean {
-  if (LINK_ASK_RE.test(lower)) return false;
+/** Whether the message asks for main on staging: now, later (a time in its clause), or not at all. */
+function asksForMain(lower: string): 'now' | 'later' | undefined {
   for (const re of MAIN_TARGET_RES) {
     const match = re.exec(lower);
-    if (match && !LATER_RE.test(lower.slice(match.index + match[0].length))) return true;
+    if (!match) continue;
+    const start = Math.max(...[',', ';', '.', '!', '?'].map(mark => lower.lastIndexOf(mark, match.index)));
+    const rest = lower.slice(match.index + match[0].length);
+    const end = rest.search(/[,;.!?]/);
+    const clause = lower.slice(start + 1, match.index + match[0].length) + (end < 0 ? rest : rest.slice(0, end));
+    return LATER_RE.test(clause) ? 'later' : 'now';
   }
-  return false;
+  return undefined;
 }
 
 /**
@@ -144,13 +165,15 @@ export function readStagingAsk(text: string, options: { answeringWhich?: boolean
 
   const ask = emptyAsk();
   const named = new RegExp(
-    String.raw`\bbranch(?:\s+(?:name\s+is|is|was|has|called|named))?(\s*:\s*|\s+)([\`'"]?)(${BRANCH_TOKEN})\2`,
+    String.raw`\bbranch(?:\s+(name\s+is|is|was|has|called|named))?(\s*:\s*|\s+)([\`'"]?)(${BRANCH_TOKEN})\3`,
     'i',
   ).exec(plain);
-  if (named && !NOT_BRANCHES.has(named[3].toLowerCase())) {
-    const name = clean(named[3]);
-    // "branch: fix", "branch `hero`", "branch hero-v2" name a ref; "the branch is ready" does not.
-    const refLike = named[1].includes(':') || named[2] !== '' || REF_SIGNAL_RE.test(name);
+  if (named && !NOT_BRANCHES.has(named[4].toLowerCase()) && !/^\d+$/.test(named[4])) {
+    const name = clean(named[4]);
+    // "branch redesign", "branch: fix", "branch `hero`" name a ref; after "branch
+    // is/was/has" only a ref-shaped word does ("the branch is ready" does not).
+    const describes = /^(?:is|was|has)$/i.test(named[1] ?? '');
+    const refLike = !describes || named[2].includes(':') || named[3] !== '' || REF_SIGNAL_RE.test(name);
     if (MAIN_WORD_RE.test(name)) ask.main = true;
     else if (refLike) ask.explicitBranch = name;
     else ask.looseBranches.push(name);
@@ -159,7 +182,9 @@ export function readStagingAsk(text: string, options: { answeringWhich?: boolean
     const ticked = /`([A-Za-z0-9][A-Za-z0-9._/-]*)`/.exec(plain);
     if (ticked && ticked[1].includes('/')) ask.explicitBranch = clean(ticked[1]);
   }
-  if (asksForMain(lower)) ask.main = true;
+  const main = asksForMain(lower);
+  if (main === 'now') ask.main = true;
+  else if (main === 'later') ask.mainLater = true;
 
   for (const match of plain.matchAll(new RegExp(String.raw`(?:^|\s)(${BRANCH_TOKEN})(?=$|[\s,.!?;:)])`, 'g'))) {
     const token = clean(match[1]);
@@ -224,16 +249,22 @@ export function isMarketingPr(pr: PrTarget, org: string): boolean {
 
 /** A report of something wrong with staging, not an ask to deploy to it. */
 const PROBLEM_RE = /\b(?:fail(?:s|ed|ing|ure)?|broken|breaks?|stuck|errors?|issue|bug|why|not working|down)\b/;
+/** A request to deploy to staging, as a verb ("can you deploy it to staging again?"), not the noun "the deploy". */
+const STAGING_REQUEST_RE =
+  /(?:^|[,;.!?]\s*|\b(?:can|could|would|will) you\s+|\bplease\s+|\bpls\s+|\bkindly\s+)(?:please\s+)?(?:re-?deploy|deploy|put|push|ship)\s+(?:[^\s,.;!?]+\s+){0,3}?(?:back\s+|again\s+)?(?:to|on|onto)\s+(?:the\s+)?(?:marketing\s+)?(?:staging|stg)\b/;
 
 /**
  * A staging ask the router read as a production deploy, that is the
  * marketing site's: it names staging as where it goes, and the marketing
  * site by name or by a PR in the message or thread, no other app, and it
- * reports no problem ("the marketing deploy to staging failed").
+ * reports no problem ("the marketing deploy to staging failed") unless it
+ * also asks for the deploy ("…can you deploy it to staging again?").
  */
 export function isMarketingStagingAsk(task: NormalizedTask, org: string): boolean {
   const text = task.event.text ?? '';
-  if (!namesStagingAsTarget(text) || namesOtherApp(text) || PROBLEM_RE.test(guardWords(text))) return false;
+  if (!namesStagingAsTarget(text) || namesOtherApp(text)) return false;
+  const words = guardWords(text);
+  if (PROBLEM_RE.test(words) && !STAGING_REQUEST_RE.test(words)) return false;
   const prs = task.prContexts ?? [];
   if (prs.some(pr => pr.source === 'trigger' && !isMarketingPr(pr, org))) return false;
   return MARKETING_RE.test(stagingPlainText(text).toLowerCase()) || prs.some(pr => isMarketingPr(pr, org));

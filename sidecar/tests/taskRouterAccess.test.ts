@@ -2167,6 +2167,42 @@ describe('a marketing staging deploy ask (issue #702)', () => {
     expect(repliesOf(slack).some(text => text.includes('put this on the marketing staging site'))).toBe(true);
   });
 
+  it('runs the staging tool for a "yes" to its staging question that the router reads as deploy (round 3)', async () => {
+    decideTool.mockResolvedValue({
+      ok: true,
+      decision: { tool: 'deploy', confidence: 0.9, reason: 'yes to a deploy' },
+      durationMs: 1,
+    });
+    const task = makeTask({ userId: 'UBUILDER', channelId: 'C-BUILD', text: 'yes', intent: 'IMPLEMENTATION' });
+    task.clarification = {
+      question:
+        'Do you want me to put this on the marketing staging site and send you the link? Say which PR or branch if it is not the one here.',
+      askedText: 'deploy marketing main to staging',
+    };
+    await routeTask({ task, config: makeConfig('enforce'), slack: makeSlack() as never, store: {} as never });
+    expect(runStagingDeployWorkflow).toHaveBeenCalledOnce();
+    expect(runDeployWorkflow).not.toHaveBeenCalled();
+  });
+
+  it('runs the staging tool for a redeploy ask beside a reported failure', async () => {
+    decideTool.mockResolvedValue({
+      ok: true,
+      decision: { tool: 'deploy', confidence: 0.9, reason: 'deploy words' },
+      durationMs: 1,
+    });
+    await routeTask({
+      task: makeTask({
+        userId: 'UBUILDER',
+        channelId: 'C-BUILD',
+        text: '<@UBOT1> the marketing staging deploy failed, can you deploy it to staging again?',
+      }),
+      config: makeConfig('enforce'),
+      slack: makeSlack() as never,
+      store: {} as never,
+    });
+    expect(runStagingDeployWorkflow).toHaveBeenCalledOnce();
+  });
+
   it('gives the help reply to "help" sent in answer to the staging question', async () => {
     const slack = makeSlack();
     const task = makeTask({ userId: 'UBUILDER', channelId: 'C-BUILD', text: 'help', intent: 'IMPLEMENTATION' });

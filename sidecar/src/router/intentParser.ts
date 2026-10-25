@@ -73,7 +73,12 @@ export function namesStagingAsTarget(text: string): boolean {
   if (/\b(prod|production)\b/.test(plain)) return false;
   return (
     /\b(?:to|onto) (?:the )?(?:[\w-]+ ){0,2}?(?:staging|stg)\b/.test(plain) ||
-    /\b(?:staging|stg) (?:deploy|deployment|release)\b/.test(plain)
+    /\b(?:staging|stg) (?:deploy|deployment|release)\b/.test(plain) ||
+    // "put main back on staging", "put PR #12 on marketing staging": led by the verb,
+    // so "deploy marketing, it looks good on staging" is still only context.
+    /\b(?:put|deploy|push|ship|get|bring)\s+(?:[^\s,.;!?]+\s+){0,3}?(?:back\s+)?on\s+(?:the\s+)?(?:[\w-]+\s+)?(?:staging|stg)\b/.test(
+      plain,
+    )
   );
 }
 

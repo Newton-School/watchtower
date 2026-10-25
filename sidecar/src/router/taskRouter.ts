@@ -41,7 +41,13 @@ import {
   type LegacyDecidedBy,
   type RouterClassification,
 } from './routerShadow.js';
-import { askRequester, decideClarify, giveUpOnClarify, type ClarifyAction } from './routeClarify.js';
+import {
+  LOW_CONFIDENCE_STAGING_QUESTION,
+  askRequester,
+  decideClarify,
+  giveUpOnClarify,
+  type ClarifyAction,
+} from './routeClarify.js';
 import { cancelledResult } from '../workflows/shared/cancelState.js';
 import { cleanResetText, usageLimitReply } from '../codex/infraRetry.js';
 import { channelDenialHint } from '../access/denialHint.js';
@@ -399,7 +405,10 @@ export async function routeTask(params: {
       // A decision that should not be acted on as given becomes one question
       // to the requester, instead of the keyword seed or a guess (issue #431).
       // The marketing site's staging ask: a `deploy` pick on it is the staging tool's (issue #702).
-      const marketingStagingAsk = isMarketingStagingAsk(task, config.allowedPrOrg);
+      // So is a reply to the router's own staging question ("yes" read as `deploy`).
+      const marketingStagingAsk =
+        isMarketingStagingAsk(task, config.allowedPrOrg) ||
+        task.clarification?.question === LOW_CONFIDENCE_STAGING_QUESTION;
       if (classification.tool && !classification.failed) {
         clarify = decideClarify({
           tool: classification.tool,

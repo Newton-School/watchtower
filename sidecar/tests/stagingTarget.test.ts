@@ -8,6 +8,7 @@ import {
   readStagingAsk,
 } from '../src/router/stagingTarget.js';
 import type { NormalizedTask, PrTarget } from '../src/types/contracts.js';
+import { namesStagingAsTarget } from '../src/router/intentParser.js';
 
 const pr = (n: number, source: PrTarget['source'], repo = 'newton-marketing-web'): PrTarget => ({
   url: `https://github.com/Newton-School/${repo}/pull/${n}`,
@@ -116,6 +117,65 @@ describe('readStagingAsk, round 2', () => {
     expect(readStagingAsk('give me a testing link, and switch staging back to main tomorrow').main).toBe(false);
     expect(readStagingAsk('restore staging to main once QA is done').main).toBe(false);
     expect(readStagingAsk('put main back on staging, thanks').main).toBe(true);
+  });
+});
+
+describe('readStagingAsk, round 3', () => {
+  it('reads polite and "so the next person" main asks as main now; only real times as later', () => {
+    for (const text of [
+      'can you put main back on staging when you get a chance?',
+      'done testing, please put main back on staging once you are free',
+      'put main back on staging so the next person can test',
+      'put main back on staging and then send me the link',
+      'put main on staging and send me the staging link',
+      'put main back on staging when done',
+    ]) {
+      expect(readStagingAsk(text), text).toMatchObject({ main: true });
+      expect(readStagingAsk(text).mainLater, text).toBeUndefined();
+    }
+    for (const text of [
+      'switch staging back to main tomorrow',
+      'put main back on staging tonight',
+      'restore staging to main after the demo',
+      'put main back on staging next week',
+    ]) {
+      expect(readStagingAsk(text), text).toMatchObject({ main: false, mainLater: true });
+    }
+  });
+
+  it('reads a number after a lead-in as a PR in an answer, and never an all-digit branch', () => {
+    const answer = (text: string) => readStagingAsk(text, { answeringWhich: true });
+    for (const text of ["it's 1490", 'use 1490', 'try 1490', 'its #1490', '1490 please', 'PR-1490', 'the 1490 one']) {
+      expect(answer(text), text).toEqual({ main: false, looseBranches: [], prNumbers: [1490] });
+      expect(isStagingTargetAnswer(text), text).toBe(true);
+    }
+    expect(readStagingAsk('branch 1490 please').explicitBranch).toBeUndefined();
+  });
+
+  it('names a branch with a plain word right after "branch", but not after "branch is/was/has" or a verb', () => {
+    expect(readStagingAsk('put branch redesign on staging').explicitBranch).toBe('redesign');
+    expect(readStagingAsk('deploy branch hero to marketing staging').explicitBranch).toBe('hero');
+    expect(readStagingAsk('the branch is ready, testing link please')).toMatchObject({ looseBranches: ['ready'] });
+    expect(readStagingAsk('the branch looks good, testing link please')).toEqual({
+      main: false,
+      looseBranches: [],
+      prNumbers: [],
+    });
+  });
+
+  it('reads "put main back on staging" as naming staging, and a redeploy ask beside a failure as an ask', () => {
+    expect(namesStagingAsTarget('put main back on staging')).toBe(true);
+    expect(namesStagingAsTarget('can you put PR #1484 on marketing staging?')).toBe(true);
+    expect(namesStagingAsTarget('deploy marketing, it looks good on staging')).toBe(false);
+    expect(
+      isMarketingStagingAsk(
+        task('the marketing staging deploy failed, can you deploy it to staging again?'),
+        'Newton-School',
+      ),
+    ).toBe(true);
+    expect(isMarketingStagingAsk(task('the marketing deploy to staging failed, can you check?'), 'Newton-School')).toBe(
+      false,
+    );
   });
 });
 

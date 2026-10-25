@@ -7,6 +7,7 @@ import { REPO_REGISTRY, repoPathOrNull } from '../repos/registry.js';
 import { LOW_CONFIDENCE_STAGING_QUESTION, STAGING_TARGET_QUESTION, askRequester } from '../router/routeClarify.js';
 import {
   MARKETING_REPO,
+  asksForTestingLink,
   isMainBranch,
   isMarketingPr,
   isSafeRef,
@@ -50,6 +51,8 @@ export const STAGING_PROD_WORD_REPLY =
 const NEWER_PUSH_NOTE = (branch: string) =>
   ` \`${branch}\` got a newer push after I checked it, so staging runs a commit I didn't check.`;
 const emptyStagingAsk = (): StagingAsk => ({ main: false, looseBranches: [], prNumbers: [] });
+export const MAIN_LATER_REPLY =
+  "I haven't changed staging. When it's time, mention me with \"put main back on staging\" and I'll do it then.";
 const GITHUB_UNREACHABLE =
   "I couldn't reach GitHub to check that, so I haven't put anything on staging. Try again in a bit.";
 
@@ -377,8 +380,12 @@ async function resolveTarget(params: {
   // when the reply names nothing.
   const ctx = { slug, repoPath };
   const linked = triggerPrs.filter(pr => isMarketingPr(pr, org)).map(pr => pr.number);
-  const fromMessage = await resolveNamed(readStagingAsk(text, { answeringWhich }), linked, ctx);
+  const ask = readStagingAsk(text, { answeringWhich });
+  const fromMessage = await resolveNamed(ask, linked, ctx);
   if (fromMessage) return fromMessage;
+  // main for later ("…back to main tomorrow") and nothing for now: not the thread's
+  // PR. A testing-link ask beside it is for now, and goes on to the thread's PR.
+  if (ask.mainLater && !asksForTestingLink(text)) return { kind: 'refuse', message: MAIN_LATER_REPLY };
   if (task.clarification?.askedText) {
     const fromAsked = await resolveNamed(readStagingAsk(task.clarification.askedText), [], ctx);
     if (fromAsked) return fromAsked;
@@ -530,6 +537,8 @@ export async function runStagingDeployWorkflow(params: {
     return result('SUCCESS', msg, await say(msg));
   }
 
+  // Stopped while it checked: nothing started, and the stop said so itself.
+  if (signal?.aborted) return result('CANCELLED', 'Stopped before the staging deploy started.', false);
   await say(`Putting \`${branch}\` on staging, about 3 minutes.`);
   const outcome = await dispatchWorkflowRun({
     repoPath,

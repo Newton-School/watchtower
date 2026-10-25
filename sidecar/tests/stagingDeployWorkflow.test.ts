@@ -10,6 +10,7 @@ import {
   routesForChangedFiles,
   runStagingDeployWorkflow,
   stagingHeadsUp,
+  MAIN_LATER_REPLY,
   STAGING_HEADS_UP_WINDOW_MS,
   STAGING_PROD_WORD_REPLY,
   STAGING_STATE_KEY,
@@ -626,12 +627,87 @@ describe('runStagingDeployWorkflow: round-2 review', () => {
     }
   });
 
-  it('deploys the thread PR when main is only asked for later', async () => {
+  it('deploys nothing when main is asked for later, not the thread PR (round 3)', async () => {
+    for (const text of [
+      '<@UBOT1> switch staging back to main tomorrow',
+      '<@UBOT1> restore staging to main once QA is done',
+    ]) {
+      const gh = fakeGh({ prs });
+      const { result, texts } = await run(makeTask(text, { prContexts: thread }));
+      expect(dispatchedRef(gh), text).toBeUndefined();
+      expect(result.status).toBe('SKIPPED');
+      expect(texts).toEqual([MAIN_LATER_REPLY]);
+    }
+  });
+});
+
+describe('runStagingDeployWorkflow: round-3 review', () => {
+  const thread = [prTarget(1484, 'thread')];
+  const prs = { 1484: { head: 'feat/a' }, 1490: { head: 'feat/b' } };
+
+  it('puts main back for a polite main ask in a PR thread', async () => {
+    for (const text of [
+      '<@UBOT1> can you put main back on staging when you get a chance?',
+      '<@UBOT1> done testing, put main back on staging so the next person can test',
+      '<@UBOT1> put main on staging and send me the staging link',
+      '<@UBOT1> put main back on staging and then send me the link',
+    ]) {
+      const gh = fakeGh({ prs });
+      await run(makeTask(text, { prContexts: thread }));
+      expect(dispatchedRef(gh), text).toBe('main');
+    }
+  });
+
+  it('reads a number after a lead-in word as the PR, never as a branch', async () => {
+    const clarification = { question: STAGING_TARGET_QUESTION, askedText: 'testing links for PR #1484 and PR #1490' };
+    for (const reply of ["it's 1490", 'use 1490', 'try 1490', 'its #1490', 'use PR 1490', 'PR-1490', 'the 1490 one']) {
+      const gh = fakeGh({ prs });
+      const { texts } = await run(makeTask(reply, { clarification }));
+      expect(dispatchedRef(gh), reply).toBe('feat/b');
+      expect(texts.join('\n')).not.toContain("can't find a branch");
+    }
+  });
+
+  it('says a branch named right after "branch" does not exist, instead of using the thread PR', async () => {
+    let gh = fakeGh({ prs, branches: [] });
+    let outcome = await run(makeTask('<@UBOT1> put branch redesign on staging', { prContexts: thread }));
+    expect(outcome.texts[0]).toBe("I can't find a branch named `redesign` in newton-marketing-web.");
+    expect(dispatchedRef(gh)).toBeUndefined();
+
+    gh = fakeGh({ prs, branches: ['redesign'] });
+    await run(makeTask('<@UBOT1> put branch redesign on staging', { prContexts: thread }));
+    expect(dispatchedRef(gh)).toBe('redesign');
+
+    // "the branch looks good" says something about a branch; it names none.
+    gh = fakeGh({ prs });
+    outcome = await run(makeTask('<@UBOT1> the branch looks good, testing link please', { prContexts: thread }));
+    expect(dispatchedRef(gh)).toBe('feat/a');
+  });
+
+  it('still deploys the thread PR for a testing-link ask beside "main tomorrow"', async () => {
     const gh = fakeGh({ prs });
     await run(
       makeTask('<@UBOT1> give me a testing link, and switch staging back to main tomorrow', { prContexts: thread }),
     );
     expect(dispatchedRef(gh)).toBe('feat/a');
+  });
+
+  it('posts nothing about putting it on staging when stopped during the check', async () => {
+    const controller = new AbortController();
+    const gh = fakeGh({ branches: ['feat/x'] });
+    const original = gh.getMockImplementation() as any;
+    gh.mockImplementation(async (args: string[]) => {
+      if (args[0] === 'api' && /\/compare\//.test(args[1])) controller.abort();
+      return original(args);
+    });
+    const { result, texts } = await run(
+      makeTask('<@UBOT1> put branch feat/x on staging'),
+      makeStore(),
+      controller.signal,
+    );
+    expect(result.status).toBe('CANCELLED');
+    expect(texts).toEqual([]);
+    expect(dispatchedRef(gh)).toBeUndefined();
   });
 });
 
