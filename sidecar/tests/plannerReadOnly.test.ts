@@ -175,6 +175,112 @@ describe('planner calls never run with permissions bypassed (#695)', () => {
   });
 });
 
+describe('a follow-up plan without a code-changes verdict goes to approval, not to a quick action (#695)', () => {
+  beforeEach(() => {
+    vi.mocked(runCodex).mockReset();
+    vi.mocked(waitForClarificationWithIdle).mockReset();
+  });
+
+  async function runUntilApproval(followUp: Record<string, unknown>) {
+    vi.mocked(waitForClarificationWithIdle).mockResolvedValueOnce({
+      outcome: 'answered',
+      answer: 'the pricing page',
+      answererId: 'UBUILDER',
+    });
+    vi.mocked(runCodex)
+      .mockResolvedValueOnce(plannerAsks('Which page?', 'claude-code'))
+      .mockResolvedValueOnce(followUp as never);
+    const controller = new AbortController();
+    const stages: string[] = [];
+    const result = await runImplementationWorkflow({
+      task: {
+        event: {
+          eventId: 'Ev695b',
+          channelId: 'C1',
+          threadTs: '111.33',
+          eventTs: '111.33',
+          userId: 'UBUILDER',
+          text: '<@UBOT1> change the price text',
+          rawEvent: {},
+        },
+        mentionDetected: true,
+        mentionType: 'bot' as const,
+        isOwnerAuthor: false,
+        isCoreDevAuthor: false,
+        intent: 'IMPLEMENTATION' as const,
+      },
+      config,
+      slack: makeSlack() as unknown as import('@slack/web-api').WebClient,
+      signal: controller.signal,
+      logStep: entry => {
+        stages.push(entry.stage);
+        // The plan is up for approval: that is all this test needs to see.
+        if (entry.stage === 'implementation.approval.waiting') controller.abort();
+      },
+    });
+    const calls = vi.mocked(runCodex).mock.calls.map(([request]) => request as CodexRunRequest);
+    return { result, stages, calls };
+  }
+
+  it('asks Claude Code for a markdown plan and sends the markdown it returns to approval', async () => {
+    vi.mocked(getActiveBackendId).mockReturnValue('claude-code');
+    const { stages, calls } = await runUntilApproval({
+      ok: true,
+      exitCode: 0,
+      timedOut: false,
+      stdout: '',
+      stderr: '',
+      lastMessage: '',
+      sessionId: 'sess-1',
+      // What the Claude Code backend returns for a markdown final message.
+      parsedJson: {
+        status: 'success',
+        summary: '## Files to change\n- `src/pricing.tsx`\n\n1. Change the price text.\n\nScope: small',
+        actions: [],
+        prUrl: '',
+      },
+    });
+
+    expect(calls[1].prompt).toContain('Reply with the complete plan as markdown');
+    expect(calls[1].outputSchemaPath).toBeUndefined();
+    expect(stages).not.toContain('implementation.quick_action');
+    expect(stages).toContain('implementation.approval.waiting');
+  });
+
+  it('treats JSON without requiresCodeChanges as a change', async () => {
+    vi.mocked(getActiveBackendId).mockReturnValue('claude-code');
+    const { stages } = await runUntilApproval({
+      ok: true,
+      exitCode: 0,
+      timedOut: false,
+      stdout: '',
+      stderr: '',
+      lastMessage: '',
+      sessionId: 'sess-1',
+      parsedJson: { planMarkdown: '## Plan\n- change the price text in `src/pricing.tsx`', clarificationNeeded: null },
+    });
+
+    expect(stages).not.toContain('implementation.quick_action');
+    expect(stages).toContain('implementation.approval.waiting');
+  });
+
+  it('keeps the earlier plan for approval when the follow-up returns nothing readable', async () => {
+    vi.mocked(getActiveBackendId).mockReturnValue('claude-code');
+    const { stages } = await runUntilApproval({
+      ok: false,
+      exitCode: 1,
+      timedOut: false,
+      stdout: '',
+      stderr: 'boom',
+      lastMessage: '',
+    });
+
+    expect(stages).toContain('implementation.planner.clarification.unreadable');
+    expect(stages).not.toContain('implementation.quick_action');
+    expect(stages).toContain('implementation.approval.waiting');
+  });
+});
+
 describe('claudePermissionMode', () => {
   it('follows the order buildArgs applies', () => {
     expect(claudePermissionMode({ noTools: true, planMode: true, readOnly: true })).toBe('no-tools');
