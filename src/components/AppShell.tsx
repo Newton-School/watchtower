@@ -13,6 +13,7 @@ import {
   PerformanceIcon,
   RunsIcon,
   SettingsIcon,
+  UxMetricsIcon,
 } from './icons';
 
 type AppShellProps = {
@@ -56,6 +57,7 @@ export function AppShell({
     },
     { view: 'intelligence', label: 'Intelligence', icon: <IntelligenceIcon /> },
     { view: 'performance', label: 'Performance', icon: <PerformanceIcon /> },
+    { view: 'ux', label: 'UX metrics', icon: <UxMetricsIcon /> },
     { view: 'dossiers', label: 'Dossiers', icon: <DossiersIcon /> },
     { view: 'diagnostics', label: 'Diagnostics', icon: <DiagnosticsIcon /> },
     {

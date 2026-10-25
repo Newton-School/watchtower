@@ -4,6 +4,7 @@ export type AppView =
   | 'runs'
   | 'intelligence'
   | 'performance'
+  | 'ux'
   | 'dossiers'
   | 'diagnostics'
   | 'settings'
@@ -335,6 +336,37 @@ export type PerformanceOverview = {
   byWorkflow: GroupedAggregate[];
   byBackendModel: GroupedAggregate[];
   topRuns: TopRun[];
+};
+
+export type UxStepTiming = {
+  key: string;
+  label: string;
+  count: number;
+  medianMs: number | null;
+  p90Ms: number | null;
+};
+
+export type UxWindow = {
+  sinceIso: string;
+  untilIso: string;
+  jobs: number;
+  steps: UxStepTiming[];
+  interventions: {
+    changeRuns: number;
+    total: number;
+    meanPerRun: number | null;
+    medianPerRun: number | null;
+  };
+  messages: Array<{ tool: string; runs: number; mean: number; median: number }>;
+  outcomes: Array<{ tool: string; jobs: number; failed: number; cancelled: number }>;
+  byTool: Array<{ key: string; label: string; count: number }>;
+  byChannel: Array<{ key: string; label: string; count: number }>;
+};
+
+export type UxMetrics = {
+  untilIso: string;
+  current: UxWindow;
+  previous: UxWindow;
 };
 
 export type DashboardRecommendation = {
