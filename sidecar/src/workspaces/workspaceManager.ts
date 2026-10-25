@@ -20,13 +20,14 @@ const STALE_THRESHOLD_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
  * no shell-injection surface. Mirrors the previous semantics: stdout/stderr are
  * piped, a per-call timeout kills the process, and a non-zero exit rejects.
  */
-async function git(args: string[], opts: { cwd: string; timeoutMs: number }): Promise<string> {
+async function git(args: string[], opts: { cwd: string; timeoutMs: number; raw?: boolean }): Promise<string> {
   const { stdout } = await execFileAsync('git', args, {
     cwd: opts.cwd,
     timeout: opts.timeoutMs,
     maxBuffer: 10 * 1024 * 1024,
   });
-  return stdout.toString().trim();
+  // `raw` keeps the output as git wrote it: trimming eats the leading space of a `-z` status entry.
+  return opts.raw ? stdout.toString() : stdout.toString().trim();
 }
 
 /**
@@ -248,12 +249,26 @@ export type SharedRepoStaleReason =
   | 'other_branch'
   /** The clone has commits that are not on origin's default branch. */
   | 'diverged'
-  | 'not_fast_forwardable';
+  | 'not_fast_forwardable'
+  /** How far behind origin the clone is could not be worked out, so it is not known to be current. */
+  | 'unverified';
+
+/** Uncommitted changes moved out of a shared clone's way so it could be updated (issue #709). */
+export interface SetAsideChanges {
+  /** The files that were in the way: tracked edits, and untracked files the update adds. */
+  files: string[];
+  /** The stash commit holding them: `git stash apply <stash>` in the clone brings them back. */
+  stash: string;
+  /** The stash message, so the entry can be found in `git stash list`. */
+  label: string;
+}
 
 /** Where a shared clone stands after a refresh attempt. */
 export interface SharedRepoState {
   branch: string;
   head: string;
+  /** The HEAD commit's date (YYYY-MM-DD): how old the files on disk are. */
+  headDate?: string;
   /** origin's default branch, e.g. "origin/master". */
   upstream?: string;
   /** Commits the working tree is behind `upstream`. 0 when current; absent when it could not be counted. */
@@ -262,6 +277,184 @@ export interface SharedRepoState {
   staleReason?: SharedRepoStaleReason;
   /** For `dirty_tree`: the files in the way (the first few). */
   dirtyFiles?: string[];
+  /** Set when uncommitted changes were set aside so the clone could be updated. */
+  setAside?: SetAsideChanges;
+  /** For `dirty_tree`: why the changes in the way were left where they are. */
+  setAsideSkipped?: 'recent_edits' | 'failed';
+}
+
+/** A change in the way is only set aside once nothing has touched it for this long. */
+export const SET_ASIDE_QUIET_MS = 15 * 60 * 1000;
+
+export interface SharedRepoRefreshOptions {
+  /**
+   * Move uncommitted changes that block the update into a stash, then
+   * update. Only for miniOG's own shared clones (the configured repo paths):
+   * the changes are kept, but they leave the working tree.
+   */
+  setAsideStrayChanges?: boolean;
+  /** Test seam: how long a change must sit untouched before it is set aside. */
+  quietMs?: number;
+  /** Test seam for the clock. */
+  now?: () => number;
+}
+
+/** One refresh per clone at a time: two runs starting together would race on the index and the stash. */
+const refreshLocks = new Map<string, Promise<unknown>>();
+
+async function withRefreshLock<T>(repoPath: string, fn: () => Promise<T>): Promise<T> {
+  const key = path.resolve(repoPath);
+  const previous = refreshLocks.get(key) ?? Promise.resolve();
+  const run = previous.catch(() => undefined).then(fn);
+  const settled = run.catch(() => undefined);
+  refreshLocks.set(key, settled);
+  try {
+    return await run;
+  } finally {
+    if (refreshLocks.get(key) === settled) refreshLocks.delete(key);
+  }
+}
+
+async function tryFastForward(repoPath: string, upstream: string): Promise<boolean> {
+  try {
+    await git(['merge', '--ff-only', upstream], { cwd: repoPath, timeoutMs: 30_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Splits `-z` output into paths, dropping empties. */
+function nulList(out: string): string[] {
+  return out.split('\0').filter(Boolean);
+}
+
+/** Tracked files with uncommitted changes, staged or not (`git status -z`; a rename lists both names). */
+async function trackedChanges(repoPath: string): Promise<string[]> {
+  const out = await git(['status', '--porcelain=v1', '-z', '--untracked-files=no'], {
+    cwd: repoPath,
+    timeoutMs: 10_000,
+    raw: true,
+  });
+  const entries = out.split('\0');
+  const files: string[] = [];
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    if (entry.length < 4) continue;
+    files.push(entry.slice(3));
+    // "R  new\0old": the original name follows as its own entry.
+    if (entry[0] === 'R' || entry[0] === 'C') {
+      const original = entries[i + 1];
+      if (original) files.push(original);
+      i += 1;
+    }
+  }
+  return files;
+}
+
+/**
+ * Moves the uncommitted changes that stop a shared clone from updating into
+ * a named stash (issue #709). On 2026-10-24 an agent's leftover edit to
+ * newton-web's package.json had held that clone on a May commit, 783 commits
+ * behind, and every lookup read five-month-old code.
+ *
+ * Only on the default branch with no local commits; only the files in the
+ * way (tracked edits, and untracked files the update would add); and only
+ * once none of them has been touched for `quietMs`, so a change someone is
+ * making right now is left alone. Nothing is deleted: `git stash apply
+ * <stash>` in the clone brings it back.
+ */
+async function setAsideStrayChanges(
+  repoPath: string,
+  upstream: string,
+  opts: SharedRepoRefreshOptions,
+): Promise<{ setAside?: SetAsideChanges; skipped?: 'recent_edits' | 'failed' }> {
+  try {
+    // The configured path must be the clone itself, not a folder inside some other repo.
+    const top = await git(['rev-parse', '--show-toplevel'], { cwd: repoPath, timeoutMs: 10_000 });
+    if (fs.realpathSync(top) !== fs.realpathSync(repoPath)) return {};
+    const branch = await git(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repoPath, timeoutMs: 10_000 });
+    if (branch !== upstream.replace(/^origin\//, '')) return {};
+    const ahead = await git(['rev-list', '--count', `${upstream}..HEAD`], { cwd: repoPath, timeoutMs: 10_000 });
+    if (Number.parseInt(ahead, 10) !== 0) return {};
+
+    const tracked = await trackedChanges(repoPath);
+    const untracked = new Set(
+      nulList(
+        await git(['ls-files', '--others', '--exclude-standard', '-z'], {
+          cwd: repoPath,
+          timeoutMs: 10_000,
+          raw: true,
+        }),
+      ),
+    );
+    const incoming = nulList(
+      await git(['diff', '--name-only', '-z', '--diff-filter=A', 'HEAD', upstream], {
+        cwd: repoPath,
+        timeoutMs: 10_000,
+        raw: true,
+      }),
+    );
+    const blockingUntracked = incoming.filter(file => untracked.has(file));
+    const files = [...new Set([...tracked, ...blockingUntracked])];
+    if (files.length === 0) return {};
+
+    const now = (opts.now ?? Date.now)();
+    const quietMs = opts.quietMs ?? SET_ASIDE_QUIET_MS;
+    const recent = files.some(file => {
+      try {
+        return now - fs.lstatSync(path.join(repoPath, file)).mtimeMs < quietMs;
+      } catch {
+        return false; // a deleted file has no mtime; its deletion is what is in the way
+      }
+    });
+    if (recent) return { skipped: 'recent_edits' };
+
+    const shown = files.slice(0, 5).join(', ') + (files.length > 5 ? ` and ${files.length - 5} more` : '');
+    const label = `miniog-autostash ${new Date(now).toISOString()} (#709): ${files.length} file${
+      files.length === 1 ? '' : 's'
+    } in the way of the update: ${shown}`;
+    const before = await git(['rev-parse', '--quiet', '--verify', 'refs/stash'], {
+      cwd: repoPath,
+      timeoutMs: 10_000,
+    }).catch(() => '');
+    await git(
+      [
+        '--literal-pathspecs',
+        'stash',
+        'push',
+        ...(blockingUntracked.length > 0 ? ['--include-untracked'] : []),
+        '-m',
+        label,
+        '--',
+        ...files,
+      ],
+      { cwd: repoPath, timeoutMs: 30_000 },
+    );
+    const stash = await git(['rev-parse', '--verify', 'refs/stash'], { cwd: repoPath, timeoutMs: 10_000 });
+    const subject = await git(['log', '-1', '--format=%s', stash], { cwd: repoPath, timeoutMs: 10_000 });
+    if (stash === before || !subject.includes(label)) return { skipped: 'failed' };
+    return { setAside: { files, stash, label } };
+  } catch (error) {
+    logger.warn({ repoPath, error: String(error) }, 'could not set aside the changes blocking a shared clone update');
+    return { skipped: 'failed' };
+  }
+}
+
+/** Puts set-aside changes back when the update still failed, so the clone is left as it was found. */
+async function restoreSetAside(repoPath: string, setAside: SetAsideChanges): Promise<void> {
+  try {
+    await git(['stash', 'apply', setAside.stash], { cwd: repoPath, timeoutMs: 30_000 });
+    const entries = (await git(['stash', 'list', '--format=%H'], { cwd: repoPath, timeoutMs: 10_000 })).split('\n');
+    const index = entries.indexOf(setAside.stash);
+    if (index >= 0) await git(['stash', 'drop', `stash@{${index}}`], { cwd: repoPath, timeoutMs: 10_000 });
+  } catch (error) {
+    // The changes are still in the stash under their label; nothing is lost.
+    logger.warn(
+      { repoPath, stash: setAside.stash, error: String(error) },
+      'could not put set-aside changes back after a failed update',
+    );
+  }
 }
 
 /**
@@ -270,20 +463,29 @@ export interface SharedRepoState {
  * PR/implementation pipeline) does NOT operate in an isolated worktree — sees
  * freshly-merged code instead of a checkout that has drifted behind origin.
  *
- * Safety: this mutates the user's real clone, so it ONLY ever fast-forwards.
+ * Safety: this mutates a real clone, so it ONLY ever fast-forwards.
  * `git merge --ff-only` advances the working tree when the local branch is a
  * strict ancestor of origin's, and refuses (non-fatal) on divergence, a feature
- * branch, or a dirty tree that would be overwritten — so uncommitted edits and
- * unpushed local commits are never clobbered. The `reset --hard` used for the
- * throwaway worktrees in `resolveWorkspace` would NOT be safe on a shared clone.
+ * branch, or a dirty tree that would be overwritten — so unpushed local
+ * commits are never clobbered. The `reset --hard` used for the throwaway
+ * worktrees in `resolveWorkspace` would NOT be safe on a shared clone. With
+ * `setAsideStrayChanges` (miniOG's own clones only), uncommitted changes that
+ * block the update are moved into a named stash first, and put back if the
+ * update still fails.
  *
  * Best-effort: returns where the checkout ended up, including how far behind
  * origin it still is and why, or null if the repo couldn't be inspected.
  * Never throws.
  */
-export async function refreshSharedRepoToDefaultBranch(repoPath: string): Promise<SharedRepoState | null> {
+export async function refreshSharedRepoToDefaultBranch(
+  repoPath: string,
+  opts: SharedRepoRefreshOptions = {},
+): Promise<SharedRepoState | null> {
+  return withRefreshLock(repoPath, () => refreshSharedRepo(repoPath, opts));
+}
+
+async function refreshSharedRepo(repoPath: string, opts: SharedRepoRefreshOptions): Promise<SharedRepoState | null> {
   let fetchFailed = false;
-  let upstream: string | undefined;
   try {
     await git(['fetch', 'origin', '--quiet'], { cwd: repoPath, timeoutMs: 30_000 });
   } catch (error) {
@@ -293,16 +495,28 @@ export async function refreshSharedRepoToDefaultBranch(repoPath: string): Promis
       'git fetch failed before agent read; answering against local repo state',
     );
   }
-  try {
-    upstream = await resolveDefaultRemoteBranch(repoPath);
-    if (!fetchFailed) {
-      await git(['merge', '--ff-only', upstream], { cwd: repoPath, timeoutMs: 30_000 });
+  const upstream = await resolveDefaultRemoteBranch(repoPath);
+  let setAside: SetAsideChanges | undefined;
+  let setAsideSkipped: SharedRepoState['setAsideSkipped'];
+  if (!fetchFailed && !(await tryFastForward(repoPath, upstream))) {
+    if (opts.setAsideStrayChanges) {
+      const outcome = await setAsideStrayChanges(repoPath, upstream, opts);
+      setAsideSkipped = outcome.skipped;
+      if (outcome.setAside) {
+        if (await tryFastForward(repoPath, upstream)) {
+          setAside = outcome.setAside;
+        } else {
+          await restoreSetAside(repoPath, outcome.setAside);
+          setAsideSkipped = 'failed';
+        }
+      }
     }
-  } catch {
-    // Not fast-forwardable (feature branch, diverged history, or a dirty tree
-    // that would be overwritten) — leave the checkout untouched rather than
-    // risk the user's local work. What that leaves is reported below.
-    logger.warn({ repoPath, upstream }, 'could not fast-forward shared repo to default branch');
+    if (!setAside) {
+      // Not fast-forwardable (feature branch, diverged history, or a dirty tree
+      // that would be overwritten) — the checkout is left as it was. What that
+      // leaves is reported below.
+      logger.warn({ repoPath, upstream }, 'could not fast-forward shared repo to default branch');
+    }
   }
 
   let head: string;
@@ -313,6 +527,9 @@ export async function refreshSharedRepoToDefaultBranch(repoPath: string): Promis
   } catch {
     return null;
   }
+  const headDate = await git(['log', '-1', '--format=%cs', 'HEAD'], { cwd: repoPath, timeoutMs: 10_000 }).catch(
+    () => undefined,
+  );
 
   // The truth about where that leaves the checkout. This used to return the
   // head and nothing else, and the caller logged "Refreshed" over a clone
@@ -326,15 +543,27 @@ export async function refreshSharedRepoToDefaultBranch(repoPath: string): Promis
       return undefined;
     }
   };
-  const behind = upstream ? await count(`HEAD..${upstream}`) : undefined;
-  const state: SharedRepoState = { branch, head, upstream, behind };
+  const behind = await count(`HEAD..${upstream}`);
+  const state: SharedRepoState = {
+    branch,
+    head,
+    ...(headDate ? { headDate } : {}),
+    upstream,
+    behind,
+    ...(setAside ? { setAside } : {}),
+  };
   if (fetchFailed) {
     return { ...state, staleReason: 'fetch_failed' };
   }
-  if (!behind) {
+  // Behind by an unknown amount is not current: the upstream ref may not
+  // exist (a guessed "origin/master" on a main repo) or git refused to count.
+  if (behind === undefined) {
+    return { ...state, staleReason: 'unverified' };
+  }
+  if (behind === 0) {
     return state;
   }
-  if (upstream && branch !== upstream.replace(/^origin\//, '')) {
+  if (branch !== upstream.replace(/^origin\//, '')) {
     return { ...state, staleReason: 'other_branch' };
   }
   try {
@@ -347,12 +576,17 @@ export async function refreshSharedRepoToDefaultBranch(repoPath: string): Promis
       .map(line => line.trim().replace(/^\S+\s+/, ''))
       .filter(Boolean);
     if (dirtyFiles.length > 0) {
-      return { ...state, staleReason: 'dirty_tree', dirtyFiles: dirtyFiles.slice(0, 5) };
+      return {
+        ...state,
+        staleReason: 'dirty_tree',
+        dirtyFiles: dirtyFiles.slice(0, 5),
+        ...(setAsideSkipped ? { setAsideSkipped } : {}),
+      };
     }
   } catch {
     // fall through to the reasons that need no status
   }
-  const ahead = upstream ? await count(`${upstream}..HEAD`) : undefined;
+  const ahead = await count(`${upstream}..HEAD`);
   return { ...state, staleReason: ahead ? 'diverged' : 'not_fast_forwardable' };
 }
 

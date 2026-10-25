@@ -92,4 +92,67 @@ describe('buildStaleCheckoutBlock (issue #446)', () => {
   it('reads right for one commit behind', () => {
     expect(buildStaleCheckoutBlock([{ name: 'r', state: { ...STUCK, behind: 1 } }])).toContain('1 commit behind');
   });
+
+  // Issue #709: with no newer tree to read, the agent is told its files may be old, and from when.
+  it('warns about a clone that could not be checked against GitHub, with the date of its files', () => {
+    const block = buildStaleCheckoutBlock([
+      { name: 'newton-web', state: { ...CURRENT, staleReason: 'fetch_failed', headDate: '2026-05-26' } },
+      { name: 'newton-api', state: CURRENT },
+    ]);
+
+    expect(block).toContain('POSSIBLY OUT OF DATE');
+    expect(block).toContain('- newton-web: git fetch failed; the files are from ac56c6935 as of 2026-05-26.');
+    expect(block).toContain('say the code you read may be out of date');
+    expect(block).not.toContain('newton-api');
+    expect(block).not.toContain('STALE CHECKOUTS');
+  });
+
+  it('adds the unconfirmed clones after the stale ones', () => {
+    const block = buildStaleCheckoutBlock([
+      { name: 'newton-web', state: STUCK },
+      { name: 'newton-api', state: { ...CURRENT, behind: undefined, staleReason: 'unverified' } },
+    ]);
+
+    expect(block.indexOf('STALE CHECKOUTS')).toBeLessThan(block.indexOf('POSSIBLY OUT OF DATE'));
+    expect(block).toContain('- newton-api: its distance from origin is unknown; the files are from ac56c6935.');
+  });
+});
+
+describe('describeRepoRefresh (issue #709)', () => {
+  it('says which files were set aside and where they are kept', () => {
+    const result = describeRepoRefresh('newton-web', {
+      ...CURRENT,
+      setAside: {
+        files: ['package.json'],
+        stash: 'abc123',
+        label: 'miniog-autostash 2026-10-26T00:00:00.000Z (#709): 1 file in the way of the update: package.json',
+      },
+    });
+
+    expect(result).toEqual({
+      message:
+        'Refreshed newton-web to master @ ac56c6935 after setting aside 1 uncommitted file that blocked the update (package.json). They are kept in the clone\'s stash as "miniog-autostash 2026-10-26T00:00:00.000Z (#709): 1 file in the way of the update: package.json".',
+      level: 'WARN',
+    });
+  });
+
+  it('says why changes in the way were left in place, and how old the files are', () => {
+    expect(
+      describeRepoRefresh('newton-web', { ...STUCK, setAsideSkipped: 'recent_edits', headDate: '2026-05-26' }).message,
+    ).toBe(
+      'newton-web is 707 commits behind origin/master and was not updated: it has uncommitted changes to package-lock.json, package.json. They changed in the last 15 minutes, so they were left in place. The files on disk are from eae5d68bb as of 2026-05-26; the agent is told to read origin/master instead.',
+    );
+    expect(describeRepoRefresh('newton-web', { ...STUCK, setAsideSkipped: 'failed' }).message).toContain(
+      'Setting them aside did not work, so they were left in place.',
+    );
+  });
+
+  it('never says "Refreshed" for a clone it could not confirm is current', () => {
+    const result = describeRepoRefresh('newton-web', { ...CURRENT, behind: undefined, staleReason: 'unverified' });
+
+    expect(result).toEqual({
+      message: 'Could not confirm newton-web is up to date with origin/master; answering from master @ ac56c6935.',
+      level: 'WARN',
+    });
+  });
 });

@@ -42,6 +42,17 @@ describe('refreshSharedClones', () => {
     expect(rows[0]).toMatchObject({ level: 'WARN', data: { behind: 731, staleReason: 'dirty_tree' } });
   });
 
+  it("asks for stray changes to be set aside: these are miniOG's own clones (issue #709)", async () => {
+    vi.mocked(refreshSharedRepoToDefaultBranch).mockResolvedValue(current);
+
+    await refreshSharedClones({ config, stage: 's' });
+
+    expect(vi.mocked(refreshSharedRepoToDefaultBranch).mock.calls).toEqual([
+      ['/repos/newton-web', { setAsideStrayChanges: true }],
+      ['/repos/newton-api', { setAsideStrayChanges: true }],
+    ]);
+  });
+
   it('returns nothing when every clone is current', async () => {
     vi.mocked(refreshSharedRepoToDefaultBranch).mockResolvedValue(current);
     expect(await refreshSharedClones({ config, stage: 's' })).toBeUndefined();
