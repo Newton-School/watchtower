@@ -24,6 +24,8 @@ export const ROUTE_CLARIFY_TTL_MS = 30 * 60_000;
 export const DEFAULT_CLARIFY_QUESTION = "I'm not sure what you'd like me to do here. What do you need?";
 export const LOW_CONFIDENCE_CHANGE_QUESTION =
   'Do you want me to change something here, or only look into it? Tell me what should change and where.';
+/** Asked by the staging tool when it can't tell what to deploy (issue #702). A reply shaped like an answer goes straight back to it. */
+export const STAGING_TARGET_QUESTION = 'Which PR or branch should I put on staging?';
 /** Staging is shared: a deploy the router was unsure of would replace someone's test for nothing. */
 export const LOW_CONFIDENCE_STAGING_QUESTION =
   'Do you want me to put this on the marketing staging site and send you the link? Say which PR or branch if it is not the one here.';
@@ -105,9 +107,9 @@ export function decideClarify(params: {
 
   let ask: { question: string; reason: ClarifyReason; park?: boolean } | undefined;
   if (tool === 'deploy' && !params.deployAllowed && params.stagingAsk) {
-    // Not a production deploy to ask about. The router has a staging tool for
-    // a marketing staging ask (issue #702); a deploy pick for one falls back to
-    // a lookup, which says how staging works.
+    // Not a production deploy to ask about. A deploy pick for a marketing
+    // staging ask goes to the staging tool (taskRouter, issue #702); any other
+    // falls back to a lookup, which says how staging works.
     return { kind: 'run' };
   } else if (tool === 'deploy' && !params.deployAllowed) {
     // The model read a deploy ask where code found no target, or in a reply to

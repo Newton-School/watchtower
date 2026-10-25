@@ -2082,6 +2082,47 @@ describe('a marketing staging deploy ask (issue #702)', () => {
     expect(repliesOf(slack).some(text => text.includes('put this on the marketing staging site'))).toBe(true);
   });
 
+  it('runs an answer to "which PR or branch?" straight away, with no router call', async () => {
+    const slack = makeSlack();
+    const logStep = vi.fn();
+    const task = makeTask({ userId: 'UBUILDER', channelId: 'C-BUILD', text: '1484', intent: 'STAGING_DEPLOY' });
+    task.clarification = {
+      question: 'Which PR or branch should I put on staging?',
+      askedText: 'give me a testing link',
+    };
+
+    await routeTask({ task, config: makeConfig('enforce'), slack: slack as never, store: {} as never, logStep });
+
+    expect(decideTool).not.toHaveBeenCalled();
+    expect(runStagingDeployWorkflow).toHaveBeenCalledOnce();
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'router.staging.answer' }));
+  });
+
+  it('sends a marketing staging ask the router read as a production deploy to the staging tool', async () => {
+    const slack = makeSlack();
+    decideTool.mockResolvedValue({
+      ok: true,
+      decision: { tool: 'deploy', confidence: 0.9, reason: 'asks for a deploy' },
+      durationMs: 1,
+    });
+    const logStep = vi.fn();
+    await routeTask({
+      task: makeTask({
+        userId: 'UBUILDER',
+        channelId: 'C-BUILD',
+        text: '<@UBOT1> once the copy is in, ship my marketing branch fix/hero to stg',
+      }),
+      config: makeConfig('enforce'),
+      slack: slack as never,
+      store: {} as never,
+      logStep,
+    });
+    expect(runDeployWorkflow).not.toHaveBeenCalled();
+    expect(runAgenticEntry).not.toHaveBeenCalled();
+    expect(runStagingDeployWorkflow).toHaveBeenCalledOnce();
+    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'router.deploy_to_staging' }));
+  });
+
   it('never runs it for an owner mention the router reads as a staging ask', async () => {
     const slack = makeSlack();
     routerPicks('STAGING_DEPLOY');

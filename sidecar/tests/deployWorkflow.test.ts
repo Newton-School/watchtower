@@ -345,6 +345,27 @@ describe('runDeployWorkflow marketing branch', () => {
     expect(result.message).toContain("clone isn't configured");
   });
 
+  it('dispatches nothing, and says nothing, when stopped between the confirmation and the dispatch', async () => {
+    const controller = new AbortController();
+    const ghExec = vi.fn(async (args: string[]) => {
+      if (args[0] === 'run' && args[1] === 'list') controller.abort();
+      return '[]';
+    });
+    __ghCli.exec = ghExec;
+    const postMessage = vi.fn().mockResolvedValue({ ok: true, ts: '1.0' });
+    const slack = { chat: { postMessage } } as any;
+
+    const result = await runDeployWorkflow({
+      task: marketingTask(),
+      config: marketingConfig,
+      slack,
+      signal: controller.signal,
+    });
+
+    expect(result.status).toBe('CANCELLED');
+    expect(ghExec.mock.calls.some(call => call[0][0] === 'workflow')).toBe(false);
+  });
+
   it('dispatches the GitHub Actions prod deploy and reports the completed run', async () => {
     const ghExec = vi
       .fn()

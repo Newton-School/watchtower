@@ -39,17 +39,19 @@ export function isDeployDryRun(store: DeployStateReader | undefined): boolean {
 
 /** What happened to a dispatched GitHub Actions run, as far as it was followed. */
 export type ActionsRunOutcome =
+  /** The job was stopped before `gh workflow run`: nothing was started. */
+  | { kind: 'stopped' }
   /** `gh workflow run` itself failed: nothing was started. */
   | { kind: 'dispatch_failed'; error: string }
   /** Dispatched, but the newest run before it could not be read, so its run can't be told apart: not followed. */
   | { kind: 'unanchored' }
   /** Dispatched, but no new run showed up in time. */
   | { kind: 'unidentified' }
-  | { kind: 'completed'; conclusion?: string; url?: string }
+  | { kind: 'completed'; id: number; conclusion?: string; url?: string }
   /** A GitHub Environment is holding the run for a person's approval. */
-  | { kind: 'waiting'; url?: string }
+  | { kind: 'waiting'; id: number; url?: string }
   /** Still running when the watch gave up or the job was stopped. */
-  | { kind: 'running'; url?: string };
+  | { kind: 'running'; id: number; url?: string };
 
 interface RunFilter {
   repoPath: string;
@@ -111,6 +113,8 @@ export async function dispatchWorkflowRun(params: {
   }
 
   const inputs = Object.entries(params.inputs ?? {}).flatMap(([key, value]) => ['-f', `${key}=${value}`]);
+  // The last moment a stop can still mean nothing happened.
+  if (signal?.aborted) return { kind: 'stopped' };
   try {
     await __ghCli.exec(['workflow', 'run', workflowFile, '--ref', ref, ...inputs], repoPath, 60_000);
   } catch (error) {
@@ -140,7 +144,8 @@ async function watchRun(params: {
   while (Date.now() < resolveDeadline && !signal?.aborted) {
     try {
       const latest = await readLatestRun(filter);
-      if (latest.id !== undefined && latest.id !== anchorRunId) {
+      // Run ids grow: a newer run has a larger id than the anchor.
+      if (latest.id !== undefined && (anchorRunId === undefined || latest.id > anchorRunId)) {
         runId = latest.id;
         runUrl = latest.url;
         break;
@@ -178,12 +183,39 @@ async function watchRun(params: {
     }
     runUrl = run.url ?? runUrl;
 
-    if (run.status === 'completed') return { kind: 'completed', conclusion: run.conclusion, url: runUrl };
+    if (run.status === 'completed') return { kind: 'completed', id: runId, conclusion: run.conclusion, url: runUrl };
     // A GitHub Environment holding the run for approval can take arbitrarily
     // long, so report and hand off to the person.
-    if (run.status === 'waiting') return { kind: 'waiting', url: runUrl };
+    if (run.status === 'waiting') return { kind: 'waiting', id: runId, url: runUrl };
     await sleep(__deployTiming.watchPollMs);
   }
 
-  return { kind: 'running', url: runUrl };
+  return { kind: 'running', id: runId, url: runUrl };
+}
+
+/** Recent runs of a workflow, newest first. Throws when `gh` fails. */
+export async function listWorkflowRuns(params: {
+  repoPath: string;
+  workflowFile: string;
+  /** Only runs that finished with this conclusion (`gh run list --status`). */
+  status?: string;
+  limit: number;
+}): Promise<Array<{ id: number; headBranch?: string; status?: string; conclusion?: string }>> {
+  const args = ['run', 'list', `--workflow=${params.workflowFile}`];
+  if (params.status) args.push('--status', params.status);
+  args.push('--limit', String(params.limit), '--json', 'databaseId,headBranch,status,conclusion');
+  const rows = JSON.parse((await __ghCli.exec(args, params.repoPath, 30_000)) || '[]') as Array<{
+    databaseId?: number;
+    headBranch?: string;
+    status?: string;
+    conclusion?: string;
+  }>;
+  return rows
+    .filter(row => typeof row.databaseId === 'number')
+    .map(row => ({
+      id: row.databaseId as number,
+      headBranch: row.headBranch,
+      status: row.status,
+      conclusion: row.conclusion,
+    }));
 }

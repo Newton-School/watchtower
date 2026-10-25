@@ -1,17 +1,17 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { toResolvedAccessControlConfig } from '../src/access/control.js';
+import { LOW_CONFIDENCE_STAGING_QUESTION } from '../src/router/routeClarify.js';
 import type { AppConfig, NormalizedTask, PrTarget } from '../src/types/contracts.js';
 import { __ghCli, __deployTiming, DEPLOY_DRY_RUN_STATE_KEY } from '../src/workflows/shared/githubActionsRun.js';
 import {
   __stagingDeps,
-  namedPrNumbers,
-  namedStagingBranch,
   routeForAppPage,
   routesForChangedFiles,
   runStagingDeployWorkflow,
   stagingHeadsUp,
   STAGING_HEADS_UP_WINDOW_MS,
+  STAGING_PROD_WORD_REPLY,
   STAGING_STATE_KEY,
   STAGING_TARGET_GIVE_UP,
   STAGING_TARGET_QUESTION,
@@ -94,27 +94,51 @@ interface FakePr {
   state?: string;
   merged?: boolean;
 }
+interface FakeRun {
+  id: number;
+  branch: string;
+  status: string;
+  conclusion?: string;
+}
 
-/** A scripted `gh`: PRs, branches, changed files and one staging run. */
+/**
+ * A scripted `gh` that honours its arguments: PRs, branches, what a branch
+ * changes against main, and a list of staging runs that `run list` filters
+ * by `--branch`, `--status` and `--limit`. Dispatching adds a run.
+ */
 function fakeGh(
   opts: {
     prs?: Record<number, FakePr>;
     branches?: string[];
     files?: string[];
+    runs?: FakeRun[];
     conclusion?: string;
+    /** Polls of the new run before it shows up in `run list`. */
+    appearAfterPolls?: number;
+    /** `run view` keeps saying in_progress; called on each view. */
+    stuck?: () => void;
     dispatchError?: string;
+    apiError?: string;
+    compareError?: string;
     runNeverAppears?: boolean;
   } = {},
 ) {
-  let dispatched = false;
+  const runs: FakeRun[] = [...(opts.runs ?? [])];
+  let newRun: FakeRun | undefined;
+  let pollsAfterDispatch = 0;
   const exec = vi.fn(async (args: string[]) => {
     const [cmd, sub] = args;
     if (cmd === 'api') {
       const route = args[1];
+      if (/\/compare\//.test(route)) {
+        if (opts.compareError) throw new Error(opts.compareError);
+        return (opts.files ?? []).join('\n');
+      }
+      if (opts.apiError) throw new Error(opts.apiError);
       const pr = /^repos\/[^/]+\/[^/]+\/pulls\/(\d+)$/.exec(route);
       if (pr) {
         const found = opts.prs?.[Number(pr[1])];
-        if (!found) throw new Error('HTTP 404');
+        if (!found) throw new Error('gh: Not Found (HTTP 404)');
         return JSON.stringify({
           html_url: prUrl(Number(pr[1])),
           number: Number(pr[1]),
@@ -126,33 +150,67 @@ function fakeGh(
       }
       const branch = /^repos\/[^/]+\/[^/]+\/branches\/(.+)$/.exec(route);
       if (branch) {
-        if (!opts.branches?.includes(branch[1])) throw new Error('HTTP 404');
+        if (!opts.branches?.includes(branch[1])) throw new Error('gh: Branch not found (HTTP 404)');
         return JSON.stringify({ name: branch[1] });
       }
-      if (/\/files\?per_page=100$/.test(route) || /\/compare\//.test(route)) return (opts.files ?? []).join('\n');
       throw new Error(`unexpected api ${route}`);
     }
     if (cmd === 'workflow' && sub === 'run') {
       if (opts.dispatchError) throw new Error(opts.dispatchError);
-      dispatched = true;
+      const ref = args[args.indexOf('--ref') + 1];
+      newRun = { id: Math.max(100, ...runs.map(run => run.id)) + 1, branch: ref, status: 'queued' };
+      if (!opts.runNeverAppears) runs.push(newRun);
       return '';
     }
     if (cmd === 'run' && sub === 'list') {
-      if (!dispatched || opts.runNeverAppears) return '[]';
-      return JSON.stringify([{ databaseId: 77, url: 'https://github.com/x/actions/runs/77', status: 'queued' }]);
+      const flag = (name: string) => (args.includes(name) ? args[args.indexOf(name) + 1] : undefined);
+      const branch = flag('--branch');
+      const status = flag('--status');
+      const limit = Number(flag('--limit') ?? 20);
+      if (newRun) pollsAfterDispatch += 1;
+      const visible = runs
+        .filter(run => run !== newRun || pollsAfterDispatch > (opts.appearAfterPolls ?? 0))
+        .filter(run => !branch || run.branch === branch)
+        .filter(run => !status || run.conclusion === status)
+        .sort((a, b) => b.id - a.id)
+        .slice(0, limit);
+      return JSON.stringify(
+        visible.map(run => ({
+          databaseId: run.id,
+          headBranch: run.branch,
+          url: `https://github.com/x/actions/runs/${run.id}`,
+          status: run.status,
+          conclusion: run.conclusion,
+        })),
+      );
     }
     if (cmd === 'run' && sub === 'view') {
+      const id = Number(args[2]);
+      const run = runs.find(entry => entry.id === id);
+      if (opts.stuck) {
+        opts.stuck();
+        return JSON.stringify({ status: 'in_progress', url: `https://github.com/x/actions/runs/${id}` });
+      }
+      if (run) {
+        run.status = 'completed';
+        run.conclusion = opts.conclusion ?? 'success';
+      }
       return JSON.stringify({
         status: 'completed',
         conclusion: opts.conclusion ?? 'success',
-        url: 'https://github.com/x/actions/runs/77',
+        url: `https://github.com/x/actions/runs/${id}`,
       });
     }
     throw new Error(`unexpected gh ${args.join(' ')}`);
   });
   __ghCli.exec = exec as any;
-  return exec;
+  return Object.assign(exec, { runs });
 }
+
+const dispatchedRef = (gh: ReturnType<typeof fakeGh>) => {
+  const call = gh.mock.calls.find(entry => entry[0][0] === 'workflow');
+  return call ? call[0][call[0].indexOf('--ref') + 1] : undefined;
+};
 
 function makeStore(initial: Record<string, string> = {}) {
   const state = new Map(Object.entries(initial));
@@ -166,6 +224,12 @@ function makeStore(initial: Record<string, string> = {}) {
 const makeSlack = () => ({ chat: { postMessage: vi.fn().mockResolvedValue({ ok: true, ts: '300.1' }) } });
 const posted = (slack: ReturnType<typeof makeSlack>) =>
   slack.chat.postMessage.mock.calls.map(call => call[0] as { channel: string; thread_ts: string; text: string });
+
+async function run(task: NormalizedTask, store = makeStore(), signal?: AbortSignal) {
+  const slack = makeSlack();
+  const result = await runStagingDeployWorkflow({ task, config, slack: slack as any, store, signal });
+  return { result, slack, texts: posted(slack).map(post => post.text), store };
+}
 
 beforeEach(() => {
   __deployTiming.resolvePollMs = 1;
@@ -181,60 +245,6 @@ beforeEach(() => {
     { file: 'src/app/(landing)/courses/data-science-v2/page.tsx', source: "import X from '@/features/ds-v4';" },
     { file: 'src/app/(landing)/nst/page.tsx', source: "import Nav from '@/features/nst-shell/sections/nav';" },
   ];
-});
-
-describe('namedStagingBranch', () => {
-  it('reads a branch named in the message', () => {
-    expect(namedStagingBranch('<@UBOT1> deploy marketing branch fix/hero-v2.1 to staging')).toEqual({
-      branch: 'fix/hero-v2.1',
-      explicit: true,
-    });
-    expect(namedStagingBranch('put `feat/nst-hire` on staging')).toEqual({ branch: 'feat/nst-hire', explicit: true });
-    expect(namedStagingBranch('can you put my fix/hero on marketing staging?')).toEqual({
-      branch: 'fix/hero',
-      explicit: false,
-    });
-  });
-
-  it('reads main when main is what goes on staging', () => {
-    for (const text of [
-      'deploy marketing main to staging',
-      'put main back on staging',
-      'restore staging to main',
-      'staging back to main please',
-      'main to staging',
-    ]) {
-      expect(namedStagingBranch(text)?.branch, text).toBe('main');
-    }
-  });
-
-  it('does not read a branch where there is none', () => {
-    for (const text of [
-      'give me a testing link',
-      'deploy the main banner change to staging',
-      'put my branch on staging',
-      'this is and/or that on staging',
-      'deploy it to staging in 24/7 mode',
-      'see https://github.com/Newton-School/newton-marketing-web/tree/fix/hero',
-    ]) {
-      expect(namedStagingBranch(text), text).toBeUndefined();
-    }
-  });
-
-  it('reads a reply that is only a name as that branch', () => {
-    expect(namedStagingBranch('fix-hero', { answering: true })).toEqual({ branch: 'fix-hero', explicit: true });
-    expect(namedStagingBranch('main', { answering: true })).toEqual({ branch: 'main', explicit: true });
-    expect(namedStagingBranch('1484', { answering: true })).toBeUndefined();
-  });
-});
-
-describe('namedPrNumbers', () => {
-  it('reads PR numbers written without a link', () => {
-    expect(namedPrNumbers('put PR #1484 on staging')).toEqual([1484]);
-    expect(namedPrNumbers('staging for pull request 12 please')).toEqual([12]);
-    expect(namedPrNumbers('#1484 and #1485')).toEqual([1484, 1485]);
-    expect(namedPrNumbers('put it on staging in 5 minutes')).toEqual([]);
-  });
 });
 
 describe('routes', () => {
@@ -302,37 +312,15 @@ describe('stagingHeadsUp', () => {
   });
 });
 
-describe('runStagingDeployWorkflow', () => {
+describe('runStagingDeployWorkflow: which branch', () => {
   it('puts the thread PR branch on staging and links the page it changes', async () => {
     const gh = fakeGh({ prs: { 12: { head: 'feat/hero' } }, files: ['src/features/ds-v4/sections/hero.tsx'] });
-    const slack = makeSlack();
-    const store = makeStore();
-    const result = await runStagingDeployWorkflow({
-      task: makeTask('<@UBOT1> give me a testing link', { prContexts: [prTarget(12, 'thread')] }),
-      config,
-      slack: slack as any,
-      store,
-    });
+    const { result, texts, store } = await run(
+      makeTask('<@UBOT1> give me a testing link', { prContexts: [prTarget(12, 'thread')] }),
+    );
 
     expect(result).toMatchObject({ workflow: 'STAGING_DEPLOY', status: 'SUCCESS' });
     expect(gh).toHaveBeenCalledWith(['workflow', 'run', 'deploy-staging.yml', '--ref', 'feat/hero'], CLONE, 60_000);
-    // The new run is found among this branch's runs only.
-    expect(gh).toHaveBeenCalledWith(
-      [
-        'run',
-        'list',
-        '--workflow=deploy-staging.yml',
-        '--branch',
-        'feat/hero',
-        '--limit',
-        '1',
-        '--json',
-        'databaseId,url,status,conclusion',
-      ],
-      CLONE,
-      30_000,
-    );
-    const texts = posted(slack).map(post => post.text);
     expect(texts[0]).toBe('Putting `feat/hero` on staging, about 3 minutes.');
     expect(texts[1]).toBe(
       '`feat/hero` is on staging: <https://staging-marketing-web.newtonschool.co/courses/data-science> and <https://staging-marketing-web.newtonschool.co/courses/data-science-v2>. Staging is shared, so the next staging deploy replaces it.',
@@ -348,52 +336,92 @@ describe('runStagingDeployWorkflow', () => {
 
   it('prefers a PR in the message over one earlier in the thread', async () => {
     const gh = fakeGh({ prs: { 12: { head: 'feat/old' }, 13: { head: 'feat/new' } } });
-    await runStagingDeployWorkflow({
-      task: makeTask('<@UBOT1> testing link for this one', {
-        prContexts: [prTarget(13, 'trigger'), prTarget(12, 'thread')],
-      }),
-      config,
-      slack: makeSlack() as any,
-      store: makeStore(),
-    });
-    expect(gh).toHaveBeenCalledWith(['workflow', 'run', 'deploy-staging.yml', '--ref', 'feat/new'], CLONE, 60_000);
+    await run(
+      makeTask('<@UBOT1> testing link for this one', { prContexts: [prTarget(13, 'trigger'), prTarget(12, 'thread')] }),
+    );
+    expect(dispatchedRef(gh)).toBe('feat/new');
   });
 
-  it('deploys a named branch that exists, and main without looking it up', async () => {
-    let gh = fakeGh({ branches: ['fix/hero'] });
-    await runStagingDeployWorkflow({
-      task: makeTask('<@UBOT1> put my branch fix/hero on marketing staging'),
-      config,
-      slack: makeSlack() as any,
-      store: makeStore(),
-    });
-    expect(gh).toHaveBeenCalledWith(['workflow', 'run', 'deploy-staging.yml', '--ref', 'fix/hero'], CLONE, 60_000);
+  it('never reads main mentioned in passing as the branch to deploy', async () => {
+    for (const text of [
+      '<@UBOT1> give me a testing link before I push to main',
+      '<@UBOT1> give me a testing link, is main on staging?',
+      '<@UBOT1> deploy this to staging, then ship to main',
+      '<@UBOT1> push marketing to staging then reset to main',
+    ]) {
+      const gh = fakeGh({ prs: { 1484: { head: 'feat/hero' } } });
+      await run(makeTask(text, { prContexts: [prTarget(1484, 'thread')] }));
+      expect(dispatchedRef(gh), text).toBe('feat/hero');
+    }
+  });
 
-    gh = fakeGh();
-    const slack = makeSlack();
-    await runStagingDeployWorkflow({
-      task: makeTask('<@UBOT1> deploy marketing main to staging'),
-      config,
-      slack: slack as any,
-      store: makeStore(),
-    });
-    expect(gh).toHaveBeenCalledWith(['workflow', 'run', 'deploy-staging.yml', '--ref', 'main'], CLONE, 60_000);
-    expect(gh.mock.calls.some(call => String(call[0][1]).includes('/branches/'))).toBe(false);
-    expect(posted(slack)[1].text).toContain('<https://staging-marketing-web.newtonschool.co/>');
+  it('lets a PR named in the message beat a main mention', async () => {
+    const gh = fakeGh({ prs: { 1484: { head: 'feat/hero' } } });
+    await run(makeTask('<@UBOT1> put PR #1484 on staging and then push to main'));
+    expect(dispatchedRef(gh)).toBe('feat/hero');
+  });
+
+  it('deploys main when main is what goes on staging, without looking it up or comparing', async () => {
+    for (const text of [
+      '<@UBOT1> deploy marketing main to staging',
+      '<@UBOT1> put main back on staging',
+      '<@UBOT1> restore staging to main',
+      '<@UBOT1> staging back to main please',
+      '<@UBOT1> main to staging',
+    ]) {
+      const gh = fakeGh();
+      const { texts } = await run(makeTask(text, { prContexts: [prTarget(1484, 'thread')] }));
+      expect(dispatchedRef(gh), text).toBe('main');
+      expect(gh.mock.calls.some(call => call[0][0] === 'api')).toBe(false);
+      expect(texts.at(-1)).toContain('<https://staging-marketing-web.newtonschool.co/>');
+    }
+  });
+
+  it('deploys a named branch that exists, and tries each slash word until one exists', async () => {
+    let gh = fakeGh({ branches: ['fix/hero'] });
+    await run(makeTask('<@UBOT1> put my branch fix/hero on marketing staging'));
+    expect(dispatchedRef(gh)).toBe('fix/hero');
+
+    gh = fakeGh({ branches: ['feat/hero'] });
+    await run(makeTask('<@UBOT1> the UI/UX fix is on feat/hero, give me a testing link'));
+    expect(dispatchedRef(gh)).toBe('feat/hero');
+
+    gh = fakeGh({ branches: ['feat/x'] });
+    await run(makeTask('<@UBOT1> deploy marketing to staging -- branch is feat/x'));
+    expect(dispatchedRef(gh)).toBe('feat/x');
   });
 
   it('says so when a named branch does not exist, and deploys nothing', async () => {
     const gh = fakeGh({ branches: [] });
-    const slack = makeSlack();
-    const result = await runStagingDeployWorkflow({
-      task: makeTask('<@UBOT1> deploy marketing branch fix/nope to staging'),
-      config,
-      slack: slack as any,
-      store: makeStore(),
-    });
+    const { result, texts } = await run(makeTask('<@UBOT1> deploy marketing branch fix/nope to staging'));
     expect(result.status).toBe('SKIPPED');
-    expect(posted(slack)[0].text).toBe("I can't find a branch named `fix/nope` in newton-marketing-web.");
-    expect(gh.mock.calls.some(call => call[0][0] === 'workflow')).toBe(false);
+    expect(texts[0]).toBe("I can't find a branch named `fix/nope` in newton-marketing-web.");
+    expect(dispatchedRef(gh)).toBeUndefined();
+  });
+
+  it('tells a GitHub failure apart from a real 404, and posts no raw error', async () => {
+    let gh = fakeGh({ apiError: 'spawn gh ENOENT' });
+    let outcome = await run(makeTask('<@UBOT1> give me a testing link', { prContexts: [prTarget(1484, 'thread')] }));
+    expect(outcome.result.status).toBe('FAILED');
+    expect(outcome.texts[0]).toBe(
+      "I couldn't reach GitHub to check that, so I haven't put anything on staging. Try again in a bit.",
+    );
+    expect(dispatchedRef(gh)).toBeUndefined();
+
+    gh = fakeGh({ apiError: 'HTTP 502: Bad Gateway (https://api.github.com/repos/x/branches/fix/hero)' });
+    outcome = await run(makeTask('<@UBOT1> put branch fix/hero on staging'));
+    expect(outcome.texts[0]).toMatch(/^I couldn't reach GitHub/);
+    expect(outcome.texts[0]).not.toContain('502');
+
+    fakeGh({ prs: {} });
+    outcome = await run(makeTask('<@UBOT1> put PR #1484 on staging'));
+    expect(outcome.texts[0]).toBe("I couldn't find PR #1484 in newton-marketing-web.");
+  });
+
+  it('does not read a bare #N in an ask as a PR', async () => {
+    const gh = fakeGh({ prs: { 702: { head: 'wrong/pr' }, 12: { head: 'feat/hero' } } });
+    await run(makeTask('<@UBOT1> give me a testing link, this fixes #702', { prContexts: [prTarget(12, 'thread')] }));
+    expect(dispatchedRef(gh)).toBe('feat/hero');
   });
 
   it('asks which one, and parks the job, when it cannot tell or there are several PRs', async () => {
@@ -416,106 +444,189 @@ describe('runStagingDeployWorkflow', () => {
           data: expect.objectContaining({ reason: 'staging_target' }),
         }),
       );
-      expect(gh.mock.calls.some(call => call[0][0] === 'workflow')).toBe(false);
+      expect(dispatchedRef(gh)).toBeUndefined();
     }
   });
 
-  it('reads the answer to its question, and does not ask twice', async () => {
-    const gh = fakeGh({ branches: ['feat/answer'] });
-    const clarification = { question: STAGING_TARGET_QUESTION, askedText: 'give me a testing link' };
-    await runStagingDeployWorkflow({
-      task: makeTask('feat/answer', { clarification }),
-      config,
-      slack: makeSlack() as any,
-      store: makeStore(),
-    });
-    expect(gh).toHaveBeenCalledWith(['workflow', 'run', 'deploy-staging.yml', '--ref', 'feat/answer'], CLONE, 60_000);
-
+  it('asks its question even when the message answered some other question', async () => {
     fakeGh();
-    const slack = makeSlack();
-    const result = await runStagingDeployWorkflow({
-      task: makeTask('the hero one', { clarification }),
-      config,
-      slack: slack as any,
-      store: makeStore(),
-    });
-    expect(result.status).toBe('SKIPPED');
-    expect(posted(slack)[0].text).toBe(STAGING_TARGET_GIVE_UP);
+    const { result, texts } = await run(
+      makeTask('<@UBOT1> a testing link for my marketing change', {
+        clarification: {
+          question: "I'm not sure what you'd like me to do here. What do you need?",
+          askedText: 'staging?',
+        },
+      }),
+    );
+    expect(result.status).toBe('PAUSED');
+    expect(texts[0]).toBe(`<@UBUILDER> ${STAGING_TARGET_QUESTION}`);
+  });
+
+  it('reads the answer to its question: a branch, a bare number, #N or main', async () => {
+    const clarification = { question: STAGING_TARGET_QUESTION, askedText: 'give me a testing link' };
+    const prContexts = [prTarget(1484, 'thread'), prTarget(1490, 'thread')];
+    const cases: Array<[string, string]> = [
+      ['feat/answer', 'feat/answer'],
+      ['1490', 'feat/x'],
+      ['#1490', 'feat/x'],
+      ['PR 1490', 'feat/x'],
+      ['main', 'main'],
+    ];
+    for (const [reply, ref] of cases) {
+      const gh = fakeGh({ branches: ['feat/answer'], prs: { 1484: { head: 'feat/hero' }, 1490: { head: 'feat/x' } } });
+      await run(makeTask(reply, { clarification, prContexts }));
+      expect(dispatchedRef(gh), reply).toBe(ref);
+    }
+  });
+
+  it('gives up on a second unclear reply to its own question or to the router staging question', async () => {
+    for (const question of [STAGING_TARGET_QUESTION, LOW_CONFIDENCE_STAGING_QUESTION]) {
+      fakeGh();
+      const { result, texts } = await run(
+        makeTask('the hero one', { clarification: { question, askedText: 'give me a testing link' } }),
+      );
+      expect(result.status).toBe('SKIPPED');
+      expect(texts[0]).toBe(STAGING_TARGET_GIVE_UP);
+    }
   });
 
   it("reads a yes to the router's staging question as the PR in the thread, not a branch called yes", async () => {
     const gh = fakeGh({ prs: { 12: { head: 'feat/hero' } } });
-    await runStagingDeployWorkflow({
-      task: makeTask('yes', {
-        clarification: {
-          question: 'Do you want me to put this on the marketing staging site?',
-          askedText: 'can I see it?',
-        },
+    await run(
+      makeTask('yes', {
+        clarification: { question: LOW_CONFIDENCE_STAGING_QUESTION, askedText: 'can I see it?' },
         prContexts: [prTarget(12, 'thread')],
       }),
-      config,
-      slack: makeSlack() as any,
-      store: makeStore(),
-    });
-    expect(gh).toHaveBeenCalledWith(['workflow', 'run', 'deploy-staging.yml', '--ref', 'feat/hero'], CLONE, 60_000);
+    );
+    expect(dispatchedRef(gh)).toBe('feat/hero');
     expect(gh.mock.calls.some(call => String(call[0][1]).endsWith('/branches/yes'))).toBe(false);
   });
+});
 
-  it('refuses a merged PR, a closed PR, a fork PR, and a PR of another repo', async () => {
-    const cases: Array<[FakePr | undefined, PrTarget, RegExp]> = [
-      [
-        { head: 'a/b', merged: true, state: 'closed' },
-        prTarget(12, 'thread'),
-        /is already merged\. Ask me to put main on staging/,
-      ],
-      [{ head: 'a/b', state: 'closed' }, prTarget(12, 'thread'), /is closed/],
-      [{ head: 'a/b', headRepo: 'someone/newton-marketing-web' }, prTarget(12, 'thread'), /comes from a fork/],
-      [{ head: 'a/b', headRepo: null }, prTarget(12, 'thread'), /comes from a fork/],
-      [
-        undefined,
-        prTarget(9433, 'thread', 'newton-web'),
-        /^I only put newton-marketing-web changes on staging, and <[^|]+\|that PR> is in newton-web\.$/,
-      ],
+describe('runStagingDeployWorkflow: refusals', () => {
+  it('refuses a merged PR, a closed PR and a fork PR', async () => {
+    const cases: Array<[FakePr, RegExp]> = [
+      [{ head: 'a/b', merged: true, state: 'closed' }, /is already merged\. Ask me to put main on staging/],
+      [{ head: 'a/b', state: 'closed' }, /is closed/],
+      [{ head: 'a/b', headRepo: 'someone/newton-marketing-web' }, /comes from a fork/],
+      [{ head: 'a/b', headRepo: null }, /comes from a fork/],
     ];
-    for (const [pr, target, expected] of cases) {
-      const gh = fakeGh({ prs: pr ? { 12: pr } : {} });
-      const slack = makeSlack();
-      const result = await runStagingDeployWorkflow({
-        task: makeTask('<@UBOT1> testing link please', { prContexts: [target] }),
-        config,
-        slack: slack as any,
-        store: makeStore(),
-      });
+    for (const [pr, expected] of cases) {
+      const gh = fakeGh({ prs: { 12: pr } });
+      const { result, texts } = await run(
+        makeTask('<@UBOT1> testing link please', { prContexts: [prTarget(12, 'thread')] }),
+      );
       expect(result.status).toBe('SKIPPED');
-      expect(posted(slack)[0].text).toMatch(expected);
-      expect(gh.mock.calls.some(call => call[0][0] === 'workflow')).toBe(false);
+      expect(texts[0]).toMatch(expected);
+      expect(dispatchedRef(gh)).toBeUndefined();
     }
   });
 
-  it('refuses a staging ask for another app instead of asking which branch', async () => {
-    fakeGh();
-    const slack = makeSlack();
-    const result = await runStagingDeployWorkflow({
-      task: makeTask('<@UBOT1> deploy newton-web to staging'),
-      config,
-      slack: slack as any,
-      store: makeStore(),
-    });
-    expect(result.status).toBe('SKIPPED');
-    expect(posted(slack)[0].text).toBe('I only put newton-marketing-web changes on staging.');
+  it('refuses an ask about another repo instead of falling back to the thread marketing PR', async () => {
+    const cases: Array<[NormalizedTask, RegExp]> = [
+      [
+        makeTask('<@UBOT1> testing link for <https://github.com/Newton-School/newton-web/pull/9040>', {
+          prContexts: [prTarget(9040, 'trigger', 'newton-web'), prTarget(1484, 'thread')],
+        }),
+        /^I only put newton-marketing-web changes on staging, and <[^|]+\|that PR> is in newton-web\.$/,
+      ],
+      [
+        makeTask('<@UBOT1> deploy newton-web to staging', { prContexts: [prTarget(1484, 'thread')] }),
+        /^I only put newton-marketing-web changes on staging\.$/,
+      ],
+      [
+        makeTask('<@UBOT1> put the newton api fix on staging'),
+        /^I only put newton-marketing-web changes on staging\.$/,
+      ],
+      [
+        makeTask('<@UBOT1> testing link', { prContexts: [prTarget(9433, 'thread', 'newton-web')] }),
+        /that PR> is in newton-web/,
+      ],
+    ];
+    for (const [task, expected] of cases) {
+      const gh = fakeGh({ prs: { 1484: { head: 'feat/hero' } } });
+      const { result, texts } = await run(task);
+      expect(result.status).toBe('SKIPPED');
+      expect(texts[0]).toMatch(expected);
+      expect(dispatchedRef(gh)).toBeUndefined();
+    }
   });
 
-  it('tells a viewer it is not for them', async () => {
-    const gh = fakeGh();
-    const slack = makeSlack();
-    const result = await runStagingDeployWorkflow({
-      task: makeTask('<@UBOT1> deploy marketing main to staging', {}, 'UVIEWER'),
-      config,
-      slack: slack as any,
-      store: makeStore(),
-    });
-    expect(result.status).toBe('SKIPPED');
+  it('never puts anything on staging from a message that says prod', async () => {
+    for (const text of [
+      '<@UBOT1> deploy marketing main to prod',
+      '<@UBOT1> give me a testing link before production',
+    ]) {
+      const gh = fakeGh({ prs: { 12: { head: 'feat/hero' } } });
+      const { result, texts } = await run(makeTask(text, { prContexts: [prTarget(12, 'thread')] }));
+      expect(result.status).toBe('SKIPPED');
+      expect(texts).toEqual([STAGING_PROD_WORD_REPLY]);
+      expect(gh).not.toHaveBeenCalled();
+    }
+    // A link that says production is not the message saying it.
+    const gh = fakeGh({ prs: { 12: { head: 'feat/hero' } } });
+    await run(
+      makeTask(
+        '<@UBOT1> testing link for <https://github.com/Newton-School/newton-marketing-web/pull/12|fix production banner>',
+        {
+          prContexts: [prTarget(12, 'trigger')],
+        },
+      ),
+    );
+    expect(dispatchedRef(gh)).toBe('feat/hero');
+  });
+
+  it('refuses a branch that changes anything under .github/, or that it cannot compare', async () => {
+    let gh = fakeGh({ branches: ['feat/x'], files: ['src/app/page.tsx', '.github/workflows/deploy-staging.yml'] });
+    let outcome = await run(makeTask('<@UBOT1> put branch feat/x on staging'));
+    expect(outcome.result.status).toBe('SKIPPED');
+    expect(outcome.texts[0]).toMatch(/^`feat\/x` changes files under \.github\/.*I haven't put it on staging/);
+    expect(dispatchedRef(gh)).toBeUndefined();
+
+    gh = fakeGh({ branches: ['feat/x'], compareError: 'HTTP 500' });
+    outcome = await run(makeTask('<@UBOT1> put branch feat/x on staging'));
+    expect(outcome.texts[0]).toBe(
+      "I couldn't check what `feat/x` changes, so I haven't put it on staging. Try again in a bit.",
+    );
+    expect(dispatchedRef(gh)).toBeUndefined();
+
+    gh = fakeGh({ branches: ['feat/x'], files: Array.from({ length: 300 }, (_, i) => `src/f${i}.ts`) });
+    outcome = await run(makeTask('<@UBOT1> put branch feat/x on staging'));
+    expect(outcome.texts[0]).toMatch(/changes too many files for me to check/);
+    expect(dispatchedRef(gh)).toBeUndefined();
+  });
+
+  it('refuses a PR whose branch name is not safe to pass on or show', async () => {
+    for (const head of ['feat/`x`', 'feat/<x>', 'a&b', '-x', 'a..b']) {
+      const gh = fakeGh({ prs: { 12: { head } } });
+      const { result, texts } = await run(makeTask('<@UBOT1> testing link', { prContexts: [prTarget(12, 'thread')] }));
+      expect(result.status, head).toBe('SKIPPED');
+      expect(texts[0]).toBe(
+        "That PR's branch name has characters I can't pass on safely, so I haven't put it on staging.",
+      );
+      expect(texts[0]).not.toContain(head);
+      expect(dispatchedRef(gh)).toBeUndefined();
+    }
+  });
+
+  it('tells a viewer it is not for them, but lets a run on the owner’s lent authority through', async () => {
+    let gh = fakeGh();
+    let outcome = await run(makeTask('<@UBOT1> deploy marketing main to staging', {}, 'UVIEWER'));
+    expect(outcome.result.status).toBe('SKIPPED');
     expect(gh).not.toHaveBeenCalled();
+
+    gh = fakeGh();
+    outcome = await run(
+      makeTask(
+        'main',
+        {
+          delegatedByOwnerId: 'UOWNER1',
+          clarification: { question: STAGING_TARGET_QUESTION, askedText: 'testing link' },
+        },
+        'USTRANGER',
+      ),
+    );
+    expect(dispatchedRef(gh)).toBe('main');
   });
 
   it('says the clone is missing on a host without it', async () => {
@@ -528,69 +639,156 @@ describe('runStagingDeployWorkflow', () => {
     expect(result.status).toBe('SKIPPED');
     expect(result.message).toContain("clone isn't configured");
   });
+});
 
-  it('reports a failed, cancelled, unfollowable or undispatchable deploy', async () => {
-    const cases: Array<[Parameters<typeof fakeGh>[0], string, RegExp]> = [
+describe('runStagingDeployWorkflow: the run', () => {
+  it('finds the new run among this branch’s runs only, newer than the anchor', async () => {
+    const gh = fakeGh({
+      branches: ['feat/hero'],
+      runs: [
+        { id: 50, branch: 'feat/hero', status: 'completed', conclusion: 'failure' },
+        { id: 90, branch: 'main', status: 'completed', conclusion: 'success' },
+      ],
+      appearAfterPolls: 2,
+    });
+    const { result, texts } = await run(makeTask('<@UBOT1> put branch feat/hero on staging'));
+    const lists = gh.mock.calls.filter(call => call[0][0] === 'run' && call[0][1] === 'list').map(call => call[0]);
+    expect(lists[0]).toEqual([
+      'run',
+      'list',
+      '--workflow=deploy-staging.yml',
+      '--branch',
+      'feat/hero',
+      '--limit',
+      '1',
+      '--json',
+      'databaseId,url,status,conclusion',
+    ]);
+    // Neither the anchor (50, a failure) nor main's newer run (90) is reported as this one.
+    const views = gh.mock.calls.filter(call => call[0][0] === 'run' && call[0][1] === 'view').map(call => call[0][2]);
+    expect(views).toEqual(['101']);
+    expect(result.status).toBe('SUCCESS');
+    expect(texts.at(-1)).toMatch(/^`feat\/hero` is on staging/);
+  });
+
+  it('reports a failed, unfollowable or undispatchable deploy without raw errors, and records none of the failures', async () => {
+    const cases: Array<[Parameters<typeof fakeGh>[0], string, RegExp, boolean]> = [
       [
         { conclusion: 'failure' },
         'FAILED',
-        /^The staging deploy of `main` failed\. Run: https:\/\/github.com\/x\/actions\/runs\/77$/,
+        /^The staging deploy of `main` failed\. Run: https:\/\/github.com\/x\/actions\/runs\/101$/,
+        false,
       ],
-      [{ conclusion: 'cancelled' }, 'FAILED', /was cancelled: a newer staging deploy started before it finished/],
-      [{ runNeverAppears: true }, 'SUCCESS', /couldn't find its run to follow/],
-      [{ dispatchError: 'HTTP 422' }, 'FAILED', /^Couldn't start the staging deploy of `main`: HTTP 422$/],
+      [{ runNeverAppears: true }, 'SUCCESS', /couldn't find its run to follow/, true],
+      [
+        { dispatchError: 'HTTP 422: Workflow does not have workflow_dispatch trigger (https://api.github.com/...)' },
+        'FAILED',
+        /^Couldn't start the staging deploy of `main`\. Check the Deploy → staging workflow in GitHub Actions\.$/,
+        false,
+      ],
     ];
-    for (const [opts, status, expected] of cases) {
+    for (const [opts, status, expected, recorded] of cases) {
       fakeGh(opts);
-      const slack = makeSlack();
-      const store = makeStore();
-      const result = await runStagingDeployWorkflow({
-        task: makeTask('<@UBOT1> deploy marketing main to staging'),
-        config,
-        slack: slack as any,
-        store,
-      });
+      const { result, texts, store } = await run(makeTask('<@UBOT1> deploy marketing main to staging'));
       expect(result.status, JSON.stringify(opts)).toBe(status);
-      expect(posted(slack).at(-1)?.text).toMatch(expected);
-      // Only a deploy that went live is recorded.
-      expect(store.setState).not.toHaveBeenCalled();
+      expect(texts.at(-1)).toMatch(expected);
+      expect(texts.join('\n')).not.toContain('HTTP');
+      expect(store.setState.mock.calls.length > 0, JSON.stringify(opts)).toBe(recorded);
     }
+  });
+
+  it('says what cancelled a run when it can tell, and calls it skipped, not failed', async () => {
+    let gh = fakeGh({ conclusion: 'cancelled' });
+    // Someone dispatched feat/other after this run started.
+    const original = gh.getMockImplementation() as any;
+    gh.mockImplementation(async (args: string[]) => {
+      if (args[0] === 'run' && args[1] === 'view') gh.runs.push({ id: 150, branch: 'feat/other', status: 'queued' });
+      return original(args);
+    });
+    let outcome = await run(makeTask('<@UBOT1> deploy marketing main to staging'));
+    expect(outcome.result.status).toBe('SKIPPED');
+    expect(outcome.result.notifyDesktop).toBe(false);
+    expect(outcome.texts.at(-1)).toMatch(
+      /^The staging deploy of `main` was cancelled: a newer staging deploy of `feat\/other` replaced it\./,
+    );
+    expect(outcome.store.setState).not.toHaveBeenCalled();
+
+    gh = fakeGh({ conclusion: 'cancelled' });
+    outcome = await run(makeTask('<@UBOT1> deploy marketing main to staging'));
+    expect(outcome.result.status).toBe('SKIPPED');
+    expect(outcome.texts.at(-1)).toMatch(/^The staging deploy of `main` was cancelled in GitHub\./);
+  });
+
+  it('after a stop mid-watch, says the deploy carries on and keeps the record true', async () => {
+    const controller = new AbortController();
+    fakeGh({ stuck: () => controller.abort() });
+    const { result, texts, store } = await run(
+      makeTask('<@UBOT1> deploy marketing main to staging'),
+      makeStore(),
+      controller.signal,
+    );
+    expect(result.status).toBe('CANCELLED');
+    expect(result.slackPosted).toBe(true);
+    expect(texts.at(-1)).toBe(
+      "Stopped. The staging deploy of `main` had already started, so it carries on in GitHub Actions and will replace what's on staging. Run: https://github.com/x/actions/runs/101",
+    );
+    expect(JSON.parse(store.state.get(STAGING_STATE_KEY) ?? '{}').branch).toBe('main');
+  });
+
+  it('dispatches nothing when stopped before the dispatch', async () => {
+    const controller = new AbortController();
+    const gh = fakeGh({ branches: ['feat/x'] });
+    const original = gh.getMockImplementation() as any;
+    gh.mockImplementation(async (args: string[]) => {
+      if (args[0] === 'run' && args[1] === 'list') controller.abort();
+      return original(args);
+    });
+    const { result } = await run(makeTask('<@UBOT1> put branch feat/x on staging'), makeStore(), controller.signal);
+    expect(result.status).toBe('CANCELLED');
+    expect(dispatchedRef(gh)).toBeUndefined();
   });
 
   it('in dry-run mode reports instead of deploying', async () => {
     const gh = fakeGh();
-    const slack = makeSlack();
-    const result = await runStagingDeployWorkflow({
-      task: makeTask('<@UBOT1> deploy marketing main to staging'),
-      config,
-      slack: slack as any,
-      store: makeStore({ [DEPLOY_DRY_RUN_STATE_KEY]: '1' }),
-    });
+    const { result, texts } = await run(
+      makeTask('<@UBOT1> deploy marketing main to staging'),
+      makeStore({ [DEPLOY_DRY_RUN_STATE_KEY]: '1' }),
+    );
     expect(result.status).toBe('SUCCESS');
-    expect(posted(slack)[0].text).toBe('Dry run: this is where I would put `main` on staging. Nothing was deployed.');
-    expect(gh.mock.calls.some(call => call[0][0] === 'workflow')).toBe(false);
+    expect(texts[0]).toBe('Dry run: this is where I would put `main` on staging. Nothing was deployed.');
+    expect(dispatchedRef(gh)).toBeUndefined();
   });
+});
+
+describe('runStagingDeployWorkflow: the shared-staging heads-up', () => {
+  const previous = {
+    branch: 'feat/a',
+    channelId: 'C-BUILD',
+    channelType: 'channel',
+    threadTs: '100.1',
+    atMs: NOW - 600_000,
+  };
 
   it('tells the thread whose branch it replaced, without tagging anyone', async () => {
-    fakeGh({ branches: ['feat/b'] });
-    const slack = makeSlack();
-    const previous = {
-      branch: 'feat/a',
-      channelId: 'C-BUILD',
-      channelType: 'channel',
-      threadTs: '100.1',
-      atMs: NOW - 600_000,
-    };
+    fakeGh({ branches: ['feat/b'], runs: [{ id: 95, branch: 'feat/a', status: 'completed', conclusion: 'success' }] });
     const store = makeStore({ [STAGING_STATE_KEY]: JSON.stringify(previous) });
-    await runStagingDeployWorkflow({
-      task: makeTask('<@UBOT1> put branch feat/b on staging'),
-      config,
-      slack: slack as any,
-      store,
-    });
+    const { slack } = await run(makeTask('<@UBOT1> put branch feat/b on staging'), store);
     const headsUp = posted(slack).find(post => post.thread_ts === '100.1');
     expect(headsUp?.text).toMatch(/^Heads-up: staging now shows `feat\/b` \(asked in <https:\/\/.+\|another thread>\)/);
     expect(headsUp?.text).not.toContain('<@');
     expect(JSON.parse(store.state.get(STAGING_STATE_KEY) ?? '{}').branch).toBe('feat/b');
+  });
+
+  it('stays quiet when someone deployed another branch from GitHub since the record', async () => {
+    fakeGh({
+      branches: ['feat/b'],
+      runs: [
+        { id: 95, branch: 'feat/a', status: 'completed', conclusion: 'success' },
+        { id: 97, branch: 'feat/manual', status: 'completed', conclusion: 'success' },
+      ],
+    });
+    const store = makeStore({ [STAGING_STATE_KEY]: JSON.stringify(previous) });
+    const { slack } = await run(makeTask('<@UBOT1> put branch feat/b on staging'), store);
+    expect(posted(slack).some(post => post.thread_ts === '100.1')).toBe(false);
   });
 });

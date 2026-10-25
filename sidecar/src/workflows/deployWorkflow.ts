@@ -447,6 +447,9 @@ async function runMarketingDeploy(params: {
     logStep,
     stagePrefix: 'deploy.marketing',
   });
+  // Stopped before the dispatch went out: nothing was deployed, and a stop says so itself.
+  if (outcome.kind === 'stopped')
+    return { ...skipped('Deploy cancelled before dispatch.'), status: 'CANCELLED', slackPosted: false };
   if (outcome.kind === 'dispatch_failed') {
     const msg = `Couldn't dispatch the marketing prod deploy: ${outcome.error}`;
     logStep?.({ stage: 'deploy.marketing.dispatch_failed', message: msg, level: 'ERROR' });
@@ -492,7 +495,7 @@ export const STAGING_OR_PROD_REPLY =
   'Staging or production? To put a branch on staging, ask me for a testing link. If you meant production, ask again and say prod.';
 
 /** What a dispatched marketing prod deploy came to, in the words posted to Slack. */
-function describeProdRun(outcome: Exclude<ActionsRunOutcome, { kind: 'dispatch_failed' }>): {
+function describeProdRun(outcome: Exclude<ActionsRunOutcome, { kind: 'dispatch_failed' | 'stopped' }>): {
   conclusion: 'success' | 'failure' | 'pending';
   url?: string;
   summary: string;

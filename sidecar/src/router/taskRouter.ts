@@ -48,6 +48,7 @@ import { channelDenialHint } from '../access/denialHint.js';
 import { buildHelpReply, isHelpRequest } from './helpReply.js';
 import { unsupportedReply } from './unsupportedReply.js';
 import { isMarketingStagingDeployAsk, namesStagingAsTarget } from './intentParser.js';
+import { isMarketingStagingAsk } from './stagingTarget.js';
 import { acknowledgementText, pickupDelayMs } from './acknowledgement.js';
 import { RESTART_EVENT_PREFIX } from '../runtime/restartRecovery.js';
 import { looksLikeFixAffirmation } from './resumeIntentParser.js';
@@ -261,7 +262,7 @@ export async function routeTask(params: {
   const directAsk =
     task.mentionType === 'bot' &&
     !task.mentionReference &&
-    !['DEV_ASSIST', 'MINIOG_DOSSIER', 'PR_REVIEW', 'WEBAPP_QA'].includes(task.intent);
+    !['DEV_ASSIST', 'MINIOG_DOSSIER', 'PR_REVIEW', 'WEBAPP_QA', 'STAGING_DEPLOY'].includes(task.intent);
   /**
    * A bare "help": answered at once, for this person in this channel, with no
    * model run. A mention in passing ("<@owner> cc <@miniOG> help") is not one.
@@ -273,8 +274,10 @@ export async function routeTask(params: {
    * became a change_code question ("change something, or only look into it?").
    */
   const stagingAsked = directAsk && !helpRequested && isMarketingStagingDeployAsk(userMessage);
+  // STAGING_DEPLOY is seeded only by an answer to the staging tool's "which
+  // PR or branch?" (pausedResume.ts): nothing for a model to read.
   const routerShadow =
-    helpRequested || stagingAsked
+    helpRequested || stagingAsked || task.intent === 'STAGING_DEPLOY'
       ? undefined
       : startRouterShadow({ task, userMessage, reviewedPrInThread, logStep, signal });
   let legacyDecidedBy: LegacyDecidedBy = 'gate';
@@ -289,6 +292,13 @@ export async function routeTask(params: {
   // (isPrReviewRequest in intentParser.ts). It does not wait for the router,
   // so a "review <PR URL>" message routes identically whether the model CLI
   // is healthy or down (issue #334, bug B).
+  if (task.intent === 'STAGING_DEPLOY') {
+    logStep?.({
+      stage: 'router.staging.answer',
+      message: 'An answer to "which PR or branch?" — back to the staging tool, no model run.',
+      data: { userMessage },
+    });
+  }
   if (task.intent === 'PR_REVIEW') {
     logStep?.({
       stage: 'router.pr_review.deterministic',
@@ -303,7 +313,8 @@ export async function routeTask(params: {
     task.intent !== 'DEV_ASSIST' &&
     task.intent !== 'MINIOG_DOSSIER' &&
     task.intent !== 'PR_REVIEW' &&
-    task.intent !== 'WEBAPP_QA'
+    task.intent !== 'WEBAPP_QA' &&
+    task.intent !== 'STAGING_DEPLOY'
   ) {
     if (isPresencePing(userMessage)) {
       resolvedIntent = 'CONVERSATIONAL';
@@ -453,6 +464,21 @@ export async function routeTask(params: {
           },
         });
         resolvedIntent = 'INFORMATIONAL';
+      } else if (
+        classification.tool === 'deploy' &&
+        !classification.deployAllowed &&
+        addressingOf(task) === 'direct' &&
+        isMarketingStagingAsk(task, config.allowedPrOrg)
+      ) {
+        // The router read a marketing staging ask as a production deploy. Code
+        // found no production target in it, and a lookup would only say "ask
+        // me for a testing link": it is the staging tool's (issue #702).
+        logStep?.({
+          stage: 'router.deploy_to_staging',
+          message: 'Router picked deploy for a marketing staging ask — running the staging tool instead.',
+          data: { confidence: classification.confidence, reasoning: classification.reasoning },
+        });
+        resolvedIntent = 'STAGING_DEPLOY';
       } else if (holdOverride) {
         // The router was unsure and the message was not addressed to miniOG (a
         // direct address became a question above). The floor used to keep the
