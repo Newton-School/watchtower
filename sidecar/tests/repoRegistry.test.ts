@@ -139,9 +139,10 @@ describe('prompt blocks', () => {
     const marketingLine = three.split('\n').find(line => line.startsWith('- newton-marketing-web:')) ?? '';
     // Staging questions come here; a staging deploy is the staging tool's (issue #702).
     expect(marketingLine).toContain('Staging (staging-marketing-web.newtonschool.co): Staging is shared');
-    expect(marketingLine).toContain('Ask miniOG for a testing link');
+    expect(marketingLine).toContain('When someone asks you (miniOG) for a testing link');
     expect(marketingLine).toContain('gh workflow run deploy-staging.yml --ref YOUR_BRANCH');
-    expect(marketingLine).toContain('never dispatch it yourself: point people to asking miniOG for a testing link.');
+    expect(marketingLine).toContain('never dispatch it yourself: tell people they can ask you for a testing link');
+    expect(marketingLine).not.toContain('Ask miniOG');
     expect(marketingLine).not.toMatch(/[<>&]/);
     expect(three.split('\n').find(line => line.startsWith('- newton-web:'))).not.toContain('Staging');
   });

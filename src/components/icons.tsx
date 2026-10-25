@@ -1,5 +1,17 @@
 import type { SVGProps } from 'react';
-import { Activity, LayoutDashboard, Lightbulb, Menu, Play, Rocket, Settings, Terminal, Users, X } from 'lucide-react';
+import {
+  Activity,
+  Gauge,
+  LayoutDashboard,
+  Lightbulb,
+  Menu,
+  Play,
+  Rocket,
+  Settings,
+  Terminal,
+  Users,
+  X,
+} from 'lucide-react';
 
 type IconProps = SVGProps<SVGSVGElement>;
 
@@ -48,6 +60,10 @@ export function IntelligenceIcon() {
 
 export function PerformanceIcon() {
   return <Activity size={ICON_SIZE} strokeWidth={ICON_STROKE} />;
+}
+
+export function UxMetricsIcon() {
+  return <Gauge size={ICON_SIZE} strokeWidth={ICON_STROKE} />;
 }
 
 export function DiagnosticsIcon() {

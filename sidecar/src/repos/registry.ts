@@ -149,7 +149,7 @@ export const REPO_REGISTRY: Record<RepoKey, RepoDescriptor> = {
       // when someone asks for a testing link (issue #702).
       stagingHost: 'staging-marketing-web.newtonschool.co',
       stagingNote:
-        'Staging is shared and shows whichever branch was deployed there last. Ask miniOG for a testing link and it puts the PR branch on staging and posts the link; developers can also run *Deploy → staging* in GitHub Actions on a branch (`gh workflow run deploy-staging.yml --ref YOUR_BRANCH`). Either way it replaces what is on staging now, so deploy `main` again when you are done.',
+        'Staging is shared and shows whichever branch was deployed there last. When someone asks you (miniOG) for a testing link, you put the PR branch on staging and post the link; developers can also run *Deploy → staging* in GitHub Actions on a branch (`gh workflow run deploy-staging.yml --ref YOUR_BRANCH`). Either way it replaces what is on staging now, so `main` should go back on staging when testing is done.',
       prodCommand: 'gh workflow run deploy-prod.yml --ref main -f confirm=deploy',
     },
     contentPolicy: {
@@ -350,7 +350,7 @@ export function describeEnabledRepos(config: AppConfig): string {
       const deploy = repo.deploy;
       const staging =
         deploy.method === 'github-actions'
-          ? ` Staging (${deploy.stagingHost}): ${deploy.stagingNote} In this answer, never dispatch it yourself: point people to asking miniOG for a testing link.`
+          ? ` Staging (${deploy.stagingHost}): ${deploy.stagingNote} In this answer, never dispatch it yourself: tell people they can ask you for a testing link, in your own voice ("ask me for a testing link", never "ask miniOG").`
           : '';
       return `- ${key}: ${repo.description}${staging}`;
     })
