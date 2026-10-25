@@ -4,7 +4,6 @@ import type { WebClient } from '@slack/web-api';
 import { evaluateCapability, getBundlesForConfig } from '../access/control.js';
 import { toolchainEnv } from '../backends/codexBackend.js';
 import { REPO_REGISTRY, repoPathOrNull } from '../repos/registry.js';
-import { replayAfterThreadFrees } from '../runtime/busyThreadMessages.js';
 import { whileWaitingForAnswer } from '../runtime/humanWaits.js';
 import { jobSlots } from '../runtime/jobSlots.js';
 import { DEPLOY_TAP_PHRASE } from '../runtime/restartNotice.js';
@@ -49,20 +48,13 @@ export const DEPLOY_OFFER_DM_LINE =
   "It isn't live yet. A deploy can't be tapped in a DM: someone from core-dev can ask me in a channel to deploy marketing to prod.";
 export const DEPLOY_OFFER_EXPIRED =
   "No deploy tap in 2 hours, so it isn't live yet. When it should go live, someone from core-dev can ask me to deploy marketing to prod.";
-export const DEPLOY_OFFER_DECLINED =
-  'Okay, not deploying it now. When it should go live, someone from core-dev can ask me to deploy marketing to prod.';
-export const DEPLOY_OFFER_SUPERSEDED_REPLAY =
-  "That closes the deploy offer, so I'm picking up your message now. To deploy later, someone from core-dev can ask me to deploy marketing to prod.";
+export const DEPLOY_OFFER_DECLINED = 'Okay, not deploying it now.';
+/** A hold that also asked for something: the thread was held, so the ask didn't start. */
+export const DEPLOY_OFFER_DECLINED_WITH_ASK =
+  "Okay, not deploying it now. Mention me again with the rest of your message and I'll pick it up.";
+/** A new ask closed the offer: the thread was held, so it didn't start. */
 export const DEPLOY_OFFER_SUPERSEDED =
-  "I was holding this thread for the deploy tap, so I didn't pick that up. The offer is closed now: mention me again with it. To deploy later, someone from core-dev can ask me to deploy marketing to prod.";
-export const DEPLOY_OFFER_SUPERSEDED_EDITED =
-  "That message was edited after you sent it, so I haven't run it. The deploy offer is closed now: send it again as a new message. To deploy later, someone from core-dev can ask me to deploy marketing to prod.";
-export const DEPLOY_OFFER_DECLINED_REPLAY =
-  "Okay, not deploying it now, and I'm picking up the rest of your message. When it should go live, someone from core-dev can ask me to deploy marketing to prod.";
-export const DEPLOY_OFFER_DECLINED_EDITED =
-  'Okay, not deploying it now. That message was edited after you sent it, so send the rest again as a new message. When it should go live, someone from core-dev can ask me to deploy marketing to prod.';
-export const DEPLOY_OFFER_DECLINED_RESEND =
-  'Okay, not deploying it now. Mention me again with the rest of your message. When it should go live, someone from core-dev can ask me to deploy marketing to prod.';
+  "That closes the deploy offer. Mention me again with your message and I'll pick it up now.";
 export const DEPLOY_OFFER_STATUS = "Not yet: it's waiting for a tap from core-dev.";
 export const DEPLOY_TAP_QUEUED_FOR_SLOT =
   "Deploy tapped. I'm finishing other work first and will start it as soon as I can.";
@@ -115,10 +107,19 @@ const HOLD_RE =
   /^(?:no|nope|nah|cancel|stop|abort|skip|later)$|^(?:no|nope|nah)\b|\b(?:dont|do not|shouldnt|should not|wont|will not|cant|cannot|can not|never ?mind|nvm|not yet|not now|not today|not ready|not until|until|hold|hang on|one sec|one second|one min|wait|pause|stop|cancel|abort|later|tomorrow|after|broken)\b/;
 /** Said before a tap without changing it: "LGTM, deploy it". */
 const LEADING_PLEASANTRY_RE =
-  /^(?:(?:ok|okay|yes|yep|yeah|sure|please|pls|plz|lgtm|looks good|looks great|look good|all good|good to go|great|nice|cool|perfect|awesome|thanks|thank you|thx|approved)\s+)+/;
+  /^(?:(?:ok|okay|yes|yep|yeah|sure|please|pls|plz|lgtm|looks good|looks great|look good|all good|good to go|great|nice|cool|perfect|awesome|thanks|thank you|thx|approved|go ahead and|go ahead|you can)\s+)+/;
 /** "is it live yet?", "when will it go live?", "any update on the deploy?" */
 const STATUS_QUESTION_RE =
-  /^(?:is|has|did|when|whats|what is|any|where|how)\b.*\b(?:live|deployed|deploy|prod|production|shipped|out|up|status|update)\b|\b(?:live|deployed|shipped) yet\b|\bstatus\b/;
+  /^(?:is|has|did|when|whats|what is|any|where|how)\b.*\b(?:live|deployed|deploy|prod|production|shipped|out|up|status|update)\b|\b(?:live|deployed|shipped) yet\b|\bstatus\b|\b(?:check|see|confirm|know|tell me)\b.*\b(?:live|deployed|shipped)\b|\bif (?:it|its|this)\b.*\b(?:live|deployed|out|up)\b/;
+/** Things a message can ask miniOG to do, beyond holding the deploy. */
+const ASK_VERBS =
+  '(?:change|update|add|remove|fix|make|revert|undo|rename|replace|reword|move|check|show|tell|send|write|put|set|edit|delete|create|open|close|merge|sync|run|test|look|swap|use|tweak|correct)';
+const POLITE_ASK_RE = new RegExp(
+  `\\b(?:can you|could you|would you|will you|please|pls|also)\\s+(?:also\\s+)?${ASK_VERBS}\\b`,
+);
+const IMPERATIVE_CLAUSE_RE = new RegExp(`^(?:then |and |also |first |instead )?${ASK_VERBS}\\b`);
+const QUESTION_RE =
+  /\b(?:can|could|would|will|what|whats|why|how|when|where|which|who|is|are|do|does|did|should)\b[^?]*\?/;
 const PLEASANTRY_RE =
   /^(?:(?:thanks|thank you|thank u|thx|ty|tysm|cheers|cool|nice|great|awesome|perfect|amazing|sweet|ok|okay|k|kk|got it|noted|sounds good|lgtm|good job|great job|nice work|great work|well done|love it|yay|woohoo|hi|hey|hello)\s*)+(?:so much|a lot|again|man|bro|buddy|team|all|folks)?$/;
 const EMOJI_ONLY_RE = /^(?::[a-z0-9_+'-]+:\s*)+$/;
@@ -127,6 +128,8 @@ const EMOJI_ONLY_RE = /^(?::[a-z0-9_+'-]+:\s*)+$/;
 interface ReadReply {
   /** Lowercased, without mentions, formatting marks or trailing punctuation. */
   text: string;
+  /** Lowercased and without mentions, punctuation kept: where one clause ends and the next begins. */
+  lower: string;
   mentionsBot: boolean;
   /** It names someone else, or a group: it is addressed to them. */
   mentionsOther: boolean;
@@ -143,6 +146,10 @@ function readReply(raw: string, botUserId?: string): ReadReply {
   const mentioned = [...visible.matchAll(/<@([A-Z0-9]+)(?:\|[^>]*)?>/g)].map(match => match[1]);
   return {
     text: normalizeConfirmationReply(visible.replace(/<![^>]+>/g, ' ')),
+    lower: visible
+      .replace(/<[@!][^>]+>/g, ' ')
+      .toLowerCase()
+      .trim(),
     mentionsBot: Boolean(botUserId && mentioned.includes(botUserId)),
     mentionsOther: mentioned.some(id => id !== botUserId) || /<!(?:subteam\^|here|channel|everyone)/.test(visible),
   };
@@ -194,13 +201,22 @@ export interface DeployTapResult {
   outcome: DeployTapOutcome;
   userId?: string;
   replyTs?: string;
-  /** The message as the thread showed it, when it is to run once the thread is free. */
-  replay?: { text: string; edited?: boolean };
+  /** A hold that also asked miniOG for something. */
+  hasAsk?: boolean;
 }
 
-/** A hold and nothing else: a message that says more also carries an ask. */
-function isBareHold(text: string): boolean {
-  return corePhrase(text).split(/\s+/).filter(Boolean).length <= 4;
+/**
+ * Whether a message asks for something beyond holding the deploy: a real
+ * question or an instruction ("wait, can you also change the footer link?").
+ * "don't deploy this until marketing signs off" and "not yet, waiting on the
+ * legal review" don't.
+ */
+export function asksForMore(lower: string): boolean {
+  const clauses = lower
+    .split(/[,.;:!\n]+|\s[-–—]\s/)
+    .map(clause => clause.trim())
+    .filter(Boolean);
+  return POLITE_ASK_RE.test(lower) || QUESTION_RE.test(lower) || clauses.some(c => IMPERATIVE_CLAUSE_RE.test(c));
 }
 
 /** May this person deploy to production here, right now; and when not, is it only this channel. */
@@ -288,13 +304,8 @@ async function pollForDeployTap(params: TapWaitParams): Promise<DeployTapResult>
 
       if (decides && HOLD_RE.test(reply.text)) {
         // "wait, can you also change the footer link?" holds the deploy back and asks for more.
-        const carriesAsk = reply.mentionsBot && !isBareHold(reply.text);
-        return {
-          outcome: 'declined',
-          userId: message.user,
-          replyTs: message.ts,
-          ...(carriesAsk ? { replay: { text: message.text, edited: message.edited } } : {}),
-        };
+        const hasAsk = reply.mentionsBot && asksForMore(reply.lower);
+        return { outcome: 'declined', userId: message.user, replyTs: message.ts, ...(hasAsk ? { hasAsk } : {}) };
       }
 
       if (isDeployTap(message.text, botUserId)) {
@@ -337,14 +348,7 @@ async function pollForDeployTap(params: TapWaitParams): Promise<DeployTapResult>
         continue;
       }
       if (reply.mentionsBot && !isPleasantry(reply.text)) {
-        if (decides) {
-          return {
-            outcome: 'superseded',
-            userId: message.user,
-            replyTs: message.ts,
-            replay: { text: message.text, edited: message.edited },
-          };
-        }
+        if (decides) return { outcome: 'superseded', userId: message.user, replyTs: message.ts };
         sayOnce(
           `busy:${message.user}`,
           `<@${message.user}> I'm holding this thread for a deploy tap, so I can't take new asks here for now. Ask me in a new thread.`,
@@ -675,33 +679,24 @@ async function actOnTap(params: {
   if (tap.outcome === 'cancelled') {
     return done('Stopped before anyone tapped deploy; nothing was deployed.', false, 'CANCELLED');
   }
-  // The message that closed the offer runs once this run lets the thread go,
-  // unless it was edited: then its old words would run.
-  const replay =
-    tap.replay && tap.replyTs ? replayAfterThreadFrees(channelId, threadTs, tap.replyTs, tap.replay) : undefined;
+  // The thread was held while the offer was open, so a message that closed it
+  // started nothing: its author is asked to send it again, now that it is free.
   if (tap.outcome === 'superseded') {
-    const text =
-      replay === 'replayed'
-        ? DEPLOY_OFFER_SUPERSEDED_REPLAY
-        : replay === 'changed'
-          ? DEPLOY_OFFER_SUPERSEDED_EDITED
-          : DEPLOY_OFFER_SUPERSEDED;
-    logStep?.({ stage: 'deploy_offer.closed_for_ask', message: text, data: { replay: replay ?? null } });
-    return done(text, await say(text));
+    logStep?.({ stage: 'deploy_offer.closed_for_ask', message: DEPLOY_OFFER_SUPERSEDED });
+    return done(DEPLOY_OFFER_SUPERSEDED, await say(DEPLOY_OFFER_SUPERSEDED));
   }
   if (tap.outcome !== 'tapped') {
     // Someone may have deployed main from GitHub meanwhile: then it is live, whatever the offer did.
     const already = await deployed();
-    const declined =
-      replay === 'replayed'
-        ? DEPLOY_OFFER_DECLINED_REPLAY
-        : replay === 'changed'
-          ? DEPLOY_OFFER_DECLINED_EDITED
-          : replay === 'not_held'
-            ? DEPLOY_OFFER_DECLINED_RESEND
-            : DEPLOY_OFFER_DECLINED;
+    const askAgain = tap.hasAsk ? " Mention me again with the rest of your message and I'll pick it up." : '';
     const text =
-      already?.kind === 'live' ? deployedLine(already) : tap.outcome === 'expired' ? DEPLOY_OFFER_EXPIRED : declined;
+      already?.kind === 'live'
+        ? `${deployedLine(already)}${askAgain}`
+        : tap.outcome === 'expired'
+          ? DEPLOY_OFFER_EXPIRED
+          : tap.hasAsk
+            ? DEPLOY_OFFER_DECLINED_WITH_ASK
+            : DEPLOY_OFFER_DECLINED;
     return done(text, await say(text));
   }
 

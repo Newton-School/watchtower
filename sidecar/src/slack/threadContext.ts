@@ -10,8 +10,6 @@ export type ThreadMessage = {
   /** Slack bot_id for integration-posted messages, when present. */
   botId?: string;
   files?: SlackFileAttachment[];
-  /** The author changed it after posting: what it says now is not what arrived. */
-  edited?: boolean;
 };
 
 function mapSlackMessage(message: Record<string, unknown>): ThreadMessage {
@@ -39,7 +37,6 @@ function mapSlackMessage(message: Record<string, unknown>): ThreadMessage {
     subtype: typeof message.subtype === 'string' ? message.subtype : undefined,
     botId: typeof message.bot_id === 'string' ? message.bot_id : undefined,
     files: files && files.length > 0 ? files : undefined,
-    ...(message.edited ? { edited: true } : {}),
   };
 }
 

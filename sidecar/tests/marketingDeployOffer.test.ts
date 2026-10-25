@@ -12,10 +12,7 @@ import {
   DEPLOY_OFFER_EXPIRED,
   DEPLOY_OFFER_LINE,
   DEPLOY_OFFER_SUPERSEDED,
-  DEPLOY_OFFER_SUPERSEDED_REPLAY,
-  DEPLOY_OFFER_SUPERSEDED_EDITED,
-  DEPLOY_OFFER_DECLINED_REPLAY,
-  DEPLOY_OFFER_DECLINED_RESEND,
+  DEPLOY_OFFER_DECLINED_WITH_ASK,
   DEPLOY_OFFER_STATUS,
   DEPLOY_TAP_QUEUED_FOR_SLOT,
   deployTappers,
@@ -31,11 +28,6 @@ import {
   STAGING_STATE_KEY,
 } from '../src/workflows/stagingDeployWorkflow.js';
 import { __resetButtonRepliesForTests, recordButtonReply } from '../src/slack/buttonReplies.js';
-import {
-  __resetBusyThreadMessagesForTests,
-  holdBusyThreadMessage,
-  takeThreadReplays,
-} from '../src/runtime/busyThreadMessages.js';
 import { jobSlots } from '../src/runtime/jobSlots.js';
 import { dispatchMarketingProdDeploy, oneMarketingProdDeployAtATime } from '../src/workflows/deployWorkflow.js';
 
@@ -110,7 +102,7 @@ function makeTask(userId = 'UBUILDER', channelType = 'channel', threadTs = '400.
   } as NormalizedTask;
 }
 
-type Reply = { user: string; text: string; ts: string; bot_id?: string; subtype?: string; edited?: { ts: string } };
+type Reply = { user: string; text: string; ts: string; bot_id?: string; subtype?: string };
 
 /** Slack: posts get a ts; the thread's replies after the offer come from `replies`. */
 function fakeSlack(replies: Reply[] | (() => Reply[]) = [], promptTs = PROMPT_TS) {
@@ -234,7 +226,6 @@ beforeEach(() => {
   __deployOffer.restoreStaging = restoreMock;
   fakePrView(MERGED_INFO);
   __resetButtonRepliesForTests();
-  __resetBusyThreadMessagesForTests();
 });
 afterEach(() => {
   __deployOffer.restoreStaging = realRestore;
@@ -603,43 +594,44 @@ describe('the deploy offer after a merge (#703)', () => {
     expect(posted.at(-1)).toBe(DEPLOY_OFFER_EXPIRED);
   });
 
-  it('closes the offer for a new ask from the requester, and picks that message up once the thread is free', async () => {
-    const ask = say('UBUILDER', '<@UBOT1> also change the heading', '505.0');
-    holdBusyThreadMessage(
-      {
-        eventId: 'Ev505',
-        channelId: 'C1',
-        threadTs: '400.1',
-        eventTs: '505.0',
-        userId: 'UBUILDER',
-        text: ask.text,
-        rawEvent: {},
-      },
-      {} as never,
-    );
-    const { posted, calls, result } = await offer({ replies: [ask] });
+  it.each([
+    ['the requester', 'UBUILDER', '<@UBOT1> also change the heading'],
+    ['core-dev', 'UADMIN', '<@UBOT1> what else changed here?'],
+  ])('closes the offer for a new ask from %s and asks for it again, once', async (_who, user, text) => {
+    const { posted, calls, result } = await offer({ replies: [say(user, text, '505.0')] });
 
     expect(dispatches(calls, 'deploy-prod.yml')).toHaveLength(0);
-    expect(posted.at(-1)).toBe(DEPLOY_OFFER_SUPERSEDED_REPLAY);
-    expect(takeThreadReplays('C1', '400.1').map(replay => replay.event.eventTs)).toEqual(['505.0']);
+    expect(posted.slice(1)).toEqual([DEPLOY_OFFER_SUPERSEDED]);
+    expect(DEPLOY_OFFER_SUPERSEDED).toBe(
+      "That closes the deploy offer. Mention me again with your message and I'll pick it up now.",
+    );
     expect(result).toMatchObject({ status: 'SUCCESS' });
   });
 
-  it('asks for the message again when it was not held for the thread', async () => {
-    const { posted } = await offer({ replies: [say('UADMIN', '<@UBOT1> what else changed here?')] });
+  it.each([
+    ['a decline', [say('UBUILDER', 'not now')], DEPLOY_OFFER_DECLINED],
+    [
+      'a hold that also asks for something',
+      [say('UBUILDER', '<@UBOT1> wait, can you also change the footer link to /apply?')],
+      DEPLOY_OFFER_DECLINED_WITH_ASK,
+    ],
+    ['a new ask', [say('UBUILDER', '<@UBOT1> also change the heading')], DEPLOY_OFFER_SUPERSEDED],
+    ['expiry', [] as Reply[], DEPLOY_OFFER_EXPIRED],
+  ])(
+    'lets the thread go at once after %s, without waiting for staging to go back to main',
+    async (_c, replies, line) => {
+      __deployOfferTiming.deadlineMs = 50;
+      let finishRestore!: () => void;
+      restoreMock.mockImplementation(() => new Promise<void>(resolve => (finishRestore = resolve)));
 
-    expect(posted.at(-1)).toBe(DEPLOY_OFFER_SUPERSEDED);
-  });
+      // Staging never finishes here: the offer must end anyway.
+      const { result, posted } = await offer({ replies });
 
-  it('lets the thread go at once on a non-tap outcome, without waiting for staging to go back to main', async () => {
-    let finishRestore!: () => void;
-    restoreMock.mockImplementation(() => new Promise<void>(resolve => (finishRestore = resolve)));
-
-    const { result } = await offer({ replies: [say('UBUILDER', 'not now')] });
-
-    expect(result).toMatchObject({ status: 'SUCCESS', message: expect.stringContaining(DEPLOY_OFFER_DECLINED) });
-    finishRestore();
-  });
+      expect(posted.at(-1)).toBe(line);
+      expect(result).toMatchObject({ status: 'SUCCESS' });
+      finishRestore();
+    },
+  );
 
   it('ends cleanly with nothing deployed when the run is stopped while it waits, and still records the merge', async () => {
     const controller = new AbortController();
@@ -983,48 +975,54 @@ describe('putting main back on staging after a merge (#703)', () => {
 });
 
 describe('round-2 review of the offer (#703)', () => {
-  const heldAsk = (ts: string, text: string) =>
-    holdBusyThreadMessage(
-      { eventId: `Ev${ts}`, channelId: 'C1', threadTs: '400.1', eventTs: ts, userId: 'UBUILDER', text, rawEvent: {} },
-      {} as never,
-    );
-
-  it('does not run a message that was edited after it arrived: its old words would run', async () => {
-    heldAsk('505.0', '<@UBOT1> revert PR 1490, the page is broken');
-    const { posted } = await offer({
-      replies: [{ user: 'UBUILDER', text: '<@UBOT1> also update the hero copy', ts: '505.0', edited: { ts: '506.0' } }],
-    });
-
-    expect(posted.at(-1)).toBe(DEPLOY_OFFER_SUPERSEDED_EDITED);
-    expect(takeThreadReplays('C1', '400.1')).toEqual([]);
-  });
-
-  it('holds the deploy back and still runs the rest of a message that also asks for something', async () => {
+  it('holds the deploy back and asks for the rest of a message that also asks for something', async () => {
     const text = '<@UBOT1> wait, can you also change the footer link to /apply?';
-    heldAsk('505.0', text);
     const { posted, calls } = await offer({
       replies: [say('UBUILDER', text, '505.0'), say('UADMIN', 'deploy it', '506.0')],
     });
 
     expect(dispatches(calls, 'deploy-prod.yml')).toHaveLength(0);
-    expect(posted.at(-1)).toBe(DEPLOY_OFFER_DECLINED_REPLAY);
-    expect(takeThreadReplays('C1', '400.1').map(replay => replay.event.text)).toEqual([text]);
+    expect(posted.slice(1)).toEqual([
+      "Okay, not deploying it now. Mention me again with the rest of your message and I'll pick it up.",
+    ]);
   });
 
-  it('asks for the rest again when that message was not held', async () => {
-    const { posted } = await offer({
-      replies: [say('UBUILDER', '<@UBOT1> wait, can you also change the footer link to /apply?', '505.0')],
+  it.each([
+    "<@UBOT1> don't deploy this until marketing signs off",
+    '<@UBOT1> hold off on the deploy for now',
+    "<@UBOT1> no, don't deploy it yet please",
+    '<@UBOT1> not yet, waiting on the legal review',
+    '<@UBOT1> wait',
+  ])('says only "Okay, not deploying it now." to the plain decline %j', async text => {
+    const { posted, calls } = await offer({ replies: [say('UBUILDER', text, '505.0')] });
+
+    expect(dispatches(calls, 'deploy-prod.yml')).toHaveLength(0);
+    expect(posted.slice(1)).toEqual(['Okay, not deploying it now.']);
+  });
+
+  it('answers "can you check if it\'s live?" and keeps the offer open', async () => {
+    const { posted, calls } = await offer({
+      replies: [say('UBUILDER', "<@UBOT1> can you check if it's live?"), say('UADMIN', 'deploy it', '502.0')],
     });
 
-    expect(posted.at(-1)).toBe(DEPLOY_OFFER_DECLINED_RESEND);
+    expect(posted).toContain(`<@UBUILDER> ${DEPLOY_OFFER_STATUS}`);
+    expect(dispatches(calls, 'deploy-prod.yml')).toHaveLength(1);
   });
 
-  it('runs nothing for a bare hold that mentions miniOG', async () => {
-    heldAsk('505.0', '<@UBOT1> wait');
-    const { posted } = await offer({ replies: [say('UBUILDER', '<@UBOT1> wait', '505.0')] });
+  it.each(['go ahead and deploy', 'go ahead and deploy it', '<@UBOT1> go ahead and deploy'])(
+    'deploys on %j from core-dev',
+    async text => {
+      const { calls } = await offer({ replies: [say('UADMIN', text)] });
 
-    expect(posted.at(-1)).toBe(DEPLOY_OFFER_DECLINED);
-    expect(takeThreadReplays('C1', '400.1')).toEqual([]);
+      expect(dispatches(calls, 'deploy-prod.yml')).toHaveLength(1);
+    },
+  );
+
+  it.each(['go ahead', '<@UBUILDER> go ahead and deploy it'])('does not deploy on %j', async text => {
+    __deployOfferTiming.deadlineMs = 50;
+    const { calls } = await offer({ replies: [say('UADMIN', text)] });
+
+    expect(dispatches(calls, 'deploy-prod.yml')).toHaveLength(0);
   });
 
   it.each(['<@UBOT1> is it live yet?', '<@UBOT1> when will it go live?', '<@UBOT1> any update on the deploy?'])(
