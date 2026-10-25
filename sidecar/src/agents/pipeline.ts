@@ -1839,6 +1839,9 @@ async function runAgentPipelineBody(
             outputSchemaPath: schemaPath,
             githubToken: ctx.githubToken,
             planMode,
+            // A planner only reads: plan mode wins on Claude Code, read-only
+            // covers the rest, so it never runs bypassed (issue #695).
+            readOnly: role === 'planner',
             // Every agent sees the thread's screenshots and PDFs. None did, so a
             // coder shipped the wrong PDF and plans said "could not open" (#595).
             imagePaths: ctx.imagePaths && ctx.imagePaths.length > 0 ? ctx.imagePaths : undefined,

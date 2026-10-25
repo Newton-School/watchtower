@@ -81,6 +81,9 @@ import { guardWords } from '../router/stagingTarget.js';
 import { refreshSharedClones } from '../workspaces/staleCheckout.js';
 import { assertThreadParentExists } from '../slack/threadContext.js';
 import { runAgenticEntry } from '../agentic/agenticEntry.js';
+import { offerMarketingProdDeploy } from './marketingDeployOffer.js';
+import type { StagingDeployStore } from './stagingDeployWorkflow.js';
+import { reloadBundlesIfChanged } from '../runtime/bundleReload.js';
 import type { JobStore } from '../state/jobStore.js';
 
 const execFileAsync = promisify(execFile);
@@ -336,6 +339,30 @@ export const __contentMergeGh = {
   },
 };
 
+/** Internal seam — tests stub the deploy offer after a merge (issue #703). */
+export const __marketingDeployOffer = { offer: offerMarketingProdDeploy };
+
+/** The job store as the deploy offer reads it: the dry-run switch and the staging record. */
+function deployStoreOf(store: ImplementationStore | undefined): StagingDeployStore | undefined {
+  if (!store?.getState) return undefined;
+  return {
+    getState: key => store.getState?.(key),
+    setState: (key, value) => store.setState?.(key, value),
+  };
+}
+
+/** Reloads access edited in the app since the run started, for a wait that outlasts it (issue #703). */
+function accessRefresherOf(store: ImplementationStore | undefined, config: AppConfig): (() => void) | undefined {
+  const { getAccessCacheSignalAt, getBundles } = store ?? {};
+  if (!store || !getAccessCacheSignalAt || !getBundles) return undefined;
+  return () => {
+    reloadBundlesIfChanged(config, {
+      getAccessCacheSignalAt: () => getAccessCacheSignalAt.call(store),
+      getBundles: () => getBundles.call(store),
+    });
+  };
+}
+
 /** Why an owner still has to confirm a change that is more than content, in one sentence. */
 export function contentOwnerReason(verdict: Exclude<ContentOnlyVerdict, { contentOnly: true }>): string {
   if (verdict.kind === 'unreadable') return "I couldn't check that it only changes text, so an owner has to confirm.";
@@ -477,9 +504,14 @@ function checksReason(state: string | null | undefined): string | undefined {
   return 'Its checks are failing, so an owner has to confirm.';
 }
 
-function contentMergedReply(url: string, skipsReview: boolean): string {
+function contentMergedLead(url: string, skipsReview: boolean): string {
   const how = skipsReview ? ', so it went in without the usual review' : '';
-  return `Merged ${url}: it only changes text and numbers${how}. It isn't live yet; someone from core-dev has to deploy it.`;
+  return `Merged ${url}: it only changes text and numbers${how}.`;
+}
+
+/** The merge reply when no deploy offer goes with it. */
+function contentMergedReply(url: string, skipsReview: boolean): string {
+  return `${contentMergedLead(url, skipsReview)} It isn't live yet; someone from core-dev has to deploy it.`;
 }
 
 /**
@@ -490,13 +522,15 @@ function contentMergedReply(url: string, skipsReview: boolean): string {
  */
 async function mergeContentOnlyPr(params: {
   task: NormalizedTask;
+  config: AppConfig;
   slack: WebClient;
+  store?: ImplementationStore;
   decision: Extract<ContentMergeDecision, { kind: 'merge' }>;
   githubToken: string;
   logStep?: WorkflowStepLogger;
   signal?: AbortSignal;
 }): Promise<WorkflowResult> {
-  const { task, slack, decision, githubToken, logStep, signal } = params;
+  const { task, config, slack, store, decision, githubToken, logStep, signal } = params;
   const { pr, policy, files, headSha, admin, skipsReview } = decision;
   if (signal?.aborted) return cancelledResult('IMPLEMENTATION');
   const requester = requesterOf(task);
@@ -513,6 +547,7 @@ async function mergeContentOnlyPr(params: {
 
   let reply: string;
   let status: WorkflowResult['status'];
+  const startedAtMs = Date.now();
   try {
     await __contentMergeGh.exec(args, githubToken);
     reply = contentMergedReply(pr.url, skipsReview);
@@ -570,6 +605,23 @@ async function mergeContentOnlyPr(params: {
       reply = `I couldn't tell whether ${pr.url} merged: ${detail} Check the PR before asking again.`;
       status = 'FAILED';
     }
+  }
+  // Merged: the reply carries the offer to deploy it (issue #703).
+  if (status === 'SUCCESS') {
+    const offered = await __marketingDeployOffer.offer({
+      task,
+      config,
+      slack,
+      store: deployStoreOf(store),
+      githubToken,
+      merged: [{ pr, knownMerged: true }],
+      startedAtMs,
+      lead: contentMergedLead(pr.url, skipsReview),
+      refreshAccess: accessRefresherOf(store, config),
+      logStep,
+      signal,
+    });
+    if (offered) return { workflow: 'IMPLEMENTATION', ...offered };
   }
   const posted = await slack.chat
     .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: reply })
@@ -692,6 +744,10 @@ async function confirmQuickPrAction(params: {
   return stop('SKIPPED', msg, await say(msg));
 }
 type ImplementationStore = PipelineStore & {
+  getState?: (key: string) => string | undefined;
+  setState?: (key: string, value: string) => void;
+  getAccessCacheSignalAt?: () => string | undefined;
+  getBundles?: () => import('../types/contracts.js').Bundle[];
   dossierStore?: () => import('../state/dossierStore.js').DossierStore;
   readVaultSettings?: () => { vaultPath: string; vaultEnabled: boolean };
   recentSignalsForUser?: (
@@ -946,7 +1002,7 @@ async function runQuickAction(params: {
           ? await decideContentMerge({ task, config, pr: checkPr, checks, githubToken, logStep, signal })
           : undefined;
       if (contentMerge?.kind === 'merge' && githubToken) {
-        return mergeContentOnlyPr({ task, slack, decision: contentMerge, githubToken, logStep, signal });
+        return mergeContentOnlyPr({ task, config, slack, store, decision: contentMerge, githubToken, logStep, signal });
       }
       if (signal?.aborted) return cancelledResult('IMPLEMENTATION');
       const confirmation = await confirmQuickPrAction({
@@ -1016,6 +1072,7 @@ Write your response as a ready-to-post Slack message describing what you did.
           }),
       })
     : getActiveBackendId();
+  const quickStartedAtMs = Date.now();
   const quickResult = await runCodex({
     cwd: ctx.cwd,
     prompt: quickPrompt,
@@ -1038,6 +1095,35 @@ Write your response as a ready-to-post Slack message describing what you did.
     thread_ts: task.event.threadTs,
     text: reply,
   });
+
+  // A marketing PR the agent actually merged gets the deploy offer (issue #703).
+  // GitHub is asked whether it merged: the agent's words are not enough.
+  const offered =
+    prAction === 'merge' && !signal?.aborted
+      ? await __marketingDeployOffer.offer({
+          task,
+          config,
+          slack,
+          store: deployStoreOf(store),
+          githubToken: ctx.githubToken,
+          merged: prs.map(pr => ({ pr, knownMerged: false })),
+          startedAtMs: quickStartedAtMs,
+          refreshAccess: accessRefresherOf(store, config),
+          logStep,
+          signal,
+        })
+      : undefined;
+  if (offered) {
+    // The agent's own failure stays the run's outcome: the offer only adds to it.
+    const failed = !quickResult.ok && offered.status !== 'CANCELLED';
+    return {
+      workflow: 'IMPLEMENTATION',
+      ...offered,
+      status: failed ? 'FAILED' : offered.status,
+      notifyDesktop: failed || offered.notifyDesktop,
+      message: `${reply}\n${offered.message}`,
+    };
+  }
 
   return {
     workflow: 'IMPLEMENTATION',
@@ -1560,6 +1646,23 @@ Reply with the complete revised plan as markdown and nothing else, in the same f
 }
 
 /**
+ * The planner's follow-up after a clarifying answer, on Claude Code, where
+ * plans are markdown. Asking it for the JSON contract got markdown or JSON
+ * without `requiresCodeChanges` back, which read as "no code changes" and
+ * sent a change request to the quick action with no approval (issue #695).
+ */
+export function clarifiedPromptMarkdown(question: string, answer: string, previousPlan: string): string {
+  const draft = previousPlan.trim() ? `\n\nYour plan so far:\n\n${previousPlan.trim()}` : '';
+  return `You asked the requester: "${question}"
+
+They answered: "${answer}"${draft}
+
+Now write the final plan with that answer in mind. Read the code again where you need to.
+
+Reply with the complete plan as markdown and nothing else, in the same format as before: the "## For the approver" block with all its lines, the intent, the "## Files to change" section, the steps, and the "Scope:" and "Requires code changes:" tags.`;
+}
+
+/**
  * Who can decide a plan besides the admins: the requester, and anyone who
  * could have asked for the change in this channel themselves. Waiting on an
  * admin for every plan was friction. Without enforced access, anyone. The
@@ -1908,6 +2011,9 @@ async function runImplementationWorkflowBody(params: {
         outputSchemaPath: plannerPlanMode ? undefined : plannerSchemaPath,
         githubToken: ctx.githubToken,
         planMode: plannerPlanMode,
+        // Plan mode wins where it applies; read-only covers the rest, so no
+        // planner call runs with permissions bypassed (issue #695).
+        readOnly: true,
         // The thread's screenshots and PDFs: a plan written without them
         // shipped the wrong PDF to production (issue #595).
         imagePaths: plannerCtx.imagePaths,
@@ -2081,18 +2187,32 @@ async function runImplementationWorkflowBody(params: {
       const answer = outcome.answer;
       clarificationHistory.push({ question, answer });
 
-      const followUpPrompt = plannerSessionId
-        ? `The user answered your clarifying question ("${question}") with:\n\n"${answer}"\n\nNow produce the final plan. Return the same JSON schema with \`clarificationNeeded\` set to null.`
-        : `You previously asked: "${question}"\nThe user answered: "${answer}"\n\nOriginal plan so far:\n${JSON.stringify(plannerOutput, null, 2)}\n\nNow produce the final plan. Return the same JSON schema with \`clarificationNeeded\` set to null.`;
+      // On Claude Code plans are markdown, so the follow-up asks for markdown
+      // too: the JSON contract came back as markdown or without
+      // `requiresCodeChanges`, which read as "no code changes" (issue #695).
+      const followUpPrompt = plannerPlanMode
+        ? clarifiedPromptMarkdown(
+            question,
+            answer,
+            typeof plannerOutput.planMarkdown === 'string' ? plannerOutput.planMarkdown : '',
+          )
+        : plannerSessionId
+          ? `The user answered your clarifying question ("${question}") with:\n\n"${answer}"\n\nNow produce the final plan. Return the same JSON schema with \`clarificationNeeded\` set to null.`
+          : `You previously asked: "${question}"\nThe user answered: "${answer}"\n\nOriginal plan so far:\n${JSON.stringify(plannerOutput, null, 2)}\n\nNow produce the final plan. Return the same JSON schema with \`clarificationNeeded\` set to null.`;
 
       plannerRunResult = await runWithInfraRetry(
         {
           cwd: ctx.cwd,
           prompt: followUpPrompt,
           ...(plannerSessionId ? { resumeSessionId: plannerSessionId } : {}),
-          outputSchemaPath: plannerSchemaPath,
+          outputSchemaPath: plannerPlanMode ? undefined : plannerSchemaPath,
           githubToken: ctx.githubToken,
           imagePaths: plannerCtx.imagePaths,
+          // Planning only reads, before anyone approved a change; this call
+          // used to run with every permission bypassed (issue #695). Like the
+          // plan revision it runs read-only rather than in plan mode, and its
+          // final message is the plan.
+          readOnly: true,
           ...plannerProfile,
           // No per-agent timeoutMs — see investigationWorkflow.ts for rationale.
           // Outer abort signal remains the safety net.
@@ -2105,14 +2225,37 @@ async function runImplementationWorkflowBody(params: {
         return cancelledResult('IMPLEMENTATION');
       }
       plannerSessionId = plannerRunResult.sessionId ?? plannerSessionId;
-      if (plannerRunResult.ok && plannerRunResult.parsedJson) {
-        plannerOutput = plannerRunResult.parsedJson;
-      } else {
+      // Read the answer's plan the way the first plan is read. One that can't
+      // be read as a plan keeps the earlier one, which goes to approval; it is
+      // never taken as "no code changes" (issue #695).
+      const followUpPlan =
+        plannerRunResult.ok && plannerRunResult.parsedJson
+          ? normalizePlannerOutput(plannerRunResult.parsedJson, plannerBackend)
+          : undefined;
+      if (!followUpPlan || (plannerPlanMode && !followUpPlan.planMarkdown)) {
+        logStep?.({
+          stage: 'implementation.planner.clarification.unreadable',
+          message: 'The planner did not return a readable plan after the answer; the earlier plan goes to approval.',
+          level: 'WARN',
+          data: { ok: plannerRunResult.ok, hasParsedJson: Boolean(plannerRunResult.parsedJson) },
+        });
+        plannerOutput = { ...plannerOutput, requiresCodeChanges: true, clarificationNeeded: null };
         break;
       }
+      plannerOutput = {
+        ...plannerRunResult.parsedJson,
+        planMarkdown: followUpPlan.planMarkdown,
+        scope: followUpPlan.scope,
+        affectedFiles: followUpPlan.affectedFiles,
+        requiresCodeChanges: followUpPlan.requiresCodeChanges,
+        clarificationNeeded: followUpPlan.clarificationNeeded,
+      };
     }
 
-    const plannerRequiresCodeChanges = Boolean(plannerOutput.requiresCodeChanges);
+    // Read through the same normalisation, so a plan with no
+    // `requiresCodeChanges` counts as a change (the safe direction), never as
+    // a quick action with no approval (issue #695).
+    const plannerRequiresCodeChanges = normalizePlannerOutput(plannerOutput, plannerBackend).requiresCodeChanges;
 
     // Quick-action fast path: if the planner says no code changes are needed
     // (e.g., "merge this PR", "close PR", "deploy", "run tests"), skip the full

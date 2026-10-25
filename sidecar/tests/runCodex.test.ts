@@ -93,6 +93,34 @@ describe('runAgent timeout (issue #440)', () => {
   });
 });
 
+describe('agent.prepare (issue #695)', () => {
+  const quick = (id: AgentBackend['id']): AgentBackend => ({
+    id,
+    displayName: 'Quick',
+    resolveBinary: () => '/usr/bin/true',
+    isAvailable: () => true,
+    supportsImages: () => false,
+    buildArgs: () => [],
+    buildEnv: () => ({}),
+    parseOutput: () => ({ finalMessage: '' }) as never,
+    availableModels: () => ['test'],
+    defaultModel: () => 'test',
+  });
+  const permissionsLogged = async (backend: AgentBackend, extra: Record<string, unknown>) => {
+    const onLog = vi.fn();
+    await runAgent({ cwd: os.tmpdir(), prompt: 'unused', onLog, ...extra }, backend);
+    return onLog.mock.calls.map(call => call[0]).find(entry => entry.stage === 'agent.prepare').data.permissions;
+  };
+
+  it('logs how the run is permitted, so a call that should only read can be checked', async () => {
+    expect(await permissionsLogged(quick('claude-code'), { readOnly: true })).toBe('read-only');
+    expect(await permissionsLogged(quick('claude-code'), { planMode: true, readOnly: true })).toBe('plan');
+    expect(await permissionsLogged(quick('claude-code'), { noTools: true })).toBe('no-tools');
+    expect(await permissionsLogged(quick('claude-code'), {})).toBe('bypass');
+    expect(await permissionsLogged(quick('codex'), { readOnly: true })).toBe('full-auto');
+  });
+});
+
 describe('detectApiError (issue #439)', () => {
   const INCIDENT = "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)";
   const envelope = (result: string, isError: boolean) =>

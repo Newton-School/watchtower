@@ -1865,6 +1865,8 @@ export class JobStore {
     eventId?: string;
     text?: string;
     eventTs?: string;
+    /** The gate it was waiting at, if any: read before startup clears the waits (issue #703). */
+    openWait?: { kind: HumanWaitKind; promptTs: string; expects?: string };
   }> {
     const rows = this.db
       .prepare(
@@ -1873,8 +1875,10 @@ export class JobStore {
                 json_extract(j.payload_json, '$.text') AS text,
                 json_extract(j.payload_json, '$.eventTs') AS event_ts,
                 json_extract(j.payload_json, '$.requestUserId') AS requested_by,
-                (SELECT l.stage FROM job_logs l WHERE l.job_id = j.id ORDER BY l.created_at DESC, l.id DESC LIMIT 1) AS last_stage
+                (SELECT l.stage FROM job_logs l WHERE l.job_id = j.id ORDER BY l.created_at DESC, l.id DESC LIMIT 1) AS last_stage,
+                h.kind AS wait_kind, h.prompt_ts AS wait_prompt_ts, h.expects AS wait_expects
          FROM jobs j
+         LEFT JOIN human_waits h ON h.job_id = j.id
          WHERE j.status = 'RUNNING'`,
       )
       .all() as Array<{
@@ -1883,6 +1887,9 @@ export class JobStore {
       thread_ts: string;
       requested_by: string | null;
       last_stage: string | null;
+      wait_kind: HumanWaitKind | null;
+      wait_prompt_ts: string | null;
+      wait_expects: string | null;
       event_id: string | null;
       workflow: string | null;
       text: string | null;
@@ -1894,6 +1901,15 @@ export class JobStore {
       threadTs: row.thread_ts,
       requestedBy: row.requested_by ?? undefined,
       lastStage: row.last_stage ?? undefined,
+      ...(row.wait_kind && row.wait_prompt_ts
+        ? {
+            openWait: {
+              kind: row.wait_kind,
+              promptTs: row.wait_prompt_ts,
+              ...(row.wait_expects ? { expects: row.wait_expects } : {}),
+            },
+          }
+        : {}),
       workflow: row.workflow ?? undefined,
       eventId: row.event_id ?? undefined,
       text: row.text ?? undefined,

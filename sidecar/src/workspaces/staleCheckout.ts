@@ -34,12 +34,80 @@ export function staleReasonText(state: SharedRepoState): string {
       return `it has local commits that are not on ${state.upstream ?? 'origin'}`;
     case 'fetch_failed':
       return 'git fetch failed, so this is as of the last successful fetch';
+    case 'unverified':
+      return "I couldn't tell how far it is behind GitHub";
     default:
       return 'git would not fast-forward it';
   }
 }
 
 const commits = (count: number): string => `${count} commit${count === 1 ? '' : 's'}`;
+
+/**
+ * A clone whose files may be old with no newer tree to read instead: the
+ * fetch failed, how far behind it is is unknown, or the refresh failed
+ * outright (null).
+ */
+function isUnconfirmedCheckout(state: SharedRepoState | null): boolean {
+  if (!state) return true;
+  return !isStaleCheckout(state) && (state.staleReason === 'fetch_failed' || state.staleReason === 'unverified');
+}
+
+/** " as of 2026-05-26", or nothing when the HEAD date is unknown. */
+const asOf = (state: SharedRepoState): string => (state.headDate ? ` as of ${state.headDate}` : '');
+
+/** Where set-aside changes are saved: the private ref (or the stash list), and the patch copy when there is one. */
+const savedAt = (kept: { ref?: string; patch?: string; stashLabel?: string }): string =>
+  `${kept.ref ?? `the clone's stash list as "${kept.stashLabel ?? 'miniog-autostash'}"`}${
+    kept.patch ? ` (patch copy: ${kept.patch})` : ''
+  }`;
+
+/** An index.lock older than this is reported as probably left by a git command that crashed. */
+export const STALE_INDEX_LOCK_MS = 10 * 60 * 1000;
+
+/** "3 minutes", "2 hours". */
+function age(ms: number): string {
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 1) return 'under a minute';
+  if (minutes < 120) return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours} hours`;
+  return `${Math.round(hours / 24)} days`;
+}
+
+/** What happened to the changes in the way when they were not set aside, as a sentence, or nothing. */
+function setAsideSkippedText(state: SharedRepoState): string {
+  switch (state.setAsideSkipped) {
+    case 'recent_edits':
+      return ' They changed in the last 15 minutes, so they were left in place.';
+    case 'busy': {
+      const lockAge = state.indexLockAgeMs;
+      if (lockAge !== undefined && lockAge > STALE_INDEX_LOCK_MS) {
+        return ` The clone has an index.lock from ${age(lockAge)} ago, probably left by a git command that crashed, so they were left in place; delete it if nothing is running there.`;
+      }
+      return ` A git command was running in the clone${lockAge !== undefined ? ` (its index.lock is ${age(lockAge)} old)` : ''}, so they were left in place.`;
+    }
+    case 'other_staged':
+      return ' Other files have staged changes, so nothing was moved.';
+    case 'update_failed':
+      return ' They were set aside, but the update still failed for another reason, so they were put back.';
+    case 'failed': {
+      const kept = state.setAsideKept;
+      if (kept?.restored === 'no') {
+        return ` Setting them aside did not finish and putting them back failed: they are NOT in the working tree, they are saved at ${savedAt(kept)}.`;
+      }
+      if (kept?.restored === 'unstaged') {
+        return ` Setting them aside did not finish; they are back in the working tree, unstaged, and a copy is saved at ${savedAt(kept)}.`;
+      }
+      return ' Setting them aside did not work, so they were left in place.';
+    }
+    default:
+      return '';
+  }
+}
+
+/** "2 files", "1 file". */
+const files = (count: number): string => `${count} file${count === 1 ? '' : 's'}`;
 
 /** The job-log line for one clone after a refresh attempt. `level` is WARN whenever it is not known to be current. */
 export function describeRepoRefresh(
@@ -51,13 +119,30 @@ export function describeRepoRefresh(
   }
   if (isStaleCheckout(state)) {
     return {
-      message: `${repoName} is ${commits(state.behind ?? 0)} behind ${state.upstream} and was not updated: ${staleReasonText(state)}. The files on disk are from ${state.head}; the agent is told to read ${state.upstream} instead.`,
+      message: `${repoName} is ${commits(state.behind ?? 0)} behind ${state.upstream} and was not updated: ${staleReasonText(state)}.${setAsideSkippedText(state)} The files on disk are from ${state.head}${asOf(state)}; the agent is told to read ${state.upstream} instead.`,
       level: 'WARN',
     };
   }
   if (state.staleReason === 'fetch_failed') {
     return {
-      message: `Could not fetch ${repoName}; answering from ${state.branch} @ ${state.head} as of the last fetch.`,
+      message: `Could not fetch ${repoName}; answering from ${state.branch} @ ${state.head}${state.headDate ? ` (${state.headDate})` : ''} as of the last fetch${state.lastFetched ? ` (${state.lastFetched})` : ''}.`,
+      level: 'WARN',
+    };
+  }
+  if (state.staleReason === 'unverified') {
+    return {
+      message: `Could not confirm ${repoName} is up to date with ${state.upstream ?? 'origin'}; answering from ${state.branch} @ ${state.head}${asOf(state)}.`,
+      level: 'WARN',
+    };
+  }
+  if (state.setAside) {
+    const set = state.setAside;
+    const shown = set.files.slice(0, 5).join(', ') + (set.files.length > 5 ? ` and ${set.files.length - 5} more` : '');
+    const others = state.leftInPlaceCount
+      ? ` ${files(state.leftInPlaceCount)} the update didn't touch stayed as they were (${(state.leftInPlace ?? []).join(', ')}${state.leftInPlaceCount > (state.leftInPlace ?? []).length ? ', …' : ''}).`
+      : '';
+    return {
+      message: `Refreshed ${repoName} to ${state.branch} @ ${state.head} after setting aside ${files(set.files.length)} with uncommitted changes in the way (${shown}). They are saved at ${savedAt(set)}; \`git stash show -p --include-untracked ${set.ref}\` in the clone shows them.${others}`,
       level: 'WARN',
     };
   }
@@ -69,7 +154,23 @@ export function buildStaleCheckoutBlock(repos: Array<{ name: string; state: Shar
   const stale = repos.filter((repo): repo is { name: string; state: SharedRepoState & { upstream: string } } =>
     isStaleCheckout(repo.state),
   );
-  if (stale.length === 0) return '';
+  // No newer tree to point at: the agent reads the files on disk and says they may be old.
+  const unconfirmed = repos.filter(repo => isUnconfirmedCheckout(repo.state));
+  const unconfirmedLine = (name: string, state: SharedRepoState | null): string => {
+    if (!state) return `- ${name}: the update check failed, so the files may be out of date.`;
+    const files = `the files are from ${state.head}${state.headDate ? ` (${state.headDate})` : ''}`;
+    return state.staleReason === 'fetch_failed'
+      ? `- ${name}: git fetch failed${state.lastFetched ? `; it last fetched on ${state.lastFetched}` : ''}, and ${files}.`
+      : `- ${name}: I couldn't tell how far it is behind GitHub; ${files}.`;
+  };
+  const unconfirmedBlock = unconfirmed.length
+    ? [
+        'POSSIBLY OUT OF DATE — these repos could not be checked against GitHub just now:',
+        ...unconfirmed.map(({ name, state }) => unconfirmedLine(name, state)),
+        'If your answer depends on recent changes in them, say the code you read may be out of date.',
+      ].join('\n')
+    : '';
+  if (stale.length === 0) return unconfirmedBlock;
   const lines = stale.map(
     ({ name, state }) =>
       `- ${name}: the files on disk are ${commits(state.behind ?? 0)} behind ${state.upstream} (${staleReasonText(state)}). Read it from ${state.upstream}.`,
@@ -88,6 +189,7 @@ export function buildStaleCheckoutBlock(repos: Array<{ name: string; state: Shar
       .map(repo => repo.state.upstream)
       .filter((v, i, a) => a.indexOf(v) === i)
       .join(' / ')}, not the local files.`,
+    ...(unconfirmedBlock ? ['', unconfirmedBlock] : []),
   ].join('\n');
 }
 
@@ -109,7 +211,8 @@ export async function refreshSharedClones(params: {
     // is reported as not refreshed and the run reads what is on disk.
     let state: SharedRepoState | null = null;
     try {
-      state = await refreshSharedRepoToDefaultBranch(repoPath);
+      // These are miniOG's own clones, so a stray change in the way is set aside (issue #709).
+      state = await refreshSharedRepoToDefaultBranch(repoPath, { setAsideStrayChanges: true });
     } catch {
       state = null;
     }
@@ -130,6 +233,12 @@ export async function refreshSharedClones(params: {
         behind: state?.behind,
         staleReason: state?.staleReason,
         dirtyFiles: state?.dirtyFiles,
+        headDate: state?.headDate,
+        lastFetched: state?.lastFetched,
+        setAside: state?.setAside,
+        setAsideSkipped: state?.setAsideSkipped,
+        setAsideKept: state?.setAsideKept,
+        leftInPlace: state?.leftInPlace,
       },
     });
   }
