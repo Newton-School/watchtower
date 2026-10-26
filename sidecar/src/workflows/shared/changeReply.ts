@@ -52,11 +52,14 @@ export function composeChangeReply(params: {
   externalBlock: string;
   /** Set when a PR was expected and could not be opened: the plain summary must not read as shipped. */
   prFailed?: boolean;
+  /** The change was added to this open PR rather than a new one (issue #730). */
+  addedTo?: boolean;
 }): string {
-  const { summary, requesterSummary, engineerReads, prUrl, externalBlock, prFailed } = params;
+  const { summary, requesterSummary, engineerReads, prUrl, externalBlock, prFailed, addedTo } = params;
   const forRequester = !engineerReads && requesterSummary.trim() !== '';
-  const lead = forRequester ? requesterSummary.trim() : summary;
-  const prBlock = prUrl ? `\n${prUrl}` : '';
+  const text = forRequester ? requesterSummary.trim() : summary;
+  const lead = addedTo && prUrl ? `Added to ${prUrl}: ${text}` : text;
+  const prBlock = prUrl && !addedTo ? `\n${prUrl}` : '';
   const pointer =
     forRequester && prUrl && requesterSummary.trim() !== summary.trim()
       ? '\n_The engineering notes are in the PR._'

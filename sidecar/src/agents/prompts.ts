@@ -143,6 +143,32 @@ Use the read tools (grep, file reads) to ground every claim — do not guess at 
 `.trim();
 }
 
+/** Requirement 2: a new branch, or, for a follow-up (issue #730), the open PR's branch. */
+function coderBranchStep(ctx: AgentContext): string {
+  if (ctx.followUp) {
+    return `2. You are already on the branch of the open pull request ${ctx.followUp.prUrl} (\`${ctx.followUp.branch}\`), detached at its latest commit. This change adds to that pull request: do NOT create a new branch and do NOT open a new pull request.`;
+  }
+  return `2. Create a NEW branch named ${ctx.requestedBy ? `${sanitizeForBranch(ctx.requestedBy)}/` : ''}<short-task-name>-${ctx.task.event.threadTs.replace('.', '-')} (the suffix ensures uniqueness — do NOT reuse or checkout an existing branch)`;
+}
+
+/** Requirements 4 and 5: open a PR, or, for a follow-up, add a commit to the open one. */
+function coderPublishSteps(ctx: AgentContext): string {
+  if (ctx.followUp) {
+    return `4. Commit the change as a new commit on top of the pull request's latest commit. Never amend, rebase or squash its existing commits.
+5. Push with \`git push origin HEAD:${ctx.followUp.branch}\`. Never force-push. If the push is rejected (someone else pushed meanwhile), do not retry with force and do not pull: leave your commit as it is and say in the summary that the push was rejected. Report "branch" as \`${ctx.followUp.branch}\` and "prUrl" as ${ctx.followUp.prUrl} once pushed ("" if the push failed).`;
+  }
+  return `4. Commit and open a PR to the default branch.${ctx.requestedBy ? ` Prefix the PR title with [${ctx.requestedBy} via miniOG], e.g. "[${ctx.requestedBy} via miniOG] Fix button text".` : ''}
+   In the PR description, always include this at the top:
+   > Requested by **${ctx.requestedBy ?? 'Unknown'}** via Slack · [View thread](${buildSlackThreadLink(ctx.task.event.channelId, ctx.task.event.threadTs)})
+
+   And this metadata block at the end:
+   ---
+   **Raised by:** miniOG (Watchtower)${ctx.requestedBy ? `\n   **Triggered by:** ${ctx.requestedBy} via Slack` : ''}
+   **Workflow:** ${ctx.workflowIntent}
+   **Thread:** ${ctx.task.event.threadTs}
+5. Push with \`git push origin HEAD:<branch>\` (not \`git push -u\`: your shell cannot write git config, so the upstream is never recorded) and create the PR with \`gh pr create --head <branch>\`, including the flag \`--label miniog\` to tag it`;
+}
+
 export function buildCoderPrompt(ctx: AgentContext): string {
   const reviewerFeedback = ctx.previousSteps.filter(s => s.role === 'reviewer');
   const { planMarkdown, scope, affectedFiles } = planFromSteps(ctx);
@@ -150,7 +176,7 @@ export function buildCoderPrompt(ctx: AgentContext): string {
   return `
 You are the CODER agent in a multi-agent pipeline.
 
-Your role: Implement the plan from the planner agent. Write code, create tests, commit, and open a PR.
+Your role: Implement the plan from the planner agent. Write code, create tests, commit, and ${ctx.followUp ? 'add it to the open pull request' : 'open a PR'}.
 
 Workflow: ${ctx.workflowIntent}
 Repository: ${ctx.repoPath}${depsLine(ctx)}
@@ -172,18 +198,9 @@ Requirements:
    - DO NOT run git commands against any other clone or path (e.g., paths under the user's home directory).
    - DO NOT \`git clone\` anything — the working tree you were given is the only repo you may touch.
    - If the worktree appears to be the wrong repo for the task (files from the planner's scope are missing), return {"status":"failed","summary":"wrong-repo-assigned: …"} instead of switching directories. A supervisor will re-run the task with the correct repo.
-2. Create a NEW branch named ${ctx.requestedBy ? `${sanitizeForBranch(ctx.requestedBy)}/` : ''}<short-task-name>-${ctx.task.event.threadTs.replace('.', '-')} (the suffix ensures uniqueness — do NOT reuse or checkout an existing branch)
+${coderBranchStep(ctx)}
 3. Implement the changes. Write the tests the approved plan lists, run them, and commit them with the change: the reviewer and verifier check the change against the plan, tests included. Do not add test files the plan does not list; you may still run the existing tests to check your work.
-4. Commit and open a PR to the default branch.${ctx.requestedBy ? ` Prefix the PR title with [${ctx.requestedBy} via miniOG], e.g. "[${ctx.requestedBy} via miniOG] Fix button text".` : ''}
-   In the PR description, always include this at the top:
-   > Requested by **${ctx.requestedBy ?? 'Unknown'}** via Slack · [View thread](${buildSlackThreadLink(ctx.task.event.channelId, ctx.task.event.threadTs)})
-
-   And this metadata block at the end:
-   ---
-   **Raised by:** miniOG (Watchtower)${ctx.requestedBy ? `\n   **Triggered by:** ${ctx.requestedBy} via Slack` : ''}
-   **Workflow:** ${ctx.workflowIntent}
-   **Thread:** ${ctx.task.event.threadTs}
-5. Push with \`git push origin HEAD:<branch>\` (not \`git push -u\`: your shell cannot write git config, so the upstream is never recorded) and create the PR with \`gh pr create --head <branch>\`, including the flag \`--label miniog\` to tag it
+${coderPublishSteps(ctx)}
 6. Do not run destructive git commands
 7. If you cannot map the request to a concrete change — the plan above is missing, the terminology
    doesn't resolve to anything in this repo, or you'd be guessing at which code the requester means —

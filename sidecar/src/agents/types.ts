@@ -34,6 +34,12 @@ export interface AgentContext {
   imagePaths?: string[];
   requestedBy?: string;
   /**
+   * The change adds to an open PR an earlier run in the thread opened (issue
+   * #730): the worktree is on its branch, and the coder commits and pushes
+   * there instead of opening a new PR.
+   */
+  followUp?: { prUrl: string; branch: string };
+  /**
    * The coder's actual changes (git diff vs the pre-coder base), captured by the
    * pipeline after the coder runs. Fed to the reviewer/verifier so they assess
    * the real diff against the approved plan rather than the coder's self-report (#388).

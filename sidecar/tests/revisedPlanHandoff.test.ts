@@ -136,3 +136,30 @@ describe('revised plan handoff (#388)', () => {
     expect(target.affectedFiles).toEqual(['a.ts']);
   });
 });
+
+// Issue #730: a follow-up adds a commit to the thread's open PR.
+describe('the coder on a follow-up', () => {
+  const PR = 'https://github.com/Newton-School/newton-marketing-web/pull/1484';
+  const ctx = (followUp?: { prUrl: string; branch: string }): AgentContext => ({
+    ...makeCoderCtx({ planMarkdown: '## Plan\n- change the footer' }),
+    requestedBy: 'Raj',
+    followUp,
+  });
+
+  it('works on the PR branch: no new branch, no new PR, a plain push, never forced', () => {
+    const prompt = buildCoderPrompt(ctx({ prUrl: PR, branch: 'raj/hero-copy-1-1' }));
+    expect(prompt).toContain(`You are already on the branch of the open pull request ${PR} (\`raj/hero-copy-1-1\`)`);
+    expect(prompt).toContain('do NOT create a new branch and do NOT open a new pull request');
+    expect(prompt).toContain('Push with `git push origin HEAD:raj/hero-copy-1-1`. Never force-push.');
+    expect(prompt).toContain('Never amend, rebase or squash');
+    expect(prompt).not.toContain('gh pr create');
+    expect(prompt).not.toContain('Create a NEW branch');
+  });
+
+  it('opens a new PR as before when it is not a follow-up', () => {
+    const prompt = buildCoderPrompt(ctx());
+    expect(prompt).toContain('Create a NEW branch named raj/<short-task-name>-111-22');
+    expect(prompt).toContain('gh pr create --head <branch>');
+    expect(prompt).toContain('Prefix the PR title with [Raj via miniOG]');
+  });
+});

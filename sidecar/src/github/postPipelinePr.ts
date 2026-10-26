@@ -104,6 +104,107 @@ async function existingPrUrl(cwd: string): Promise<string | undefined> {
   }
 }
 
+export type FollowUpPush =
+  /** The change is on the PR's branch, pushed by the coder or here. */
+  | { kind: 'pushed' }
+  /** The run left nothing new on top of the PR. */
+  | { kind: 'nothing' }
+  /**
+   * Someone else pushed to the PR's branch meanwhile: nothing was pushed over
+   * it. The change went to a new branch and a PR into that branch instead.
+   */
+  | { kind: 'stacked'; prUrl: string }
+  | { kind: 'failed'; reason: string };
+
+/** Test seams for the follow-up push. */
+export const __followUpPushDeps = {
+  git,
+  createPullRequest,
+};
+
+/**
+ * Lands a follow-up change (issue #730) on the open PR's branch. The worktree
+ * was detached at the branch's head (`startHead`) before the coder ran.
+ * Uncommitted changes are committed; the commits are pushed with a plain
+ * fast-forward push, never forced. When the branch moved under us and the
+ * push can't fast-forward, the work goes to a new branch with a PR into the
+ * original branch, so it shows only this change and nobody's commits are
+ * overwritten.
+ */
+export async function pushFollowUpToPr(params: {
+  repoPath: string;
+  branch: string;
+  prUrl: string;
+  startHead: string;
+  threadTs: string;
+  summary: string;
+  requestedBy?: string;
+  onLog?: (msg: string) => void;
+}): Promise<FollowUpPush> {
+  const { repoPath, branch, prUrl, startHead, threadTs, summary, requestedBy, onLog } = params;
+  const run = (args: string[]) => __followUpPushDeps.git(repoPath, args);
+  try {
+    if (await hasUncommittedChanges(repoPath)) {
+      await run(['add', '-A']);
+      const skipped = await unstageUnsafePaths(repoPath);
+      if (skipped.length > 0) onLog?.(`Left out of the commit (symlink or never-commit path): ${skipped.join(', ')}.`);
+      const staged = await run(['diff', '--cached', '--name-only']);
+      if (staged.length > 0) {
+        const title = summary.length > 72 ? `${summary.slice(0, 69)}...` : summary;
+        await run(['commit', '-m', title]);
+        onLog?.('Committed the follow-up change.');
+      }
+    }
+    const head = await run(['rev-parse', 'HEAD']);
+    await run(['fetch', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+    const remote = await run(['rev-parse', `origin/${branch}`]);
+    if (head === startHead) {
+      onLog?.('Nothing new on top of the pull request.');
+      return { kind: 'nothing' };
+    }
+    const isAncestor = async (ancestor: string, of: string) =>
+      run(['merge-base', '--is-ancestor', ancestor, of]).then(
+        () => true,
+        () => false,
+      );
+    // The coder pushed already.
+    if (await isAncestor(head, remote)) return { kind: 'pushed' };
+    // A plain push fast-forwards the branch.
+    if (await isAncestor(remote, head)) {
+      await run(['push', 'origin', `HEAD:refs/heads/${branch}`]);
+      onLog?.(`Pushed the follow-up to origin/${branch}.`);
+      return { kind: 'pushed' };
+    }
+    // The branch moved under us: never push over it.
+    const safeTs = threadTs.replace(/[^a-zA-Z0-9.-]/g, '-');
+    const stackedBranch = `${branch}-followup-${safeTs}`;
+    await run(['push', 'origin', `HEAD:refs/heads/${stackedBranch}`]);
+    const rawTitle = summary.length > 72 ? `${summary.slice(0, 69)}...` : summary;
+    const { prUrl: stackedUrl } = await __followUpPushDeps.createPullRequest({
+      repoPath,
+      title: requestedBy ? `[${requestedBy} via miniOG] ${rawTitle}` : rawTitle,
+      body: [
+        `Follow-up to ${prUrl}. That branch moved while this change was being made, so it goes in as its own PR into \`${branch}\` instead of being pushed over it.`,
+        '',
+        '## Summary',
+        summary,
+        '',
+        '---',
+        '**Raised by:** miniOG (Watchtower)',
+        `**Thread:** ${threadTs}`,
+      ].join('\n'),
+      branch: stackedBranch,
+      baseBranch: branch,
+      labels: ['miniog'],
+    });
+    onLog?.(`The branch moved; opened ${stackedUrl} into ${branch} instead.`);
+    return { kind: 'stacked', prUrl: stackedUrl };
+  } catch (error) {
+    logger.warn({ repoPath, branch, error: String(error) }, 'failed to push a follow-up to its PR');
+    return { kind: 'failed', reason: String(error).split('\n')[0] };
+  }
+}
+
 /**
  * After a pipeline run, detect changes in the workspace and ensure a PR exists.
  *

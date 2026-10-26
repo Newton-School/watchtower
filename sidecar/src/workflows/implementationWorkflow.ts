@@ -53,7 +53,16 @@ import type { ClarificationRound } from './shared/clarificationGuards.js';
 import { profileForAgentRole } from '../codex/modelProfiles.js';
 import { buildPlannerPrompt, buildPlannerPlanModePrompt } from '../agents/prompts.js';
 import { refreshWorktreeToBase, resolveWorkspace } from '../workspaces/workspaceManager.js';
-import { createPrFromWorkspace, findRunPr } from '../github/postPipelinePr.js';
+import { createPrFromWorkspace, findRunPr, pushFollowUpToPr } from '../github/postPipelinePr.js';
+import {
+  checkoutFollowUpBranch,
+  findFollowUpPr,
+  followUpPlannerBlock,
+  STAGING_STILL_OLD,
+  stagingShowsBranch,
+  whichPrQuestion,
+  type FollowUpPr,
+} from './shared/followUpPr.js';
 import { buildUnfinishedRunMessage, coderReportedPrUrl } from '../agents/unfinishedRun.js';
 import {
   fetchChecksState,
@@ -806,6 +815,8 @@ async function confirmQuickPrAction(params: {
   return stop('SKIPPED', msg, await say(msg));
 }
 type ImplementationStore = PipelineStore & {
+  /** PRs earlier change runs in a thread opened, newest first (issue #730). */
+  changeRunPrUrlsInThread?: (channelId: string, threadTs: string) => string[];
   getState?: (key: string) => string | undefined;
   setState?: (key: string, value: string) => void;
   getAccessCacheSignalAt?: () => string | undefined;
@@ -1899,10 +1910,21 @@ export async function prepareForCoder(params: {
   threadTexts: string[];
   slack: WebClient;
   logStep?: WorkflowStepLogger;
+  /** The open PR from this thread the change adds to (issue #730). */
+  followUp?: FollowUpPr;
   /** Test seams. */
-  deps?: { listOpenPrs?: (cwd: string) => Promise<OpenPr[]>; refresh?: typeof refreshWorktreeToBase };
-}): Promise<void> {
-  const { jobId, task, config, pipelineCwd, planMarkdown, slack, logStep } = params;
+  deps?: {
+    listOpenPrs?: (cwd: string) => Promise<OpenPr[]>;
+    refresh?: typeof refreshWorktreeToBase;
+    checkoutBranch?: typeof checkoutFollowUpBranch;
+  };
+}): Promise<{
+  /** Set when the worktree is on the PR's branch: the coder adds to that PR. */
+  followUp?: { pr: FollowUpPr; startHead: string };
+  /** Why the change gets a new PR after all, for the reply. */
+  followUpFallback?: string;
+}> {
+  const { jobId, task, config, pipelineCwd, planMarkdown, slack, logStep, followUp } = params;
   const repoKey = repoKeyForWorkspacePath(pipelineCwd, config);
   await headsUpOnSameFiles({
     jobId,
@@ -1912,11 +1934,43 @@ export async function prepareForCoder(params: {
     cwd: pipelineCwd,
     // Files the plan lists, never a guess from every path in it.
     files: planListsFiles(planMarkdown) ? params.planAffectedFiles : [],
-    context: [task.event.text ?? '', ...params.threadTexts, planMarkdown],
+    // The PR this change adds to is named, so it's never a "someone else is changing this file" PR.
+    context: [task.event.text ?? '', ...params.threadTexts, planMarkdown, followUp?.url ?? ''],
     slack,
     logStep,
     listOpenPrs: params.deps?.listOpenPrs,
   });
+
+  // A follow-up works on the PR's branch, never reset to the default branch (issue #730).
+  let followUpFallback: string | undefined;
+  if (followUp) {
+    if (followUp.repoKey && repoKey && followUp.repoKey !== repoKey) {
+      followUpFallback = `This change is in ${repoKey}, so it has its own pull request rather than going onto ${followUp.url}.`;
+      logStep?.({
+        stage: 'implementation.followup.fallback',
+        message: `The plan is for ${repoKey}, not ${followUp.repoKey} — a new PR.`,
+        data: { prUrl: followUp.url, reason: 'other_repo', repo: repoKey },
+      });
+    } else {
+      const checkout = await (params.deps?.checkoutBranch ?? checkoutFollowUpBranch)(pipelineCwd, followUp.branch);
+      if (checkout.ok) {
+        logStep?.({
+          stage: 'implementation.followup.checked_out',
+          message: `The coder works on ${followUp.branch}, the branch of ${followUp.url}.`,
+          data: { prUrl: followUp.url, branch: followUp.branch, head: checkout.head },
+        });
+        return { followUp: { pr: followUp, startHead: checkout.head } };
+      }
+      followUpFallback = `I couldn't check out the branch of ${followUp.url}, so this change is in a new pull request.`;
+      logStep?.({
+        stage: 'implementation.followup.fallback',
+        message: `Couldn't check out ${followUp.branch} — a new PR instead.`,
+        level: 'WARN',
+        data: { prUrl: followUp.url, reason: 'checkout_failed', detail: checkout.reason },
+      });
+    }
+  }
+
   const refresh = await (params.deps?.refresh ?? refreshWorktreeToBase)(pipelineCwd);
   if (refresh.ok) {
     logStep?.({
@@ -1932,6 +1986,7 @@ export async function prepareForCoder(params: {
       data: { pipelineCwd, reason: refresh.reason },
     });
   }
+  return followUpFallback ? { followUpFallback } : {};
 }
 
 /**
@@ -2111,6 +2166,47 @@ async function runImplementationWorkflowBody(params: {
         prs: [prActionAsk.pr],
         checkPr: prActionAsk.pr,
         action: prActionAsk.action,
+      });
+    }
+
+    // A change asked in a thread whose earlier change run left an open PR goes
+    // onto that PR, not a second one that conflicts with it (issue #730).
+    const followUpLookup = await findFollowUpPr({ task, store });
+    if (followUpLookup.kind === 'several') {
+      const question = whichPrQuestion(followUpLookup.prUrls);
+      logStep?.({
+        stage: 'implementation.followup.ask',
+        message: 'More than one open PR from this thread could take the change — asking which.',
+        data: { prUrls: followUpLookup.prUrls },
+      });
+      const posted = await slack.chat
+        .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: question })
+        .then(() => true)
+        .catch(() => false);
+      return {
+        workflow: 'IMPLEMENTATION',
+        status: 'SKIPPED',
+        message: question,
+        notifyDesktop: false,
+        slackPosted: posted,
+      };
+    }
+    const followUpCandidate = followUpLookup.kind === 'followup' ? followUpLookup.pr : undefined;
+    // Said at the end when the change lands in a new PR for a reason the person would not guess.
+    let followUpNote = '';
+    if (followUpCandidate) {
+      logStep?.({
+        stage: 'implementation.followup.detected',
+        message: `This thread has an open PR from an earlier change: ${followUpCandidate.url} — planning this as a follow-up on it.`,
+        data: { prUrl: followUpCandidate.url, branch: followUpCandidate.branch },
+      });
+      ctx.threadContext = `${ctx.threadContext}${followUpPlannerBlock(followUpCandidate)}`;
+    } else if (followUpLookup.kind === 'ended') {
+      followUpNote = `${followUpLookup.prUrl} is already ${followUpLookup.state === 'MERGED' ? 'merged' : 'closed'}, so this change is in a new pull request.`;
+      logStep?.({
+        stage: 'implementation.followup.fallback',
+        message: `The thread's earlier PR is ${followUpLookup.state.toLowerCase()} — this change gets a new PR.`,
+        data: { prUrl: followUpLookup.prUrl, reason: followUpLookup.state.toLowerCase() },
       });
     }
 
@@ -2730,7 +2826,7 @@ async function runImplementationWorkflowBody(params: {
     // initial repo classification.
     pipelineCwd = loopOutcome.pipelineCwd;
 
-    await prepareForCoder({
+    const prepared = await prepareForCoder({
       jobId,
       task,
       config,
@@ -2740,7 +2836,10 @@ async function runImplementationWorkflowBody(params: {
       threadTexts: (ctx.threadMessages ?? []).map(message => message.text),
       slack,
       logStep,
+      followUp: followUpCandidate,
     });
+    const activeFollowUp = prepared.followUp;
+    if (prepared.followUpFallback) followUpNote = prepared.followUpFallback;
     if (signal?.aborted) {
       return cancelledResult('IMPLEMENTATION');
     }
@@ -2800,6 +2899,8 @@ async function runImplementationWorkflowBody(params: {
       // which the backend also reads in the worktree). Derived from the final
       // pipelineCwd because plan revisions may have swapped repos mid-flight.
       policyPack: repoPolicyPackForCwd(pipelineCwd, config),
+      // The coder commits to the thread's open PR instead of opening one (issue #730).
+      followUp: activeFollowUp ? { prUrl: activeFollowUp.pr.url, branch: activeFollowUp.pr.branch } : undefined,
     });
 
     let currentThreadContext = ctx.threadContext;
@@ -3055,7 +3156,7 @@ async function runImplementationWorkflowBody(params: {
       // A dossier read must not decide whether the run reports.
     }
     const engineerReads = requesterIsEngineer({ userId: requesterUserId, config, role: requesterRole });
-    const replyFor = (prUrlForReply: string, external: string, prFailed = false): string =>
+    const replyFor = (prUrlForReply: string, external: string, prFailed = false, addedTo = false): string =>
       composeChangeReply({
         summary,
         requesterSummary,
@@ -3063,6 +3164,7 @@ async function runImplementationWorkflowBody(params: {
         prUrl: prUrlForReply,
         externalBlock: external,
         prFailed,
+        addedTo,
       });
 
     let prUrl = coderReportedPrUrl(fullResult.steps) ?? '';
@@ -3118,6 +3220,67 @@ async function runImplementationWorkflowBody(params: {
       };
     }
 
+    // A follow-up lands on the thread's open PR (issue #730): commit what's left,
+    // fast-forward the branch, and never push over someone else's commits.
+    if (activeFollowUp) {
+      const { pr, startHead } = activeFollowUp;
+      const push = await pushFollowUpToPr({
+        repoPath: pipelineCwd,
+        branch: pr.branch,
+        prUrl: pr.url,
+        startHead,
+        threadTs: task.event.threadTs,
+        summary,
+        requestedBy: ctx.requestedBy,
+        onLog: msg => logStep?.({ stage: 'implementation.pr.progress', message: msg }),
+      });
+      const stagingLine = stagingShowsBranch(deployStoreOf(store), pr.branch) ? `\n${STAGING_STILL_OLD}` : '';
+      let text: string;
+      let status: WorkflowResult['status'] = 'SUCCESS';
+      let resultPrUrl = pr.url;
+      if (push.kind === 'pushed') {
+        text = `${replyFor(pr.url, externalBlock, false, true)}${stagingLine}`;
+        logStep?.({
+          stage: 'implementation.followup.pushed',
+          message: `Added the change to ${pr.url} (${pr.branch}).`,
+          data: { prUrl: pr.url, branch: pr.branch },
+        });
+      } else if (push.kind === 'stacked') {
+        resultPrUrl = push.prUrl;
+        text = `${replyFor(push.prUrl, externalBlock)}\n\nSomeone else pushed to ${pr.url} while I worked, so I didn't push over it: this change is in its own pull request into that branch.`;
+        logStep?.({
+          stage: 'implementation.followup.fallback',
+          message: `${pr.branch} moved while the coder worked — opened ${push.prUrl} into it instead.`,
+          data: { prUrl: pr.url, reason: 'branch_moved', stackedPrUrl: push.prUrl },
+        });
+      } else if (push.kind === 'nothing') {
+        text = `${replyFor('', externalBlock)}\n\nNothing new was added to ${pr.url}.`;
+        logStep?.({
+          stage: 'implementation.followup.nothing',
+          message: `The run left nothing new on top of ${pr.url}.`,
+          data: { prUrl: pr.url },
+        });
+      } else {
+        status = 'FAILED';
+        text = `${replyFor('', externalBlock, true)}\n\nI couldn't push this to ${pr.url}, so nothing was added to it.`;
+        logStep?.({
+          stage: 'implementation.followup.fallback',
+          message: `Couldn't push the follow-up to ${pr.url}: ${push.reason}`,
+          level: 'ERROR',
+          data: { prUrl: pr.url, reason: 'push_failed', detail: push.reason },
+        });
+      }
+      await slack.chat.postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text });
+      return {
+        workflow: 'IMPLEMENTATION',
+        status,
+        message: summary,
+        notifyDesktop: status === 'FAILED',
+        slackPosted: true,
+        result: { prUrl: resultPrUrl },
+      };
+    }
+
     if (!prUrl) {
       logStep?.({
         stage: 'implementation.pr.creating',
@@ -3143,7 +3306,7 @@ async function runImplementationWorkflowBody(params: {
     await slack.chat.postMessage({
       channel: task.event.channelId,
       thread_ts: task.event.threadTs,
-      text: replyFor(prUrl, externalBlock, prUrl === ''),
+      text: `${replyFor(prUrl, externalBlock, prUrl === '')}${followUpNote ? `\n\n${followUpNote}` : ''}`,
     });
 
     return {

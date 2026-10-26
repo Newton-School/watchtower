@@ -51,6 +51,31 @@ describe('composeChangeReply', () => {
     expect(text).not.toContain('pid 43469');
   });
 
+  // Issue #730: a follow-up was added to the thread's open PR.
+  it('says the change was added to the open PR, linking it once', () => {
+    const pr = 'https://github.com/Newton-School/newton-marketing-web/pull/1407';
+    expect(
+      composeChangeReply({
+        summary,
+        requesterSummary,
+        engineerReads: false,
+        prUrl: pr,
+        externalBlock: '',
+        addedTo: true,
+      }),
+    ).toBe(`Added to ${pr}: ${requesterSummary}\n_The engineering notes are in the PR._`);
+    expect(
+      composeChangeReply({
+        summary,
+        requesterSummary,
+        engineerReads: true,
+        prUrl: pr,
+        externalBlock: '',
+        addedTo: true,
+      }),
+    ).toBe(`Added to ${pr}: ${summary}`);
+  });
+
   it('gives an engineer the full account', () => {
     const text = composeChangeReply({
       summary,

@@ -3285,6 +3285,38 @@ export class JobStore {
     return Boolean(row?.hit);
   }
 
+  /**
+   * The pull requests change runs in this thread opened, newest first (issue
+   * #730): a later change asked in the thread is added to one of them instead
+   * of opening another. Only a change run's result carries a `prUrl`; a run
+   * that failed after the coder opened its PR counts too.
+   */
+  changeRunPrUrlsInThread(channelId: string, threadTs: string): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT result_json
+         FROM jobs
+         WHERE COALESCE(executed_workflow, workflow) = 'IMPLEMENTATION'
+           AND status IN ('SUCCESS', 'FAILED')
+           AND channel_id = ?
+           AND thread_ts = ?
+           AND result_json LIKE '%prUrl%'
+         ORDER BY updated_at DESC
+         LIMIT 20`,
+      )
+      .all(channelId, threadTs) as Array<{ result_json?: string | null }>;
+    const urls: string[] = [];
+    for (const row of rows) {
+      try {
+        const prUrl = (JSON.parse(row.result_json ?? '{}') as { prUrl?: unknown }).prUrl;
+        if (typeof prUrl === 'string' && prUrl && !urls.includes(prUrl)) urls.push(prUrl);
+      } catch {
+        // A result that isn't JSON names no PR.
+      }
+    }
+    return urls;
+  }
+
   findLatestReviewedPrHeadSha(input: {
     channelId: string;
     threadTs: string;

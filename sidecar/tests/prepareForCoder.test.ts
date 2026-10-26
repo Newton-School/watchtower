@@ -108,9 +108,7 @@ describe('prepareForCoder', () => {
     const refresh = vi.fn(
       async (): Promise<WorktreeRefresh> => ({ ok: false, reason: 'fatal: unable to access origin' }),
     );
-    await expect(
-      run({ logStep, deps: { listOpenPrs: vi.fn().mockResolvedValue([]), refresh } }),
-    ).resolves.toBeUndefined();
+    await expect(run({ logStep, deps: { listOpenPrs: vi.fn().mockResolvedValue([]), refresh } })).resolves.toEqual({});
     expect(logStep).toHaveBeenCalledWith(
       expect.objectContaining({ stage: 'implementation.refresh.failed', level: 'WARN' }),
     );
@@ -147,5 +145,74 @@ describe('prepareForCoder', () => {
       deps: { listOpenPrs: vi.fn().mockResolvedValue([otherPr]), refresh: vi.fn(async () => refreshed) },
     });
     expect(slack.chat.postMessage).not.toHaveBeenCalled();
+  });
+
+  // Issue #730: a follow-up works on the thread's open PR's branch.
+  describe('a follow-up on the thread PR', () => {
+    const threadPr = {
+      url: 'https://github.com/o/newton-web/pull/1404',
+      owner: 'o',
+      repo: 'newton-web',
+      number: 1404,
+      branch: 'pm/hero-111-1',
+      repoKey: 'newton-web' as const,
+      files: [FILE],
+    };
+
+    it('checks out the PR branch and never resets to the base', async () => {
+      const refresh = vi.fn(async () => refreshed);
+      const checkoutBranch = vi.fn(async () => ({ ok: true as const, head: 'prhead1' }));
+      const logStep = vi.fn();
+      const slack = makeSlack();
+      const result = await run({
+        slack: slack as never,
+        logStep,
+        followUp: threadPr,
+        deps: { listOpenPrs: vi.fn().mockResolvedValue([otherPr]), refresh, checkoutBranch },
+      });
+      expect(result).toEqual({ followUp: { pr: threadPr, startHead: 'prhead1' } });
+      expect(checkoutBranch).toHaveBeenCalledWith(CWD, 'pm/hero-111-1');
+      expect(refresh).not.toHaveBeenCalled();
+      // Its own PR is never "another PR changing the same files".
+      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+      expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'implementation.followup.checked_out' }));
+    });
+
+    it('a plan for another repo gets its own PR, from a refreshed base', async () => {
+      const refresh = vi.fn(async () => refreshed);
+      const checkoutBranch = vi.fn();
+      const logStep = vi.fn();
+      const result = await run({
+        logStep,
+        followUp: { ...threadPr, repo: 'newton-marketing-web', repoKey: 'newton-marketing-web' },
+        deps: { listOpenPrs: vi.fn().mockResolvedValue([]), refresh, checkoutBranch },
+      });
+      expect(checkoutBranch).not.toHaveBeenCalled();
+      expect(refresh).toHaveBeenCalledWith(CWD);
+      expect(result.followUp).toBeUndefined();
+      expect(result.followUpFallback).toBe(
+        'This change is in newton-web, so it has its own pull request rather than going onto https://github.com/o/newton-web/pull/1404.',
+      );
+      expect(logStep).toHaveBeenCalledWith(
+        expect.objectContaining({
+          stage: 'implementation.followup.fallback',
+          data: expect.objectContaining({ reason: 'other_repo' }),
+        }),
+      );
+    });
+
+    it("falls back to a new PR when the branch can't be checked out", async () => {
+      const refresh = vi.fn(async () => refreshed);
+      const checkoutBranch = vi.fn(async () => ({ ok: false as const, reason: "fatal: couldn't find remote ref" }));
+      const result = await run({
+        followUp: threadPr,
+        deps: { listOpenPrs: vi.fn().mockResolvedValue([]), refresh, checkoutBranch },
+      });
+      expect(refresh).toHaveBeenCalledWith(CWD);
+      expect(result).toEqual({
+        followUpFallback:
+          "I couldn't check out the branch of https://github.com/o/newton-web/pull/1404, so this change is in a new pull request.",
+      });
+    });
   });
 });
