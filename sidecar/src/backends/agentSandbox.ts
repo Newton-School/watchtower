@@ -95,9 +95,18 @@ function neighbourDir(): string | undefined {
  * The `--settings` value for a run with tools. A read-only run keeps its
  * allow-list: without `autoAllowBashIfSandboxed: false`, any sandboxed shell
  * command would run without asking, `rm` included.
+ *
+ * A read-only run also may not write inside its working directory, which the
+ * sandbox otherwise allows (issue #622). Its allow-list admits read-only git
+ * commands, and a few of them take a write flag (`git log --output=<file>`
+ * wrote a file in a probe on CLI 2.1.310); the sandbox refuses that write
+ * whatever the flags. /tmp stays writable for the reply's attachments.
  */
-export function agentSandboxSettings(params: { readOnly: boolean }): { sandbox: Record<string, unknown> } {
+export function agentSandboxSettings(params: { readOnly: boolean; cwd?: string }): {
+  sandbox: Record<string, unknown>;
+} {
   const neighbours = neighbourDir();
+  const denyWrite = params.readOnly && params.cwd ? [params.cwd] : [];
   return {
     sandbox: {
       enabled: true,
@@ -123,6 +132,7 @@ export function agentSandboxSettings(params: { readOnly: boolean }): { sandbox: 
           '~/Library/Caches',
           ...state.repoPaths.map(repoPath => path.join(repoPath, 'node_modules', '.cache')),
         ],
+        ...(denyWrite.length > 0 ? { denyWrite } : {}),
         denyRead: [...deniedReadPaths(), ...(neighbours ? [neighbours] : [])],
         ...(neighbours && state.readRoot ? { allowRead: [state.readRoot] } : {}),
       },

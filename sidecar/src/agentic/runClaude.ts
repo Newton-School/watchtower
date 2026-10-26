@@ -13,9 +13,11 @@ import type { AgentBackendId } from '../backends/types.js';
 
 /**
  * Told to a run that only reads, so it does not spend turns on commands it
- * will be refused (issue #443). Matches `READ_ONLY_ALLOW_RULES`.
+ * will be refused (issue #443). Matches `READ_ONLY_ALLOW_RULES`; the git
+ * advice matches what CLI 2.1.310 allows (issue #622): a lone `cd` carries
+ * over to the next command, while `cd … && git …` and `git -C` are refused.
  */
-export const READ_ONLY_RUN_NOTE = `This run is read-only. You can read and search the repos under the current directory, run read-only commands there (grep, sed -n, cat, ls, find, git log / show / grep / diff, gh pr view), use the connectors you were given, and write files under /tmp to attach to your reply. Anything else is refused without asking: editing files in the repos, scripts (python, node), network calls (curl), reading outside the repos. If a command is refused, find a read-only way instead (for example \`cd newton-web && git log\`, not \`git -C newton-web log\`).`;
+export const READ_ONLY_RUN_NOTE = `This run is read-only. You can read and search the repos under the current directory, run read-only commands there (grep, sed -n, cat, ls, find, git log / show / blame / grep / diff with any flags such as -S, -G, -L, --follow, gh pr view), use the connectors you were given, and write files under /tmp to attach to your reply. Anything else is refused without asking: editing files in the repos, scripts (python, node), network calls (curl), reading outside the repos. The current directory is already the root that holds the repos. To run git in one repo, first run \`cd <absolute path of that repo>\` as a command on its own, then run each git command as its own call: a \`cd … && git …\` line and \`git -C …\` are always refused. Quote glob patterns (\`grep -rn x --include='*.py'\`). If a command is refused, find a read-only way instead of retrying variants of it.`;
 
 /** A usage-limit notice is one line; a failed run that wrote more than this was answering. */
 const USAGE_LIMIT_LINE_MAX = 300;
