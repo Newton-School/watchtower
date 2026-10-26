@@ -172,15 +172,20 @@ export async function runInvestigationWorkflow(params: {
     scope.scope === 'broad'
       ? enabledRepoPaths(config).filter(repo => repo.key === 'newton-web' || repo.key === 'newton-api')
       : [{ key: scope.scope, path: repoPath }];
-  const recentChangesBlock = await recentChangesNear({
+  const recentChanges = await recentChangesNear({
     repos: recentChangesRepos,
     reportText: [task.event.text ?? '', ...scopeThread.map(m => m.text ?? '')].join('\n').slice(0, 4_000),
   });
-  if (recentChangesBlock) {
+  const recentChangesBlock = recentChanges.block;
+  if (recentChanges.matched.length > 0) {
+    const commits = recentChanges.matched.reduce((sum, repo) => sum + repo.commits, 0);
     logStep?.({
       stage: 'investigation.recent_changes',
-      message: 'Found recent commits near what was reported; they go to the investigator.',
-      data: { lines: recentChangesBlock.split('\n').filter(line => line.startsWith('- ')).length },
+      message:
+        commits > 0
+          ? `Found ${commits} recent commit(s) near what was reported; they go to the investigator as hints.`
+          : 'The report names files or folders in the repo, but none changed recently.',
+      data: { matched: recentChanges.matched },
     });
   }
 

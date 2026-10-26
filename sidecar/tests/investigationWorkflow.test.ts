@@ -750,10 +750,18 @@ describe('runInvestigationWorkflow recent commits', () => {
     });
     const prompt = runCodex.mock.calls[0][0].prompt as string;
     expect(prompt).toContain('do not conclude "cannot reproduce"');
-    // The commit near what was reported is handed over up front.
-    expect(prompt).toContain('Recent changes near what was reported');
+    // The commit near what was reported is handed over up front, as a hint.
+    expect(prompt).toContain('unchecked hints');
+    expect(prompt).toContain('src/features/agentic-ai-course ("agentic ai course")');
     expect(prompt).toContain('admission fee total 1.3L -> 1.5L (#1483)');
-    expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'investigation.recent_changes' }));
+    expect(logStep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stage: 'investigation.recent_changes',
+        data: {
+          matched: [{ repo: 'newton-marketing-web', pathspecs: ['src/features/agentic-ai-course'], commits: 1 }],
+        },
+      }),
+    );
   });
 
   it('adds no block when the report names nothing in the repo', async () => {
@@ -764,6 +772,6 @@ describe('runInvestigationWorkflow recent commits', () => {
     });
     const prompt = runCodex.mock.calls[0][0].prompt as string;
     expect(prompt).toContain('do not conclude "cannot reproduce"');
-    expect(prompt).not.toContain('Recent changes near what was reported');
+    expect(prompt).not.toContain('unchecked hints');
   });
 });
