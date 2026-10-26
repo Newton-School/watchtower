@@ -17,10 +17,17 @@ function serializePreviousSteps(ctx: AgentContext): string {
  * Every agent runs as the same OS user as every other job's agents. One
  * coder's `pkill -f "next dev" -s 0` killed the agents of two other jobs: on
  * macOS `-s` and `0` are two more patterns, not "my session" (issue #445).
+ *
+ * Each shell command runs in a sandbox of its own, so a later command cannot
+ * stop what an earlier one started; agents then asked the requester to
+ * "run `kill 43469`". The sidecar now stops what a run leaves (issue #608).
  */
 export const PROCESS_HYGIENE_RULE =
-  'Other jobs run on this machine as the same user. Stop only processes you started, and only by PID (`kill <pid>`): ' +
-  'when you start a dev server or any background process, note its PID then and stop that PID before you finish. ' +
+  'Other jobs run on this machine as the same user. Stop only processes you started, and only by PID (`kill <pid>`). ' +
+  'A later command cannot stop a process an earlier command started (the sandbox refuses: "operation not permitted"), ' +
+  'so to stop a dev server yourself, start it, use it and stop it in one command ' +
+  '(`npm run dev > /tmp/dev.log 2>&1 & PID=$!; …; kill $PID`). ' +
+  'Anything still running when you finish is stopped for you: never ask anyone to stop a process or run a command for you. ' +
   "Never use `pkill`, `killall` or `kill -1`: they stop other jobs' agents too, and are blocked.";
 
 /** The worktree's dependencies, as a line under "Repository:" (issue #611); empty when there is nothing to say. */

@@ -101,6 +101,14 @@ describe('process rule on every agent prompt (issue #445)', () => {
     expect(PROCESS_HYGIENE_RULE).toContain('are blocked');
   });
 
+  it('says a later command cannot stop a server, that leftovers are stopped for it, and never to ask the requester (issue #608)', () => {
+    expect(PROCESS_HYGIENE_RULE).toContain('A later command cannot stop a process an earlier command started');
+    expect(PROCESS_HYGIENE_RULE).toContain('start it, use it and stop it in one command');
+    expect(PROCESS_HYGIENE_RULE).toContain('Anything still running when you finish is stopped for you');
+    expect(PROCESS_HYGIENE_RULE).toContain('never ask anyone to stop a process or run a command for you');
+    expect(PROCESS_HYGIENE_RULE).not.toContain('stop that PID before you finish');
+  });
+
   it('keeps the repo policy pack beside it', () => {
     const prompt = buildCoderPrompt(makeCtx(MARKETING_PACK));
     expect(prompt).toContain('Active policy pack: repo:newton-marketing-web');

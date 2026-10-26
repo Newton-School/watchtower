@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import type {
   CodexRunRequest,
   CodexRunResult,
@@ -14,6 +15,12 @@ import { getBackend } from '../backends/registry.js';
 import { claudePermissionMode } from '../backends/claudeCodeBackend.js';
 import { currentConnectors } from '../backends/connectors.js';
 import { agentBaseEnv } from '../backends/launchEnv.js';
+import {
+  AGENT_RUN_ENV,
+  isLeftoverSweepEnabled,
+  processLabel,
+  stopLeftoverProcesses,
+} from '../backends/leftoverProcesses.js';
 import { computeCostUsd } from '../pricing/modelPrices.js';
 import { agentCallContext } from '../state/runContext.js';
 import { createStreamDecoder } from './streamEvents.js';
@@ -346,7 +353,15 @@ export async function runAgent(rawRequest: CodexRunRequest, backend: AgentBacken
   const args = backend.buildArgs(request, outputPath);
   const envOverrides = backend.buildEnv(request, process.env.PATH ?? '');
   // Not the launching terminal's or Claude Code session's variables (issue #572).
-  const env = { ...agentBaseEnv(process.env), ...envOverrides, ...(request.extraEnv ?? {}) };
+  // The run's id goes last: every process the run starts inherits it, which is
+  // how what it leaves running is found when it ends (issue #608).
+  const runId = randomUUID();
+  const env = {
+    ...agentBaseEnv(process.env),
+    ...envOverrides,
+    ...(request.extraEnv ?? {}),
+    [AGENT_RUN_ENV]: runId,
+  };
 
   let timedOut = false;
   let cancelled = false;
@@ -737,6 +752,10 @@ export async function runAgent(rawRequest: CodexRunRequest, backend: AgentBacken
       request.signal.removeEventListener('abort', onAbort);
     }
     child.removeAllListeners();
+    // A run with no tools starts nothing.
+    if (!request.noTools && isLeftoverSweepEnabled()) {
+      await stopWhatTheRunLeft(runId, request, backend);
+    }
     request.onLog?.({
       stage: 'agent.cleanup',
       message: `Cleaning up temporary ${backend.displayName} output directory.`,
@@ -745,6 +764,29 @@ export async function runAgent(rawRequest: CodexRunRequest, backend: AgentBacken
       },
     });
     void fs.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+/** Stop the dev servers and other processes a run left running (issue #608). Never throws. */
+async function stopWhatTheRunLeft(runId: string, request: CodexRunRequest, backend: AgentBackend): Promise<void> {
+  try {
+    const { stopped, forced } = await stopLeftoverProcesses(runId);
+    if (stopped.length === 0) return;
+    request.onLog?.({
+      stage: 'agent.leftover_processes',
+      message: `Stopped ${stopped.length} process(es) the ${backend.displayName} run left running.`,
+      data: {
+        processes: stopped.map(row => ({ pid: row.pid, command: processLabel(row.command) })),
+        forced: forced.length,
+      },
+    });
+  } catch (error) {
+    request.onLog?.({
+      stage: 'agent.leftover_processes.error',
+      message: `Could not check for processes the ${backend.displayName} run left running.`,
+      level: 'WARN',
+      data: { error: String(error) },
+    });
   }
 }
 

@@ -9,7 +9,10 @@ import path from 'node:path';
  * read any checkout in his home. With the sandbox on, every shell command an
  * agent runs is confined by macOS Seatbelt. What it does, measured on CLI
  * 2.1.299 with permissions bypassed:
- * - signalling a process outside the sandbox fails ("operation not permitted");
+ * - signalling a process outside the sandbox fails ("operation not permitted").
+ *   Each shell command is a sandbox of its own, so a later command cannot stop
+ *   a server an earlier one started; the sidecar stops what a run leaves
+ *   running when it ends (`leftoverProcesses.ts`, issue #608);
  * - writes outside the working directory fail, except the paths below. A
  *   linked worktree may still commit to its main clone's `.git`, but never
  *   write its `config` or `hooks` (so `git push -u` pushes and then cannot
