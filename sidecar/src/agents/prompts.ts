@@ -155,7 +155,7 @@ function coderBranchStep(ctx: AgentContext): string {
 function coderPublishSteps(ctx: AgentContext): string {
   if (ctx.followUp) {
     return `4. Commit the change as one or more new commits on top of the pull request's latest commit. Never amend, rebase, reset or squash its existing commits.
-5. Do NOT push, and do not run \`gh pr\` commands: the reviewer and the final check look at your commits first, and miniOG pushes them to the pull request once they pass. Report "branch" as \`${ctx.followUp.branch}\` and "prUrl" as "".`;
+5. Do NOT push, and do not run \`gh pr\` commands: the reviewer and the final check look at your commits first, and miniOG pushes them to the pull request once they pass. Report "branch" as \`${ctx.followUp.branch}\` and "prUrl" as "". In "summary" and "requesterSummary", don't mention pushing or say the change still has to reach the pull request: they are read after miniOG has added it.`;
   }
   return `4. Commit and open a PR to the default branch.${ctx.requestedBy ? ` Prefix the PR title with [${ctx.requestedBy} via miniOG], e.g. "[${ctx.requestedBy} via miniOG] Fix button text".` : ''}
    In the PR description, always include this at the top:
