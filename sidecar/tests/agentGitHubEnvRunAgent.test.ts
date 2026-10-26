@@ -9,7 +9,8 @@ vi.mock('../src/backends/leftoverProcesses.js', async importOriginal => ({
 }));
 
 const { runAgent } = await import('../src/codex/runCodex.js');
-const { gitConfigEntries, GITHUB_OVER_HTTPS_GIT_CONFIG } = await import('../src/backends/agentGitHubEnv.js');
+const { gitConfigEntries, GITHUB_OVER_HTTPS_GIT_CONFIG, NO_UPSTREAM_WRITES_GIT_CONFIG } =
+  await import('../src/backends/agentGitHubEnv.js');
 const { NO_PUSH_TO_GITHUB_ENV } = await import('../src/github/noPush.js');
 
 /** Prints the run's environment, then whether its gh config folder exists and what is in it. */
@@ -53,6 +54,7 @@ describe('gh and git settings in runAgent (issue #746)', () => {
       printEnv,
     );
     expect(gitConfigEntries(envOf(result.stdout))).toEqual([
+      ...NO_UPSTREAM_WRITES_GIT_CONFIG,
       ...GITHUB_OVER_HTTPS_GIT_CONFIG,
       ...gitConfigEntries(NO_PUSH_TO_GITHUB_ENV),
     ]);
@@ -72,10 +74,10 @@ describe('gh and git settings in runAgent (issue #746)', () => {
     expect(envOf(result.stdout).GH_CONFIG_DIR).toMatch(/watchtower-codex-[^/]+\/gh$/);
   });
 
-  it('changes nothing for a run without a token', async () => {
+  it('gives a run without a token only the no-upstream settings', async () => {
     const result = await runAgent({ cwd: os.tmpdir(), prompt: 'x', mcpServers: {} }, printEnv);
     const env = envOf(result.stdout);
     expect(env.GH_CONFIG_DIR ?? '').not.toMatch(/watchtower-codex-/);
-    expect(gitConfigEntries(env)).not.toEqual(expect.arrayContaining([GITHUB_OVER_HTTPS_GIT_CONFIG[0]]));
+    expect(gitConfigEntries(env)).toEqual(NO_UPSTREAM_WRITES_GIT_CONFIG);
   });
 });

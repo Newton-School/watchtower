@@ -15,7 +15,7 @@ import { getBackend } from '../backends/registry.js';
 import { claudePermissionMode } from '../backends/claudeCodeBackend.js';
 import { currentConnectors } from '../backends/connectors.js';
 import { agentBaseEnv } from '../backends/launchEnv.js';
-import { githubAccessGitEnv, makeGhConfigDir, mergeAgentEnv } from '../backends/agentGitHubEnv.js';
+import { agentGitDefaultsEnv, githubAccessGitEnv, makeGhConfigDir, mergeAgentEnv } from '../backends/agentGitHubEnv.js';
 import {
   AGENT_RUN_ENV,
   isLeftoverSweepEnabled,
@@ -359,11 +359,18 @@ export async function runAgent(rawRequest: CodexRunRequest, backend: AgentBacken
   const runId = randomUUID();
   // gh and git on the run's token, past the sandbox's denials (issue #746).
   // The git settings merge with the caller's, such as a follow-up's push block.
-  const ghConfigDir = await makeGhConfigDir(tempDir, request.githubToken);
+  const ghConfigDir = await makeGhConfigDir(tempDir, request.githubToken, code =>
+    request.onLog?.({
+      stage: 'agent.gh_config.failed',
+      message: `Couldn't make the run's own gh config folder (${code}); its gh calls may fail on the sandbox's denial of gh's login file.`,
+      level: 'WARN',
+    }),
+  );
   const env = {
     ...mergeAgentEnv([
       agentBaseEnv(process.env),
       envOverrides,
+      agentGitDefaultsEnv(),
       githubAccessGitEnv(request.githubToken),
       request.extraEnv,
     ]),
