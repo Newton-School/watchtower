@@ -7,6 +7,7 @@ import {
   assembleConversationRecall,
   CONVERSATION_RECALL_BEGIN,
   CONVERSATION_RECALL_END,
+  RECALLED_STATE_NOTE,
 } from '../src/conversation/conversationRecall.js';
 import { assembleRecall } from '../src/codex/recallAssembler.js';
 import type { CapturedMessage } from '../src/state/conversationStore.js';
@@ -119,9 +120,11 @@ describe('assembleConversationRecall', () => {
     expect(out.promptBlock.endsWith(CONVERSATION_RECALL_END)).toBe(true);
     expect(out.promptBlock).toContain(out.body);
 
-    // Header line: title — #channel, date (from last activity), with <humans only>.
+    // Header line: title — #channel, last activity date and age, with <humans only>.
     const expectedDate = new Date((NOW_EPOCH - 7100) * 1000).toISOString().slice(0, 10);
-    expect(out.body).toContain(`• Vitest rollout — #eng-infra, ${expectedDate}, with Dipesh`);
+    expect(out.body).toContain(
+      `• Vitest rollout — #eng-infra, last active ${expectedDate} (within the last day), with Dipesh`,
+    );
 
     expect(out.body).toContain('Summary: Team agreed to roll out vitest across the sidecar test suites.');
     expect(out.body).toContain('Decision: Pin vitest to 2.x');
@@ -133,6 +136,30 @@ describe('assembleConversationRecall', () => {
     expect(out.body).not.toContain('watchtower-bot');
 
     expect(out.body).toContain(`Slack ref: channel C123, thread ${threadTs}`);
+  });
+
+  it('says how long ago each thread was active, and that what it mentions may have changed since (issue #749)', () => {
+    const threadTs = slackTs(7200);
+    seedThread(store, {
+      channelId: 'C400',
+      threadTs,
+      channelName: 'eng',
+      messages: [human(threadTs, 'readme sandbox pr opened for the newton-web readme tail')],
+      synthesis: { title: 'README sandbox PR', summary: 'PR opened.', decisions: [] },
+    });
+    const query = 'readme sandbox pr';
+    const at = (days: number) =>
+      assembleConversationRecall({ query, store, nowMs: (NOW_EPOCH + days * 24 * 60 * 60) * 1000 });
+
+    expect(at(0).body).toContain('(within the last day)');
+    expect(at(1).body).toContain('(1 day ago)');
+    expect(at(12).body).toContain('(12 days ago)');
+    // A clock behind the message (skew) gives no label rather than a negative age.
+    expect(at(-2).body).not.toMatch(/\(.*ago\)|within the last day/);
+
+    expect(at(0).promptBlock).toContain(RECALLED_STATE_NOTE);
+    expect(RECALLED_STATE_NOTE).toContain('may have merged, closed or changed since');
+    expect(RECALLED_STATE_NOTE).toContain('check its current state before relying on it');
   });
 
   it('excludeThread removes the thread the query came from', () => {
@@ -243,6 +270,7 @@ describe('assembleRecall — conversations source integration', () => {
     // No dossier, memories, signals, vault, or pinned facts — conversations alone survives.
     expect(out.sources).toEqual(['conversations']);
     expect(out.promptBlock).toContain('Related past conversations');
+    expect(out.promptBlock).toContain(RECALLED_STATE_NOTE);
     expect(out.promptBlock).toContain('Sentry quota');
     expect(out.estimatedTokens).toBeGreaterThan(0);
   });
