@@ -28,7 +28,12 @@ import { detectMention, normalizeTask } from './router/intentParser.js';
 import { isOwnerTagDelegationEnabled } from './access/ownerDelegation.js';
 import { isRouteQuestionExpired } from './router/routeClarify.js';
 import { jobSlots } from './runtime/jobSlots.js';
-import { keepAwake } from './runtime/keepAwake.js';
+import {
+  isStayAwakeOnPowerEnabled,
+  keepAwake,
+  STAY_AWAKE_ON_POWER_STATE_KEY,
+  stayAwakeOnPower,
+} from './runtime/keepAwake.js';
 import { decidePausedResume } from './router/pausedResume.js';
 import { classifyProduct } from './router/productClassifier.js';
 import { routeTask } from './router/taskRouter.js';
@@ -1716,6 +1721,12 @@ async function main(): Promise<void> {
     store.setState('last_app_version', sidecarBuild.appVersion);
   }
 
+  // On mains power the Mac stays awake while the sidecar runs, so miniOG is
+  // reachable between jobs, not only during them (issue #727).
+  if (isStayAwakeOnPowerEnabled(process.env, store.getState(STAY_AWAKE_ON_POWER_STATE_KEY))) {
+    stayAwakeOnPower.start();
+  }
+
   // A connector that needs signing in again left requesters blocked until the
   // owner happened to notice (issue #593). The first run to find one tells the
   // owner, on the desktop and by DM, once until it is connected again.
@@ -1879,6 +1890,7 @@ async function main(): Promise<void> {
 
   process.on('SIGINT', () => {
     logger.info('received SIGINT');
+    stayAwakeOnPower.stop();
     shutdownVaultWriter();
     void shutdownVaultWatcher();
     stopProfileSynthesizerScheduler();
@@ -1891,6 +1903,7 @@ async function main(): Promise<void> {
 
   process.on('SIGTERM', () => {
     logger.info('received SIGTERM');
+    stayAwakeOnPower.stop();
     shutdownVaultWriter();
     void shutdownVaultWatcher();
     stopProfileSynthesizerScheduler();
