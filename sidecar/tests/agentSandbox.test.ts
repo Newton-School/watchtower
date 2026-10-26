@@ -1,10 +1,14 @@
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  HOST_CONFIG_WRITE_DENY_RULES,
   SETTINGS_WRITE_DENY_RULES,
+  __agentSandboxRuntime,
   agentSandboxSettings,
   configureAgentSandbox,
+  fileWriteDenyRules,
   isAgentSandboxEnabled,
   sandboxReadDenyRules,
 } from '../src/backends/agentSandbox.js';
@@ -210,10 +214,156 @@ describe('the shell sandbox for agent runs', () => {
     );
   });
 
-  it('adds no settings rule when the run is not sandboxed, as the Read rules', () => {
+  // Issue #743: a run with the sandbox off (browser QA, deploys) has the same file tools.
+  it('keeps the file-tool write rules on a run without the sandbox, but not the Read rules', () => {
     const optedOut = denyRulesOf(claudeCodeBackend.buildArgs({ ...base, sandbox: false }, '/tmp/out.json'));
-    expect(optedOut.some(rule => rule.startsWith('Edit('))).toBe(false);
+    expect(optedOut).toEqual(expect.arrayContaining(fileWriteDenyRules()));
+    expect(optedOut.some(rule => rule.startsWith('Read('))).toBe(false);
+
+    process.env.WATCHTOWER_AGENT_SANDBOX = '0';
+    expect(denyRulesOf(claudeCodeBackend.buildArgs(base, '/tmp/out.json'))).toEqual(
+      expect.arrayContaining(fileWriteDenyRules()),
+    );
     expect(denyRulesOf(claudeCodeBackend.buildArgs({ ...base, noTools: true }, '/tmp/out.json'))).toEqual([]);
+  });
+
+  // Gitignore-style, as the CLI matches: a rule that matches a folder refuses
+  // every file under it (measured on CLI 2.1.310: `Edit(~/x/*)` refused a write
+  // to `~/x/workspaces/repo/1-1/src/index.ts`).
+  const refuses = (rule: string, file: string): boolean => {
+    const pattern = rule.slice('Edit('.length, -1).replace(/^~\//, `${home}/`).replace(/^\/\//, '/');
+    const toRegex = (part: string) =>
+      part
+        .split('*')
+        .map(text => text.replace(/[.+?^${}()|[\]\\]/g, '\\$&'))
+        .join('[^/]*');
+    const re = new RegExp(`^${pattern.split('**').map(toRegex).join('.*')}$`);
+    const segments = file.split('/');
+    return segments.some((_, i) => i > 0 && re.test(segments.slice(0, i + 1).join('/')));
+  };
+  const refusedByAny = (file: string) => fileWriteDenyRules().some(rule => refuses(rule, file));
+
+  it('a single-star rule on the data folder would refuse the worktrees too', () => {
+    expect(refuses('Edit(~/.watchtower/*)', `${home}/.watchtower/workspaces/newton-web/1-1/src/index.ts`)).toBe(true);
+  });
+
+  // Issue #743: with permissions bypassed the file tools skip the CLI's own
+  // checks on `.git` and `.claude`, and write anywhere the user can.
+  it('refuses the file tools config outside the worktree that runs commands outside the sandbox', () => {
+    configureAgentSandbox({
+      repoPaths: [],
+      appDataDir: path.join(home, 'Library', 'Application Support', 'com.example.watchtower'),
+    });
+    const refused = [
+      path.join(root, 'newton-web', '.git', 'config'),
+      path.join(root, 'newton-web', '.git', 'hooks', 'pre-push'),
+      path.join(root, 'newton-web', '.git', 'modules', 'lib', 'config'),
+      path.join(root, 'newton-web', '.git', 'worktrees', '1-1', 'config.worktree'),
+      path.join(root, 'newton-web', '.git', 'info', 'attributes'),
+      // A linked worktree's pointer to its git folder.
+      `${home}/.watchtower/workspaces/newton-web/1-1/.git`,
+      `${home}/.gitconfig`,
+      `${home}/.config/git/config`,
+      `${home}/.config/gh/config.yml`,
+      '/opt/homebrew/etc/gitconfig',
+      '/opt/homebrew/bin/git',
+      '/usr/local/bin/node',
+      `${home}/.bashrc`,
+      `${home}/.profile`,
+      `${home}/.zshrc`,
+      `${home}/.oh-my-zsh/oh-my-zsh.sh`,
+      `${home}/.nvm/nvm.sh`,
+      `${home}/.nvm/versions/node/v20.19.2/bin/node`,
+      `${home}/.npmrc`,
+      `${home}/.local/share/claude/versions/2.1.310`,
+      `${home}/.codex/config.toml`,
+      `${home}/Library/LaunchAgents/com.example.plist`,
+      `${home}/.ssh/config`,
+      `${home}/.claude.json`,
+      `${home}/.claude/CLAUDE.md`,
+      `${home}/.claude/commands/x.md`,
+      `${home}/.claude/skills/x/SKILL.md`,
+      `${home}/.claude/settings.json`,
+      `${home}/.watchtower/watchtower.db`,
+      `${home}/.watchtower/dep-cache/abc/node_modules/left-pad/index.js`,
+      `${home}/.watchtower/vault/notes.md`,
+      `${home}/.watchtower/lookup-workspaces/1/newton-web/a.ts`,
+      `${home}/Library/Application Support/com.example.watchtower/watchtower.db`,
+    ];
+    for (const file of refused) expect(refusedByAny(file), file).toBe(true);
+  });
+
+  it("leaves the worktree writable, its `.claude/skills` included, and /tmp and the planner's plan files", () => {
+    configureAgentSandbox({ repoPaths: [], appDataDir: path.join(home, '.watchtower') });
+    const worktree = `${home}/.watchtower/workspaces/newton-marketing-web/1793-1`;
+    const writable = [
+      `${worktree}/src/index.ts`,
+      `${worktree}/package.json`,
+      `${worktree}/.claude/skills/parity-audit/ledgers/nst-home.json`,
+      `${worktree}/.claude/skills/parity-audit/SKILL.md`,
+      `${worktree}/.claude/commands/x.md`,
+      `${worktree}/.github/workflows/ci.yml`,
+      '/tmp/miniog-attachments/table.csv',
+      `${home}/.claude/plans/plan.md`,
+    ];
+    for (const file of writable) expect(refusedByAny(file), file).toBe(false);
+    // Only `.git` is refused by name at any depth; the rest is anchored.
+    const unanchored = HOST_CONFIG_WRITE_DENY_RULES.filter(rule => rule.startsWith('Edit(//**/'));
+    expect(unanchored).toEqual(['Edit(//**/.git)', 'Edit(//**/.git/**)']);
+  });
+
+  describe('programs the sidecar runs outside the sandbox', () => {
+    const saved = { ...__agentSandboxRuntime };
+    afterEach(() => Object.assign(__agentSandboxRuntime, saved));
+
+    it("refuses the sidecar's own code, the node running it and the agent CLI's folder", () => {
+      const shims = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-shims-'));
+      fs.writeFileSync(path.join(shims, 'claude'), '#!/bin/sh\n', { mode: 0o755 });
+      const shimsReal = fs.realpathSync(shims);
+      try {
+        const rules = fileWriteDenyRules({ cwd: '/tmp/wt', executables: [path.join(shims, 'claude'), 'claude'] });
+        const refusedHere = (file: string) => rules.some(rule => refuses(rule, file));
+        expect(refusedHere(path.join(fs.realpathSync(saved.sidecarRoot), 'dist', 'index.js'))).toBe(true);
+        expect(refusedHere(fs.realpathSync(process.execPath))).toBe(true);
+        expect(refusedHere(path.join(shimsReal, 'claude'))).toBe(true);
+      } finally {
+        fs.rmSync(shims, { recursive: true, force: true });
+      }
+    });
+
+    it('refuses the whole app bundle when the sidecar runs from one', () => {
+      __agentSandboxRuntime.sidecarRoot = '/Applications/watchtower.app/Contents/Resources/_up_/sidecar';
+      expect(fileWriteDenyRules()).toEqual(
+        expect.arrayContaining([
+          'Edit(//Applications/watchtower.app/Contents/Resources/_up_/sidecar/**)',
+          'Edit(//Applications/watchtower.app/**)',
+        ]),
+      );
+    });
+
+    it('leaves out a folder that holds home, the worktrees or the run itself', () => {
+      __agentSandboxRuntime.execPath = path.join(home, 'bin', 'node');
+      __agentSandboxRuntime.sidecarRoot = '/srv/miniog/sidecar';
+      const rules = fileWriteDenyRules({ cwd: '/srv/miniog/sidecar/work' });
+      expect(rules).not.toContain('Edit(~/**)');
+      expect(rules.some(rule => rule.startsWith('Edit(//srv/miniog'))).toBe(false);
+      const worktreeFile = `${home}/.watchtower/workspaces/newton-web/1-1/src/index.ts`;
+      expect(rules.some(rule => refuses(rule, worktreeFile))).toBe(false);
+    });
+  });
+
+  it('refuses a vault set elsewhere, unless it is in a folder macOS guards with a prompt', () => {
+    configureAgentSandbox({ repoPaths: [], vaultPath: path.join(home, 'notes', 'miniog-vault') });
+    expect(fileWriteDenyRules()).toContain('Edit(~/notes/miniog-vault/**)');
+    configureAgentSandbox({ repoPaths: [], vaultPath: path.join(home, 'Documents', 'miniog-vault') });
+    expect(fileWriteDenyRules().some(rule => rule.includes('Documents'))).toBe(false);
+  });
+
+  it("refuses the app's data folder by a rule from the root when it is outside home", () => {
+    configureAgentSandbox({ repoPaths: [], appDataDir: '/var/lib/watchtower' });
+    expect(fileWriteDenyRules()).toContain('Edit(//var/lib/watchtower/**)');
+    configureAgentSandbox({ repoPaths: [], appDataDir: path.join(home, '.watchtower') });
+    expect(fileWriteDenyRules().filter(rule => rule.endsWith('/.watchtower/**)'))).toEqual([]);
   });
 
   it("doesn't list the worktree's `.claude` in allowWrite: the sandbox protects it whatever the list says", () => {

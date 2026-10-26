@@ -1,5 +1,7 @@
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 /**
  * Claude Code's shell sandbox for agent runs (issue #445).
@@ -25,24 +27,38 @@ import path from 'node:path';
  * The file tools (Read, Write, Edit) are not sandboxed: the same secrets are
  * denied to Read by permission rule (`sandboxReadDenyRules`). So a change
  * run updates a file a repo keeps under `.claude/skills/` (a skill's ledger)
- * with the Write or Edit tool (issue #609). Of that config, the file tools are
- * refused only what runs code outside the sandbox (`SETTINGS_WRITE_DENY_RULES`).
+ * with the Write or Edit tool (issue #609). With permissions bypassed the file
+ * tools also skip the CLI's own checks on `.git` and `.claude`; deny rules are
+ * what they still obey. They are refused the files outside the worktree that
+ * run code outside the sandbox or load into the owner's own sessions
+ * (`fileWriteDenyRules`, issues #609 and #743), on every run with tools.
+ * That list is best-effort: it names the places known to run code. The real
+ * fix is an allow-list (the worktree, /tmp, the planner's plan files), which
+ * bypassed permissions ignore: it needs a hook or change runs off bypass.
+ *
+ * Still open by design: the PR build gate installs and builds the PR's own code
+ * outside the sandbox, so a change's package scripts run there.
  *
  * Not sandboxed: browser QA (headless Chromium does not start inside it) and
- * deploys. Kill switch: `WATCHTOWER_AGENT_SANDBOX=0`.
+ * deploys. Kill switch: `WATCHTOWER_AGENT_SANDBOX=0` (the file-tool write
+ * rules stay).
  */
 
-const state: { readRoot?: string; repoPaths: string[]; appDataDir?: string } = { repoPaths: [] };
+const state: { readRoot?: string; repoPaths: string[]; appDataDir?: string; vaultPath?: string } = {
+  repoPaths: [],
+};
 
 /** Called once at startup with where the repos and miniOG's own data live. */
 export function configureAgentSandbox(params: {
   miniOgRepoRoot?: string;
   repoPaths: string[];
   appDataDir?: string;
+  vaultPath?: string;
 }): void {
   state.readRoot = params.miniOgRepoRoot;
   state.repoPaths = params.repoPaths;
   state.appDataDir = params.appDataDir;
+  state.vaultPath = params.vaultPath || undefined;
 }
 
 export function isAgentSandboxEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -152,6 +168,169 @@ export const SETTINGS_WRITE_DENY_RULES = [
   'Edit(//**/.claude/settings.local.json)',
   'Edit(//**/.claude/hooks/**)',
 ];
+
+/**
+ * Files outside the worktree that are read as config naming a command to run,
+ * or are programs the sidecar runs outside the sandbox (issue #743). Home
+ * paths are anchored at `~/`, so the same names inside a worktree (its
+ * `.claude/skills`, #609) stay writable.
+ */
+export const HOST_CONFIG_WRITE_DENY_RULES = [
+  // Every `.git`, a linked worktree's pointer file included: the CLI protects
+  // it, but not with permissions bypassed, and the sidecar runs git on the
+  // shared clones outside the sandbox. Agents' own git commands write there
+  // through the shell, which these rules don't govern.
+  'Edit(//**/.git)',
+  'Edit(//**/.git/**)',
+  'Edit(~/.gitconfig)',
+  // Shell start-up: the PR build gate runs a login bash outside the sandbox and
+  // sources nvm, which also holds the node the sidecar runs on; the owner's own
+  // shells read the rest. npm's user config: that gate's install reads it.
+  'Edit(~/.profile)',
+  'Edit(~/.bash_profile)',
+  'Edit(~/.bash_login)',
+  'Edit(~/.bashrc)',
+  'Edit(~/.bash_logout)',
+  'Edit(~/.zshenv)',
+  'Edit(~/.zprofile)',
+  'Edit(~/.zshrc)',
+  'Edit(~/.zlogin)',
+  'Edit(~/.zlogout)',
+  'Edit(~/.oh-my-zsh/**)',
+  'Edit(~/.nvm/**)',
+  'Edit(~/.npmrc)',
+  // What launchd starts at login.
+  'Edit(~/Library/LaunchAgents/**)',
+  // Tools' config that can name a command: git's and gh's under ~/.config,
+  // ssh's ProxyCommand, credential helpers, kubectl exec plugins.
+  'Edit(~/.config/**)',
+  'Edit(~/.ssh/**)',
+  'Edit(~/.aws/**)',
+  'Edit(~/.docker/**)',
+  'Edit(~/.kube/**)',
+  'Edit(~/.gnupg/**)',
+  // Programs the sidecar runs outside the sandbox: Homebrew's (git among them,
+  // with its system config in etc/), the claude CLI (~/.local), Codex's.
+  'Edit(//opt/homebrew/**)',
+  'Edit(//usr/local/**)',
+  'Edit(~/.local/**)',
+  'Edit(~/.codex/**)',
+  // The owner's own Claude Code config, which loads into his sessions. Not
+  // `~/.claude/plans`: a planner in plan mode writes its plan there.
+  'Edit(~/.claude.json)',
+  'Edit(~/.claude/CLAUDE.md)',
+  'Edit(~/.claude/commands/**)',
+  'Edit(~/.claude/agents/**)',
+  'Edit(~/.claude/skills/**)',
+  'Edit(~/.claude/plugins/**)',
+];
+
+/** miniOG's own folders under `~/.watchtower`. Not `workspaces`: change runs work there. */
+const MINIOG_DATA_DIRS = [
+  'app-backups',
+  'autostash',
+  'dep-cache',
+  'egress',
+  'logs',
+  'lookup-workspaces',
+  'replay-snapshots',
+  'vault',
+];
+
+/** Folders macOS guards with a prompt; see the note at the end of `SECRET_PATHS`. */
+const PROMPT_GUARDED_DIRS = ['Documents', 'Desktop', 'Downloads'].map(dir => path.join(os.homedir(), dir));
+
+/** A path as a permission rule takes it: `~/…` inside home, `//…` from the root. */
+const toRuleForm = (absolute: string): string => {
+  const homeForm = toHomeForm(absolute);
+  return homeForm.startsWith('~/') ? homeForm : `/${absolute}`;
+};
+
+const isInside = (child: string, parent: string): boolean => {
+  const relative = path.relative(parent, child);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+};
+
+const realPathOf = (file: string): string => {
+  try {
+    return fs.realpathSync(file);
+  } catch {
+    return file;
+  }
+};
+
+/** Where the sidecar's own code and the node running it are. Replaced in tests. */
+export const __agentSandboxRuntime = {
+  // src/backends/ or dist/backends/ → the sidecar package.
+  sidecarRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..'),
+  execPath: process.execPath,
+};
+
+/**
+ * Folders of programs the sidecar runs outside the sandbox, found at run
+ * time: its own code (and the app bundle around it), the node install running
+ * it, and the agent CLI the backend resolved. Rules match the resolved path,
+ * so each is followed through symlinks. A folder that holds home, the
+ * worktrees or the run's own working directory would refuse the run its work:
+ * such a folder is left out.
+ */
+function runtimeDirs(params: { cwd?: string; executables: string[] }): string[] {
+  const { sidecarRoot, execPath } = __agentSandboxRuntime;
+  const dirs = [realPathOf(sidecarRoot), path.dirname(path.dirname(realPathOf(execPath)))];
+  const bundle = /^(.*?\.app)\/Contents\//.exec(dirs[0]);
+  if (bundle) dirs.push(bundle[1]);
+  for (const executable of params.executables) {
+    if (path.isAbsolute(executable)) dirs.push(path.dirname(realPathOf(executable)));
+  }
+  const keep = [
+    os.homedir(),
+    path.join(os.homedir(), '.watchtower', 'workspaces'),
+    ...(params.cwd ? [params.cwd] : []),
+  ];
+  return [...new Set(dirs)].filter(dir => !keep.some(kept => isInside(kept, dir)));
+}
+
+/**
+ * miniOG's own records, caches and settings: its database, the dependency
+ * cache later worktrees are cloned from, its exports and backups, and the
+ * vault, whose edits flow back into people's dossiers. Files by name, not
+ * `~/.watchtower/*`: a rule that matches the `workspaces` folder would refuse
+ * every file under it.
+ */
+function miniOgDataWriteDenyRules(): string[] {
+  const rules = [
+    ...['watchtower.db', 'watchtower.db-wal', 'watchtower.db-shm', 'watchtower.db-journal'].map(
+      file => `Edit(~/.watchtower/${file})`,
+    ),
+    ...MINIOG_DATA_DIRS.map(dir => `Edit(~/.watchtower/${dir}/**)`),
+  ];
+  const workspaces = path.join(os.homedir(), '.watchtower', 'workspaces');
+  // The app's data folder, unless the worktrees are inside it.
+  const appData = state.appDataDir ? path.resolve(state.appDataDir) : undefined;
+  if (appData && !isInside(workspaces, appData)) rules.push(`Edit(${toRuleForm(appData)}/**)`);
+  // A vault set somewhere else, unless it is in a folder macOS guards.
+  const vault = state.vaultPath ? path.resolve(state.vaultPath) : undefined;
+  if (vault && !isInside(workspaces, vault) && !PROMPT_GUARDED_DIRS.some(dir => isInside(vault, dir))) {
+    rules.push(`Edit(${toRuleForm(vault)}/**)`);
+  }
+  return rules;
+}
+
+/**
+ * Every write the file tools are refused, on any run with tools, sandboxed or
+ * not: a run with the sandbox off (browser QA, deploys) runs the same tools.
+ * `executables` are the programs the run's backend starts (its CLI).
+ */
+export function fileWriteDenyRules(params: { cwd?: string; executables?: string[] } = {}): string[] {
+  return [
+    ...SETTINGS_WRITE_DENY_RULES,
+    ...HOST_CONFIG_WRITE_DENY_RULES,
+    ...miniOgDataWriteDenyRules(),
+    ...runtimeDirs({ cwd: params.cwd, executables: params.executables ?? [] }).map(
+      dir => `Edit(${toRuleForm(dir)}/**)`,
+    ),
+  ];
+}
 
 /**
  * The checkouts beside the miniOG root (the owner's own clones in `~/code`)

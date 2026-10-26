@@ -6,8 +6,8 @@ import type { TokenUsage } from '../types/contracts.js';
 import { buildCodexPath, parseStructuredOutput } from './codexBackend.js';
 import { personalSkillDenyRules } from './personalSkills.js';
 import {
-  SETTINGS_WRITE_DENY_RULES,
   agentSandboxSettings,
+  fileWriteDenyRules,
   isAgentSandboxEnabled,
   sandboxReadDenyRules,
 } from './agentSandbox.js';
@@ -394,9 +394,11 @@ export const claudeCodeBackend: AgentBackend = {
         '--disallowedTools',
         ...PROCESS_KILL_DENY_RULES,
         ...personalSkillDenyRules(request.cwd),
-        // The sandbox covers shell commands only; the Read tool is refused the same secrets by rule,
-        // and the Write and Edit tools Claude Code's settings and hooks (issue #609).
-        ...(sandboxed ? [...sandboxReadDenyRules(), ...SETTINGS_WRITE_DENY_RULES] : []),
+        // The sandbox covers shell commands only; the Read tool is refused the same secrets by rule.
+        ...(sandboxed ? sandboxReadDenyRules() : []),
+        // The Write and Edit tools are refused what runs code outside the sandbox, sandboxed run or
+        // not (issues #609, #743).
+        ...fileWriteDenyRules({ cwd: request.cwd, executables: [resolveClaudeCodeBinary()] }),
         ...(request.disallowedTools ?? []),
       );
     }
