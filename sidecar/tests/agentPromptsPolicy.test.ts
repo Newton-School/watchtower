@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   CLAUDE_DIR_WRITE_RULE,
+  OTHER_PRS_RULE,
   PROCESS_HYGIENE_RULE,
   buildCoderPrompt,
   buildPromptForRole,
@@ -118,6 +119,25 @@ describe('process rule on every agent prompt (issue #445)', () => {
     const prompt = buildCoderPrompt(makeCtx(MARKETING_PACK));
     expect(prompt).toContain('Active policy pack: repo:newton-marketing-web');
     expect(prompt).toContain(PROCESS_HYGIENE_RULE);
+  });
+});
+
+describe("other PRs' state comes from GitHub, not memory (issue #749)", () => {
+  it.each(['planner', 'coder', 'reviewer', 'verifier'] as const)(
+    'tells the %s to check a PR before calling it open',
+    role => {
+      expect(buildPromptForRole(role, makeCtx())).toContain(OTHER_PRS_RULE);
+    },
+  );
+
+  it('is in the plan-mode planner prompt too', () => {
+    expect(buildPlannerPlanModePrompt(makeCtx())).toContain(OTHER_PRS_RULE);
+  });
+
+  it('names the check, and says to flag what it cannot check instead of asserting it', () => {
+    expect(OTHER_PRS_RULE).toContain('never from memory or past conversations');
+    expect(OTHER_PRS_RULE).toContain('`gh pr view <number> --repo <owner>/<repo> --json state`');
+    expect(OTHER_PRS_RULE).toContain('If you cannot check, do not assert it: name it as something to confirm.');
   });
 });
 

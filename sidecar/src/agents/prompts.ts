@@ -43,6 +43,16 @@ export const CLAUDE_DIR_WRITE_RULE =
   'when a script produces the new content, have it write to /tmp and save the result with the Write tool. ' +
   "Claude Code's settings files and `.claude/hooks/` can't be changed at all: if the plan needs that, say so in the summary.";
 
+/**
+ * Another PR's state is read from GitHub, not remembered. Two change runs
+ * called PRs "still open" that had closed since a past thread mentioned them,
+ * and warned of conflicts with them (issue #749).
+ */
+export const OTHER_PRS_RULE =
+  "Take another pull request's state from GitHub, never from memory or past conversations: " +
+  'before calling a PR open or warning that this change will conflict with it, check it with ' +
+  '`gh pr view <number> --repo <owner>/<repo> --json state`. If you cannot check, do not assert it: name it as something to confirm.';
+
 /** The worktree's dependencies, as a line under "Repository:" (issue #611); empty when there is nothing to say. */
 function depsLine(ctx: AgentContext): string {
   const line = depsPromptLine(ctx.repoPath);
@@ -53,7 +63,7 @@ function policyBlock(ctx: AgentContext): string {
   const pack = ctx.policyPack
     ? [`Active policy pack: ${ctx.policyPack.packName}`, ...ctx.policyPack.rules.map(r => `- ${r}`)].join('\n')
     : 'No explicit policy pack assigned.';
-  return `${pack}\nProcesses: ${PROCESS_HYGIENE_RULE}`;
+  return `${pack}\nProcesses: ${PROCESS_HYGIENE_RULE}\nOther PRs: ${OTHER_PRS_RULE}`;
 }
 
 /** The approved plan the coder/reviewer/verifier all read off the planner step. */
