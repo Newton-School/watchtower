@@ -693,7 +693,10 @@ describe('claudeCodeBackend.buildArgs denies killing by name (issue #445)', () =
     // Variadic: the rules end the argument list, or a flag follows them. The prompt is never after them.
     const next = args
       .slice(at + 1)
-      .find(arg => !arg.startsWith('Bash(') && !arg.startsWith('Skill(') && !arg.startsWith('Read('));
+      .find(
+        arg =>
+          !arg.startsWith('Bash(') && !arg.startsWith('Skill(') && !arg.startsWith('Read(') && !arg.startsWith('Edit('),
+      );
     expect(next === undefined || next.startsWith('--')).toBe(true);
     expect(args.indexOf('hello')).toBeLessThan(at);
   });

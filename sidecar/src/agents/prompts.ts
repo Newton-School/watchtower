@@ -23,6 +23,18 @@ export const PROCESS_HYGIENE_RULE =
   'when you start a dev server or any background process, note its PID then and stop that PID before you finish. ' +
   "Never use `pkill`, `killall` or `kill -1`: they stop other jobs' agents too, and are blocked.";
 
+/**
+ * The sandbox refuses shell writes under the worktree's `.claude/`, and no
+ * setting lifts that; the Write and Edit tools are not sandboxed, so a repo's
+ * skill ledger is saved with them. They are refused only Claude Code's
+ * settings and hooks (issue #609).
+ */
+export const CLAUDE_DIR_WRITE_RULE =
+  "Shell commands can't write under `.claude/` (skills, hooks, commands, agents, settings). " +
+  'To change a file there, such as a ledger a skill under `.claude/skills/` keeps up to date, use the Write or Edit tool; ' +
+  'when a script produces the new content, have it write to /tmp and save the result with the Write tool. ' +
+  "Claude Code's settings files and `.claude/hooks/` can't be changed at all: if the plan needs that, say so in the summary.";
+
 /** The worktree's dependencies, as a line under "Repository:" (issue #611); empty when there is nothing to say. */
 function depsLine(ctx: AgentContext): string {
   const line = depsPromptLine(ctx.repoPath);
@@ -181,6 +193,7 @@ Your role: Implement the plan from the planner agent. Write code, create tests, 
 Workflow: ${ctx.workflowIntent}
 Repository: ${ctx.repoPath}${depsLine(ctx)}
 Policy: ${policyBlock(ctx)}
+Files: ${CLAUDE_DIR_WRITE_RULE}
 Plan scope: ${scope}
 ${affectedFiles.length > 0 ? `Likely files to touch: ${affectedFiles.map(f => `\`${f}\``).join(', ')}` : ''}
 
