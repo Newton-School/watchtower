@@ -10,8 +10,10 @@ const runCodex = vi.fn();
 const getActiveBackendId = vi.fn(() => 'claude-code');
 const classifyInvestigationScope = vi.fn();
 const prepareWorkflowContext = vi.fn();
+const prepareSiblingRepos = vi.fn();
 
 vi.mock('../src/codex/runCodex.js', () => ({ runCodex, getActiveBackendId }));
+vi.mock('../src/workspaces/siblingRepos.js', () => ({ prepareSiblingRepos }));
 vi.mock('../src/codex/modelProfiles.js', () => ({
   highReasoningProfile: vi.fn(() => ({ model: 'opus-test', reasoningEffort: 'high' })),
 }));
@@ -72,6 +74,46 @@ beforeEach(() => {
   getActiveBackendId.mockReset().mockReturnValue('claude-code');
   classifyInvestigationScope.mockReset();
   prepareWorkflowContext.mockReset().mockResolvedValue(baseCtx);
+  prepareSiblingRepos.mockReset().mockResolvedValue({ dirs: [], block: '' });
+});
+
+// Issue #610: a scoped investigation could not read the other repo at all and
+// pointed its fix at the wrong endpoint.
+describe('runInvestigationWorkflow other repos', () => {
+  const block = 'OTHER REPOS — besides your working directory, you can read these clones.';
+
+  it('refreshes the other repos for a scoped investigation, tells it about them and lets it read them', async () => {
+    classifyInvestigationScope.mockResolvedValue({ scope: 'newton-api', confidence: 0.9, method: 'grep' });
+    prepareWorkflowContext.mockResolvedValue({
+      ...baseCtx,
+      cwd: '/home/.watchtower/workspaces/newton-api/1.1',
+      repoName: 'newton-api',
+    });
+    prepareSiblingRepos.mockResolvedValue({ dirs: ['/repos/newton-web'], block });
+
+    await runInvestigationWorkflow({
+      task: makeTask('XP is assigned on a failed test'),
+      config,
+      slack: slackStub() as any,
+    });
+
+    expect(prepareSiblingRepos).toHaveBeenCalledWith(
+      expect.objectContaining({ currentRepoPath: '/repos/newton-api', mode: 'refresh' }),
+    );
+    const request = runCodex.mock.calls[0][0];
+    expect(request.readOnly).toBe(true);
+    expect(request.readDirs).toEqual(['/repos/newton-web']);
+    expect(request.prompt).toContain(block);
+  });
+
+  it('leaves a broad investigation to read every clone in place, as before', async () => {
+    classifyInvestigationScope.mockResolvedValue({ scope: 'broad', confidence: 0.5, method: 'llm' });
+
+    await runInvestigationWorkflow({ task: makeTask('the page is broken'), config, slack: slackStub() as any });
+
+    expect(prepareSiblingRepos).not.toHaveBeenCalled();
+    expect(runCodex.mock.calls[0][0].readDirs).toBeUndefined();
+  });
 });
 
 describe('runInvestigationWorkflow thread images', () => {

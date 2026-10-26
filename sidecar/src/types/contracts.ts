@@ -501,6 +501,13 @@ export interface CodexRunRequest {
    */
   readOnly?: boolean;
   /**
+   * Directories outside `cwd` the run may read: the other repos' clones for
+   * a run in one repo's worktree (issue #610). Only honored by the
+   * claude-code backend (`--add-dir`), where a read-only run is otherwise
+   * refused every read outside its working directory.
+   */
+  readDirs?: string[];
+  /**
    * Run the agent's shell commands in Claude Code's sandbox (issue #445).
    * On by default for every run with tools on the claude-code backend; set
    * false only for runs the sandbox breaks (browser QA, deploys). See

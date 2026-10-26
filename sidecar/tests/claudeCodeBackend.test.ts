@@ -463,6 +463,28 @@ describe('claudeCodeBackend.buildArgs', () => {
     expect(args.filter(a => a === '--add-dir')).toHaveLength(1);
   });
 
+  // Issue #610: a read-only run is refused every read outside its working directory.
+  it('lets a read-only run read the other repos through the same single --add-dir', () => {
+    const args = claudeCodeBackend.buildArgs(
+      {
+        ...baseRequest,
+        readOnly: true,
+        imagePaths: ['/tmp/slack-a/F1-shot.png'],
+        readDirs: ['/code/mini-og/newton-web', '/code/mini-og/newton-marketing-web'],
+      },
+      '/tmp/out.json',
+    );
+    const addDir = args.indexOf('--add-dir');
+    expect(args.slice(addDir + 1, addDir + 4)).toEqual([
+      '/tmp/slack-a',
+      '/code/mini-og/newton-web',
+      '/code/mini-og/newton-marketing-web',
+    ]);
+    expect(args.filter(a => a === '--add-dir')).toHaveLength(1);
+    // Still read-only: nothing is bypassed.
+    expect(args).not.toContain('--dangerously-skip-permissions');
+  });
+
   // Issue #443: text-only calls ran with 441 tools, 18 MCP servers and 76 skills.
   describe('noTools', () => {
     const args = () => claudeCodeBackend.buildArgs({ ...baseRequest, noTools: true }, '/tmp/out.json');

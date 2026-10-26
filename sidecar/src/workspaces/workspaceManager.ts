@@ -251,7 +251,9 @@ export type SharedRepoStaleReason =
   | 'diverged'
   | 'not_fast_forwardable'
   /** How far behind origin the clone is could not be worked out, so it is not known to be current. */
-  | 'unverified';
+  | 'unverified'
+  /** Only fetched (`fetchOnly`): origin's refs are current, the files on disk were left as they were (issue #610). */
+  | 'not_updated';
 
 /** Uncommitted changes moved out of a shared clone's way so it could be updated (issue #709). */
 export interface SetAsideChanges {
@@ -339,6 +341,12 @@ export interface SharedRepoRefreshOptions {
   now?: () => number;
   /** Test seam: the wait before retrying a failed fetch. */
   fetchRetryMs?: number;
+  /**
+   * Fetch origin and report where the clone is, without touching its files
+   * (issue #610): a review reads the other repos through origin's refs, so
+   * their checkouts are left as they are.
+   */
+  fetchOnly?: boolean;
 }
 
 /** Where the patch copies of set-aside changes go. Read at call time, so tests can point HOME elsewhere. */
@@ -350,9 +358,13 @@ function autostashDir(): string {
  * One refresh per clone at a time, and a caller that arrives while one is
  * running shares its result instead of queueing another full run: two runs
  * starting together used to race on the index, the fetch and the stash. A
- * caller that wants stray changes set aside only shares a run that does too.
+ * caller only shares a run that does at least what it asked for: a fetch, an
+ * update, or an update that sets stray changes aside.
  */
-const inFlightRefreshes = new Map<string, { promise: Promise<SharedRepoState | null>; setAside: boolean }>();
+const inFlightRefreshes = new Map<string, { promise: Promise<SharedRepoState | null>; strength: number }>();
+
+const refreshStrength = (opts: SharedRepoRefreshOptions): number =>
+  opts.fetchOnly ? 0 : opts.setAsideStrayChanges ? 2 : 1;
 
 async function tryFastForward(repoPath: string, upstream: string): Promise<boolean> {
   try {
@@ -729,7 +741,7 @@ async function restoreSetAside(repoPath: string, setAside: SetAsideChanges): Pro
  * worktrees in `resolveWorkspace` would NOT be safe on a shared clone. With
  * `setAsideStrayChanges` (miniOG's own clones only), uncommitted changes that
  * block the update are moved aside first, and put back if the update still
- * fails.
+ * fails. With `fetchOnly`, it only fetches and reports.
  *
  * Best-effort: returns where the checkout ended up, including how far behind
  * origin it still is and why, or null if the repo couldn't be inspected.
@@ -740,14 +752,14 @@ export function refreshSharedRepoToDefaultBranch(
   opts: SharedRepoRefreshOptions = {},
 ): Promise<SharedRepoState | null> {
   const key = path.resolve(repoPath);
-  const setAside = Boolean(opts.setAsideStrayChanges);
+  const strength = refreshStrength(opts);
   const current = inFlightRefreshes.get(key);
-  if (current && (current.setAside || !setAside)) return current.promise;
+  if (current && current.strength >= strength) return current.promise;
   // The entry leaves the map inside the run, before callers see the result,
   // so a call made right after one finishes starts a fresh refresh.
-  const entry: { promise: Promise<SharedRepoState | null>; setAside: boolean } = {
+  const entry: { promise: Promise<SharedRepoState | null>; strength: number } = {
     promise: Promise.resolve(null),
-    setAside,
+    strength,
   };
   entry.promise = (current?.promise ?? Promise.resolve(null))
     .catch(() => null)
@@ -768,7 +780,7 @@ async function refreshSharedRepo(repoPath: string, opts: SharedRepoRefreshOption
   let indexLockAgeMs: number | undefined;
   let inTheWay: string[] = [];
   let leftInPlace: string[] = [];
-  if (!fetchFailed && !(await tryFastForward(repoPath, upstream))) {
+  if (!fetchFailed && !opts.fetchOnly && !(await tryFastForward(repoPath, upstream))) {
     if (opts.setAsideStrayChanges) {
       const outcome = await setAsideStrayChanges(repoPath, upstream, opts);
       setAsideSkipped = outcome.skipped;
@@ -849,6 +861,9 @@ async function refreshSharedRepo(repoPath: string, opts: SharedRepoRefreshOption
   }
   if (behind === 0) {
     return state;
+  }
+  if (opts.fetchOnly) {
+    return { ...state, staleReason: 'not_updated' };
   }
   if (branch !== upstream.replace(/^origin\//, '')) {
     return { ...state, staleReason: 'other_branch' };

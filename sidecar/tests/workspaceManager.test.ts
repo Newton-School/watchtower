@@ -458,6 +458,41 @@ describe('refreshSharedRepoToDefaultBranch', () => {
     expect(second).not.toBe(first);
   });
 
+  // Issue #610: a review reads the other repos through origin's refs and leaves their checkouts alone.
+  it('with fetchOnly, updates origin/main and leaves the files as they were', async () => {
+    const commitA = await git(repo, ['rev-parse', 'HEAD']);
+    await writeFile(path.join(seed, 'file.txt'), 'B\n');
+    await git(seed, ['commit', '-aqm', 'commit B']);
+    await git(seed, ['push', '-q', 'origin', 'main']);
+    const commitB = await git(seed, ['rev-parse', 'HEAD']);
+
+    const state = await refreshSharedRepoToDefaultBranch(repo, { fetchOnly: true });
+
+    expect(await git(repo, ['rev-parse', 'HEAD'])).toBe(commitA);
+    expect(fs.readFileSync(path.join(repo, 'file.txt'), 'utf8')).toBe('A\n');
+    expect(await git(repo, ['rev-parse', 'origin/main'])).toBe(commitB);
+    expect(state).toMatchObject({ upstream: 'origin/main', behind: 1, staleReason: 'not_updated' });
+  });
+
+  it('a fetch shares an update already running, but an update does not share a fetch', async () => {
+    await writeFile(path.join(seed, 'file.txt'), 'B\n');
+    await git(seed, ['commit', '-aqm', 'commit B']);
+    await git(seed, ['push', '-q', 'origin', 'main']);
+
+    const fetching = refreshSharedRepoToDefaultBranch(repo, { fetchOnly: true });
+    const updating = refreshSharedRepoToDefaultBranch(repo);
+    const [fetched, updated] = await Promise.all([fetching, updating]);
+
+    expect(fetched).toMatchObject({ staleReason: 'not_updated', behind: 1 });
+    expect(updated).toMatchObject({ behind: 0 });
+    expect(fs.readFileSync(path.join(repo, 'file.txt'), 'utf8')).toBe('B\n');
+
+    const updatingFirst = refreshSharedRepoToDefaultBranch(repo);
+    const fetchingSecond = refreshSharedRepoToDefaultBranch(repo, { fetchOnly: true });
+    expect(fetchingSecond).toBe(updatingFirst);
+    await updatingFirst;
+  });
+
   // Issue #709: an agent's leftover package.json edit held newton-web's clone
   // on a May commit, 783 commits behind, until someone stashed it by hand.
   describe('sets aside stray changes in the way (issue #709)', () => {

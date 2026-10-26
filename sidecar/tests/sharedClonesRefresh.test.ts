@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { refreshSharedRepoToDefaultBranch } from '../src/workspaces/workspaceManager.js';
-import { refreshSharedClones } from '../src/workspaces/staleCheckout.js';
+import { refreshRepoClones, refreshSharedClones } from '../src/workspaces/staleCheckout.js';
 import type { AppConfig } from '../src/types/contracts.js';
 
 vi.mock('../src/workspaces/workspaceManager.js', () => ({ refreshSharedRepoToDefaultBranch: vi.fn() }));
@@ -66,5 +66,52 @@ describe('refreshSharedClones', () => {
     const block = await refreshSharedClones({ config, stage: 's', logStep });
     expect(block).toContain('- newton-web: the update check failed, so the files may be out of date.');
     expect(logStep).toHaveBeenCalledTimes(2);
+  });
+});
+
+// Issue #610: a run in one repo's worktree reads the other clones beside it.
+describe('refreshRepoClones', () => {
+  beforeEach(() => {
+    vi.mocked(refreshSharedRepoToDefaultBranch).mockReset();
+  });
+
+  it('leaves out the repo the run has a worktree of, and only fetches when asked to', async () => {
+    vi.mocked(refreshSharedRepoToDefaultBranch).mockResolvedValue(current);
+    const logStep = vi.fn();
+
+    const refreshed = await refreshRepoClones({
+      config,
+      stage: 's',
+      logStep,
+      except: '/repos/newton-web/',
+      fetchOnly: true,
+    });
+
+    expect(refreshed).toEqual([{ name: 'newton-api', path: '/repos/newton-api', state: current }]);
+    expect(vi.mocked(refreshSharedRepoToDefaultBranch).mock.calls).toEqual([
+      ['/repos/newton-api', { fetchOnly: true }],
+    ]);
+    expect(logStep.mock.calls[0][0].message).toBe('Fetched newton-api; its files (master @ ac56c6935) are current.');
+  });
+
+  it('refreshes the clones at the same time, and logs them in repo order', async () => {
+    const started: string[] = [];
+    let release: () => void = () => {};
+    const gate = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    vi.mocked(refreshSharedRepoToDefaultBranch).mockImplementation(async (repoPath: string) => {
+      started.push(repoPath);
+      // newton-web only finishes once newton-api has started: one at a time would never get there.
+      if (repoPath.endsWith('newton-web')) await gate;
+      else release();
+      return current;
+    });
+    const logStep = vi.fn();
+
+    await refreshRepoClones({ config, stage: 's', logStep });
+
+    expect(started).toEqual(['/repos/newton-web', '/repos/newton-api']);
+    expect(logStep.mock.calls.map(call => call[0].data.repoPath)).toEqual(['/repos/newton-web', '/repos/newton-api']);
   });
 });

@@ -19,6 +19,7 @@ import { classifyInvestigationScope, type InvestigationScope } from '../router/i
 import { enabledRepoPaths } from '../repos/registry.js';
 import { connectorsFor, NO_CONNECTORS } from '../backends/connectors.js';
 import { refreshSharedClones } from '../workspaces/staleCheckout.js';
+import { prepareSiblingRepos } from '../workspaces/siblingRepos.js';
 import { attachReplyTablesAsCsv } from '../slack/tableCsv.js';
 import { recentChangesNear, RECENT_COMMITS_RULE } from './shared/recentChanges.js';
 import type { PipelineStore } from '../agents/pipeline.js';
@@ -161,11 +162,24 @@ export async function runInvestigationWorkflow(params: {
         }${analyticsNote}
 - Read-only mode: you may use Read, Grep, Glob, and read-only git/bash (git log, git show, git blame, git diff)${useMetabase ? ', and read-only Metabase queries' : ''}. Do NOT invoke Edit, Write, any bash command that mutates the worktree, or any mutating MCP tool.`;
 
-  // A broad investigation reads the shared clones in place (issue #446).
+  // A broad investigation reads the shared clones in place (issue #446). A
+  // scoped one reads its repo in a fresh worktree, and the other repos'
+  // clones beside it, refreshed the same way (issue #610).
   const staleBlock =
     scope.scope === 'broad'
       ? await refreshSharedClones({ config, stage: 'investigation.repo_refresh', logStep })
       : undefined;
+  const scopedClonePath =
+    scope.scope === 'broad' ? undefined : enabledRepoPaths(config).find(repo => repo.key === scope.scope)?.path;
+  const siblings = scopedClonePath
+    ? await prepareSiblingRepos({
+        config,
+        currentRepoPath: scopedClonePath,
+        mode: 'refresh',
+        stage: 'investigation.repo_refresh',
+        logStep,
+      })
+    : undefined;
 
   // Recent commits near what the report names, so a symptom fixed days ago is
   // found by reading the history, not by rounds of "cannot reproduce" (issue #621).
@@ -200,7 +214,7 @@ Your job is to DIAGNOSE — not to fix. Read code, run read-only queries (git lo
 ${RECENT_COMMITS_RULE}
 
 Environment:
-${environmentBlock}${staleBlock ? `\n\n${staleBlock}` : ''}${recentChangesBlock ? `\n\n${recentChangesBlock}` : ''}
+${environmentBlock}${staleBlock ? `\n\n${staleBlock}` : ''}${siblings?.block ? `\n\n${siblings.block}` : ''}${recentChangesBlock ? `\n\n${recentChangesBlock}` : ''}
 
 ${READ_ONLY_RUN_NOTE}
 
@@ -262,6 +276,7 @@ Return strict JSON:
       disallowedTools: connectors.disallowedTools,
       // An investigation reads and reports; the change, if any, is a later job (issue #443).
       readOnly: true,
+      readDirs: siblings?.dirs,
       // No per-agent timeoutMs. Substantive investigations on the high-reasoning
       // tier (Opus at xhigh) routinely exceed a fractional sub-budget (e.g. 40%
       // of bugFixTimeoutMs = 18 min) on real feature scoping, and a forced
