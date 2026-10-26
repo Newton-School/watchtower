@@ -405,7 +405,9 @@ export const claudeCodeBackend: AgentBackend = {
     if (sandboxed) {
       args.push(
         '--settings',
-        JSON.stringify(agentSandboxSettings({ readOnly: Boolean(request.readOnly), cwd: request.cwd })),
+        JSON.stringify(
+          agentSandboxSettings({ readOnly: Boolean(request.readOnly), cwd: request.cwd, readDirs: request.readDirs }),
+        ),
       );
     }
     if (request.sessionId) {
@@ -420,11 +422,14 @@ export const claudeCodeBackend: AgentBackend = {
     // The CLI has no `--image` flag (it exits with "unknown option '--image'"),
     // so images go in by path: the prompt names them (see
     // withImageReadInstructions) and `--add-dir` lets the Read tool open them
-    // from outside the repo, in plan mode too. `--add-dir` is variadic, so it
-    // must stay after the `-p` prompt positional.
-    const imageDirs = [...new Set((request.imagePaths ?? []).map(p => path.dirname(p)))];
-    if (imageDirs.length > 0) {
-      args.push('--add-dir', ...imageDirs);
+    // from outside the repo, in plan mode too. The other repos' clones go in
+    // the same way, for a run in one repo's worktree (issue #610). `--add-dir`
+    // is variadic, so it must stay after the `-p` prompt positional.
+    const addDirs = [
+      ...new Set([...(request.imagePaths ?? []).map(p => path.dirname(p)), ...(request.readDirs ?? [])]),
+    ];
+    if (addDirs.length > 0) {
+      args.push('--add-dir', ...addDirs);
     }
     // A run that uses tools loads ONLY the MCP servers named for it, and none
     // when nothing is named (issue #443). `--strict-mcp-config` makes the CLI

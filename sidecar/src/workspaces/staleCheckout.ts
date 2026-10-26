@@ -36,12 +36,15 @@ export function staleReasonText(state: SharedRepoState): string {
       return 'git fetch failed, so this is as of the last successful fetch';
     case 'unverified':
       return "I couldn't tell how far it is behind GitHub";
+    case 'not_updated':
+      return 'it was only fetched, and its files were left as they were';
     default:
       return 'git would not fast-forward it';
   }
 }
 
-const commits = (count: number): string => `${count} commit${count === 1 ? '' : 's'}`;
+/** "1 commit", "707 commits". */
+export const commits = (count: number): string => `${count} commit${count === 1 ? '' : 's'}`;
 
 /**
  * A clone whose files may be old with no newer tree to read instead: the
@@ -113,6 +116,7 @@ const files = (count: number): string => `${count} file${count === 1 ? '' : 's'}
 export function describeRepoRefresh(
   repoName: string,
   state: SharedRepoState | null,
+  opts: { fetchOnly?: boolean } = {},
 ): { message: string; level: 'INFO' | 'WARN' } {
   if (!state) {
     return { message: `Could not inspect ${repoName}; it may not be a git checkout.`, level: 'WARN' };
@@ -146,13 +150,23 @@ export function describeRepoRefresh(
       level: 'WARN',
     };
   }
+  if (opts.fetchOnly) {
+    return { message: `Fetched ${repoName}; its files (${state.branch} @ ${state.head}) are current.`, level: 'INFO' };
+  }
   return { message: `Refreshed ${repoName} to ${state.branch} @ ${state.head}.`, level: 'INFO' };
 }
 
-/** The block added to the agent's instructions for the clones it must read from git. Empty when none is stale. */
-export function buildStaleCheckoutBlock(repos: Array<{ name: string; state: SharedRepoState | null }>): string {
-  const stale = repos.filter((repo): repo is { name: string; state: SharedRepoState & { upstream: string } } =>
-    isStaleCheckout(repo.state),
+/**
+ * The block added to the agent's instructions for the clones it must read
+ * from git. Empty when none is stale. `path` is where to `cd` when the clone
+ * is not below the run's working directory.
+ */
+export function buildStaleCheckoutBlock(
+  repos: Array<{ name: string; path?: string; state: SharedRepoState | null }>,
+): string {
+  const stale = repos.filter(
+    (repo): repo is { name: string; path?: string; state: SharedRepoState & { upstream: string } } =>
+      isStaleCheckout(repo.state),
   );
   // No newer tree to point at: the agent reads the files on disk and says they may be old.
   const unconfirmed = repos.filter(repo => isUnconfirmedCheckout(repo.state));
@@ -179,11 +193,15 @@ export function buildStaleCheckoutBlock(repos: Array<{ name: string; state: Shar
   return [
     'STALE CHECKOUTS — for these repos the files on disk are OUT OF DATE. Do not read, grep or glob them from disk:',
     ...lines,
-    // `cd … &&`, not `git -C`: a read-only run allows the first and refuses the second (issue #443).
-    'Read the up-to-date tree through git instead, for example:',
-    `  cd ${example.name} && git grep -n "<pattern>" ${example.state.upstream} -- <path>`,
-    `  cd ${example.name} && git show ${example.state.upstream}:<path>`,
-    `  cd ${example.name} && git log -5 ${example.state.upstream} -- <path>`,
+    // A read-only run refuses `cd … && git …`, `git -C` and `git grep`
+    // whatever its rules say (issue #622): `cd` on its own, then git.
+    'Read the up-to-date tree through git instead: run `cd` into the repo as a command on its own, then each git command as its own call, for example:',
+    `  cd ${example.path ?? example.name}`,
+    `  git show ${example.state.upstream}:<path>`,
+    `  git log -5 ${example.state.upstream} -- <path>`,
+    `  git ls-tree -r --name-only ${example.state.upstream} -- <folder>`,
+    '  # the commits that added or removed a piece of text:',
+    `  git log -S"<pattern>" --oneline ${example.state.upstream} -- <path>`,
     'Never conclude that something "does not exist" or "is not there" in such a repo from the files on disk.',
     `Say in your answer that you read ${stale
       .map(repo => repo.state.upstream)
@@ -204,23 +222,47 @@ export async function refreshSharedClones(params: {
   stage: string;
   logStep?: WorkflowStepLogger;
 }): Promise<string | undefined> {
-  const { config, stage, logStep } = params;
-  const refreshed: Array<{ name: string; state: SharedRepoState | null }> = [];
-  for (const { path: repoPath } of enabledRepoPaths(config)) {
-    // A refresh that throws must not stop the run that wanted it: the clone
-    // is reported as not refreshed and the run reads what is on disk.
-    let state: SharedRepoState | null = null;
-    try {
-      // These are miniOG's own clones, so a stray change in the way is set aside (issue #709).
-      state = await refreshSharedRepoToDefaultBranch(repoPath, { setAsideStrayChanges: true });
-    } catch {
-      state = null;
-    }
-    const name = path.basename(repoPath);
-    refreshed.push({ name, state });
+  // A stale clone still has origin's refs: point the agent at those.
+  return buildStaleCheckoutBlock(await refreshRepoClones(params)) || undefined;
+}
+
+/**
+ * Refresh the shared clones, all at once, and log where each one really is.
+ * `except` leaves out a clone the run already has a fresh worktree of;
+ * `fetchOnly` updates origin's refs and leaves the files as they are.
+ */
+export async function refreshRepoClones(params: {
+  config: AppConfig;
+  stage: string;
+  logStep?: WorkflowStepLogger;
+  except?: string;
+  fetchOnly?: boolean;
+}): Promise<Array<{ name: string; path: string; state: SharedRepoState | null }>> {
+  const { config, stage, logStep, except, fetchOnly } = params;
+  const repoPaths = enabledRepoPaths(config)
+    .map(repo => repo.path)
+    .filter(repoPath => !except || path.resolve(repoPath) !== path.resolve(except));
+  const refreshed = await Promise.all(
+    repoPaths.map(async repoPath => {
+      // A refresh that throws must not stop the run that wanted it: the clone
+      // is reported as not refreshed and the run reads what is on disk.
+      let state: SharedRepoState | null = null;
+      try {
+        // These are miniOG's own clones, so a stray change in the way is set aside (issue #709).
+        state = await refreshSharedRepoToDefaultBranch(
+          repoPath,
+          fetchOnly ? { fetchOnly: true } : { setAsideStrayChanges: true },
+        );
+      } catch {
+        state = null;
+      }
+      return { name: path.basename(repoPath), path: repoPath, state };
+    }),
+  );
+  for (const { name, path: repoPath, state } of refreshed) {
     // Says what happened, not what was attempted: a clone that could not be
     // updated is a WARN with how far behind it is and why.
-    const { message, level } = describeRepoRefresh(name, state);
+    const { message, level } = describeRepoRefresh(name, state, { fetchOnly });
     logStep?.({
       stage,
       message,
@@ -242,6 +284,5 @@ export async function refreshSharedClones(params: {
       },
     });
   }
-  // A stale clone still has origin's refs: point the agent at those.
-  return buildStaleCheckoutBlock(refreshed) || undefined;
+  return refreshed;
 }

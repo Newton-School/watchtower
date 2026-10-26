@@ -1,7 +1,8 @@
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   HOST_CONFIG_WRITE_DENY_RULES,
   SETTINGS_WRITE_DENY_RULES,
@@ -9,6 +10,7 @@ import {
   agentSandboxSettings,
   configureAgentSandbox,
   fileWriteDenyRules,
+  gitCommonDir,
   isAgentSandboxEnabled,
   sandboxReadDenyRules,
 } from '../src/backends/agentSandbox.js';
@@ -139,6 +141,68 @@ describe('the shell sandbox for agent runs', () => {
     };
     expect(filesystem.allowWrite).toEqual(['/tmp', '/private/tmp']);
     expect(filesystem.denyWrite).toEqual(['/lookups/lookup-1']);
+  });
+
+  // Issue #610: the CLI makes every --add-dir folder writable, and `git log --output=<file>` wrote into one.
+  it('never lets a run write into the other repos it is given to read', () => {
+    const readDirs = ['/code/mini-og/newton-web', '/code/mini-og/newton-marketing-web'];
+
+    const settings = settingsOf(claudeCodeBackend.buildArgs({ ...base, readOnly: true, readDirs }, '/tmp/out.json'));
+    const { filesystem } = settings!.sandbox as { filesystem: { denyWrite: string[] } };
+    expect(filesystem.denyWrite).toEqual(expect.arrayContaining(['/tmp/wt', ...readDirs]));
+
+    const working = agentSandboxSettings({ readOnly: false, cwd: '/tmp/wt', readDirs }).sandbox as {
+      filesystem: { denyWrite: string[] };
+    };
+    expect(working.filesystem.denyWrite).toEqual(readDirs);
+  });
+
+  describe("a read-only run is refused the checkouts' git directories", () => {
+    let tmp: string;
+    let clone: string;
+    let worktree: string;
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, stdio: 'ignore' });
+
+    beforeEach(() => {
+      tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-sandbox-git-')));
+      clone = path.join(tmp, 'newton-api');
+      fs.mkdirSync(clone);
+      git(clone, 'init', '-q', '-b', 'main');
+      git(clone, '-c', 'user.email=t@example.com', '-c', 'user.name=T', 'commit', '-q', '--allow-empty', '-m', 'A');
+      worktree = path.join(tmp, 'workspaces', 'newton-api', '1.1');
+      git(clone, 'worktree', 'add', '-q', '--detach', worktree);
+    });
+
+    afterEach(() => {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    });
+
+    it("finds a linked worktree's history in its main clone", () => {
+      expect(gitCommonDir(worktree)).toBe(path.join(clone, '.git'));
+      expect(gitCommonDir(clone)).toBe(path.join(clone, '.git'));
+      expect(gitCommonDir(tmp)).toBeUndefined();
+    });
+
+    it("denies writes to the main clone's .git for a run in a worktree, and for a folder of worktrees", () => {
+      const inWorktree = agentSandboxSettings({ readOnly: true, cwd: worktree }).sandbox as {
+        filesystem: { denyWrite: string[] };
+      };
+      expect(inWorktree.filesystem.denyWrite).toEqual([worktree, path.join(clone, '.git')]);
+
+      // A lookup's copy: one worktree per repo inside the slot folder.
+      const slot = path.dirname(worktree);
+      const inSlot = agentSandboxSettings({ readOnly: true, cwd: slot }).sandbox as {
+        filesystem: { denyWrite: string[] };
+      };
+      expect(inSlot.filesystem.denyWrite).toContain(path.join(clone, '.git'));
+    });
+
+    it("leaves a working run's git directory alone: it commits there", () => {
+      const working = agentSandboxSettings({ readOnly: false, cwd: worktree }).sandbox as {
+        filesystem: { denyWrite?: string[] };
+      };
+      expect(working.filesystem.denyWrite).toBeUndefined();
+    });
   });
 
   it('lists no folder macOS guards with a permission prompt: a pending prompt hung every agent', () => {

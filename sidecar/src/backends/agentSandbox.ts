@@ -345,6 +345,52 @@ function neighbourDir(): string | undefined {
 }
 
 /**
+ * Where a checkout's history lives: `<dir>/.git` for a clone; for a linked
+ * worktree, its main clone's `.git` (its `.git` file points at
+ * `<clone>/.git/worktrees/<name>`, whose `commondir` leads back). Undefined
+ * when `dir` is not a checkout.
+ */
+export function gitCommonDir(dir: string): string | undefined {
+  const dotGit = path.join(dir, '.git');
+  try {
+    if (fs.statSync(dotGit).isDirectory()) return dotGit;
+    const pointer = fs.readFileSync(dotGit, 'utf8').match(/^gitdir:\s*(.+)$/m);
+    if (!pointer) return undefined;
+    const gitDir = path.resolve(dir, pointer[1].trim());
+    return path.resolve(gitDir, fs.readFileSync(path.join(gitDir, 'commondir'), 'utf8').trim());
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The git directories of these checkouts, and of the checkouts directly
+ * inside them (a lookup's copy is a folder of worktrees, one per repo).
+ */
+function checkoutGitDirs(dirs: string[]): string[] {
+  const found = new Set<string>();
+  for (const dir of dirs) {
+    const own = gitCommonDir(dir);
+    if (own) {
+      found.add(own);
+      continue;
+    }
+    let children: fs.Dirent[] = [];
+    try {
+      children = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const child of children) {
+      if (!child.isDirectory()) continue;
+      const childGit = gitCommonDir(path.join(dir, child.name));
+      if (childGit) found.add(childGit);
+    }
+  }
+  return [...found];
+}
+
+/**
  * The `--settings` value for a run with tools. A read-only run keeps its
  * allow-list: without `autoAllowBashIfSandboxed: false`, any sandboxed shell
  * command would run without asking, `rm` included.
@@ -354,12 +400,26 @@ function neighbourDir(): string | undefined {
  * and the package caches; its allow-list admits git commands that take a
  * write flag (`git log --output=<file>` wrote a file in a probe on CLI
  * 2.1.310), and the sandbox refuses that write whatever the flags.
+ *
+ * `readDirs` (the other repos' clones, issue #610) are never writable: the
+ * CLI adds every `--add-dir` folder to the sandbox's writable paths, and the
+ * same `git log --output=<file>` wrote into one. A read-only run is also
+ * refused the git directories of its checkouts: a linked worktree's history
+ * is in its main clone's `.git`, outside the working directory, where a
+ * write could move refs or another job's worktree. git still reads there.
  */
-export function agentSandboxSettings(params: { readOnly: boolean; cwd?: string }): {
+export function agentSandboxSettings(params: { readOnly: boolean; cwd?: string; readDirs?: string[] }): {
   sandbox: Record<string, unknown>;
 } {
   const neighbours = neighbourDir();
-  const denyWrite = params.readOnly && params.cwd ? [params.cwd] : [];
+  const readDirs = params.readDirs ?? [];
+  const denyWrite = [
+    ...new Set([
+      ...(params.readOnly && params.cwd ? [params.cwd] : []),
+      ...readDirs,
+      ...(params.readOnly ? checkoutGitDirs([...(params.cwd ? [params.cwd] : []), ...readDirs]) : []),
+    ]),
+  ];
   const allowWrite = params.readOnly
     ? ['/tmp', '/private/tmp']
     : [

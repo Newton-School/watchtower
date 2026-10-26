@@ -183,6 +183,7 @@ function makeDeps(overrides: Record<string, unknown> = {}) {
       .fn()
       .mockResolvedValue({ ok: true, nodeVersion: 'v20.0.0', usedNvmrc: false, buildScript: 'build', outputTail: '' }),
     prepareDeps: vi.fn().mockResolvedValue({ status: 'skipped' }),
+    prepareSiblings: vi.fn().mockResolvedValue({ dirs: [], block: '' }),
     ...overrides,
   };
 }
@@ -929,6 +930,90 @@ describe('agenticPrReview', () => {
       .map((c: any[]) => c[0].prompt as string)
       .find(p => p.includes(ORCHESTRATOR_PROMPT_MARKER)) as string;
     expect(orchPrompt).toContain("Dependencies: installed in node_modules for this checkout's package-lock.json");
+  });
+
+  it("fetches the other repos' clones and tells the orchestrator and the lenses how current they are (issue #610)", async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const runAgent = routedRunAgent({ orchestrator: agentOk([]) });
+    const block = 'OTHER REPOS — besides your working directory, you can read these clones.';
+    const deps = makeDeps({
+      runAgent,
+      prepareSiblings: vi.fn().mockResolvedValue({ dirs: ['/repos/newton-api'], block }),
+    });
+
+    await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+    });
+
+    // Fetch only: a review never moves a clone's checkout.
+    expect(deps.prepareSiblings).toHaveBeenCalledWith(
+      expect.objectContaining({ currentRepoPath: '/repos/newton-web', mode: 'fetch' }),
+    );
+    const prompts = runAgent.mock.calls.map((c: any[]) => c[0].prompt as string);
+    const orchPrompt = prompts.find(p => p.includes(ORCHESTRATOR_PROMPT_MARKER)) as string;
+    expect(orchPrompt).toContain(block);
+    expect(prompts.filter(p => p.includes(block)).length).toBeGreaterThan(1);
+  });
+
+  it('fetches the other repos while the diff is being read, not before it', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    let finishSiblings: (value: { dirs: string[]; block: string }) => void = () => {};
+    const events: string[] = [];
+    const deps = makeDeps({
+      prepareSiblings: vi.fn(
+        () =>
+          new Promise(resolve => {
+            events.push('siblings started');
+            finishSiblings = resolve;
+          }),
+      ),
+      fetchDiff: vi.fn(async () => {
+        events.push('diff fetched');
+        // Only a review that started the sibling fetch first, and did not wait for it, gets here.
+        finishSiblings({ dirs: [], block: '' });
+        return {
+          diff: 'diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,1 +1,2 @@\n line\n+added',
+          truncated: false,
+          reason: 'ok',
+        };
+      }),
+    });
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    expect(events).toEqual(['siblings started', 'diff fetched']);
+  });
+
+  it('reviews anyway, and logs it, when fetching the other repos fails', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const deps = makeDeps({ prepareSiblings: vi.fn().mockRejectedValue(new Error('git exploded')) });
+    const logStep = vi.fn();
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+      logStep,
+    });
+
+    expect(result.status).toBe('SUCCESS');
+    expect(deps.runAgent).toHaveBeenCalled();
+    expect(logStep).toHaveBeenCalledWith(
+      expect.objectContaining({ stage: 'agentic.pr_review.sibling_repos.threw', level: 'WARN' }),
+    );
   });
 
   it('fails plainly when it cannot make its own worktree, and never checks the PR out in the shared clone', async () => {

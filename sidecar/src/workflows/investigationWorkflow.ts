@@ -9,7 +9,7 @@ import {
   usageLimitReply,
   cleanResetText,
 } from '../codex/infraRetry.js';
-import { READ_ONLY_RUN_NOTE } from '../agentic/runClaude.js';
+import { readOnlyRunNote } from '../agentic/runClaude.js';
 import { assembleRecall } from '../codex/recallAssembler.js';
 import { highReasoningProfile } from '../codex/modelProfiles.js';
 import { buildMentionSystemPrompt } from '../codex/mentionSystemPrompt.js';
@@ -19,6 +19,7 @@ import { classifyInvestigationScope, type InvestigationScope } from '../router/i
 import { enabledRepoPaths } from '../repos/registry.js';
 import { connectorsFor, NO_CONNECTORS } from '../backends/connectors.js';
 import { refreshSharedClones } from '../workspaces/staleCheckout.js';
+import { prepareSiblingRepos, type SiblingRepos } from '../workspaces/siblingRepos.js';
 import { attachReplyTablesAsCsv } from '../slack/tableCsv.js';
 import { recentChangesNear, RECENT_COMMITS_RULE } from './shared/recentChanges.js';
 import type { PipelineStore } from '../agents/pipeline.js';
@@ -161,36 +162,68 @@ export async function runInvestigationWorkflow(params: {
         }${analyticsNote}
 - Read-only mode: you may use Read, Grep, Glob, and read-only git/bash (git log, git show, git blame, git diff)${useMetabase ? ', and read-only Metabase queries' : ''}. Do NOT invoke Edit, Write, any bash command that mutates the worktree, or any mutating MCP tool.`;
 
-  // A broad investigation reads the shared clones in place (issue #446).
-  const staleBlock =
-    scope.scope === 'broad'
-      ? await refreshSharedClones({ config, stage: 'investigation.repo_refresh', logStep })
-      : undefined;
+  // A broad investigation reads the shared clones in place (issue #446). A
+  // scoped one reads its repo in a fresh worktree, and the other repos'
+  // clones beside it, refreshed the same way (issue #610). The refresh starts
+  // now and is awaited after the requester hears what we're digging into: a
+  // hanging GitHub can hold it for a minute. It never fails the job.
+  const scopedClonePath =
+    scope.scope === 'broad' ? undefined : enabledRepoPaths(config).find(repo => repo.key === scope.scope)?.path;
+  const refreshing: Promise<{ staleBlock?: string; siblings?: SiblingRepos }> = (async () => {
+    try {
+      if (scope.scope === 'broad') {
+        return { staleBlock: await refreshSharedClones({ config, stage: 'investigation.repo_refresh', logStep }) };
+      }
+      if (scopedClonePath) {
+        const siblings = await prepareSiblingRepos({
+          config,
+          currentRepoPath: scopedClonePath,
+          mode: 'refresh',
+          stage: 'investigation.repo_refresh',
+          logStep,
+        });
+        return { siblings };
+      }
+    } catch (error) {
+      logStep?.({
+        stage: 'investigation.repo_refresh',
+        level: 'WARN',
+        message: `Could not refresh the repos; the investigation reads them as they are. ${String(error).slice(0, 300)}`,
+      });
+    }
+    return {};
+  })();
 
   // Recent commits near what the report names, so a symptom fixed days ago is
   // found by reading the history, not by rounds of "cannot reproduce" (issue #621).
-  const recentChangesRepos =
-    scope.scope === 'broad'
-      ? enabledRepoPaths(config).filter(repo => repo.key === 'newton-web' || repo.key === 'newton-api')
-      : [{ key: scope.scope, path: repoPath }];
-  const recentChanges = await recentChangesNear({
-    repos: recentChangesRepos,
-    reportText: [task.event.text ?? '', ...scopeThread.map(m => m.text ?? '')].join('\n').slice(0, 4_000),
-  });
-  const recentChangesBlock = recentChanges.block;
-  if (recentChanges.matched.length > 0) {
-    const commits = recentChanges.matched.reduce((sum, repo) => sum + repo.commits, 0);
-    logStep?.({
-      stage: 'investigation.recent_changes',
-      message:
-        commits > 0
-          ? `Found ${commits} recent commit(s) near what was reported; they go to the investigator as hints.`
-          : 'The report names files or folders in the repo, but none changed recently.',
-      data: { matched: recentChanges.matched },
+  const findRecentChanges = async (): Promise<string | undefined> => {
+    const recentChangesRepos =
+      scope.scope === 'broad'
+        ? enabledRepoPaths(config).filter(repo => repo.key === 'newton-web' || repo.key === 'newton-api')
+        : [{ key: scope.scope, path: repoPath }];
+    const recentChanges = await recentChangesNear({
+      repos: recentChangesRepos,
+      reportText: [task.event.text ?? '', ...scopeThread.map(m => m.text ?? '')].join('\n').slice(0, 4_000),
     });
-  }
+    if (recentChanges.matched.length > 0) {
+      const commits = recentChanges.matched.reduce((sum, repo) => sum + repo.commits, 0);
+      logStep?.({
+        stage: 'investigation.recent_changes',
+        message:
+          commits > 0
+            ? `Found ${commits} recent commit(s) near what was reported; they go to the investigator as hints.`
+            : 'The report names files or folders in the repo, but none changed recently.',
+        data: { matched: recentChanges.matched },
+      });
+    }
+    return recentChanges.block;
+  };
 
-  const investigatorPrompt = `${recallBlock}${`
+  const buildInvestigatorPrompt = (
+    { staleBlock, siblings }: { staleBlock?: string; siblings?: SiblingRepos },
+    recentChangesBlock: string | undefined,
+  ): string =>
+    `${recallBlock}${`
 ${buildMentionSystemPrompt({ task, workflow: 'INVESTIGATION', toneMode: task.toneMode, dossierRole: task.dossierRole })}
 
 You are the INVESTIGATOR agent.
@@ -200,9 +233,9 @@ Your job is to DIAGNOSE — not to fix. Read code, run read-only queries (git lo
 ${RECENT_COMMITS_RULE}
 
 Environment:
-${environmentBlock}${staleBlock ? `\n\n${staleBlock}` : ''}${recentChangesBlock ? `\n\n${recentChangesBlock}` : ''}
+${environmentBlock}${staleBlock ? `\n\n${staleBlock}` : ''}${siblings?.block ? `\n\n${siblings.block}` : ''}${recentChangesBlock ? `\n\n${recentChangesBlock}` : ''}
 
-${READ_ONLY_RUN_NOTE}
+${readOnlyRunNote({ otherRepos: Boolean(siblings?.block) })}
 
 Slack thread context (includes the bug report and any evidence the user has shared):
 ${ctx.threadContext}${ctx.imageContext}
@@ -249,6 +282,15 @@ Return strict JSON:
     })
     .catch(() => {});
 
+  // A broad investigation's history hints read the clones being refreshed, so
+  // they wait for it; a scoped one reads its own fresh worktree meanwhile.
+  const [refreshed, recentChangesBlock] =
+    scope.scope === 'broad'
+      ? [await refreshing, await findRecentChanges()]
+      : await Promise.all([refreshing, findRecentChanges()]);
+  const siblings = refreshed.siblings;
+  const investigatorPrompt = buildInvestigatorPrompt(refreshed, recentChangesBlock);
+
   const profile = highReasoningProfile(getActiveBackendId());
   const investigatorResult = await runWithInfraRetry(
     {
@@ -262,6 +304,7 @@ Return strict JSON:
       disallowedTools: connectors.disallowedTools,
       // An investigation reads and reports; the change, if any, is a later job (issue #443).
       readOnly: true,
+      readDirs: siblings?.dirs,
       // No per-agent timeoutMs. Substantive investigations on the high-reasoning
       // tier (Opus at xhigh) routinely exceed a fractional sub-budget (e.g. 40%
       // of bugFixTimeoutMs = 18 min) on real feature scoping, and a forced

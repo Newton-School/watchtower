@@ -53,6 +53,16 @@ describe('describeRepoRefresh (issue #446)', () => {
       'it has local commits that are not on origin/master',
     );
     expect(staleReasonText({ ...STUCK, staleReason: 'not_fast_forwardable' })).toBe('git would not fast-forward it');
+    expect(staleReasonText({ ...STUCK, staleReason: 'not_updated' })).toBe(
+      'it was only fetched, and its files were left as they were',
+    );
+  });
+
+  it('says "Fetched", not "Refreshed", for a current clone that was only fetched (issue #610)', () => {
+    expect(describeRepoRefresh('newton-api', CURRENT, { fetchOnly: true })).toEqual({
+      message: 'Fetched newton-api; its files (master @ ac56c6935) are current.',
+      level: 'INFO',
+    });
   });
 });
 
@@ -72,8 +82,13 @@ describe('buildStaleCheckoutBlock (issue #446)', () => {
       '- newton-web: the files on disk are 707 commits behind origin/master (it has uncommitted changes to package-lock.json, package.json). Read it from origin/master.',
     );
     expect(block).not.toContain('newton-api');
-    expect(block).toContain('cd newton-web && git grep -n "<pattern>" origin/master -- <path>');
-    expect(block).toContain('cd newton-web && git show origin/master:<path>');
+    // `cd` on its own, then git: a read-only run refuses `cd … && git …` and `git grep` (issue #622).
+    expect(block).toContain('  cd newton-web\n  git show origin/master:<path>\n  git log -5 origin/master -- <path>');
+    expect(block).not.toContain('&& git');
+    expect(block).not.toContain('git grep');
+    // Searching origin's tree with a command a read-only run allows.
+    // On a line of its own, with nothing after it an agent could paste into the command.
+    expect(block).toContain('\n  git log -S"<pattern>" --oneline origin/master -- <path>\n');
     // The wrong answer in the incident was "that param doesn't exist anywhere: zero hits".
     expect(block).toContain('Never conclude that something "does not exist"');
     expect(block).toContain('Say in your answer that you read origin/master, not the local files.');
@@ -86,6 +101,11 @@ describe('buildStaleCheckoutBlock (issue #446)', () => {
     expect(isStaleCheckout({ ...STUCK, upstream: undefined })).toBe(false);
     // Fetch failed but older refs still show it behind: origin's last-known tree is still the better read.
     expect(isStaleCheckout({ ...STUCK, staleReason: 'fetch_failed' })).toBe(true);
+  });
+
+  it('cds to the clone by its path when it is given, for a run whose working directory is elsewhere (issue #610)', () => {
+    const block = buildStaleCheckoutBlock([{ name: 'newton-api', path: '/code/mini-og/newton-api', state: STUCK }]);
+    expect(block).toContain('  cd /code/mini-og/newton-api\n');
   });
 
   it('reads right for one commit behind', () => {

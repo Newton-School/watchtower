@@ -8,7 +8,11 @@ import { discardInBackground } from './depCache.js';
 
 const execFileAsync = promisify(execFile);
 
-const WORKSPACES_ROOT = path.join(os.homedir(), '.watchtower', 'workspaces');
+/** Read at call time, like `autostashDir()`: a test points HOME elsewhere after this module may have loaded. */
+function workspacesRoot(): string {
+  return path.join(os.homedir(), '.watchtower', 'workspaces');
+}
+
 const STALE_THRESHOLD_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 /**
@@ -87,7 +91,7 @@ function repoNameFromPath(repoPath: string): string {
 function workspacePath(repoPath: string, threadTs: string): string {
   const repoName = repoNameFromPath(repoPath);
   const safeThread = sanitizeThreadTs(threadTs);
-  return path.join(WORKSPACES_ROOT, repoName, safeThread);
+  return path.join(workspacesRoot(), repoName, safeThread);
 }
 
 async function resolveDefaultRemoteBranch(repoPath: string): Promise<string> {
@@ -134,7 +138,8 @@ export async function resolveWorkspace(repoPath: string, threadTs: string): Prom
   // node_modules survives).
   if (fs.existsSync(wsPath)) {
     try {
-      await git(['fetch', 'origin', '--quiet'], { cwd: wsPath, timeoutMs: 30_000 });
+      // The worktree shares the clone's refs, so the clone's fetch serves it.
+      if (!(await fetchClone(repoPath))) throw new Error('git fetch failed');
       const defaultBranch = await resolveDefaultRemoteBranch(repoPath);
       await git(['reset', '--hard', defaultBranch], { cwd: wsPath, timeoutMs: 15_000 });
       await git(['clean', '-fd'], { cwd: wsPath, timeoutMs: 15_000 });
@@ -162,9 +167,7 @@ export async function resolveWorkspace(repoPath: string, threadTs: string): Prom
     fs.mkdirSync(path.dirname(wsPath), { recursive: true });
 
     // Fetch latest from origin so the worktree starts from up-to-date code
-    try {
-      await git(['fetch', 'origin', '--quiet'], { cwd: repoPath, timeoutMs: 30_000 });
-    } catch {
+    if (!(await fetchClone(repoPath))) {
       logger.warn({ repoPath }, 'git fetch failed before worktree creation, proceeding with local state');
     }
 
@@ -224,7 +227,7 @@ export type WorktreeRefresh =
  * is touched; a shared clone is never reset.
  */
 export async function refreshWorktreeToBase(wsPath: string): Promise<WorktreeRefresh> {
-  if (!path.resolve(wsPath).startsWith(`${WORKSPACES_ROOT}${path.sep}`)) {
+  if (!path.resolve(wsPath).startsWith(`${workspacesRoot()}${path.sep}`)) {
     return { ok: false, reason: 'not a miniOG worktree', skipped: true };
   }
   try {
@@ -251,7 +254,9 @@ export type SharedRepoStaleReason =
   | 'diverged'
   | 'not_fast_forwardable'
   /** How far behind origin the clone is could not be worked out, so it is not known to be current. */
-  | 'unverified';
+  | 'unverified'
+  /** Only fetched (`fetchOnly`): origin's refs are current, the files on disk were left as they were (issue #610). */
+  | 'not_updated';
 
 /** Uncommitted changes moved out of a shared clone's way so it could be updated (issue #709). */
 export interface SetAsideChanges {
@@ -339,6 +344,12 @@ export interface SharedRepoRefreshOptions {
   now?: () => number;
   /** Test seam: the wait before retrying a failed fetch. */
   fetchRetryMs?: number;
+  /**
+   * Fetch origin and report where the clone is, without touching its files
+   * (issue #610): a review reads the other repos through origin's refs, so
+   * their checkouts are left as they are.
+   */
+  fetchOnly?: boolean;
 }
 
 /** Where the patch copies of set-aside changes go. Read at call time, so tests can point HOME elsewhere. */
@@ -350,9 +361,19 @@ function autostashDir(): string {
  * One refresh per clone at a time, and a caller that arrives while one is
  * running shares its result instead of queueing another full run: two runs
  * starting together used to race on the index, the fetch and the stash. A
- * caller that wants stray changes set aside only shares a run that does too.
+ * caller only shares a run that does at least what it asked for: a fetch, an
+ * update, or an update that sets stray changes aside.
  */
-const inFlightRefreshes = new Map<string, { promise: Promise<SharedRepoState | null>; setAside: boolean }>();
+const inFlightRefreshes = new Map<string, { promise: Promise<RefreshOutcome>; strength: number }>();
+
+/** Where a refresh left the clone, and whether its fetch worked (known even when the clone can't be inspected). */
+interface RefreshOutcome {
+  state: SharedRepoState | null;
+  fetched: boolean;
+}
+
+const refreshStrength = (opts: SharedRepoRefreshOptions): number =>
+  opts.fetchOnly ? 0 : opts.setAsideStrayChanges ? 2 : 1;
 
 async function tryFastForward(repoPath: string, upstream: string): Promise<boolean> {
   try {
@@ -716,6 +737,23 @@ async function restoreSetAside(repoPath: string, setAside: SetAsideChanges): Pro
 }
 
 /**
+ * Fetches a clone's origin through its refresh queue (issue #610): a fetch or
+ * refresh already running there is shared, and a fetch that loses a ref lock
+ * to another one is retried. True when the fetch worked, whether or not the
+ * clone's own checkout could be inspected afterwards. Never throws.
+ */
+export async function fetchClone(repoPath: string, opts: { fetchRetryMs?: number } = {}): Promise<boolean> {
+  try {
+    return (await queueRefresh(repoPath, { fetchOnly: true, ...opts })).fetched;
+  } catch {
+    return false;
+  }
+}
+
+/** Test seam: how many refresh runs have started, shared ones counted once. */
+export const __refreshQueue = { runs: 0 };
+
+/**
  * Fast-forwards a SHARED repo clone to its default remote branch so an agent
  * that reads the clone directly — the informational Q&A path, which (unlike the
  * PR/implementation pipeline) does NOT operate in an isolated worktree — sees
@@ -729,7 +767,7 @@ async function restoreSetAside(repoPath: string, setAside: SetAsideChanges): Pro
  * worktrees in `resolveWorkspace` would NOT be safe on a shared clone. With
  * `setAsideStrayChanges` (miniOG's own clones only), uncommitted changes that
  * block the update are moved aside first, and put back if the update still
- * fails.
+ * fails. With `fetchOnly`, it only fetches and reports.
  *
  * Best-effort: returns where the checkout ended up, including how far behind
  * origin it still is and why, or null if the repo couldn't be inspected.
@@ -739,15 +777,20 @@ export function refreshSharedRepoToDefaultBranch(
   repoPath: string,
   opts: SharedRepoRefreshOptions = {},
 ): Promise<SharedRepoState | null> {
+  return queueRefresh(repoPath, opts).then(outcome => outcome.state);
+}
+
+/** One refresh run, shared by every caller it covers (see `inFlightRefreshes`). */
+function queueRefresh(repoPath: string, opts: SharedRepoRefreshOptions): Promise<RefreshOutcome> {
   const key = path.resolve(repoPath);
-  const setAside = Boolean(opts.setAsideStrayChanges);
+  const strength = refreshStrength(opts);
   const current = inFlightRefreshes.get(key);
-  if (current && (current.setAside || !setAside)) return current.promise;
+  if (current && current.strength >= strength) return current.promise;
   // The entry leaves the map inside the run, before callers see the result,
   // so a call made right after one finishes starts a fresh refresh.
-  const entry: { promise: Promise<SharedRepoState | null>; setAside: boolean } = {
-    promise: Promise.resolve(null),
-    setAside,
+  const entry: { promise: Promise<RefreshOutcome>; strength: number } = {
+    promise: Promise.resolve({ state: null, fetched: false }),
+    strength,
   };
   entry.promise = (current?.promise ?? Promise.resolve(null))
     .catch(() => null)
@@ -759,8 +802,18 @@ export function refreshSharedRepoToDefaultBranch(
   return entry.promise;
 }
 
-async function refreshSharedRepo(repoPath: string, opts: SharedRepoRefreshOptions): Promise<SharedRepoState | null> {
-  const fetchFailed = !(await fetchOrigin(repoPath, opts.fetchRetryMs ?? 1_500));
+async function refreshSharedRepo(repoPath: string, opts: SharedRepoRefreshOptions): Promise<RefreshOutcome> {
+  __refreshQueue.runs++;
+  const fetched = await fetchOrigin(repoPath, opts.fetchRetryMs ?? 1_500);
+  return { state: await updateSharedRepo(repoPath, opts, !fetched), fetched };
+}
+
+/** After the fetch: the update (unless only fetching), and where the clone ended up. */
+async function updateSharedRepo(
+  repoPath: string,
+  opts: SharedRepoRefreshOptions,
+  fetchFailed: boolean,
+): Promise<SharedRepoState | null> {
   const upstream = await resolveDefaultRemoteBranch(repoPath);
   let setAside: SetAsideChanges | undefined;
   let setAsideSkipped: SharedRepoState['setAsideSkipped'];
@@ -768,7 +821,7 @@ async function refreshSharedRepo(repoPath: string, opts: SharedRepoRefreshOption
   let indexLockAgeMs: number | undefined;
   let inTheWay: string[] = [];
   let leftInPlace: string[] = [];
-  if (!fetchFailed && !(await tryFastForward(repoPath, upstream))) {
+  if (!fetchFailed && !opts.fetchOnly && !(await tryFastForward(repoPath, upstream))) {
     if (opts.setAsideStrayChanges) {
       const outcome = await setAsideStrayChanges(repoPath, upstream, opts);
       setAsideSkipped = outcome.skipped;
@@ -849,6 +902,9 @@ async function refreshSharedRepo(repoPath: string, opts: SharedRepoRefreshOption
   }
   if (behind === 0) {
     return state;
+  }
+  if (opts.fetchOnly) {
+    return { ...state, staleReason: 'not_updated' };
   }
   if (branch !== upstream.replace(/^origin\//, '')) {
     return { ...state, staleReason: 'other_branch' };
@@ -939,15 +995,16 @@ export async function removeWorktreeByPath(wsPath: string): Promise<boolean> {
  * keys (PR review), across both repo directories. Best-effort and non-fatal.
  */
 export async function cleanupThreadWorkspaces(threadTs: string): Promise<void> {
-  if (!fs.existsSync(WORKSPACES_ROOT)) {
+  const root = workspacesRoot();
+  if (!fs.existsSync(root)) {
     return;
   }
   const safeThread = sanitizeThreadTs(threadTs);
   let cleaned = 0;
 
   try {
-    for (const repoDir of fs.readdirSync(WORKSPACES_ROOT)) {
-      const repoWorkspacesDir = path.join(WORKSPACES_ROOT, repoDir);
+    for (const repoDir of fs.readdirSync(root)) {
+      const repoWorkspacesDir = path.join(root, repoDir);
       let stat: fs.Stats;
       try {
         stat = fs.statSync(repoWorkspacesDir);
@@ -983,7 +1040,8 @@ export async function cleanupThreadWorkspaces(threadTs: string): Promise<void> {
  * startup).
  */
 export async function cleanupStaleWorkspaces(): Promise<void> {
-  if (!fs.existsSync(WORKSPACES_ROOT)) {
+  const root = workspacesRoot();
+  if (!fs.existsSync(root)) {
     return;
   }
 
@@ -991,8 +1049,8 @@ export async function cleanupStaleWorkspaces(): Promise<void> {
   let cleaned = 0;
 
   try {
-    for (const repoDir of fs.readdirSync(WORKSPACES_ROOT)) {
-      const repoWorkspacesDir = path.join(WORKSPACES_ROOT, repoDir);
+    for (const repoDir of fs.readdirSync(root)) {
+      const repoWorkspacesDir = path.join(root, repoDir);
       const stat = fs.statSync(repoWorkspacesDir);
       if (!stat.isDirectory()) continue;
 

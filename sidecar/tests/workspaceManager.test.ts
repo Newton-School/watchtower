@@ -19,6 +19,8 @@ const {
   refreshSharedRepoToDefaultBranch,
   removeWorktreeByPath,
   WorkspaceSetupError,
+  fetchClone,
+  __refreshQueue,
 } = await import('../src/workspaces/workspaceManager.js');
 
 const WS_ROOT = path.join(TEST_HOME, '.watchtower', 'workspaces');
@@ -456,6 +458,83 @@ describe('refreshSharedRepoToDefaultBranch', () => {
     const first = await refreshSharedRepoToDefaultBranch(repo);
     const second = await refreshSharedRepoToDefaultBranch(repo);
     expect(second).not.toBe(first);
+  });
+
+  // Issue #610: a review reads the other repos through origin's refs and leaves their checkouts alone.
+  it('with fetchOnly, updates origin/main and leaves the files as they were', async () => {
+    const commitA = await git(repo, ['rev-parse', 'HEAD']);
+    await writeFile(path.join(seed, 'file.txt'), 'B\n');
+    await git(seed, ['commit', '-aqm', 'commit B']);
+    await git(seed, ['push', '-q', 'origin', 'main']);
+    const commitB = await git(seed, ['rev-parse', 'HEAD']);
+
+    const state = await refreshSharedRepoToDefaultBranch(repo, { fetchOnly: true });
+
+    expect(await git(repo, ['rev-parse', 'HEAD'])).toBe(commitA);
+    expect(fs.readFileSync(path.join(repo, 'file.txt'), 'utf8')).toBe('A\n');
+    expect(await git(repo, ['rev-parse', 'origin/main'])).toBe(commitB);
+    expect(state).toMatchObject({ upstream: 'origin/main', behind: 1, staleReason: 'not_updated' });
+  });
+
+  it('a fetch shares an update already running, but an update does not share a fetch', async () => {
+    await writeFile(path.join(seed, 'file.txt'), 'B\n');
+    await git(seed, ['commit', '-aqm', 'commit B']);
+    await git(seed, ['push', '-q', 'origin', 'main']);
+
+    const fetching = refreshSharedRepoToDefaultBranch(repo, { fetchOnly: true });
+    const updating = refreshSharedRepoToDefaultBranch(repo);
+    const [fetched, updated] = await Promise.all([fetching, updating]);
+
+    expect(fetched).toMatchObject({ staleReason: 'not_updated', behind: 1 });
+    expect(updated).toMatchObject({ behind: 0 });
+    expect(fs.readFileSync(path.join(repo, 'file.txt'), 'utf8')).toBe('B\n');
+
+    const updatingFirst = refreshSharedRepoToDefaultBranch(repo);
+    const fetchingSecond = refreshSharedRepoToDefaultBranch(repo, { fetchOnly: true });
+    expect(await fetchingSecond).toBe(await updatingFirst);
+  });
+
+  describe('fetchClone (issue #610)', () => {
+    it('joins a refresh already running in the clone instead of fetching again', async () => {
+      const runsBefore = __refreshQueue.runs;
+
+      const [updated, fetched] = await Promise.all([refreshSharedRepoToDefaultBranch(repo), fetchClone(repo)]);
+
+      expect(fetched).toBe(true);
+      expect(updated).toMatchObject({ behind: 0 });
+      expect(__refreshQueue.runs - runsBefore).toBe(1);
+    });
+
+    it('waits out a ref lock held by another fetch, then fetches', async () => {
+      await writeFile(path.join(seed, 'file.txt'), 'B\n');
+      await git(seed, ['commit', '-aqm', 'commit B']);
+      await git(seed, ['push', '-q', 'origin', 'main']);
+      const commitB = await git(seed, ['rev-parse', 'HEAD']);
+      const lock = path.join(repo, '.git', 'refs', 'remotes', 'origin', 'main.lock');
+      fs.mkdirSync(path.dirname(lock), { recursive: true });
+      fs.writeFileSync(lock, '');
+      const fetching = fetchClone(repo, { fetchRetryMs: 400 });
+      await new Promise(resolve => setTimeout(resolve, 150));
+      fs.rmSync(lock, { force: true });
+
+      expect(await fetching).toBe(true);
+      expect(await git(repo, ['rev-parse', 'origin/main'])).toBe(commitB);
+      // Only fetched: the files stay where they were.
+      expect(fs.readFileSync(path.join(repo, 'file.txt'), 'utf8')).toBe('A\n');
+    });
+
+    it('says the fetch worked even when the clone itself cannot be inspected afterwards', async () => {
+      // An unborn HEAD: `rev-parse HEAD` fails, the fetch does not.
+      await git(repo, ['checkout', '-q', '--orphan', 'nothing-yet']);
+
+      expect(await refreshSharedRepoToDefaultBranch(repo, { fetchOnly: true })).toBeNull();
+      expect(await fetchClone(repo)).toBe(true);
+    });
+
+    it('says false when the fetch failed', async () => {
+      await git(repo, ['remote', 'set-url', 'origin', path.join(os.tmpdir(), 'wt-no-such-remote')]);
+      expect(await fetchClone(repo)).toBe(false);
+    });
   });
 
   // Issue #709: an agent's leftover package.json edit held newton-web's clone

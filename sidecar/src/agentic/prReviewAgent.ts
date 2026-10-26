@@ -48,6 +48,7 @@ import type {
 import { isAnchorInDiff, parseDiffHunks } from '../github/diffHunks.js';
 import { resolveWorkspace, WorkspaceSetupError } from '../workspaces/workspaceManager.js';
 import { depsPromptLine, prepareWorktreeDeps } from '../workspaces/depCache.js';
+import { prepareSiblingRepos } from '../workspaces/siblingRepos.js';
 import { applyFollowUpScope, formatFollowUpLine, type FollowUpStats } from './reReview.js';
 import { withAgentCallContext } from '../state/runContext.js';
 import { STE_REVIEW_TEXT_RULE } from '../codex/replyStyle.js';
@@ -99,6 +100,8 @@ export interface PrReviewDeps {
   runBuildGate: typeof runPrBuildGate;
   /** Installed dependencies for the PR's lockfile, so the review can run its gates (issue #611). */
   prepareDeps: typeof prepareWorktreeDeps;
+  /** The other repos' clones, fetched, and what the review is told about them (issue #610). */
+  prepareSiblings: typeof prepareSiblingRepos;
 }
 
 export const defaultPrReviewDeps: PrReviewDeps = {
@@ -116,6 +119,7 @@ export const defaultPrReviewDeps: PrReviewDeps = {
   discoverSkills: discoverReviewSkills,
   runBuildGate: runPrBuildGate,
   prepareDeps: prepareWorktreeDeps,
+  prepareSiblings: prepareSiblingRepos,
 };
 
 /** Rollout switch for the orchestrator-led review. Default ON; set
@@ -1503,6 +1507,28 @@ export async function reviewSinglePr(params: {
     }
   }
 
+  // 2b. The other repos' clones, fetched while the diff is read: the review
+  //     may cite them, and its sandbox refuses a fetch there (issue #610).
+  const siblings = hasLocalRepo
+    ? deps
+        .prepareSiblings({
+          config,
+          currentRepoPath: baseRepoPath as string,
+          mode: 'fetch',
+          stage: 'agentic.pr_review.sibling_repos',
+          logStep,
+        })
+        .catch(error => {
+          logStep?.({
+            stage: 'agentic.pr_review.sibling_repos.threw',
+            level: 'WARN',
+            message: `Fetching the other repos threw (non-fatal): ${String(error)}`,
+            data: { prUrl: prContext.url },
+          });
+          return undefined;
+        })
+    : Promise.resolve(undefined);
+
   // 3. Diff fetch (TS-side: the same bytes feed the agent prompt AND the
   //    submitPrReview hunk validator, eliminating agent/validator drift).
   //    A diff past the prompt budget is cut for the prompt only: a finding's
@@ -1625,8 +1651,10 @@ export async function reviewSinglePr(params: {
     diff: diffResult.diff,
     userFocusBlock,
     checkoutDegraded,
-    // The prompts carry one block about what is installed and built.
-    buildStatusBlock: buildStatusBlock ?? depsBlock,
+    // The prompts carry one block about what is installed and built, and
+    // what the other repos' clones hold.
+    buildStatusBlock:
+      [buildStatusBlock ?? depsBlock, (await siblings)?.block].filter(Boolean).join('\n\n') || undefined,
     priorReviewBlock,
     priorReviewLensBlock,
   };

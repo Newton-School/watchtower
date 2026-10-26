@@ -314,7 +314,8 @@ export function followUpPlannerBlock(pr: FollowUpPr): string {
   ].join('\n');
 }
 
-const WORKSPACES_ROOT = path.join(os.homedir(), '.watchtower', 'workspaces');
+/** Read at call time: a test points HOME elsewhere after this module may have loaded. */
+const workspacesRoot = (): string => path.join(os.homedir(), '.watchtower', 'workspaces');
 
 /**
  * Moves the run's worktree onto the PR's branch, detached at its latest
@@ -326,7 +327,7 @@ export async function checkoutFollowUpBranch(
   wsPath: string,
   branch: string,
 ): Promise<{ ok: true; head: string } | { ok: false; reason: string }> {
-  if (!path.resolve(wsPath).startsWith(`${WORKSPACES_ROOT}${path.sep}`)) {
+  if (!path.resolve(wsPath).startsWith(`${workspacesRoot()}${path.sep}`)) {
     return { ok: false, reason: 'not a miniOG worktree' };
   }
   try {
