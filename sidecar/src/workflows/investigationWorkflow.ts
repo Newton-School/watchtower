@@ -19,6 +19,7 @@ import { classifyInvestigationScope, type InvestigationScope } from '../router/i
 import { enabledRepoPaths } from '../repos/registry.js';
 import { connectorsFor, NO_CONNECTORS } from '../backends/connectors.js';
 import { refreshSharedClones } from '../workspaces/staleCheckout.js';
+import { attachReplyTablesAsCsv } from '../slack/tableCsv.js';
 import { recentChangesNear, RECENT_COMMITS_RULE } from './shared/recentChanges.js';
 import type { PipelineStore } from '../agents/pipeline.js';
 import type { InvestigationStore } from '../state/investigationStore.js';
@@ -359,13 +360,26 @@ Return strict JSON:
   const message = formatInvestigationMessage(findings);
   const nextStep = investigationNextStep(findings);
 
-  await slack.chat
+  const findingsPosted = await slack.chat
     .postMessage({
       channel: task.event.channelId,
       thread_ts: task.event.threadTs,
       text: message,
     })
-    .catch(() => {});
+    // Slack can turn a post down without throwing (the thread is gone): no CSV then.
+    .then(response => (response as { ok?: boolean } | undefined)?.ok !== false)
+    .catch(() => false);
+  // A table in the findings also goes in the thread as a CSV (issue #731).
+  if (findingsPosted) {
+    await attachReplyTablesAsCsv({
+      slack,
+      channelId: task.event.channelId,
+      threadTs: task.event.threadTs,
+      replyText: message,
+      askText: task.event.text ?? '',
+      logStep,
+    });
+  }
 
   let promptMessageTs: string | undefined;
   if (nextStep === 'fix_outside_repos') {
@@ -528,6 +542,14 @@ function scopeAckText(scope: InvestigationScope, useMetabase: boolean): string {
     : 'Tracing this end-to-end through *newton-web* and *newton-api*. I’ll share what I find.';
 }
 
+/**
+ * A label and its text. Text that opens with a table or a code block goes on
+ * the next line, so the label doesn't join the table's header (issue #731).
+ */
+function labelled(label: string, text: string): string {
+  return /^\s*(\||```)/.test(text) ? `${label}\n${text.trimStart()}` : `${label} ${text}`;
+}
+
 function formatInvestigationMessage(findings: {
   rootCauseHypothesis?: string;
   evidence?: Array<{ file?: string; line?: number; snippet?: string; why?: string }>;
@@ -537,7 +559,7 @@ function formatInvestigationMessage(findings: {
 }): string {
   const parts: string[] = [];
   if (findings.summary) parts.push(`*${findings.summary}*`);
-  if (findings.rootCauseHypothesis) parts.push(`*Root cause:* ${findings.rootCauseHypothesis}`);
+  if (findings.rootCauseHypothesis) parts.push(labelled('*Root cause:*', findings.rootCauseHypothesis));
 
   if (findings.evidence && findings.evidence.length > 0) {
     const items = findings.evidence
@@ -551,7 +573,7 @@ function formatInvestigationMessage(findings: {
     parts.push(`*Evidence:*\n${items}`);
   }
 
-  if (findings.recommendedFix) parts.push(`*Recommended fix:* ${findings.recommendedFix}`);
+  if (findings.recommendedFix) parts.push(labelled('*Recommended fix:*', findings.recommendedFix));
   if (findings.confidence) parts.push(`_Confidence: ${findings.confidence}_`);
 
   return parts.join('\n\n');
