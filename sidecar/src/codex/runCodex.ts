@@ -15,6 +15,7 @@ import { getBackend } from '../backends/registry.js';
 import { claudePermissionMode } from '../backends/claudeCodeBackend.js';
 import { currentConnectors } from '../backends/connectors.js';
 import { agentBaseEnv } from '../backends/launchEnv.js';
+import { githubAccessGitEnv, makeGhConfigDir, mergeAgentEnv } from '../backends/agentGitHubEnv.js';
 import {
   AGENT_RUN_ENV,
   isLeftoverSweepEnabled,
@@ -356,10 +357,17 @@ export async function runAgent(rawRequest: CodexRunRequest, backend: AgentBacken
   // The run's id goes last: every process the run starts inherits it, which is
   // how what it leaves running is found when it ends (issue #608).
   const runId = randomUUID();
+  // gh and git on the run's token, past the sandbox's denials (issue #746).
+  // The git settings merge with the caller's, such as a follow-up's push block.
+  const ghConfigDir = await makeGhConfigDir(tempDir, request.githubToken);
   const env = {
-    ...agentBaseEnv(process.env),
-    ...envOverrides,
-    ...(request.extraEnv ?? {}),
+    ...mergeAgentEnv([
+      agentBaseEnv(process.env),
+      envOverrides,
+      githubAccessGitEnv(request.githubToken),
+      request.extraEnv,
+    ]),
+    ...(ghConfigDir ? { GH_CONFIG_DIR: ghConfigDir } : {}),
     [AGENT_RUN_ENV]: runId,
   };
 

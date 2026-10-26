@@ -9,6 +9,9 @@
  * fails with "unable to find remote helper for 'no-push'". Fetches are
  * unaffected (`pushInsteadOf` applies to pushes only). Git skips these rules
  * for a remote with an explicit `pushurl`, which our clones never set.
+ * runAgent merges these entries with the run's own (`mergeAgentEnv`, issue
+ * #746): git matches `pushInsteadOf` against the remote's own URL before the
+ * run's SSH-to-HTTPS `insteadOf`, so both forms of remote stay blocked.
  */
 export const NO_PUSH_TO_GITHUB_ENV: Readonly<Record<string, string>> = {
   GIT_CONFIG_COUNT: '3',

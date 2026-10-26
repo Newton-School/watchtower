@@ -113,7 +113,8 @@ const SECRET_PATHS = [
   '~/.profile',
   '~/.bash_profile',
   '~/.bashrc',
-  // gh's stored login: agents get GH_TOKEN instead.
+  // gh's stored login: agents get GH_TOKEN and an empty GH_CONFIG_DIR of their
+  // own instead, so gh never tries this file (agentGitHubEnv.ts, issue #746).
   '~/.config/gh/hosts.yml',
   // miniOG's own records: transcripts, exports, logs, set-aside changes.
   '~/.watchtower/replay-snapshots',
