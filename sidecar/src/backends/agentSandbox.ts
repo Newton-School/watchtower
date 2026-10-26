@@ -17,9 +17,16 @@ import path from 'node:path';
  *   linked worktree may still commit to its main clone's `.git`, but never
  *   write its `config` or `hooks` (so `git push -u` pushes and then cannot
  *   record the upstream: the coder is told to push `HEAD:<branch>`);
- * - reads of the paths below fail.
+ * - reads of the paths below fail;
+ * - writes to Claude Code's own config in the working directory fail, whatever
+ *   `allowWrite` says: `.claude/skills`, `.claude/hooks`, `.claude/commands`,
+ *   `.claude/agents` and `.claude/settings*.json` (built in; measured on CLI
+ *   2.1.310).
  * The file tools (Read, Write, Edit) are not sandboxed: the same secrets are
- * denied to Read by permission rule (`SANDBOX_READ_DENY_RULES`).
+ * denied to Read by permission rule (`sandboxReadDenyRules`). So a change
+ * run updates a file a repo keeps under `.claude/skills/` (a skill's ledger)
+ * with the Write or Edit tool (issue #609). Of that config, the file tools are
+ * refused only what runs code outside the sandbox (`SETTINGS_WRITE_DENY_RULES`).
  *
  * Not sandboxed: browser QA (headless Chromium does not start inside it) and
  * deploys. Kill switch: `WATCHTOWER_AGENT_SANDBOX=0`.
@@ -130,6 +137,21 @@ function deniedReadPaths(): string[] {
 export function sandboxReadDenyRules(): string[] {
   return deniedReadPaths().flatMap(denied => [`Read(${denied})`, `Read(${denied}/**)`]);
 }
+
+/**
+ * Claude Code's settings files and hook scripts, at any depth: the worktree's,
+ * and the host user's own. A hook runs outside the sandbox. In a probe on CLI
+ * 2.1.310, a hook in the worktree's `.claude/settings.local.json`, written with
+ * the Write tool, wrote a file the sandbox had just refused the agent's own
+ * command; every later agent in that worktree would run it too. Skills,
+ * commands and agents stay writable by the file tools: they are instructions
+ * a change may rightly edit, and the change still goes through review and a PR.
+ */
+export const SETTINGS_WRITE_DENY_RULES = [
+  'Edit(//**/.claude/settings.json)',
+  'Edit(//**/.claude/settings.local.json)',
+  'Edit(//**/.claude/hooks/**)',
+];
 
 /**
  * The checkouts beside the miniOG root (the owner's own clones in `~/code`)

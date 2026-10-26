@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  CLAUDE_DIR_WRITE_RULE,
   PROCESS_HYGIENE_RULE,
   buildCoderPrompt,
   buildPromptForRole,
@@ -157,5 +158,21 @@ describe('the coder writes for two readers (issue #601)', () => {
     } as unknown as AgentContext);
     expect(prompt).toContain('"requesterSummary": string');
     expect(prompt).toContain('process ids, tooling, lint, git, dependency or sandbox details in it.');
+  });
+});
+
+// Issue #609: shell commands can't write a repo's skill ledger under `.claude/skills/`.
+describe('writing under .claude in a change run', () => {
+  it('tells the coder to save files under .claude with the Write or Edit tool, and what stays off limits', () => {
+    const prompt = buildCoderPrompt(makeCtx());
+    expect(prompt).toContain(`Files: ${CLAUDE_DIR_WRITE_RULE}`);
+    expect(CLAUDE_DIR_WRITE_RULE).toContain('use the Write or Edit tool');
+    expect(CLAUDE_DIR_WRITE_RULE).toContain('/tmp');
+    expect(CLAUDE_DIR_WRITE_RULE).toContain("settings files and `.claude/hooks/` can't be changed at all");
+  });
+
+  it('leaves it out of the agents that do not write', () => {
+    expect(buildVerifierPrompt(makeCtx())).not.toContain(CLAUDE_DIR_WRITE_RULE);
+    expect(buildPlannerPrompt(makeCtx())).not.toContain(CLAUDE_DIR_WRITE_RULE);
   });
 });

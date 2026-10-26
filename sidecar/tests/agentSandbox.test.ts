@@ -2,6 +2,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  SETTINGS_WRITE_DENY_RULES,
   agentSandboxSettings,
   configureAgentSandbox,
   isAgentSandboxEnabled,
@@ -175,13 +176,50 @@ describe('the shell sandbox for agent runs', () => {
     expect(filesystem.allowWrite.filter(covers)).toEqual([]);
   });
 
-  it('puts the Read rules among the deny rules and ahead of a flag', () => {
-    const args = claudeCodeBackend.buildArgs(base, '/tmp/out.json');
+  const denyRulesOf = (args: string[]) => {
     const at = args.indexOf('--disallowedTools');
-    const rules = args.slice(
-      at + 1,
-      args.findIndex((arg, i) => i > at && arg.startsWith('--')),
+    return at === -1
+      ? []
+      : args.slice(
+          at + 1,
+          args.findIndex((arg, i) => i > at && arg.startsWith('--')),
+        );
+  };
+
+  it('puts the Read rules among the deny rules and ahead of a flag', () => {
+    expect(denyRulesOf(claudeCodeBackend.buildArgs(base, '/tmp/out.json'))).toContain('Read(~/.ssh/**)');
+  });
+
+  // Issue #609: the sandbox refuses shell writes under `.claude/`, so a skill's
+  // ledger is saved with the Write tool, which is not sandboxed. A hook written
+  // the same way ran outside the sandbox, so settings and hooks are refused to it.
+  it("refuses the file tools Claude Code's settings and hooks at any depth, but not a skill's files", () => {
+    expect(SETTINGS_WRITE_DENY_RULES).toEqual([
+      'Edit(//**/.claude/settings.json)',
+      'Edit(//**/.claude/settings.local.json)',
+      'Edit(//**/.claude/hooks/**)',
+    ]);
+    for (const editable of ['skills', 'commands', 'agents']) {
+      expect(SETTINGS_WRITE_DENY_RULES.some(rule => rule.includes(`/.claude/${editable}`))).toBe(false);
+    }
+
+    const rules = denyRulesOf(claudeCodeBackend.buildArgs(base, '/tmp/out.json'));
+    expect(rules).toEqual(expect.arrayContaining(SETTINGS_WRITE_DENY_RULES));
+    expect(denyRulesOf(claudeCodeBackend.buildArgs({ ...base, readOnly: true }, '/tmp/out.json'))).toEqual(
+      expect.arrayContaining(SETTINGS_WRITE_DENY_RULES),
     );
-    expect(rules).toContain('Read(~/.ssh/**)');
+  });
+
+  it('adds no settings rule when the run is not sandboxed, as the Read rules', () => {
+    const optedOut = denyRulesOf(claudeCodeBackend.buildArgs({ ...base, sandbox: false }, '/tmp/out.json'));
+    expect(optedOut.some(rule => rule.startsWith('Edit('))).toBe(false);
+    expect(denyRulesOf(claudeCodeBackend.buildArgs({ ...base, noTools: true }, '/tmp/out.json'))).toEqual([]);
+  });
+
+  it("doesn't list the worktree's `.claude` in allowWrite: the sandbox protects it whatever the list says", () => {
+    const { filesystem } = agentSandboxSettings({ readOnly: false, cwd: '/ws/repo/1-1' }).sandbox as {
+      filesystem: { allowWrite: string[] };
+    };
+    expect(filesystem.allowWrite.some(entry => entry.includes('.claude'))).toBe(false);
   });
 });
