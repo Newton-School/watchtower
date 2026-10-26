@@ -200,7 +200,8 @@ export function buildStaleCheckoutBlock(
     `  git show ${example.state.upstream}:<path>`,
     `  git log -5 ${example.state.upstream} -- <path>`,
     `  git ls-tree -r --name-only ${example.state.upstream} -- <folder>`,
-    `  git log -S"<pattern>" --oneline ${example.state.upstream} -- <path>   (the commits that added or removed it)`,
+    '  # the commits that added or removed a piece of text:',
+    `  git log -S"<pattern>" --oneline ${example.state.upstream} -- <path>`,
     'Never conclude that something "does not exist" or "is not there" in such a repo from the files on disk.',
     `Say in your answer that you read ${stale
       .map(repo => repo.state.upstream)

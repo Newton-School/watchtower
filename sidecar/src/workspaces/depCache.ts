@@ -104,11 +104,24 @@ async function copyTree(source: string, target: string, timeoutMs: number, signa
   await fs.promises.cp(source, target, { recursive: true, verbatimSymlinks: true });
 }
 
+/** The folders, when a test has set them; otherwise under HOME as it is when they're used. */
+const folders: { root?: string; workspacesRoot?: string } = {};
+
 /** Settings; tests point them at temp dirs and stub the install and the copy. */
 export const __depCache = {
-  root: path.join(os.homedir(), '.watchtower', 'dep-cache'),
+  get root(): string {
+    return folders.root ?? path.join(os.homedir(), '.watchtower', 'dep-cache');
+  },
+  set root(value: string) {
+    folders.root = value;
+  },
   /** Only worktrees miniOG made are given deps; never a shared clone. */
-  workspacesRoot: path.join(os.homedir(), '.watchtower', 'workspaces'),
+  get workspacesRoot(): string {
+    return folders.workspacesRoot ?? path.join(os.homedir(), '.watchtower', 'workspaces');
+  },
+  set workspacesRoot(value: string) {
+    folders.workspacesRoot = value;
+  },
   /** Installs kept per repo, the most recently used first. newton-web's is about 2.5 GB. */
   keepPerRepo: 2,
   installTimeoutMs: 10 * 60_000,

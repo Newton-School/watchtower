@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { AppConfig, WorkflowStepLogger } from '../types/contracts.js';
 import { enabledRepoPaths, REPO_REGISTRY } from '../repos/registry.js';
+import { fetchClone } from './workspaceManager.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -23,8 +24,18 @@ const execFileAsync = promisify(execFile);
  * directory, and a fresh name every time would leave one behind per lookup.
  */
 
+/** Where the slots live, when a test has set it; otherwise under HOME as it is when used. */
+let slotsRoot: string | undefined;
+
 /** Where the slots live. Tests point it at a temp dir. */
-export const __lookupWorkspaces = { root: path.join(os.homedir(), '.watchtower', 'lookup-workspaces') };
+export const __lookupWorkspaces = {
+  get root(): string {
+    return slotsRoot ?? path.join(os.homedir(), '.watchtower', 'lookup-workspaces');
+  },
+  set root(value: string) {
+    slotsRoot = value;
+  },
+};
 
 /** Slots in use by a lookup in this process. Only this process creates them (the sidecar lock). */
 const claimedSlots = new Set<number>();
@@ -107,10 +118,6 @@ export async function createLookupWorkspace(params: {
   };
 
   try {
-    // Loaded here, not at the top: the test setup imports this module, and
-    // workspaceManager fixes its folders from HOME when it loads, before a
-    // test can point HOME elsewhere.
-    const { fetchClone } = await import('./workspaceManager.js');
     // A slot left behind by a cleanup that failed.
     await removeSlotDir(dir, repoPaths);
     fs.mkdirSync(dir, { recursive: true });
