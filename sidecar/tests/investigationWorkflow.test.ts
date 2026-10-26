@@ -185,8 +185,8 @@ describe('runInvestigationWorkflow thread images', () => {
       ok: true,
       exitCode: 0,
       parsedJson: {
+        // The table opens the field: it must not join the "Root cause:" label.
         rootCauseHypothesis: [
-          'Five batches lost leads:',
           '| Batch | Lost |',
           '|---|---|',
           ...Array.from({ length: 5 }, (_, i) => `| B${i} | ${i} |`),
@@ -207,7 +207,9 @@ describe('runInvestigationWorkflow thread images', () => {
       jobId: 'job-1',
     });
     expect(filesUploadV2).toHaveBeenCalledTimes(1);
-    expect(filesUploadV2.mock.calls[0][0].file_uploads[0].filename).toBe('root-cause-five-batches-lost-leads.csv');
+    const upload = filesUploadV2.mock.calls[0][0];
+    expect(upload.file_uploads[0].filename).toBe('root-cause.csv');
+    expect(upload.file_uploads[0].file.toString('utf8')).toContain('Batch,Lost\r\nB0,0\r\n');
   });
 
   it('drops an earlier investigation in the thread when this one finds nothing to fix', async () => {

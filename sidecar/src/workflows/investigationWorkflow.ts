@@ -340,7 +340,8 @@ Return strict JSON:
       thread_ts: task.event.threadTs,
       text: message,
     })
-    .then(() => true)
+    // Slack can turn a post down without throwing (the thread is gone): no CSV then.
+    .then(response => (response as { ok?: boolean } | undefined)?.ok !== false)
     .catch(() => false);
   // A table in the findings also goes in the thread as a CSV (issue #731).
   if (findingsPosted) {
@@ -515,6 +516,14 @@ function scopeAckText(scope: InvestigationScope, useMetabase: boolean): string {
     : 'Tracing this end-to-end through *newton-web* and *newton-api*. I’ll share what I find.';
 }
 
+/**
+ * A label and its text. Text that opens with a table or a code block goes on
+ * the next line, so the label doesn't join the table's header (issue #731).
+ */
+function labelled(label: string, text: string): string {
+  return /^\s*(\||```)/.test(text) ? `${label}\n${text.trimStart()}` : `${label} ${text}`;
+}
+
 function formatInvestigationMessage(findings: {
   rootCauseHypothesis?: string;
   evidence?: Array<{ file?: string; line?: number; snippet?: string; why?: string }>;
@@ -524,7 +533,7 @@ function formatInvestigationMessage(findings: {
 }): string {
   const parts: string[] = [];
   if (findings.summary) parts.push(`*${findings.summary}*`);
-  if (findings.rootCauseHypothesis) parts.push(`*Root cause:* ${findings.rootCauseHypothesis}`);
+  if (findings.rootCauseHypothesis) parts.push(labelled('*Root cause:*', findings.rootCauseHypothesis));
 
   if (findings.evidence && findings.evidence.length > 0) {
     const items = findings.evidence
@@ -538,7 +547,7 @@ function formatInvestigationMessage(findings: {
     parts.push(`*Evidence:*\n${items}`);
   }
 
-  if (findings.recommendedFix) parts.push(`*Recommended fix:* ${findings.recommendedFix}`);
+  if (findings.recommendedFix) parts.push(labelled('*Recommended fix:*', findings.recommendedFix));
   if (findings.confidence) parts.push(`_Confidence: ${findings.confidence}_`);
 
   return parts.join('\n\n');

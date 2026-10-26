@@ -26,7 +26,7 @@ import {
 } from '../slack/fileAttachments.js';
 import type { AttachmentLimits, UndeliveredAttachment } from '../slack/fileAttachments.js';
 import { buildUndeliveredFollowUp, INLINE_MAX_CHARS } from '../slack/attachmentFollowUp.js';
-import { attachReplyTablesAsCsv, CSV_MIN_ROWS } from '../slack/tableCsv.js';
+import { attachReplyTablesAsCsv, canUploadFiles, CSV_MIN_ROWS, SHEET_EXTENSIONS } from '../slack/tableCsv.js';
 import { botScopes } from '../slack/botScopes.js';
 import { connectorPromptBlock, connectorsFor, NO_CONNECTORS, withConnectors } from '../backends/connectors.js';
 import { collectThreadAttachments, filesForTrigger, type ThreadAttachments } from '../slack/threadAttachments.js';
@@ -239,6 +239,20 @@ Example of a final message that attaches a file:
 ${manifestExample}`;
 }
 
+/**
+ * How a lookup writes a table, and what happens to it (issue #731). A pipe
+ * table in a code block lines up in Slack and can be read back as a CSV; one
+ * lined up with spaces can't. The CSV is promised only while the app can
+ * upload, and the agent never announces it: miniOG posts its own line with it.
+ */
+function tablePromptBlock(): string {
+  const format =
+    '- Write any table as a pipe table inside a code block, so its columns line up in Slack: a header line, a `|---|---|` line with one `---` per column, then one line per row, every line starting and ending with `|`. Never line columns up with spaces instead.';
+  if (!canUploadFiles()) return format;
+  return `${format}
+- A pipe table of ${CSV_MIN_ROWS} or more rows (or any pipe table, when they asked for a sheet or a CSV) is attached under your reply as a CSV automatically, with its own line. Don't mention that CSV yourself. You can't create a Google Sheet; a CSV imports into one. When you show only part of a longer table, attach the full table as a .csv file yourself (see "Attaching files"); then no other CSV is added.`;
+}
+
 export function informationalSystemPrompt(config: AppConfig): string {
   return `You are miniOG, a Slack assistant. The user has asked an informational question — code lookup, "where is X", "how does Y work", documentation, table schemas, data sources.
 
@@ -255,7 +269,7 @@ Constraints:
 - Stay terse. The user reads on Slack; long answers get skipped.
 - Never fabricate file paths or line numbers — only cite things you actually opened.
 - Never trigger a deploy or a GitHub Actions workflow, staging or production, and never push, merge or edit anything in a repo or an outside system. When asked for one, say how it is done.
-- A table of ${CSV_MIN_ROWS} or more rows in your reply (or any table, when they asked for a sheet or a CSV) is attached under it as a CSV automatically: when they want a sheet, say the CSV below imports into one (you can't create a Google Sheet itself). When you show only part of a longer table, attach the full table as a .csv file yourself (see "Attaching files"); then that file is the CSV and nothing else is added.
+${tablePromptBlock()}
 
 ${STE_REPLY_STYLE_BLOCK}
 
@@ -512,13 +526,17 @@ async function runAgenticTurn(params: RunAgenticEntryParams, workspace?: LookupW
       slackPosted: false,
     };
   }
+  // A post Slack turned down (`ok: false`, e.g. the thread's parent is gone)
+  // gets no CSV after it: there is no thread to put it in.
+  let postAccepted = false;
   try {
-    await slack.chat.postMessage({
+    const posted = await slack.chat.postMessage({
       channel: task.event.channelId,
       thread_ts: task.event.threadTs,
       text: replyText,
     });
     slackPosted = true;
+    postAccepted = (posted as { ok?: boolean } | undefined)?.ok !== false;
   } catch (err) {
     logStep?.({
       stage: 'agentic.slack_post_failed',
@@ -530,6 +548,8 @@ async function runAgenticTurn(params: RunAgenticEntryParams, workspace?: LookupW
   // Attachments are supplementary: upload them only once the text landed, and
   // never let an upload failure downgrade an otherwise-good answer.
   let fileOutcome: Record<string, unknown> | undefined;
+  // The agent's own sheet (a .csv, .tsv or .xlsx) that reached the thread.
+  let agentSheetDelivered = false;
   if (attachments.length > 0) {
     const report = await uploadAttachments({
       slack,
@@ -538,6 +558,13 @@ async function runAgenticTurn(params: RunAgenticEntryParams, workspace?: LookupW
       attachments,
       logStep,
     });
+    const undelivered = new Set(report.undelivered.map(file => file.filename));
+    agentSheetDelivered =
+      report.uploaded > 0 &&
+      attachments.some(attachment => {
+        const name = attachment.path.split('/').pop() ?? attachment.path;
+        return SHEET_EXTENSIONS.some(ext => name.toLowerCase().endsWith(ext)) && !undelivered.has(name);
+      });
     logStep?.({
       stage: 'agentic.files.summary',
       message: `Reply attachments: ${attachments.length} listed, ${report.uploaded} uploaded to Slack.`,
@@ -563,14 +590,14 @@ async function runAgenticTurn(params: RunAgenticEntryParams, workspace?: LookupW
   }
 
   // A lookup's tables also go in the thread as CSV files, for a sheet (issue #731).
-  if (mode === 'informational' && slackPosted && result.ok) {
+  if (mode === 'informational' && postAccepted && result.ok) {
     await attachReplyTablesAsCsv({
       slack,
       channelId: task.event.channelId,
       threadTs: task.event.threadTs,
       replyText,
       askText: task.event.text ?? '',
-      csvAlreadyAttached: attachments.some(attachment => attachment.path.toLowerCase().endsWith('.csv')),
+      sheetAlreadyDelivered: agentSheetDelivered,
       logStep,
     });
   }

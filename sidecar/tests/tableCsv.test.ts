@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { WebClient } from '@slack/web-api';
+import { botScopes } from '../src/slack/botScopes.js';
 import {
   asksForSheet,
   attachReplyTablesAsCsv,
@@ -21,6 +22,8 @@ function pipeTable(rows: number, header = '| Batch | Open | Closed |'): string {
   return [header, '|---|---|---|', ...body].join('\n');
 }
 
+afterEach(() => botScopes.setForTest(undefined));
+
 describe('splitTableRow', () => {
   it('drops the outer pipes and trims cells', () => {
     expect(splitTableRow('| a | b |  c |')).toEqual(['a', 'b', 'c']);
@@ -33,6 +36,21 @@ describe('splitTableRow', () => {
 
   it('keeps a pipe inside inline code', () => {
     expect(splitTableRow('| `a | b` | c |')).toEqual(['`a | b`', 'c']);
+  });
+
+  it('keeps the pipe inside a Slack link, mention or channel', () => {
+    expect(
+      splitTableRow('| <https://x.co/pr/1|PR #1> | <@U123|dipesh> | <#C42|general> | <!here> |').map(plainCell),
+    ).toEqual(['PR #1 (https://x.co/pr/1)', '@dipesh', '#general', '@here']);
+  });
+
+  it('reads a stray backtick as text when no closing one follows', () => {
+    expect(splitTableRow("| it's ` odd | b |")).toEqual(["it's ` odd", 'b']);
+  });
+
+  it('drops a last cell only when it is empty', () => {
+    expect(splitTableRow('| a | b | `x|`')).toEqual(['a', 'b', '`x|`']);
+    expect(splitTableRow('| a | |')).toEqual(['a', '']);
   });
 });
 
@@ -91,9 +109,16 @@ describe('extractTables', () => {
     expect(tables.map(t => t.heading)).toEqual(['Open', 'Closed']);
   });
 
-  it('reads a table inside a code fence', () => {
-    const text = '```\n' + pipeTable(5) + '\n```';
-    expect(extractTables(text)[0].rows).toHaveLength(5);
+  it('reads a pipe table inside a plain code block, the way the lookup prompt asks for it', () => {
+    const text = 'Per batch:\n```\n' + pipeTable(5) + '\n```';
+    const [table] = extractTables(text);
+    expect(table.rows).toHaveLength(5);
+    expect(table.heading).toBe('Per batch');
+  });
+
+  it('accepts a one-dash separator, but only with as many columns as the header', () => {
+    expect(extractTables('| a | b |\n|-|-|\n| 1 | 2 |')[0].rows).toEqual([['1', '2']]);
+    expect(extractTables('| a | b | c |\n|---|---|\n| 1 | 2 | 3 |')).toEqual([]);
   });
 
   it('stops a piped table at the first line without an outer pipe', () => {
@@ -113,6 +138,35 @@ describe('extractTables', () => {
     expect(extractTables('• one\n• two\nA | B without a separator\nmore')).toEqual([]);
     expect(extractTables('no tables here')).toEqual([]);
   });
+
+  it('does not read a table lined up with spaces (no pipes): its columns would be a guess', () => {
+    const aligned = [
+      '```',
+      'Batch          Sem  Total  Open',
+      "NST'23 CS+AI   7    26     14",
+      "NST'24 CS+AI   5    82     16",
+      "NST'24 CS+DS   5    4      2",
+      "NST'25 CS+AI   3    90     29",
+      "NST'26 CS+AI   1    26     8",
+      '```',
+    ].join('\n');
+    expect(extractTables(aligned)).toEqual([]);
+  });
+
+  it('skips a table quoted from Markdown docs and a reference table of --flags', () => {
+    const docs = '```markdown\n' + pipeTable(6) + '\n```';
+    expect(extractTables(docs)).toEqual([]);
+    const flags = [
+      '| Flag | Meaning |',
+      '|---|---|',
+      '| --ref | branch to run on |',
+      '| --repo | which repo |',
+      '| -f | a workflow input |',
+      '| --json | output fields |',
+      '| --limit | how many |',
+    ].join('\n');
+    expect(extractTables(flags)).toEqual([]);
+  });
 });
 
 describe('tableToCsv', () => {
@@ -130,9 +184,38 @@ describe('tableToCsv', () => {
     );
   });
 
-  it('neutralises spreadsheet formulas but keeps negative numbers', () => {
-    const csv = tableToCsv({ columns: ['v'], rows: [['=SUM(A1)'], ['+1'], ['@cmd'], ['-5'], ['-3.2'], ['-x']] });
-    expect(csv.split('\r\n').slice(1, -1)).toEqual(["'=SUM(A1)", "'+1", "'@cmd", '-5', '-3.2', "'-x"]);
+  it('neutralises anything a spreadsheet would run, and leaves whole numbers alone', () => {
+    const cells = [
+      '=SUM(A1)',
+      '+1',
+      '@cmd',
+      "-1+cmd|' /C calc'!A0",
+      '-1+IMPORTXML("https://x.co","//a")',
+      '-1-1',
+      '-x',
+      '-5',
+      '-3.2',
+      '+12%',
+      '1,234',
+      '-1,234.50',
+    ];
+    const lines = tableToCsv({ columns: ['v'], rows: cells.map(cell => [cell]) })
+      .split('\r\n')
+      .slice(1, -1);
+    expect(lines).toEqual([
+      "'=SUM(A1)",
+      '+1',
+      "'@cmd",
+      `"'-1+cmd|' /C calc'!A0"`.replace(/^"|"$/g, ''),
+      `"'-1+IMPORTXML(""https://x.co"",""//a"")"`,
+      "'-1-1",
+      "'-x",
+      '-5',
+      '-3.2',
+      '+12%',
+      '"1,234"',
+      '"-1,234.50"',
+    ]);
   });
 });
 
@@ -144,11 +227,15 @@ describe('which tables get a CSV', () => {
     expect(tablesWorthCsv(pipeTable(3), 'can you share a CSV of this?')).toHaveLength(1);
   });
 
-  it('reads sheet asks', () => {
+  it('reads an ask for a sheet, not a sheet named in the message', () => {
     expect(asksForSheet('put it in a google sheet')).toBe(true);
     expect(asksForSheet('export to excel please')).toBe(true);
-    expect(asksForSheet('xlsx?')).toBe(true);
-    expect(asksForSheet('what sheets of paper')).toBe(true);
+    expect(asksForSheet('can I download this?')).toBe(true);
+    expect(asksForSheet('send me the spreadsheet')).toBe(true);
+    expect(asksForSheet('I need an excel file of these')).toBe(true);
+    expect(asksForSheet('as csv please')).toBe(true);
+    expect(asksForSheet('which batches are in DS Spreadsheets - September?')).toBe(false);
+    expect(asksForSheet('what sheets of paper')).toBe(false);
     expect(asksForSheet('how does the cheatsheet work')).toBe(false);
     expect(asksForSheet('<https://x.co/sheet|link> what changed?')).toBe(false);
   });
@@ -161,6 +248,14 @@ describe('which tables get a CSV', () => {
       'open-2.csv',
     ]);
     expect(csvFileNames(extractTables(pipeTable(5)), '')).toEqual(['table.csv']);
+  });
+
+  it('cuts a long name at a word boundary', () => {
+    const [name] = csvFileNames(
+      extractTables(pipeTable(5)),
+      'how many students joined each data science batch since january and from which cities',
+    );
+    expect(name).toBe('how-many-students-joined-each-data-science-batch.csv');
   });
 });
 
@@ -201,7 +296,7 @@ describe('attachReplyTablesAsCsv', () => {
     expect(upload).not.toHaveBeenCalled();
   });
 
-  it('skips when the agent already attached a CSV', async () => {
+  it('skips when the agent already delivered a sheet', async () => {
     const upload = vi.fn();
     const logs: WorkflowStepLog[] = [];
     await attachReplyTablesAsCsv({
@@ -209,11 +304,27 @@ describe('attachReplyTablesAsCsv', () => {
       slack: slackWith(upload),
       replyText: pipeTable(8),
       askText: 'q',
-      csvAlreadyAttached: true,
+      sheetAlreadyDelivered: true,
       logStep: entry => logs.push(entry),
     });
     expect(upload).not.toHaveBeenCalled();
-    expect(logs.map(l => l.stage)).toEqual(['reply.tables_csv.skipped']);
+    expect(logs).toEqual([expect.objectContaining({ stage: 'reply.tables_csv.skipped' })]);
+    expect(logs[0].data).toMatchObject({ reason: 'agent_sheet' });
+  });
+
+  it('skips when the app is known to lack files:write', async () => {
+    botScopes.setForTest(['chat:write', 'files:read']);
+    const upload = vi.fn();
+    const logs: WorkflowStepLog[] = [];
+    await attachReplyTablesAsCsv({
+      ...base,
+      slack: slackWith(upload),
+      replyText: pipeTable(8),
+      askText: 'q',
+      logStep: entry => logs.push(entry),
+    });
+    expect(upload).not.toHaveBeenCalled();
+    expect(logs[0].data).toMatchObject({ reason: 'missing_scope' });
   });
 
   it('logs a failed upload and does not throw', async () => {
@@ -230,5 +341,22 @@ describe('attachReplyTablesAsCsv', () => {
     });
     expect(result.uploaded).toBe(0);
     expect(logs[0]).toMatchObject({ stage: 'reply.tables_csv.failed', level: 'WARN' });
+  });
+
+  it('never throws, even when the logger does', async () => {
+    const upload = vi.fn(async () => {
+      throw new Error('boom');
+    });
+    await expect(
+      attachReplyTablesAsCsv({
+        ...base,
+        slack: slackWith(upload),
+        replyText: pipeTable(5),
+        askText: 'q',
+        logStep: () => {
+          throw new Error('logger down');
+        },
+      }),
+    ).resolves.toEqual({ uploaded: 0 });
   });
 });

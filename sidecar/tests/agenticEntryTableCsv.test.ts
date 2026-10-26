@@ -7,6 +7,7 @@ import { informationalSystemPrompt, runAgenticEntry } from '../src/agentic/agent
 import { runClaudeAgentic } from '../src/agentic/runClaude.js';
 import { JobStore } from '../src/state/jobStore.js';
 import { CSV_NOTE_ONE } from '../src/slack/tableCsv.js';
+import { botScopes } from '../src/slack/botScopes.js';
 import type { AppConfig, NormalizedTask } from '../src/types/contracts.js';
 
 vi.mock('../src/agentic/runClaude.js', () => ({ runClaudeAgentic: vi.fn() }));
@@ -127,6 +128,27 @@ describe('runAgenticEntry attaches a lookup table as CSV', () => {
     expect(filesUploadV2).not.toHaveBeenCalled();
   });
 
+  it("attaches the table when the agent's own CSV didn't reach the thread", async () => {
+    const own = path.join(workDir, 'full.csv');
+    fs.writeFileSync(own, 'Batch,Open\nB1,0\n');
+    // The agent's upload fails; the table's goes through.
+    filesUploadV2.mockRejectedValueOnce(new Error('upload failed')).mockResolvedValue({ ok: true });
+    replies(`Preview below.\n\n${TABLE}\n===FILES===\n${JSON.stringify([{ path: own }])}`);
+    await run('informational', 'open requests per batch?');
+
+    const filenames = filesUploadV2.mock.calls.map(
+      call => (call[0] as { file_uploads: Array<{ filename: string }> }).file_uploads[0].filename,
+    );
+    expect(filenames).toEqual(['full.csv', 'open-requests-per-batch.csv']);
+  });
+
+  it('attaches nothing after a post Slack turned down (the thread is gone)', async () => {
+    vi.mocked(slack.chat.postMessage).mockResolvedValue({ ok: false, error: 'thread_parent_deleted' } as never);
+    replies(TABLE);
+    await run('informational', 'open requests per batch?');
+    expect(filesUploadV2).not.toHaveBeenCalled();
+  });
+
   it('a failed CSV upload leaves the answer a success', async () => {
     filesUploadV2.mockRejectedValue(new Error('missing_scope'));
     replies(TABLE);
@@ -135,7 +157,19 @@ describe('runAgenticEntry attaches a lookup table as CSV', () => {
     expect(result.slackPosted).toBe(true);
   });
 
-  it('tells the lookup agent the table becomes a CSV', () => {
-    expect(informationalSystemPrompt(config)).toContain('is attached under it as a CSV automatically');
+  it('asks the lookup agent for pipe tables in a code block, and promises the CSV only while files can be uploaded', () => {
+    const prompt = informationalSystemPrompt(config);
+    expect(prompt).toContain('Write any table as a pipe table inside a code block');
+    expect(prompt).toContain('is attached under your reply as a CSV automatically');
+    expect(prompt).toContain("Don't mention that CSV yourself");
+
+    botScopes.setForTest(['chat:write', 'files:read']);
+    try {
+      const withoutUploads = informationalSystemPrompt(config);
+      expect(withoutUploads).toContain('Write any table as a pipe table inside a code block');
+      expect(withoutUploads).not.toContain('as a CSV automatically');
+    } finally {
+      botScopes.setForTest(undefined);
+    }
   });
 });
