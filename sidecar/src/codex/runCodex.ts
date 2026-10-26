@@ -346,7 +346,7 @@ export async function runAgent(rawRequest: CodexRunRequest, backend: AgentBacken
   const args = backend.buildArgs(request, outputPath);
   const envOverrides = backend.buildEnv(request, process.env.PATH ?? '');
   // Not the launching terminal's or Claude Code session's variables (issue #572).
-  const env = { ...agentBaseEnv(process.env), ...envOverrides };
+  const env = { ...agentBaseEnv(process.env), ...envOverrides, ...(request.extraEnv ?? {}) };
 
   let timedOut = false;
   let cancelled = false;

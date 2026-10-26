@@ -26,8 +26,15 @@ const {
   unfinishedFollowUpSummary,
   whichPrQuestion,
 } = await import('../src/workflows/shared/followUpPr.js');
-const { __followUpPushDeps, commentFollowUpOnPr, pushFollowUpToPr, relandFollowUpAsNewPr, settleUnfinishedFollowUp } =
-  await import('../src/github/postPipelinePr.js');
+const { NO_PUSH_TO_GITHUB_ENV } = await import('../src/github/noPush.js');
+const {
+  __followUpPushDeps,
+  commentFollowUpOnPr,
+  keepFollowUpOnSideBranch,
+  pushFollowUpToPr,
+  relandFollowUpAsNewPr,
+  settleUnfinishedFollowUp,
+} = await import('../src/github/postPipelinePr.js');
 const { STAGING_STATE_KEY } = await import('../src/workflows/stagingDeployWorkflow.js');
 
 const execFileAsync = promisify(execFile);
@@ -251,13 +258,20 @@ describe('what people and the planner are told', () => {
     expect(text).not.toContain('close it');
   });
 
-  it('says what an unfinished follow-up left on the PR', () => {
-    expect(unfinishedFollowUpLine(PR1, { prUntouched: true, landed: [], wipBranch: 'miniog/followup-wip-1-2' })).toBe(
-      `Nothing was added to ${PR1}; it's as it was. The unreviewed change is on branch \`miniog/followup-wip-1-2\`, with no pull request.`,
+  it('says what an unfinished follow-up left on the PR, in plain words', () => {
+    expect(
+      unfinishedFollowUpLine(PR1, { prUntouched: true, landed: [], wipBranch: 'miniog/followup-wip-1-2-abc1234' }),
+    ).toBe(
+      `Nothing was added to ${PR1}; it's as it was. I saved the unfinished change on a side branch (\`miniog/followup-wip-1-2-abc1234\`), with no pull request.`,
     );
-    expect(unfinishedFollowUpLine(PR1, { prUntouched: false, landed: ['abc123 someone else'] })).toBe(
-      `${PR1} has commits that weren't there when I started (abc123 someone else); this run didn't review them.`,
+    expect(unfinishedFollowUpLine(PR1, { prUntouched: false, landed: ['abc123 someone else'], ours: false })).toBe(
+      `${PR1} has new changes from someone else since I started (abc123 someone else).`,
     );
+    // The coder got a push through before its checks passed.
+    expect(unfinishedFollowUpLine(PR1, { prUntouched: false, landed: ['abc123 coder: footer'], ours: true })).toBe(
+      `My unfinished change reached ${PR1} before its checks passed — don't merge it yet.`,
+    );
+    expect(unfinishedFollowUpLine(PR1, { landed: [] })).toBe(`I couldn't check ${PR1} on GitHub.`);
   });
 });
 
@@ -362,15 +376,89 @@ describe('working on the PR branch and landing on it (real git)', () => {
     expect(await branchHead()).toBe(start);
   });
 
-  it('never pushes a rewritten history: the PR stays as it was, the work goes to a side branch', async () => {
+  const wipName = async () => `miniog/followup-wip-730-5-${await git(ws, ['rev-parse', '--short=7', 'HEAD'])}`;
+
+  it('never pushes a rewritten history: the PR stays as it was (checked), the work goes to a side branch', async () => {
     const start = await checkedOut();
     await writeFile(path.join(ws, 'footer.txt'), 'New footer\n');
     await git(ws, ['commit', '-aq', '--amend', '--no-edit']);
+    const wip = await wipName();
 
     const result = await push(start);
-    expect(result).toEqual({ kind: 'rewritten', wipBranch: 'miniog/followup-wip-730-5' });
+    expect(result).toEqual({
+      kind: 'rewritten',
+      wipBranch: wip,
+      prState: { untouched: true, landed: [], ours: false },
+    });
     expect(await branchHead()).toBe(start);
-    expect(await git(bare, ['show', 'miniog/followup-wip-730-5:footer.txt'])).toBe('New footer');
+    expect(await git(bare, ['show', `${wip}:footer.txt`])).toBe('New footer');
+  });
+
+  it('an amend that was force-pushed anyway is reported as our unchecked change on the PR, not "as it was"', async () => {
+    const start = await checkedOut();
+    await writeFile(path.join(ws, 'footer.txt'), 'New footer\n');
+    await git(ws, ['commit', '-aq', '--amend', '--no-edit']);
+    // The coder got past the push block somehow.
+    await git(ws, ['push', '-q', '--force', 'origin', `HEAD:${BRANCH}`]);
+
+    const result = await push(start);
+    expect(result).toMatchObject({ kind: 'rewritten', prState: { untouched: false, ours: true } });
+  });
+
+  it('a branch the owner rewound is replayed onto, never pushed back to with the dropped commit', async () => {
+    // A second commit on the PR, which the owner later drops.
+    await pushAsOtherPerson('nav.txt', 'Nav that gets dropped\n', 'PR: nav (dropped later)');
+    const start = await checkedOut();
+    await git(seed, ['checkout', '-q', BRANCH]);
+    await git(seed, ['reset', '-q', '--hard', 'HEAD~1']);
+    await git(seed, ['push', '-q', '--force', 'origin', BRANCH]);
+    await git(seed, ['checkout', '-q', 'main']);
+    const rewound = await branchHead();
+    await writeFile(path.join(ws, 'footer.txt'), 'New footer\n');
+
+    expect(await push(start)).toEqual({ kind: 'pushed', ontoNewerCommits: true });
+    const head = await branchHead();
+    expect(await git(bare, ['rev-parse', `${head}^`])).toBe(rewound);
+    expect(await git(bare, ['show', `${head}:nav.txt`])).toBe('Old nav');
+    expect(await git(bare, ['show', `${head}:footer.txt`])).toBe('New footer');
+  });
+
+  it('an unsafe leftover (.env) is set aside for the replay, not read as a clash', async () => {
+    await git(seed, ['checkout', '-q', BRANCH]);
+    await writeFile(path.join(seed, '.env'), 'A=1\n');
+    await git(seed, ['add', '.env']);
+    await git(seed, ['commit', '-qm', 'PR: env']);
+    await git(seed, ['push', '-q', 'origin', BRANCH]);
+    await git(seed, ['checkout', '-q', 'main']);
+    const start = await checkedOut();
+    await pushAsOtherPerson('nav.txt', 'New nav\n', 'someone else: nav');
+    await writeFile(path.join(ws, 'footer.txt'), 'New footer\n');
+    await writeFile(path.join(ws, '.env'), 'A=local-secret\n');
+
+    expect(await push(start)).toEqual({ kind: 'pushed', ontoNewerCommits: true });
+    const head = await branchHead();
+    expect(await git(bare, ['show', `${head}:footer.txt`])).toBe('New footer');
+    // Never committed, and still there for whoever left it.
+    expect(await git(bare, ['show', `${head}:.env`])).toBe('A=1');
+    expect(await readFile(path.join(ws, '.env'), 'utf8')).toBe('A=local-secret\n');
+  });
+
+  it('a rebase left half-done is aborted before the checkout, but never by the push', async () => {
+    const start = await checkedOut();
+    // Leave a conflicting rebase in progress in the worktree.
+    await pushAsOtherPerson('footer.txt', 'Their footer\n', 'someone else: footer');
+    await writeFile(path.join(ws, 'footer.txt'), 'New footer\n');
+    await git(ws, ['commit', '-aqm', 'coder: footer']);
+    await git(ws, ['fetch', '-q', 'origin']);
+    await git(ws, ['rebase', `origin/${BRANCH}`]).catch(() => undefined);
+
+    const refused = await push(start);
+    expect(refused).toMatchObject({ kind: 'failed', reason: 'a rebase was left half-done in the working copy' });
+    // Still in progress: the push didn't start it, so it didn't abort it.
+    expect(fs.existsSync(path.join(await git(ws, ['rev-parse', '--absolute-git-dir']), 'rebase-merge'))).toBe(true);
+
+    expect((await checkoutFollowUpBranch(ws, BRANCH)).ok).toBe(true);
+    expect(fs.existsSync(path.join(await git(ws, ['rev-parse', '--absolute-git-dir']), 'rebase-merge'))).toBe(false);
   });
 
   it('replays our commit on top of what someone else pushed, and pushes normally', async () => {
@@ -385,25 +473,21 @@ describe('working on the PR branch and landing on it (real git)', () => {
     expect(await git(bare, ['show', `${head}:nav.txt`])).toBe('New nav');
   });
 
-  it('stacks only on a conflict, on a uniquely named branch, never pushing over them', async () => {
+  it('a clash with new commits on the PR keeps the change on a side branch: no stacked PR, nothing pushed over them', async () => {
     const start = await checkedOut();
     const theirs = await pushAsOtherPerson('footer.txt', 'Their footer\n', 'someone else: footer');
     await writeFile(path.join(ws, 'footer.txt'), 'New footer\n');
-    const createPullRequest = vi
-      .spyOn(__followUpPushDeps, 'createPullRequest')
-      .mockResolvedValue({ prUrl: 'https://github.com/Newton-School/newton-marketing-web/pull/1499' });
+    const createPullRequest = vi.spyOn(__followUpPushDeps, 'createPullRequest');
 
-    expect(await push(start, '730.9')).toEqual({
-      kind: 'stacked',
-      prUrl: 'https://github.com/Newton-School/newton-marketing-web/pull/1499',
-    });
+    const result = await push(start, '730.9');
+    expect(result).toMatchObject({ kind: 'conflict', prState: { untouched: false, ours: false } });
+    expect(createPullRequest).not.toHaveBeenCalled();
     expect(await branchHead()).toBe(theirs);
-    const stacked = `${BRANCH}-followup-730-9`;
-    expect(await git(bare, ['show', `${stacked}:footer.txt`])).toBe('New footer');
-    expect(createPullRequest).toHaveBeenCalledWith(
-      expect.objectContaining({ branch: stacked, baseBranch: BRANCH, labels: ['miniog'] }),
-    );
-    expect(createPullRequest.mock.calls[0][0].body).toContain(`Merge this one first, then ${PR1}.`);
+    const wip = result.kind === 'conflict' ? result.wipBranch : undefined;
+    expect(wip).toMatch(/^miniog\/followup-wip-730-9-[0-9a-f]{7}$/);
+    expect(await git(bare, ['show', `${wip}:footer.txt`])).toBe('New footer');
+    // The worktree is back where it was, not mid-rebase.
+    expect(fs.existsSync(path.join(await git(ws, ['rev-parse', '--absolute-git-dir']), 'rebase-merge'))).toBe(false);
   });
 
   it('fails without touching the PR when its branch is gone, keeping the work', async () => {
@@ -411,7 +495,7 @@ describe('working on the PR branch and landing on it (real git)', () => {
     await git(bare, ['branch', '-D', BRANCH]);
     await writeFile(path.join(ws, 'footer.txt'), 'New footer\n');
     const result = await push(start);
-    expect(result).toMatchObject({ kind: 'failed', wipBranch: 'miniog/followup-wip-730-5' });
+    expect(result).toMatchObject({ kind: 'failed', wipBranch: await wipName() });
     expect(await remoteBranches()).not.toContain(BRANCH);
   });
 
@@ -427,10 +511,27 @@ describe('working on the PR branch and landing on it (real git)', () => {
       startHead: start,
       uniqueTs: '730.5',
     });
-    expect(settled).toEqual({ prUntouched: true, landed: [], wipBranch: 'miniog/followup-wip-730-5' });
+    const wip = await wipName();
+    expect(settled).toEqual({ prUntouched: true, landed: [], wipBranch: wip });
     expect(await branchHead()).toBe(start);
-    expect(await git(bare, ['show', 'miniog/followup-wip-730-5:footer.txt'])).toBe('Half-done footer');
-    expect(await git(bare, ['show', 'miniog/followup-wip-730-5:nav.txt'])).toBe('uncommitted');
+    expect(await git(bare, ['show', `${wip}:footer.txt`])).toBe('Half-done footer');
+    expect(await git(bare, ['show', `${wip}:nav.txt`])).toBe('uncommitted');
+  });
+
+  it("a failed run whose coder pushed anyway says it's our unchecked change on the PR", async () => {
+    const start = await checkedOut();
+    await writeFile(path.join(ws, 'footer.txt'), 'Half-done footer\n');
+    await git(ws, ['commit', '-aqm', 'coder: footer (failed review)']);
+    await git(ws, ['push', '-q', 'origin', `HEAD:${BRANCH}`]);
+
+    const settled = await settleUnfinishedFollowUp({
+      repoPath: ws,
+      branch: BRANCH,
+      startHead: start,
+      uniqueTs: '730.5',
+    });
+    expect(settled).toMatchObject({ prUntouched: false, ours: true });
+    expect(unfinishedFollowUpLine(PR1, settled)).toContain("before its checks passed — don't merge it yet");
   });
 
   it('a failed run names commits that landed on the PR meanwhile', async () => {
@@ -470,7 +571,6 @@ describe('working on the PR branch and landing on it (real git)', () => {
       threadTs: '730.1',
       summary: 'Change the footer copy',
       originalPrUrl: PR1,
-      originalState: 'MERGED',
       requestedBy: 'Raj',
     });
     expect(result).toEqual({
@@ -485,6 +585,70 @@ describe('working on the PR branch and landing on it (real git)', () => {
     expect(createPullRequest.mock.calls[0][0].body).toContain(
       `Follow-up to ${PR1}, which was merged before this change was ready`,
     );
+  });
+
+  it('a merged PR whose main already has everything the follow-up does opens nothing ("already in main")', async () => {
+    const start = await checkedOut();
+    await writeFile(path.join(ws, 'footer.txt'), 'New footer\n');
+    await git(ws, ['commit', '-aqm', 'coder: footer']);
+    // Someone already made the same change on main (merging the PR and the same footer edit).
+    await git(seed, ['fetch', '-q', 'origin']);
+    await git(seed, ['checkout', '-q', 'main']);
+    await git(seed, ['merge', '-q', '--ff-only', `origin/${BRANCH}`]);
+    await writeFile(path.join(seed, 'footer.txt'), 'New footer\n');
+    await git(seed, ['commit', '-aqm', 'main: same footer']);
+    await git(seed, ['push', '-q', 'origin', 'main']);
+    const createPullRequest = vi.spyOn(__followUpPushDeps, 'createPullRequest');
+
+    expect(
+      await relandFollowUpAsNewPr({
+        repoPath: ws,
+        startHead: start,
+        uniqueTs: '730.5',
+        threadTs: '730.1',
+        summary: 'Change the footer copy',
+        originalPrUrl: PR1,
+      }),
+    ).toEqual({ kind: 'already' });
+    expect(createPullRequest).not.toHaveBeenCalled();
+  });
+
+  it('a closed PR is not revived: the checked change is kept on a side branch', async () => {
+    const start = await checkedOut();
+    await writeFile(path.join(ws, 'footer.txt'), 'New footer\n');
+    const kept = await keepFollowUpOnSideBranch({
+      repoPath: ws,
+      startHead: start,
+      uniqueTs: '730.5',
+      summary: 'footer',
+    });
+    expect(kept.nothing).toBe(false);
+    expect(kept.wipBranch).toBe(await wipName());
+    expect(await git(bare, ['show', `${kept.wipBranch}:footer.txt`])).toBe('New footer');
+    expect(await branchHead()).toBe(start);
+  });
+
+  it("the coder's git can't push to GitHub in follow-up mode (real git push)", async () => {
+    await writeFile(path.join(ws, 'footer.txt'), 'New footer\n');
+    await git(ws, ['commit', '-aqm', 'coder: footer']);
+    const pushWithEnv = (target: string) =>
+      execFileAsync('git', ['push', '-q', target, 'HEAD:refs/heads/x'], {
+        cwd: ws,
+        env: { ...process.env, ...NO_PUSH_TO_GITHUB_ENV, GIT_TERMINAL_PROMPT: '0' },
+      });
+    for (const url of [
+      'https://github.com/Newton-School/newton-marketing-web.git',
+      'git@github.com:Newton-School/newton-marketing-web.git',
+      'ssh://git@github.com/Newton-School/newton-marketing-web.git',
+    ]) {
+      await expect(pushWithEnv(url)).rejects.toThrow(/no-push/);
+    }
+    // A clone of a GitHub repo: a plain `git push` to origin is refused too.
+    await git(ws, ['remote', 'set-url', 'origin', 'https://github.com/Newton-School/newton-marketing-web.git']);
+    await expect(pushWithEnv('origin')).rejects.toThrow(/no-push/);
+    // Only GitHub pushes are rewritten.
+    await git(ws, ['remote', 'set-url', 'origin', bare]);
+    await expect(pushWithEnv('origin')).resolves.toBeDefined();
   });
 
   it('posts the engineering account on the PR as a comment, and says when it could not', async () => {

@@ -197,22 +197,29 @@ async function boundedDiff(url: string, logStep?: WorkflowStepLogger): Promise<{
   }
 }
 
-/** The PR as it is on GitHub now, or undefined when GitHub can't say. */
+/** How long `readPrNow` waits before its one retry. A test seam. */
+export const __followUpTiming = { retryMs: 1_500 };
+
+/** The PR as it is on GitHub now, asked twice before saying GitHub can't say. */
 export async function readPrNow(
   url: string,
 ): Promise<{ state: string; branch?: string; head?: string; crossRepo: boolean } | undefined> {
-  try {
-    const view = await __followUpDeps.viewPr(url);
-    if (!view.state) return undefined;
-    return {
-      state: view.state,
-      ...(view.headRefName ? { branch: view.headRefName } : {}),
-      ...(view.headRefOid ? { head: view.headRefOid } : {}),
-      crossRepo: Boolean(view.isCrossRepository),
-    };
-  } catch {
-    return undefined;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) await new Promise(resolve => setTimeout(resolve, __followUpTiming.retryMs));
+    try {
+      const view = await __followUpDeps.viewPr(url);
+      if (!view.state) continue;
+      return {
+        state: view.state,
+        ...(view.headRefName ? { branch: view.headRefName } : {}),
+        ...(view.headRefOid ? { head: view.headRefOid } : {}),
+        crossRepo: Boolean(view.isCrossRepository),
+      };
+    } catch {
+      // Asked again below, once.
+    }
   }
+  return undefined;
 }
 
 /** The question when several open PRs from this thread could take the change. */
@@ -241,18 +248,31 @@ export function followUpNoteFor(lookup: FollowUpLookup): string {
  */
 export function unfinishedFollowUpLine(
   prUrl: string,
-  settled: { prUntouched?: boolean; landed: string[]; wipBranch?: string },
+  settled: { prUntouched?: boolean; landed: string[]; ours?: boolean; wipBranch?: string },
 ): string {
-  const prPart =
-    settled.prUntouched === true
-      ? `Nothing was added to ${prUrl}; it's as it was.`
-      : settled.prUntouched === false
-        ? `${prUrl} has commits that weren't there when I started (${settled.landed.join('; ') || 'see the pull request'}); this run didn't review them.`
-        : `I couldn't check ${prUrl} on GitHub; nothing from this run was pushed to it.`;
-  const wip = settled.wipBranch
-    ? ` The unreviewed change is on branch \`${settled.wipBranch}\`, with no pull request.`
-    : '';
-  return `${prPart}${wip}`;
+  return `${prStatePart(prUrl, settled)}${savedPart(settled.wipBranch, 'the unfinished change')}`;
+}
+
+/** What the PR's branch looks like now, in plain words. Never "as it was" unless it was fetched and is. */
+export function prStatePart(prUrl: string, state: { prUntouched?: boolean; landed: string[]; ours?: boolean }): string {
+  if (state.prUntouched === true) return `Nothing was added to ${prUrl}; it's as it was.`;
+  if (state.prUntouched === false && state.ours) {
+    return `My unfinished change reached ${prUrl} before its checks passed — don't merge it yet.`;
+  }
+  if (state.prUntouched === false) {
+    return `${prUrl} has new changes from someone else since I started (${state.landed.join('; ') || 'see the pull request'}).`;
+  }
+  return `I couldn't check ${prUrl} on GitHub.`;
+}
+
+/** A PR the coder opened although it was told to only commit, on its own line; or nothing. */
+export function strayPrLine(strayPrUrl: string | undefined, prUrl: string): string {
+  return strayPrUrl && strayPrUrl !== prUrl ? `\nI also opened ${strayPrUrl} by mistake; you can close it.` : '';
+}
+
+/** "I saved … on a side branch (`name`)", or nothing. */
+export function savedPart(wipBranch: string | undefined, what: string): string {
+  return wipBranch ? ` I saved ${what} on a side branch (\`${wipBranch}\`), with no pull request.` : '';
 }
 
 /**
@@ -264,7 +284,7 @@ export function unfinishedFollowUpSummary(
   result: PipelineResult,
   reason: string | undefined,
   prUrl: string,
-  settled: { prUntouched?: boolean; landed: string[]; wipBranch?: string },
+  settled: { prUntouched?: boolean; landed: string[]; ours?: boolean; wipBranch?: string },
 ): string {
   return buildUnfinishedRunMessage({ result, reason }).replace(
     prLine(undefined),
@@ -310,6 +330,11 @@ export async function checkoutFollowUpBranch(
     return { ok: false, reason: 'not a miniOG worktree' };
   }
   try {
+    // A rebase, cherry-pick or merge an earlier run left half-done in this
+    // worktree would block the checkout: nothing of it is wanted any more.
+    for (const op of ['rebase', 'cherry-pick', 'merge']) {
+      await __followUpDeps.git(wsPath, [op, '--abort']).catch(() => undefined);
+    }
     await __followUpDeps.git(wsPath, ['fetch', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
     await __followUpDeps.git(wsPath, ['checkout', '--detach', '--force', `origin/${branch}`]);
     await __followUpDeps.git(wsPath, ['clean', '-fd']);

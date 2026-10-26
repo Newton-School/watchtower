@@ -57,9 +57,11 @@ import {
   commentFollowUpOnPr,
   createPrFromWorkspace,
   findRunPr,
+  keepFollowUpOnSideBranch,
   pushFollowUpToPr,
   relandFollowUpAsNewPr,
   settleUnfinishedFollowUp,
+  type PrBranchState,
 } from '../github/postPipelinePr.js';
 import {
   checkoutFollowUpBranch,
@@ -68,9 +70,12 @@ import {
   followUpPlanNote,
   followUpPlannerBlock,
   originSlug,
+  prStatePart,
   readPrNow,
+  savedPart,
   STAGING_STILL_OLD,
   stagingShowsBranch,
+  strayPrLine,
   unfinishedFollowUpLine,
   unfinishedFollowUpSummary,
   whichPrQuestion,
@@ -2031,19 +2036,30 @@ export async function prepareForCoder(params: {
 }
 
 export type LandedFollowUp =
-  | { kind: 'added'; ontoNewerCommits: boolean; commented: boolean; stagingStillOld: boolean; wipBranch?: undefined }
-  | { kind: 'stacked'; prUrl: string; wipBranch?: undefined }
-  | { kind: 'relanded'; prUrl: string; state: 'MERGED' | 'CLOSED'; wipBranch?: undefined }
-  | { kind: 'nothing'; wipBranch?: undefined }
-  | { kind: 'rewritten'; wipBranch?: string }
-  | { kind: 'failed'; reason: string; wipBranch?: string };
+  | {
+      kind: 'added';
+      ontoNewerCommits: boolean;
+      commented: boolean;
+      stagingStillOld: boolean;
+      /** The PR merged in the moment between the push and the re-read: this commit isn't in it. */
+      mergedMeanwhile: boolean;
+    }
+  | { kind: 'conflict'; wipBranch?: string; prState?: PrBranchState }
+  | { kind: 'relanded'; prUrl: string }
+  | { kind: 'already' }
+  | { kind: 'closed'; wipBranch?: string }
+  | { kind: 'nothing' }
+  | { kind: 'rewritten'; wipBranch?: string; prState?: PrBranchState }
+  | { kind: 'failed'; reason: string; wipBranch?: string; prState?: PrBranchState; mergedMeanwhile?: boolean };
 
 /**
  * Lands a follow-up whose checks passed (issue #730). The PR is read again
- * first: if it was merged or closed while the run worked, pushing to its
- * branch would land on a dead branch, so the new commits become a fresh PR
- * from the default branch instead. Otherwise the commits go onto the PR's
- * branch, and the engineering account goes on the PR as a comment.
+ * first (asked twice). Merged while the run worked: pushing to its branch
+ * would land on a dead branch, so the new commits become a fresh PR from the
+ * default branch. Closed: the work is kept on a side branch and the person is
+ * asked, not revived. Otherwise the commits go onto the PR's branch, the PR is
+ * read once more in case it merged in that moment, and the engineering
+ * account goes on the PR as a comment.
  */
 export async function landFollowUp(params: {
   followUp: { pr: FollowUpPr; startHead: string };
@@ -2059,11 +2075,13 @@ export async function landFollowUp(params: {
     readPr?: typeof readPrNow;
     push?: typeof pushFollowUpToPr;
     reland?: typeof relandFollowUpAsNewPr;
+    keep?: typeof keepFollowUpOnSideBranch;
     comment?: typeof commentFollowUpOnPr;
   };
 }): Promise<LandedFollowUp> {
   const { followUp, repoPath, task, summary, requestedBy, store, logStep, onLog, deps } = params;
   const { pr, startHead } = followUp;
+  const readPr = deps?.readPr ?? readPrNow;
   const common = {
     repoPath,
     startHead,
@@ -2072,57 +2090,71 @@ export async function landFollowUp(params: {
     summary,
     requestedBy,
   };
+  const fallback = (
+    reason: string,
+    message: string,
+    data: Record<string, unknown> = {},
+    level: 'INFO' | 'WARN' | 'ERROR' = 'INFO',
+  ) =>
+    logStep?.({ stage: 'implementation.followup.fallback', message, level, data: { prUrl: pr.url, reason, ...data } });
 
-  const now = await (deps?.readPr ?? readPrNow)(pr.url);
-  if (now && (now.state === 'MERGED' || now.state === 'CLOSED')) {
-    const state = now.state;
+  const now = await readPr(pr.url);
+  if (now?.state === 'MERGED') {
     const relanded = await (deps?.reland ?? relandFollowUpAsNewPr)({
       ...common,
       originalPrUrl: pr.url,
-      originalState: state,
       channelId: task.event.channelId,
       onLog,
     });
-    logStep?.({
-      stage: 'implementation.followup.fallback',
-      message: `${pr.url} was ${state.toLowerCase()} while the run worked — ${relanded.kind === 'opened' ? `opened ${relanded.prUrl} from the default branch` : relanded.kind}.`,
-      level: relanded.kind === 'failed' ? 'ERROR' : 'INFO',
-      data: { prUrl: pr.url, reason: state.toLowerCase(), result: relanded },
-    });
-    if (relanded.kind === 'opened') return { kind: 'relanded', prUrl: relanded.prUrl, state };
+    fallback(
+      'merged',
+      `${pr.url} was merged while the run worked — ${relanded.kind === 'opened' ? `opened ${relanded.prUrl} from the default branch` : relanded.kind}.`,
+      { result: relanded },
+      relanded.kind === 'failed' ? 'ERROR' : 'INFO',
+    );
+    if (relanded.kind === 'opened') return { kind: 'relanded', prUrl: relanded.prUrl };
+    if (relanded.kind === 'already') return { kind: 'already' };
     if (relanded.kind === 'nothing') return { kind: 'nothing' };
-    return { kind: 'failed', reason: relanded.reason, wipBranch: relanded.wipBranch };
+    return { kind: 'failed', reason: relanded.reason, wipBranch: relanded.wipBranch, mergedMeanwhile: true };
+  }
+  if (now?.state === 'CLOSED') {
+    const kept = await (deps?.keep ?? keepFollowUpOnSideBranch)({ ...common, onLog });
+    fallback('closed', `${pr.url} was closed while the run worked — kept the change on a side branch and asked.`, {
+      wipBranch: kept.wipBranch,
+    });
+    return kept.nothing ? { kind: 'nothing' } : { kind: 'closed', wipBranch: kept.wipBranch };
   }
 
   const push = await (deps?.push ?? pushFollowUpToPr)({ ...common, branch: pr.branch, prUrl: pr.url, onLog });
   if (push.kind === 'pushed') {
-    const commented = await (deps?.comment ?? commentFollowUpOnPr)({
-      repoPath,
-      prUrl: pr.url,
-      summary,
-      requestedBy,
-      channelId: task.event.channelId,
-      threadTs: task.event.threadTs,
-    });
+    // It may have merged in the moment between the read above and the push.
+    const after = await readPr(pr.url);
+    const mergedMeanwhile = after?.state === 'MERGED';
+    const commented = mergedMeanwhile
+      ? false
+      : await (deps?.comment ?? commentFollowUpOnPr)({
+          repoPath,
+          prUrl: pr.url,
+          summary,
+          requestedBy,
+          channelId: task.event.channelId,
+          threadTs: task.event.threadTs,
+        });
     logStep?.({
-      stage: 'implementation.followup.pushed',
-      message: `Added the change to ${pr.url} (${pr.branch})${push.ontoNewerCommits ? ', on top of commits someone else pushed meanwhile' : ''}.`,
+      stage: mergedMeanwhile ? 'implementation.followup.merged_meanwhile' : 'implementation.followup.pushed',
+      message: mergedMeanwhile
+        ? `${pr.url} merged just as the follow-up was pushed to ${pr.branch}: the commit isn't in it.`
+        : `Added the change to ${pr.url} (${pr.branch})${push.ontoNewerCommits ? ', on top of changes made meanwhile' : ''}.`,
+      level: mergedMeanwhile ? 'WARN' : 'INFO',
       data: { prUrl: pr.url, branch: pr.branch, ontoNewerCommits: push.ontoNewerCommits, commented },
     });
     return {
       kind: 'added',
       ontoNewerCommits: push.ontoNewerCommits,
       commented,
-      stagingStillOld: stagingShowsBranch(deployStoreOf(store), pr),
+      stagingStillOld: !mergedMeanwhile && stagingShowsBranch(deployStoreOf(store), pr),
+      mergedMeanwhile,
     };
-  }
-  if (push.kind === 'stacked') {
-    logStep?.({
-      stage: 'implementation.followup.fallback',
-      message: `${pr.branch} moved and the change conflicts with it — opened ${push.prUrl} into it instead.`,
-      data: { prUrl: pr.url, reason: 'branch_moved_conflict', stackedPrUrl: push.prUrl },
-    });
-    return push;
   }
   if (push.kind === 'nothing') {
     logStep?.({
@@ -2132,21 +2164,70 @@ export async function landFollowUp(params: {
     });
     return push;
   }
-  logStep?.({
-    stage: 'implementation.followup.fallback',
-    message:
-      push.kind === 'rewritten'
+  // Our own unchecked commits reached the PR (the coder got a push through):
+  // the loudest case, whatever else went wrong.
+  const level = push.prState?.ours ? 'ERROR' : push.kind === 'failed' ? 'ERROR' : 'WARN';
+  const reason =
+    push.kind === 'conflict'
+      ? 'branch_moved_conflict'
+      : push.kind === 'rewritten'
+        ? 'history_rewritten'
+        : 'push_failed';
+  fallback(
+    reason,
+    push.kind === 'conflict'
+      ? `${pr.branch} changed and the follow-up clashes with it — kept on a side branch, nothing pushed.`
+      : push.kind === 'rewritten'
         ? `The coder rewrote ${pr.url}'s history instead of adding a commit — not pushed.`
         : `Couldn't push the follow-up to ${pr.url}: ${push.reason}`,
-    level: push.kind === 'rewritten' ? 'WARN' : 'ERROR',
-    data: {
-      prUrl: pr.url,
-      reason: push.kind === 'rewritten' ? 'history_rewritten' : 'push_failed',
+    {
       ...(push.kind === 'failed' ? { detail: push.reason } : {}),
       wipBranch: push.wipBranch,
+      prState: push.prState,
+      ...(push.prState?.ours ? { uncheckedCommitsOnPr: true } : {}),
     },
-  });
+    level,
+  );
   return push;
+}
+
+/** What the thread is told after a follow-up's checks passed (issue #730), in plain words. */
+export function landedFollowUpText(params: {
+  outcome: LandedFollowUp;
+  prUrl: string;
+  /** The usual change reply for a given PR link (`composeChangeReply`). */
+  reply: (prUrl: string, opts?: { addedTo?: boolean; notesInPr?: boolean }) => string;
+  /** A PR the coder opened although it was told not to. */
+  strayPrUrl?: string;
+}): string {
+  const { outcome, prUrl, reply } = params;
+  const stray = strayPrLine(params.strayPrUrl, prUrl);
+  switch (outcome.kind) {
+    case 'added': {
+      if (outcome.mergedMeanwhile) {
+        return `${reply('')}\n\n${prUrl} was merged just as I added this, so this change isn't in it. Mention me and I'll open it as its own pull request.${stray}`;
+      }
+      const lines = [reply(prUrl, { addedTo: true, notesInPr: outcome.commented })];
+      if (outcome.ontoNewerCommits)
+        lines.push('It had changed since I started; this change is on top of those changes.');
+      if (outcome.stagingStillOld) lines.push(STAGING_STILL_OLD);
+      return `${lines.join('\n')}${stray}`;
+    }
+    case 'conflict':
+      return `${reply('')}\n\nThis clashes with what's on ${prUrl} now, so I didn't add it.${savedPart(outcome.wipBranch, 'it')} Mention me and I'll redo it on top of the latest version.${outcome.prState?.ours ? ` ${prStatePart(prUrl, { prUntouched: false, landed: outcome.prState.landed, ours: true })}` : ''}${stray}`;
+    case 'relanded':
+      return `${reply(outcome.prUrl)}\n\n${prUrl} was merged while I worked, so this change is in a new pull request.${stray}`;
+    case 'already':
+      return `${reply('')}\n\n${prUrl} was merged while I worked, and everything this change does is already in the main branch, so there's nothing new to add.${stray}`;
+    case 'closed':
+      return `${reply('')}\n\n${prUrl} was closed while I worked, so I didn't add this to it.${savedPart(outcome.wipBranch, 'the change')} Want it as a new pull request? Mention me and say so.${stray}`;
+    case 'nothing':
+      return `${reply('')}\n\nNothing new was added to ${prUrl}.${stray}`;
+    case 'rewritten':
+      return `${reply('')}\n\nI didn't add this to ${prUrl}: it was saved in a way that would have replaced what's already there. ${prStatePart(prUrl, outcome.prState ? { prUntouched: outcome.prState.untouched, landed: outcome.prState.landed, ours: outcome.prState.ours } : { landed: [] })}${savedPart(outcome.wipBranch, 'the change')}${stray}`;
+    default:
+      return `${reply('')}\n\n${outcome.mergedMeanwhile ? `${prUrl} was merged while I worked, and I couldn't open this as a new pull request.` : `I couldn't add this to ${prUrl}.`}${outcome.prState ? ` ${prStatePart(prUrl, { prUntouched: outcome.prState.untouched, landed: outcome.prState.landed, ours: outcome.prState.ours })}` : ''}${savedPart(outcome.wipBranch, 'the change')}${stray}`;
+  }
 }
 
 /**
@@ -3087,6 +3168,8 @@ async function runImplementationWorkflowBody(params: {
       policyPack: repoPolicyPackForCwd(pipelineCwd, config),
       // The coder commits to the thread's open PR instead of opening one (issue #730).
       followUp: activeFollowUp ? { prUrl: activeFollowUp.pr.url, branch: activeFollowUp.pr.branch } : undefined,
+      // Every commit since the PR commit it started from is reviewed, also after a coder question.
+      diffBaseSha: activeFollowUp?.startHead,
     });
 
     // The follow-up block is the coder's only when it really adds to that PR.
@@ -3275,11 +3358,19 @@ async function runImplementationWorkflowBody(params: {
       // A stopped follow-up pushed nothing to its PR: say so, and keep the work (issue #730).
       if (activeFollowUp) {
         const settled = await settleFollowUp(activeFollowUp);
+        if (settled.ours) {
+          logStep?.({
+            stage: 'implementation.followup.unfinished',
+            message: `The follow-up was stopped, and its unchecked commits are on ${activeFollowUp.pr.url}.`,
+            level: 'ERROR',
+            data: { prUrl: activeFollowUp.pr.url, ...settled },
+          });
+        }
         await slack.chat
           .postMessage({
             channel: task.event.channelId,
             thread_ts: task.event.threadTs,
-            text: unfinishedFollowUpLine(activeFollowUp.pr.url, settled),
+            text: `${unfinishedFollowUpLine(activeFollowUp.pr.url, settled)}${strayPrLine(coderReportedPrUrl(fullResult.steps), activeFollowUp.pr.url)}`,
           })
           .catch(() => {});
       }
@@ -3296,10 +3387,13 @@ async function runImplementationWorkflowBody(params: {
           : fullResult.interrupted
             ? killedFromOutsideReply(`The ${fullResult.interrupted.role}`)
             : undefined;
-      const failureSummary = unfinishedFollowUpSummary(fullResult, interruptedReason, activeFollowUp.pr.url, settled);
+      const failureSummary = `${unfinishedFollowUpSummary(fullResult, interruptedReason, activeFollowUp.pr.url, settled)}${strayPrLine(coderReportedPrUrl(fullResult.steps), activeFollowUp.pr.url)}`;
       logStep?.({
         stage: 'implementation.followup.unfinished',
-        message: `The follow-up did not pass; ${activeFollowUp.pr.url} ${settled.prUntouched ? 'is as it was' : 'was not confirmed unchanged'}.`,
+        message: settled.ours
+          ? `The follow-up did not pass, and its unchecked commits are on ${activeFollowUp.pr.url}.`
+          : `The follow-up did not pass; ${activeFollowUp.pr.url} ${settled.prUntouched ? 'is as it was' : 'was not confirmed unchanged'}.`,
+        level: settled.ours ? 'ERROR' : 'WARN',
         data: { finalStatus: fullResult.finalStatus, prUrl: activeFollowUp.pr.url, ...settled },
       });
       await slack.chat.postMessage({
@@ -3311,7 +3405,8 @@ async function runImplementationWorkflowBody(params: {
         workflow: 'IMPLEMENTATION',
         status: 'FAILED',
         message: failureSummary,
-        notifyDesktop: false,
+        // Unchecked commits on someone's PR need an admin's eyes.
+        notifyDesktop: Boolean(settled.ours),
         slackPosted: true,
       };
     }
@@ -3468,40 +3563,25 @@ async function runImplementationWorkflowBody(params: {
         logStep,
         onLog: followUpLog,
       });
-      const wipLine = outcome.wipBranch
-        ? ` The change is on branch \`${outcome.wipBranch}\`, with no pull request.`
-        : '';
-      let text: string;
-      switch (outcome.kind) {
-        case 'added':
-          text = `${replyFor(activeFollowUp.pr.url, externalBlock, false, true, outcome.commented)}${outcome.ontoNewerCommits ? `\nSomeone else had pushed to it meanwhile; this change is on top of their commits.` : ''}${outcome.stagingStillOld ? `\n${STAGING_STILL_OLD}` : ''}`;
-          break;
-        case 'stacked':
-          text = `${replyFor(outcome.prUrl, externalBlock)}\n\nSomeone else pushed to ${activeFollowUp.pr.url} while I worked, and this change conflicts with their commits, so I didn't push over them: it's in its own pull request into that branch. Merge this one first, then ${activeFollowUp.pr.url}.`;
-          break;
-        case 'relanded':
-          text = `${replyFor(outcome.prUrl, externalBlock)}\n\n${activeFollowUp.pr.url} was ${outcome.state === 'MERGED' ? 'merged' : 'closed'} while I worked, so this change is in a new pull request.`;
-          break;
-        case 'nothing':
-          text = `${replyFor('', externalBlock)}\n\nNothing new was added to ${activeFollowUp.pr.url}.`;
-          break;
-        case 'rewritten':
-          text = `${replyFor('', externalBlock, true)}\n\nThe coder changed ${activeFollowUp.pr.url}'s existing commits instead of adding one, so I didn't push it. Nothing was added to ${activeFollowUp.pr.url}; it's as it was.${wipLine}`;
-          break;
-        default:
-          text = `${replyFor('', externalBlock, true)}\n\nI couldn't add this to ${activeFollowUp.pr.url}, so nothing was added to it.${wipLine}`;
-      }
-      const delivered = outcome.kind === 'added' || outcome.kind === 'stacked' || outcome.kind === 'relanded';
+      const text = landedFollowUpText({
+        outcome,
+        prUrl: activeFollowUp.pr.url,
+        // Plain words for the person who asked: no "could not open a pull request" warning here.
+        reply: (link, opts) => replyFor(link, externalBlock, false, opts?.addedTo ?? false, opts?.notesInPr ?? true),
+        strayPrUrl: prUrl || undefined,
+      });
+      const delivered = (outcome.kind === 'added' && !outcome.mergedMeanwhile) || outcome.kind === 'relanded';
+      const quiet = outcome.kind === 'nothing' || outcome.kind === 'already' || outcome.kind === 'closed';
       await slack.chat.postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text });
       return {
         workflow: 'IMPLEMENTATION',
-        status: delivered || outcome.kind === 'nothing' ? 'SUCCESS' : 'FAILED',
+        status: delivered || quiet ? 'SUCCESS' : 'FAILED',
         message: summary,
-        notifyDesktop: !delivered && outcome.kind !== 'nothing',
+        notifyDesktop: !delivered && !quiet,
         slackPosted: true,
-        ...(outcome.kind === 'added'
+        ...(outcome.kind === 'added' && !outcome.mergedMeanwhile
           ? { result: { prUrl: activeFollowUp.pr.url } }
-          : outcome.kind === 'stacked' || outcome.kind === 'relanded'
+          : outcome.kind === 'relanded'
             ? { result: { prUrl: outcome.prUrl } }
             : {}),
       };
