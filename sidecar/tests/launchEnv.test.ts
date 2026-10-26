@@ -50,6 +50,8 @@ describe('what agents inherit from whoever started the app', () => {
       'CLAUDE_CODE_ENTRYPOINT',
       'CLAUDE_CODE_EXECPATH',
       'CLAUDE_CODE_SESSION_ATTENDED',
+      // The backend sets the agent's shell itself (issue #622).
+      'CLAUDE_CODE_SHELL',
     ]) {
       expect(isInheritedLaunchVar(key)).toBe(true);
     }

@@ -16,7 +16,15 @@ export function isTerminalShimDir(dir: string): boolean {
   return /[\\/]cmux-cli-shims(?:[\\/]|$)/.test(dir);
 }
 
-const PARENT_SESSION_KEYS = new Set(['CLAUDECODE', 'CLAUDE_EFFORT', 'CLAUDE_JOB_DIR', 'CLAUDE_PID']);
+// CLAUDE_CODE_SHELL too: the backend sets the agent's shell itself, and with
+// `WATCHTOWER_AGENT_SHELL=default` an inherited one would still win (issue #622).
+const PARENT_SESSION_KEYS = new Set([
+  'CLAUDECODE',
+  'CLAUDE_EFFORT',
+  'CLAUDE_JOB_DIR',
+  'CLAUDE_PID',
+  'CLAUDE_CODE_SHELL',
+]);
 /** A parent Claude Code session's identity and channels. Tuning variables (`CLAUDE_CODE_MAX_RETRIES`) stay. */
 const PARENT_SESSION_CODE_RE = /^CLAUDE_CODE_\w*(SESSION|SOCKET|TOKEN|CHILD|ENTRYPOINT|EXECPATH|BRIDGE|ATTENDED)/;
 const TERMINAL_PREFIX_RE = /^(CMUX_|GHOSTTY_)/;

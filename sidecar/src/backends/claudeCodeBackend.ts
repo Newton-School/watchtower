@@ -197,14 +197,42 @@ export const PROCESS_KILL_DENY_RULES = ['Bash(pkill:*)', 'Bash(killall:*)'];
  * `git checkout`, and any read outside those directories. On top of that:
  * - files written and read back under /tmp, which is where the reply's
  *   attachments go (`Edit` rules cover the Write tool; /tmp is /private/tmp);
- * - read-only GitHub CLI commands, for questions about pull requests and runs.
+ * - read-only GitHub CLI commands, for questions about pull requests and runs;
+ * - a few read-only git commands (issue #622). Measured on CLI 2.1.310, once
+ *   a run has `cd`-ed into a repo below its working directory, `dontAsk`
+ *   refuses every git command there, `git log` and `git status` included;
+ *   `cd <dir> && git …` and `git -C <dir> …` are refused whatever the rules
+ *   say. So the prompt tells agents to `cd` in one command and run git in the
+ *   next, and these rules let that git through.
+ *   A rule allows its command with any flags: the CLI matches only a prefix
+ *   (`Bash(git log:*)`) and ignores a `*` anywhere else, so a deny rule cannot
+ *   pick out one flag. Only commands whose every flag is safe are listed:
+ *   - not `git grep`: `-O<program>` / `--open-files-in-pager` runs a program;
+ *   - not `git blame` (`--contents <file>`) or `git diff` (`--no-index`): both
+ *     read any file the shell can, outside the repos;
+ *   - not `git cat-file` (`--filters` runs configured filters), not needed.
+ *   A write flag on what is left (`git log --output=<file>`) is refused by
+ *   the sandbox outside /tmp; `--textconv`/`--ext-diff` run only drivers from
+ *   the git config, which agents can't set (`git -c …` and `VAR=… git …`
+ *   don't match these rules).
  * The run's connectors are allowed by server name in `readOnlyAllowRules`.
  */
+export const READ_ONLY_GIT_ALLOW_RULES = [
+  'Bash(git log:*)',
+  'Bash(git show:*)',
+  'Bash(git shortlog:*)',
+  'Bash(git ls-files:*)',
+  'Bash(git ls-tree:*)',
+  'Bash(git rev-parse:*)',
+  'Bash(git status:*)',
+];
+
 export const READ_ONLY_ALLOW_RULES = [
   'Edit(//tmp/**)',
   'Edit(//private/tmp/**)',
   'Read(//tmp/**)',
   'Read(//private/tmp/**)',
+  ...READ_ONLY_GIT_ALLOW_RULES,
   'Bash(gh pr view:*)',
   'Bash(gh pr list:*)',
   'Bash(gh pr diff:*)',
@@ -228,6 +256,24 @@ export function claudePermissionMode(
   if (request.planMode) return 'plan';
   if (request.readOnly) return 'read-only';
   return 'bypass';
+}
+
+/** Homebrew's bash first: macOS's /bin/bash is 3.2, without `globstar`. */
+const DEFAULT_AGENT_SHELLS = ['/opt/homebrew/bin/bash', '/usr/local/bin/bash', '/bin/bash'];
+
+/**
+ * The shell agents' Bash commands run in: the newest bash found, unless
+ * `WATCHTOWER_AGENT_SHELL` names another, or is `default` to leave the CLI's
+ * own choice (the owner's login shell). Undefined when no such shell exists.
+ */
+export function agentShellPath(
+  env: NodeJS.ProcessEnv = process.env,
+  exists: (file: string) => boolean = isExecutable,
+): string | undefined {
+  const raw = env.WATCHTOWER_AGENT_SHELL?.trim();
+  if (raw === 'default') return undefined;
+  if (raw) return exists(raw) ? raw : undefined;
+  return DEFAULT_AGENT_SHELLS.find(shell => exists(shell));
 }
 
 /** The allow-list for a read-only run: the fixed rules, plus each of its connectors by server name. */
@@ -349,7 +395,10 @@ export const claudeCodeBackend: AgentBackend = {
       );
     }
     if (sandboxed) {
-      args.push('--settings', JSON.stringify(agentSandboxSettings({ readOnly: Boolean(request.readOnly) })));
+      args.push(
+        '--settings',
+        JSON.stringify(agentSandboxSettings({ readOnly: Boolean(request.readOnly), cwd: request.cwd })),
+      );
     }
     if (request.sessionId) {
       args.push('--session-id', request.sessionId);
@@ -391,6 +440,12 @@ export const claudeCodeBackend: AgentBackend = {
     // Same toolchain PATH the codex backend gets. Without it agents cannot
     // find gh, node or npm and re-export PATH in every Bash call (issue #444).
     env.PATH = buildCodexPath(basePath);
+    // The agent's shell is bash, not the owner's zsh (issue #622): zsh fails a
+    // whole command on an unmatched glob ("no matches found" for an unquoted
+    // `grep --include=*.py`, 345 times in 400 recent agent sessions) and on
+    // `echo ===`. bash passes an unmatched glob through as written.
+    const agentShell = agentShellPath();
+    if (agentShell) env.CLAUDE_CODE_SHELL = agentShell;
     // HOME (and USER) are required for Claude Code to find its config and the
     // Keychain/credentials store where MCP OAuth tokens live — without HOME an
     // HTTP/OAuth MCP server (e.g. Metabase) silently fails to connect in the

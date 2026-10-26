@@ -95,6 +95,47 @@ describe('the shell sandbox for agent runs', () => {
     expect(sandboxReadDenyRules().some(rule => rule.includes('/code'))).toBe(false);
   });
 
+  // Issue #622: `git blame --contents ~/.claude/history.jsonl` printed the file in a read-only run.
+  it("hides the owner's Claude sessions, shell history and miniOG's records, files as well as folders", () => {
+    configureAgentSandbox({ miniOgRepoRoot: root, repoPaths: [] });
+
+    const { filesystem } = agentSandboxSettings({ readOnly: true, cwd: root }).sandbox as {
+      filesystem: { denyRead: string[] };
+    };
+    for (const secret of [
+      '~/.claude/history.jsonl',
+      '~/.claude/session-env',
+      '~/.claude/settings.json',
+      '~/.zsh_history',
+      '~/.profile',
+      '~/.config/gh/hosts.yml',
+      '~/.watchtower/vault',
+      '~/.watchtower/egress',
+      '~/.watchtower/logs',
+      '~/.watchtower/autostash',
+    ]) {
+      expect(filesystem.denyRead).toContain(secret);
+    }
+    // A file needs its own rule: `~/.netrc/**` never matched `~/.netrc`.
+    expect(sandboxReadDenyRules()).toEqual(
+      expect.arrayContaining(['Read(~/.netrc)', 'Read(~/.claude/history.jsonl)', 'Read(~/.ssh)', 'Read(~/.ssh/**)']),
+    );
+    // Commands source the CLI's shell snapshot; runs that do work use skills' files.
+    for (const needed of ['~/.claude/shell-snapshots', '~/.claude/skills', '~/.claude/plugins', '~/.claude']) {
+      expect(filesystem.denyRead).not.toContain(needed);
+    }
+  });
+
+  it('lets a read-only run write only under /tmp, never in its working directory or the caches', () => {
+    configureAgentSandbox({ miniOgRepoRoot: root, repoPaths: [path.join(root, 'newton-web')] });
+
+    const { filesystem } = agentSandboxSettings({ readOnly: true, cwd: '/lookups/lookup-1' }).sandbox as {
+      filesystem: { allowWrite: string[]; denyWrite: string[] };
+    };
+    expect(filesystem.allowWrite).toEqual(['/tmp', '/private/tmp']);
+    expect(filesystem.denyWrite).toEqual(['/lookups/lookup-1']);
+  });
+
   it('lists no folder macOS guards with a permission prompt: a pending prompt hung every agent', () => {
     configureAgentSandbox({ miniOgRepoRoot: root, repoPaths: [] });
 
