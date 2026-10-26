@@ -1,4 +1,5 @@
 import { cancelledResult } from '../workflows/shared/cancelState.js';
+import { LOOKUP_RECENT_COMMITS_RULE } from '../workflows/shared/recentChanges.js';
 import type { WebClient } from '@slack/web-api';
 import type {
   AppConfig,
@@ -266,6 +267,7 @@ ${describeEnabledRepos(config)}
 
 Constraints:
 - If you can't find what they asked about, say so directly — don't speculate.
+- ${LOOKUP_RECENT_COMMITS_RULE}
 - Stay terse. The user reads on Slack; long answers get skipped.
 - Never fabricate file paths or line numbers — only cite things you actually opened.
 - Never trigger a deploy or a GitHub Actions workflow, staging or production, and never push, merge or edit anything in a repo or an outside system. When asked for one, say how it is done.
