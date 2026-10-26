@@ -50,7 +50,52 @@ const SECRET_PATHS = [
   '~/.git-credentials',
   '~/.claude.json',
   '~/.claude/projects',
+  // The owner's own Claude Code sessions and settings (issue #622: a read-only
+  // run printed history.jsonl through `git blame --contents`). Not
+  // shell-snapshots, skills, plugins or commands: commands source the shell
+  // snapshot, and runs that do work use skills' files. The CLI itself reads
+  // its settings outside the sandbox.
+  '~/.claude/history.jsonl',
+  '~/.claude/file-history',
+  '~/.claude/paste-cache',
+  '~/.claude/sessions',
+  '~/.claude/session-env',
+  '~/.claude/jobs',
+  '~/.claude/tasks',
+  '~/.claude/todos',
+  '~/.claude/plans',
+  '~/.claude/memory-proposals',
+  '~/.claude/backups',
+  '~/.claude/scratch-backups',
+  '~/.claude/debug',
+  '~/.claude/daemon.log',
+  '~/.claude/telemetry',
+  '~/.claude/ssh',
+  '~/.claude/chrome',
+  '~/.claude/playwright-profiles',
+  '~/.claude/settings.json',
+  '~/.claude/settings.local.json',
+  '~/.claude/remote-settings.json',
+  '~/.claude/seed-admin',
+  // Shell history and start-up files can hold commands with tokens; agents'
+  // commands source the CLI's shell snapshot, not these.
+  '~/.zsh_history',
+  '~/.bash_history',
+  '~/.zshrc',
+  '~/.zprofile',
+  '~/.zshenv',
+  '~/.profile',
+  '~/.bash_profile',
+  '~/.bashrc',
+  // gh's stored login: agents get GH_TOKEN instead.
+  '~/.config/gh/hosts.yml',
+  // miniOG's own records: transcripts, exports, logs, set-aside changes.
   '~/.watchtower/replay-snapshots',
+  '~/.watchtower/vault',
+  '~/.watchtower/egress',
+  '~/.watchtower/logs',
+  '~/.watchtower/autostash',
+  '~/.watchtower/watchtower.db',
   '~/Library/Keychains',
   '~/Library/Cookies',
   '~/Library/Application Support/Google',
@@ -74,9 +119,13 @@ function deniedReadPaths(): string[] {
   return denied;
 }
 
-/** The same paths as permission rules, so the Read tool is refused them too. */
+/**
+ * The same paths as permission rules, so the Read tool is refused them too.
+ * Each path gets two rules: `path/**` covers a folder's contents and `path`
+ * the path itself, which is what a file such as `~/.netrc` needs.
+ */
 export function sandboxReadDenyRules(): string[] {
-  return deniedReadPaths().map(denied => `Read(${denied}/**)`);
+  return deniedReadPaths().flatMap(denied => [`Read(${denied})`, `Read(${denied}/**)`]);
 }
 
 /**
@@ -96,17 +145,27 @@ function neighbourDir(): string | undefined {
  * allow-list: without `autoAllowBashIfSandboxed: false`, any sandboxed shell
  * command would run without asking, `rm` included.
  *
- * A read-only run also may not write inside its working directory, which the
- * sandbox otherwise allows (issue #622). Its allow-list admits read-only git
- * commands, and a few of them take a write flag (`git log --output=<file>`
- * wrote a file in a probe on CLI 2.1.310); the sandbox refuses that write
- * whatever the flags. /tmp stays writable for the reply's attachments.
+ * A read-only run writes only under /tmp, where the reply's attachments go
+ * (issue #622). The sandbox otherwise allows writes in the working directory
+ * and the package caches; its allow-list admits git commands that take a
+ * write flag (`git log --output=<file>` wrote a file in a probe on CLI
+ * 2.1.310), and the sandbox refuses that write whatever the flags.
  */
 export function agentSandboxSettings(params: { readOnly: boolean; cwd?: string }): {
   sandbox: Record<string, unknown>;
 } {
   const neighbours = neighbourDir();
   const denyWrite = params.readOnly && params.cwd ? [params.cwd] : [];
+  const allowWrite = params.readOnly
+    ? ['/tmp', '/private/tmp']
+    : [
+        '/tmp',
+        '/private/tmp',
+        '~/.npm',
+        '~/.cache',
+        '~/Library/Caches',
+        ...state.repoPaths.map(repoPath => path.join(repoPath, 'node_modules', '.cache')),
+      ];
   return {
     sandbox: {
       enabled: true,
@@ -124,14 +183,7 @@ export function agentSandboxSettings(params: { readOnly: boolean; cwd?: string }
         allowedDomains: ['github.com', 'api.github.com'],
       },
       filesystem: {
-        allowWrite: [
-          '/tmp',
-          '/private/tmp',
-          '~/.npm',
-          '~/.cache',
-          '~/Library/Caches',
-          ...state.repoPaths.map(repoPath => path.join(repoPath, 'node_modules', '.cache')),
-        ],
+        allowWrite,
         ...(denyWrite.length > 0 ? { denyWrite } : {}),
         denyRead: [...deniedReadPaths(), ...(neighbours ? [neighbours] : [])],
         ...(neighbours && state.readRoot ? { allowRead: [state.readRoot] } : {}),

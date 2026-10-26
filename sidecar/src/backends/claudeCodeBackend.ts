@@ -198,28 +198,33 @@ export const PROCESS_KILL_DENY_RULES = ['Bash(pkill:*)', 'Bash(killall:*)'];
  * - files written and read back under /tmp, which is where the reply's
  *   attachments go (`Edit` rules cover the Write tool; /tmp is /private/tmp);
  * - read-only GitHub CLI commands, for questions about pull requests and runs;
- * - the read-only git commands, whatever their flags (issue #622): `dontAsk`
- *   refuses `git log -S/-G/-i/-L/--follow`. A write flag such as
- *   `git log --output=<file>` is refused by the sandbox, which denies a
- *   read-only run writes in its working directory (`agentSandboxSettings`).
- *   Measured on CLI 2.1.310: `cd <dir> && git …` and `git -C <dir> …` are
- *   refused whatever the rules say (the CLI's own guard against a repo's git
- *   config running code), so the prompt tells agents to `cd` in one command
- *   and run git in the next; a lone `cd` is allowed and carries over.
+ * - a few read-only git commands (issue #622). Measured on CLI 2.1.310, once
+ *   a run has `cd`-ed into a repo below its working directory, `dontAsk`
+ *   refuses every git command there, `git log` and `git status` included;
+ *   `cd <dir> && git …` and `git -C <dir> …` are refused whatever the rules
+ *   say. So the prompt tells agents to `cd` in one command and run git in the
+ *   next, and these rules let that git through.
+ *   A rule allows its command with any flags: the CLI matches only a prefix
+ *   (`Bash(git log:*)`) and ignores a `*` anywhere else, so a deny rule cannot
+ *   pick out one flag. Only commands whose every flag is safe are listed:
+ *   - not `git grep`: `-O<program>` / `--open-files-in-pager` runs a program;
+ *   - not `git blame` (`--contents <file>`) or `git diff` (`--no-index`): both
+ *     read any file the shell can, outside the repos;
+ *   - not `git cat-file` (`--filters` runs configured filters), not needed.
+ *   A write flag on what is left (`git log --output=<file>`) is refused by
+ *   the sandbox outside /tmp; `--textconv`/`--ext-diff` run only drivers from
+ *   the git config, which agents can't set (`git -c …` and `VAR=… git …`
+ *   don't match these rules).
  * The run's connectors are allowed by server name in `readOnlyAllowRules`.
  */
 export const READ_ONLY_GIT_ALLOW_RULES = [
   'Bash(git log:*)',
   'Bash(git show:*)',
-  'Bash(git blame:*)',
-  'Bash(git grep:*)',
-  'Bash(git diff:*)',
+  'Bash(git shortlog:*)',
   'Bash(git ls-files:*)',
   'Bash(git ls-tree:*)',
   'Bash(git rev-parse:*)',
   'Bash(git status:*)',
-  'Bash(git cat-file:*)',
-  'Bash(git shortlog:*)',
 ];
 
 export const READ_ONLY_ALLOW_RULES = [
@@ -253,10 +258,13 @@ export function claudePermissionMode(
   return 'bypass';
 }
 
+/** Homebrew's bash first: macOS's /bin/bash is 3.2, without `globstar`. */
+const DEFAULT_AGENT_SHELLS = ['/opt/homebrew/bin/bash', '/usr/local/bin/bash', '/bin/bash'];
+
 /**
- * The shell agents' Bash commands run in: /bin/bash unless
+ * The shell agents' Bash commands run in: the newest bash found, unless
  * `WATCHTOWER_AGENT_SHELL` names another, or is `default` to leave the CLI's
- * own choice (the owner's login shell). Undefined when that shell is missing.
+ * own choice (the owner's login shell). Undefined when no such shell exists.
  */
 export function agentShellPath(
   env: NodeJS.ProcessEnv = process.env,
@@ -264,8 +272,8 @@ export function agentShellPath(
 ): string | undefined {
   const raw = env.WATCHTOWER_AGENT_SHELL?.trim();
   if (raw === 'default') return undefined;
-  const shell = raw || '/bin/bash';
-  return exists(shell) ? shell : undefined;
+  if (raw) return exists(raw) ? raw : undefined;
+  return DEFAULT_AGENT_SHELLS.find(shell => exists(shell));
 }
 
 /** The allow-list for a read-only run: the fixed rules, plus each of its connectors by server name. */
