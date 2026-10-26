@@ -134,7 +134,8 @@ export async function resolveWorkspace(repoPath: string, threadTs: string): Prom
   // node_modules survives).
   if (fs.existsSync(wsPath)) {
     try {
-      await git(['fetch', 'origin', '--quiet'], { cwd: wsPath, timeoutMs: 30_000 });
+      // The worktree shares the clone's refs, so the clone's fetch serves it.
+      if (!(await fetchClone(repoPath))) throw new Error('git fetch failed');
       const defaultBranch = await resolveDefaultRemoteBranch(repoPath);
       await git(['reset', '--hard', defaultBranch], { cwd: wsPath, timeoutMs: 15_000 });
       await git(['clean', '-fd'], { cwd: wsPath, timeoutMs: 15_000 });
@@ -162,9 +163,7 @@ export async function resolveWorkspace(repoPath: string, threadTs: string): Prom
     fs.mkdirSync(path.dirname(wsPath), { recursive: true });
 
     // Fetch latest from origin so the worktree starts from up-to-date code
-    try {
-      await git(['fetch', 'origin', '--quiet'], { cwd: repoPath, timeoutMs: 30_000 });
-    } catch {
+    if (!(await fetchClone(repoPath))) {
       logger.warn({ repoPath }, 'git fetch failed before worktree creation, proceeding with local state');
     }
 
@@ -725,6 +724,16 @@ async function restoreSetAside(repoPath: string, setAside: SetAsideChanges): Pro
     }
   }
   return restored;
+}
+
+/**
+ * Fetches a clone's origin through its refresh queue (issue #610): a fetch or
+ * refresh already running there is shared, and a fetch that loses a ref lock
+ * to another one is retried. True when the fetch worked.
+ */
+export async function fetchClone(repoPath: string): Promise<boolean> {
+  const state = await refreshSharedRepoToDefaultBranch(repoPath, { fetchOnly: true });
+  return Boolean(state) && state?.staleReason !== 'fetch_failed';
 }
 
 /**

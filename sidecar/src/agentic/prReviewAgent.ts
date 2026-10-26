@@ -1518,7 +1518,15 @@ export async function reviewSinglePr(params: {
           stage: 'agentic.pr_review.sibling_repos',
           logStep,
         })
-        .catch(() => undefined)
+        .catch(error => {
+          logStep?.({
+            stage: 'agentic.pr_review.sibling_repos.threw',
+            level: 'WARN',
+            message: `Fetching the other repos threw (non-fatal): ${String(error)}`,
+            data: { prUrl: prContext.url },
+          });
+          return undefined;
+        })
     : Promise.resolve(undefined);
 
   // 3. Diff fetch (TS-side: the same bytes feed the agent prompt AND the

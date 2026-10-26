@@ -107,18 +107,18 @@ export async function createLookupWorkspace(params: {
   };
 
   try {
+    // Loaded here, not at the top: the test setup imports this module, and
+    // workspaceManager fixes its folders from HOME when it loads, before a
+    // test can point HOME elsewhere.
+    const { fetchClone } = await import('./workspaceManager.js');
     // A slot left behind by a cleanup that failed.
     await removeSlotDir(dir, repoPaths);
     fs.mkdirSync(dir, { recursive: true });
     const repos: LookupRepo[] = [];
     for (const { key, path: repoPath } of sources) {
       const name = path.basename(repoPath);
-      let fetchFailed = false;
-      try {
-        await git(repoPath, ['fetch', 'origin', '--quiet'], 60_000);
-      } catch {
-        fetchFailed = true;
-      }
+      // Shares a fetch already running in the clone, and waits out its ref lock (issue #610).
+      const fetchFailed = !(await fetchClone(repoPath));
       let upstream: string;
       try {
         upstream = await git(repoPath, ['symbolic-ref', 'refs/remotes/origin/HEAD', '--short'], 10_000);

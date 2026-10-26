@@ -43,7 +43,8 @@ export function staleReasonText(state: SharedRepoState): string {
   }
 }
 
-const commits = (count: number): string => `${count} commit${count === 1 ? '' : 's'}`;
+/** "1 commit", "707 commits". */
+export const commits = (count: number): string => `${count} commit${count === 1 ? '' : 's'}`;
 
 /**
  * A clone whose files may be old with no newer tree to read instead: the
@@ -199,6 +200,7 @@ export function buildStaleCheckoutBlock(
     `  git show ${example.state.upstream}:<path>`,
     `  git log -5 ${example.state.upstream} -- <path>`,
     `  git ls-tree -r --name-only ${example.state.upstream} -- <folder>`,
+    `  git log -S"<pattern>" --oneline ${example.state.upstream} -- <path>   (the commits that added or removed it)`,
     'Never conclude that something "does not exist" or "is not there" in such a repo from the files on disk.',
     `Say in your answer that you read ${stale
       .map(repo => repo.state.upstream)

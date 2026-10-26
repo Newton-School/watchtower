@@ -16,8 +16,21 @@ import type { AgentBackendId } from '../backends/types.js';
  * will be refused (issue #443). Matches `READ_ONLY_ALLOW_RULES`; the git
  * advice matches what CLI 2.1.310 allows (issue #622): a lone `cd` carries
  * over to the next command, while `cd … && git …` and `git -C` are refused.
+ *
+ * `otherRepos`: a run in one repo's worktree that may also read the other
+ * repos' clones, listed in its prompt (issue #610).
  */
-export const READ_ONLY_RUN_NOTE = `This run is read-only. You can read and search the repos under the current directory, run read-only commands there (grep, sed -n, cat, ls, find, git log / show / status / ls-files / rev-parse with flags such as -S, -G, -L, --follow, gh pr view), use the connectors you were given, and write files under /tmp to attach to your reply. Anything else is refused without asking: editing files in the repos, scripts (python, node), network calls (curl), reading outside the repos. The current directory is already the root that holds the repos. To run git in one repo, first run \`cd <absolute path of that repo>\` as a command on its own, then run each git command as its own call: a \`cd … && git …\` line and \`git -C …\` are always refused. \`git blame\`, \`git grep\` and \`git diff\` are refused too: use \`git log -L <start>,<end>:<file>\` for a line's history, \`grep -rn\` to search, and \`git show\` or \`git log -p\` to see what a commit changed. Quote glob patterns (\`grep -rn x --include='*.py'\`). If a command is refused, find a read-only way instead of retrying variants of it.`;
+export function readOnlyRunNote(opts: { otherRepos?: boolean } = {}): string {
+  const where = opts.otherRepos
+    ? 'the repo in the current directory and the other repos listed under OTHER REPOS'
+    : 'the repos under the current directory';
+  const root = opts.otherRepos
+    ? 'The current directory is the root of that one repo.'
+    : 'The current directory is already the root that holds the repos.';
+  return `This run is read-only. You can read and search ${where}, run read-only commands there (grep, sed -n, cat, ls, find, git log / show / status / ls-files / rev-parse with flags such as -S, -G, -L, --follow, gh pr view), use the connectors you were given, and write files under /tmp to attach to your reply. Anything else is refused without asking: editing files in the repos, scripts (python, node), network calls (curl), reading outside the repos. ${root} To run git in one repo, first run \`cd <absolute path of that repo>\` as a command on its own, then run each git command as its own call: a \`cd … && git …\` line and \`git -C …\` are always refused. \`git blame\`, \`git grep\` and \`git diff\` are refused too: use \`git log -L <start>,<end>:<file>\` for a line's history, \`grep -rn\` to search, and \`git show\` or \`git log -p\` to see what a commit changed. Quote glob patterns (\`grep -rn x --include='*.py'\`). If a command is refused, find a read-only way instead of retrying variants of it.`;
+}
+
+export const READ_ONLY_RUN_NOTE = readOnlyRunNote();
 
 /** A usage-limit notice is one line; a failed run that wrote more than this was answering. */
 const USAGE_LIMIT_LINE_MAX = 300;

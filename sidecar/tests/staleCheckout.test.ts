@@ -86,6 +86,8 @@ describe('buildStaleCheckoutBlock (issue #446)', () => {
     expect(block).toContain('  cd newton-web\n  git show origin/master:<path>\n  git log -5 origin/master -- <path>');
     expect(block).not.toContain('&& git');
     expect(block).not.toContain('git grep');
+    // Searching origin's tree with a command a read-only run allows.
+    expect(block).toContain('  git log -S"<pattern>" --oneline origin/master -- <path>');
     // The wrong answer in the incident was "that param doesn't exist anywhere: zero hits".
     expect(block).toContain('Never conclude that something "does not exist"');
     expect(block).toContain('Say in your answer that you read origin/master, not the local files.');

@@ -403,7 +403,9 @@ export const claudeCodeBackend: AgentBackend = {
     if (sandboxed) {
       args.push(
         '--settings',
-        JSON.stringify(agentSandboxSettings({ readOnly: Boolean(request.readOnly), cwd: request.cwd })),
+        JSON.stringify(
+          agentSandboxSettings({ readOnly: Boolean(request.readOnly), cwd: request.cwd, readDirs: request.readDirs }),
+        ),
       );
     }
     if (request.sessionId) {

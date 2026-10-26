@@ -1,6 +1,6 @@
 import type { AppConfig, WorkflowStepLogger } from '../types/contracts.js';
 import { enabledRepoPaths, REPO_REGISTRY, type RepoKey } from '../repos/registry.js';
-import { buildStaleCheckoutBlock, isStaleCheckout, refreshRepoClones } from './staleCheckout.js';
+import { buildStaleCheckoutBlock, commits, isStaleCheckout, refreshRepoClones } from './staleCheckout.js';
 import type { SharedRepoState } from './workspaceManager.js';
 
 /**
@@ -27,19 +27,20 @@ export interface SiblingRepos {
   block: string;
 }
 
-const commits = (count: number): string => `${count} commit${count === 1 ? '' : 's'}`;
+/** What to say about a clone that may be old, with no newer tree to point at. */
+const MAY_BE_OLD = 'if your answer depends on recent changes there, say the code you read may be out of date';
 
 /** Where one clone is, as the end of its line in the block. */
 function cloneStatus(state: SharedRepoState | null): string {
-  if (!state) return "couldn't be checked against GitHub just now, so its files may be out of date";
+  if (!state) return `couldn't be checked against GitHub just now, so its files may be out of date; ${MAY_BE_OLD}`;
   const at = `${state.branch} @ ${state.head}${state.headDate ? ` (${state.headDate})` : ''}`;
   if (isStaleCheckout(state)) {
     return `its files are ${at}, ${commits(state.behind ?? 0)} behind ${state.upstream}: read ${state.upstream} instead (below)`;
   }
   if (state.staleReason === 'fetch_failed') {
-    return `couldn't be refreshed; it is as of its last fetch${state.lastFetched ? ` on ${state.lastFetched}` : ''}: ${at}`;
+    return `couldn't be refreshed; it is as of its last fetch${state.lastFetched ? ` on ${state.lastFetched}` : ''}: ${at}; ${MAY_BE_OLD}`;
   }
-  if (state.staleReason === 'unverified') return `${at}; I couldn't confirm it is current with GitHub`;
+  if (state.staleReason === 'unverified') return `${at}; I couldn't confirm it is current with GitHub; ${MAY_BE_OLD}`;
   return `${at}, current with GitHub`;
 }
 
@@ -76,7 +77,9 @@ export async function prepareSiblingRepos(params: {
     return `- ${name}${slug ? ` (${slug} on GitHub)` : ''}: ${repoPath} — ${cloneStatus(state)}.`;
   });
   const exampleSlug = slugOf(refreshed[0].path) ?? '<owner>/<repo>';
-  const staleBlock = buildStaleCheckoutBlock(refreshed);
+  // Only the clones there is a newer tree to read: each line above already
+  // says which ones may be old.
+  const staleBlock = buildStaleCheckoutBlock(refreshed.filter(repo => isStaleCheckout(repo.state)));
   const block = [
     "OTHER REPOS — besides your working directory, you can read miniOG's clones of these repos. Read them; never edit them:",
     ...lines,

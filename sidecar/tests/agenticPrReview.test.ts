@@ -959,9 +959,29 @@ describe('agenticPrReview', () => {
     expect(prompts.filter(p => p.includes(block)).length).toBeGreaterThan(1);
   });
 
-  it('reviews anyway when fetching the other repos fails', async () => {
+  it('fetches the other repos while the diff is being read, not before it', async () => {
     const slack = makeSlack([`review ${WEB_PR}`]);
-    const deps = makeDeps({ prepareSiblings: vi.fn().mockRejectedValue(new Error('git exploded')) });
+    let finishSiblings: (value: { dirs: string[]; block: string }) => void = () => {};
+    const events: string[] = [];
+    const deps = makeDeps({
+      prepareSiblings: vi.fn(
+        () =>
+          new Promise(resolve => {
+            events.push('siblings started');
+            finishSiblings = resolve;
+          }),
+      ),
+      fetchDiff: vi.fn(async () => {
+        events.push('diff fetched');
+        // Only a review that started the sibling fetch first, and did not wait for it, gets here.
+        finishSiblings({ dirs: [], block: '' });
+        return {
+          diff: 'diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,1 +1,2 @@\n line\n+added',
+          truncated: false,
+          reason: 'ok',
+        };
+      }),
+    });
 
     const result = await runAgenticPrReview({
       task: makeTask(`<@UBOT1> review ${WEB_PR}`),
@@ -972,7 +992,28 @@ describe('agenticPrReview', () => {
     });
 
     expect(result.status).toBe('SUCCESS');
+    expect(events).toEqual(['siblings started', 'diff fetched']);
+  });
+
+  it('reviews anyway, and logs it, when fetching the other repos fails', async () => {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const deps = makeDeps({ prepareSiblings: vi.fn().mockRejectedValue(new Error('git exploded')) });
+    const logStep = vi.fn();
+
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps: deps as any,
+      logStep,
+    });
+
+    expect(result.status).toBe('SUCCESS');
     expect(deps.runAgent).toHaveBeenCalled();
+    expect(logStep).toHaveBeenCalledWith(
+      expect.objectContaining({ stage: 'agentic.pr_review.sibling_repos.threw', level: 'WARN' }),
+    );
   });
 
   it('fails plainly when it cannot make its own worktree, and never checks the PR out in the shared clone', async () => {

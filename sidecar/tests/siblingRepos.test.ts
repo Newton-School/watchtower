@@ -114,12 +114,14 @@ describe('prepareSiblingRepos', () => {
 
     expect(dirs).toHaveLength(2);
     expect(block).toContain(
-      "/code/mini-og/newton-api — couldn't be refreshed; it is as of its last fetch on 2026-10-14: master @ 1a2b3c4 (2026-10-14).",
+      "/code/mini-og/newton-api — couldn't be refreshed; it is as of its last fetch on 2026-10-14: master @ 1a2b3c4 (2026-10-14); if your answer depends on recent changes there, say the code you read may be out of date.",
     );
     expect(block).toContain(
-      "/code/mini-og/newton-marketing-web — couldn't be checked against GitHub just now, so its files may be out of date.",
+      "/code/mini-og/newton-marketing-web — couldn't be checked against GitHub just now, so its files may be out of date;",
     );
-    expect(block).toContain('say the code you read may be out of date');
+    // Said once, on each repo's own line: no second block about the same clones.
+    expect(block).not.toContain('POSSIBLY OUT OF DATE');
+    expect(block.match(/2026-10-14/g)).toHaveLength(2);
     expect(logStep.mock.calls.map(call => call[0].level)).toEqual(['WARN', 'WARN']);
   });
 
