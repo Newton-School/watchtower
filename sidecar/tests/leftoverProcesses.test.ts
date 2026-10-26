@@ -113,6 +113,30 @@ describe('finding what a run left running (issue #608)', () => {
     expect(pick(rows, envRows)).toEqual([]);
   });
 
+  it("does not take a running agent's prompt for the daemon: its words count only where the arguments start", () => {
+    const prompt = 'claude -p review: spare daemon run, --bg-pty-host and bg-spare processes';
+    const rows = [
+      row(980, 1, `/Users/x/.local/bin/${prompt}`),
+      row(981, 980, 'node node_modules/.bin/next dev'),
+      row(982, 1, `node /Users/x/claude-code/cli.js -p ${prompt}`),
+    ];
+    const envRows = rows.map(r => marked(r.pid, r.ppid, r.command));
+    expect(pick(rows, envRows)).toEqual([980, 981, 982]);
+  });
+
+  it('reads CLAUDE_BG_ only in the environment, not on the command line', () => {
+    const command = '/Users/x/.local/bin/claude -p check that CLAUDE_BG_SESSION=abc is ignored';
+    const rows = [row(990, 1, command), row(991, 990, 'node server.js')];
+    const envRows = [marked(990, 1, command), marked(991, 990, 'node server.js')];
+    expect(pick(rows, envRows)).toEqual([990, 991]);
+  });
+
+  it('reads the whole line when the two listings disagree, which can only spare more', () => {
+    const rows = [row(995, 1, 'next-server (v15)')];
+    const envRows = [row(995, 1, `node next start CLAUDE_BG_SESSION=abc ${AGENT_RUN_ENV}=${RUN}`)];
+    expect(pick(rows, envRows)).toEqual([]);
+  });
+
   it('ignores CLAUDE_BG_ values the sidecar itself has, which every agent inherits', () => {
     const rows = [row(940, 1, 'node server.js')];
     const envRows = [row(940, 1, `node server.js CLAUDE_BG_SESSION=abc ${AGENT_RUN_ENV}=${RUN}`)];
@@ -232,10 +256,42 @@ describe('stopping what a run left', () => {
     expect(signal.mock.calls).toEqual([[710, 'SIGTERM']]);
   });
 
-  it('reports and waits for only the processes it could signal', async () => {
+  it('lists once more after every first-batch process exited, and stops a worker restarted meanwhile', async () => {
+    // A supervisor whose environment is hidden (`/bin/sh` looping) restarts its worker.
+    let rows = [row(700, 650, 'node server.js')];
+    const alive = new Set([700]);
+    const signal = vi.fn((pid: number, sig: NodeJS.Signals) => {
+      alive.delete(pid);
+      if (sig === 'SIGTERM') {
+        rows = [row(702, 650, 'node server.js')];
+        alive.add(702);
+      }
+      return true;
+    });
     const sleep = vi.fn(async () => {});
     const result = await stopLeftoverProcesses(RUN, {
-      listProcesses: listing([row(700, 1, 'node a.js'), row(710, 1, 'node b.js')]),
+      listProcesses: async withEnv => listing(rows)(withEnv),
+      signal,
+      isAlive: pid => alive.has(pid),
+      sleep,
+      selfPid: SIDECAR,
+    });
+    expect(sleep).not.toHaveBeenCalled();
+    expect(signal.mock.calls).toEqual([
+      [700, 'SIGTERM'],
+      [702, 'SIGKILL'],
+    ]);
+    expect(result.stopped.map(r => r.pid)).toEqual([700, 702]);
+    expect(result.forced.map(r => r.pid)).toEqual([702]);
+  });
+
+  it('reports and waits for only the processes it could signal', async () => {
+    const sleep = vi.fn(async () => {});
+    let listed = 0;
+    const first = listing([row(700, 1, 'node a.js'), row(710, 1, 'node b.js')]);
+    const result = await stopLeftoverProcesses(RUN, {
+      // The first pass lists both; by the second, nothing of the run's is left.
+      listProcesses: async withEnv => (++listed <= 2 ? first(withEnv) : '1 0 /sbin/launchd'),
       // 710 exited (or is no longer this user's) before the signal reached it.
       signal: pid => pid === 700,
       isAlive: pid => pid === 710,

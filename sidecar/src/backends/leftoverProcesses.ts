@@ -65,13 +65,19 @@ export function parsePsRows(raw: string): ProcessRow[] {
  * - Apps (`/Applications/<app>.app/Contents/MacOS/…`): VS Code, Chrome.
  *   Playwright's browsers live under `~/Library/Caches` and are stopped.
  * A dev server an agent starts inside one of these is left running too.
+ *
+ * The daemon's words count only where its arguments start (after the script,
+ * for `node …/cli.js`), and `CLAUDE_BG_*` only in the environment: an agent
+ * CLI still running has its whole prompt on its command line, and a review of
+ * this file's diff would otherwise spare it.
  */
-const SHARED_SERVER_ARG_RE = /(?:^|\s)(?:daemon\s+run|--bg-pty-host|--bg-spare|bg-pty-host|bg-spare)(?=\s|$)/;
+const DAEMON_ARGS_RE = /^(?:\S+\.[cm]?js\s+)?(?:daemon\s+run|--bg-pty-host|--bg-spare|bg-pty-host|bg-spare)(?:\s|$)/;
 const SHARED_SERVER_PROGRAM_RE =
   /^(?:\S*\/)?(?:tmux|screen)(?:\s|$)|^(?:\/Users\/[^/]+)?\/Applications\/.+?\.app\/Contents\/MacOS\//;
 
 function isSharedServer(row: ProcessRow): boolean {
-  return SHARED_SERVER_ARG_RE.test(row.command) || SHARED_SERVER_PROGRAM_RE.test(row.command);
+  const [, ...args] = tokensOf(row.command);
+  return DAEMON_ARGS_RE.test(args.slice(0, 3).join(' ')) || SHARED_SERVER_PROGRAM_RE.test(row.command);
 }
 
 function tokensOf(command: string): string[] {
@@ -121,18 +127,29 @@ export function leftoverProcesses(params: {
     ancestors.add(pid);
     pid = byPid.get(pid)?.ppid;
   }
+  // `ps -E` prints the command line, then the environment: what follows the
+  // plain listing's command is the environment. Should the two listings
+  // disagree (the process changed its title), the whole line is read, which
+  // can only spare more.
+  const environmentOf = (row: ProcessRow): ProcessRow => {
+    const plain = byPid.get(row.pid)?.command;
+    return plain !== undefined && row.command.startsWith(plain)
+      ? { ...row, command: row.command.slice(plain.length) }
+      : row;
+  };
+  const environments = params.envRows.map(environmentOf);
   const inherited = new Set(
     Object.entries(params.selfEnv ?? {})
       .filter(([key]) => key.startsWith('CLAUDE_BG_'))
       .map(([key, value]) => `${key}=${value}`),
   );
-  const hostedByDaemon = params.envRows
-    .filter(row =>
-      tokensOf(row.command).some(
+  const hostedByDaemon = environments
+    .filter(env =>
+      tokensOf(env.command).some(
         token => token.startsWith('CLAUDE_BG_') && token.includes('=') && !inherited.has(token),
       ),
     )
-    .map(row => row.pid);
+    .map(env => env.pid);
   const sharedRoots = [...params.rows.filter(isSharedServer).map(row => row.pid), ...hostedByDaemon];
   const spared = walk(
     sharedRoots.filter(pid => !ancestors.has(pid)),
@@ -140,7 +157,7 @@ export function leftoverProcesses(params: {
   );
   for (const pid of ancestors) spared.add(pid);
 
-  const marked = params.envRows.filter(row => carriesRunId(row, params.runId)).map(row => row.pid);
+  const marked = environments.filter(env => carriesRunId(env, params.runId)).map(env => env.pid);
   return [...walk(marked, spared)].map(pid => byPid.get(pid)).filter((row): row is ProcessRow => row !== undefined);
 }
 
@@ -197,10 +214,10 @@ export interface StopLeftoverDeps {
 }
 
 /**
- * Stop what a run left running: SIGTERM, then after the grace period one more
- * listing, and SIGKILL for everything of the run's it finds, processes started
- * since included (a watcher restarting its worker). Returns the processes
- * actually signalled.
+ * Stop what a run left running: SIGTERM, then after the grace period (cut
+ * short once all of it has exited) one more listing, and SIGKILL for
+ * everything of the run's it finds, processes started since included (a
+ * watcher restarting its worker). Returns the processes actually signalled.
  */
 export async function stopLeftoverProcesses(
   runId: string,
@@ -226,9 +243,9 @@ export async function stopLeftoverProcesses(
   for (let waited = 0; waited < graceMs && terminated.some(row => alive(row.pid)); waited += 100) {
     await sleep(100);
   }
-  if (!terminated.some(row => alive(row.pid))) return { stopped: terminated, forced: [] };
-  // One more pass, and only one: what is still the run's (a pid that exited
-  // may have been reused), and what it started meanwhile.
+  // One more pass, and only one, even when everything above has exited: what
+  // is still the run's (a pid that exited may have been reused), and what it
+  // started meanwhile (a worker restarted after the first one died).
   const forced = (await find()).filter(row => signal(row.pid, 'SIGKILL'));
   const terminatedPids = new Set(terminated.map(row => row.pid));
   return { stopped: [...terminated, ...forced.filter(row => !terminatedPids.has(row.pid))], forced };
