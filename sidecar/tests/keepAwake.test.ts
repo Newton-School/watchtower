@@ -1,6 +1,11 @@
 import { EventEmitter } from 'node:events';
 import { describe, expect, it, vi } from 'vitest';
-import { isKeepAwakeEnabled, KeepAwake } from '../src/runtime/keepAwake.js';
+import {
+  isKeepAwakeEnabled,
+  isStayAwakeOnPowerEnabled,
+  KeepAwake,
+  StayAwakeOnPower,
+} from '../src/runtime/keepAwake.js';
 import { JobSlots } from '../src/runtime/jobSlots.js';
 
 function fakeChild() {
@@ -77,6 +82,141 @@ describe('KeepAwake', () => {
   it('is on unless switched off', () => {
     expect(isKeepAwakeEnabled({})).toBe(true);
     expect(isKeepAwakeEnabled({ WATCHTOWER_KEEP_AWAKE: '0' })).toBe(false);
+  });
+});
+
+function stayAwakeWith(overrides: Partial<ConstructorParameters<typeof StayAwakeOnPower>[0]> = {}) {
+  const children: ReturnType<typeof fakeChild>[] = [];
+  const spawnFn = vi.fn(() => {
+    const child = fakeChild();
+    children.push(child);
+    return child;
+  });
+  const timers: Array<{ fn: () => void; ms: number }> = [];
+  const setTimeoutFn = vi.fn((fn: () => void, ms: number) => {
+    timers.push({ fn, ms });
+    return timers.length as unknown as ReturnType<typeof setTimeout>;
+  });
+  let clock = 0;
+  const stay = new StayAwakeOnPower({
+    spawnFn: spawnFn as never,
+    platform: 'darwin',
+    available: () => true,
+    enabled: () => true,
+    pid: 777,
+    now: () => clock,
+    setTimeoutFn,
+    clearTimeoutFn: vi.fn(),
+    ...overrides,
+  });
+  const runNextTimer = () => timers.shift()?.fn();
+  return { stay, spawnFn, children, timers, runNextTimer, advance: (ms: number) => (clock += ms) };
+}
+
+// Issue #727: miniOG was offline whenever the laptop slept (#585). On mains
+// power the Mac stays awake for as long as the sidecar runs.
+describe('StayAwakeOnPower', () => {
+  it('holds a mains-power-only assertion tied to the sidecar process from startup', () => {
+    const { stay, spawnFn } = stayAwakeWith();
+
+    stay.start();
+
+    expect(spawnFn).toHaveBeenCalledWith('/usr/bin/caffeinate', ['-s', '-w', '777'], { stdio: 'ignore' });
+    expect(stay.awake).toBe(true);
+  });
+
+  it('never runs two caffeinates however often it is started', () => {
+    const { stay, spawnFn } = stayAwakeWith();
+
+    stay.start();
+    stay.start();
+
+    expect(spawnFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('does nothing off macOS, without caffeinate, or when switched off', () => {
+    for (const overrides of [{ platform: 'linux' as const }, { available: () => false }, { enabled: () => false }]) {
+      const { stay, spawnFn } = stayAwakeWith(overrides);
+      stay.start();
+      expect(spawnFn).not.toHaveBeenCalled();
+      expect(stay.awake).toBe(false);
+    }
+  });
+
+  it('starts caffeinate again after it exits on its own, waiting longer each time, then gives up', () => {
+    const { stay, spawnFn, children, timers, runNextTimer } = stayAwakeWith();
+    stay.start();
+
+    const delays: number[] = [];
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      children[children.length - 1].emit('exit', 1);
+      expect(stay.awake).toBe(false);
+      delays.push(timers[0].ms);
+      runNextTimer();
+      expect(stay.awake).toBe(true);
+    }
+    expect(delays).toEqual([1_000, 5_000, 30_000]);
+
+    // A fourth quick exit: no more tries.
+    children[children.length - 1].emit('exit', 1);
+    expect(timers).toHaveLength(0);
+    expect(spawnFn).toHaveBeenCalledTimes(4);
+    expect(stay.awake).toBe(false);
+  });
+
+  it('counts tries from the start again after caffeinate ran for a while', () => {
+    const { stay, children, timers, runNextTimer, advance } = stayAwakeWith();
+    stay.start();
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      advance(120_000);
+      children[children.length - 1].emit('exit', 1);
+      expect(timers[0].ms).toBe(1_000);
+      runNextTimer();
+    }
+    expect(stay.awake).toBe(true);
+  });
+
+  it('only one restart is pending when caffeinate both errors and exits', () => {
+    const { stay, children, timers } = stayAwakeWith();
+    stay.start();
+
+    children[0].emit('error', new Error('spawn failed'));
+    children[0].emit('exit', 1);
+
+    expect(timers).toHaveLength(1);
+  });
+
+  it('stops with the sidecar and does not start again', () => {
+    const { stay, spawnFn, children, timers } = stayAwakeWith();
+    stay.start();
+
+    stay.stop();
+
+    expect(children[0].kill).toHaveBeenCalledOnce();
+    expect(timers).toHaveLength(0);
+    expect(spawnFn).toHaveBeenCalledTimes(1);
+    expect(stay.awake).toBe(false);
+  });
+
+  it('a stop while a restart is pending cancels it', () => {
+    const { stay, spawnFn, children, runNextTimer } = stayAwakeWith();
+    stay.start();
+    children[0].emit('exit', 1);
+
+    stay.stop();
+    runNextTimer();
+
+    expect(spawnFn).toHaveBeenCalledTimes(1);
+    expect(stay.awake).toBe(false);
+  });
+
+  it('is on unless the env switch or the stored setting turns it off', () => {
+    expect(isStayAwakeOnPowerEnabled({})).toBe(true);
+    expect(isStayAwakeOnPowerEnabled({}, 'on')).toBe(true);
+    expect(isStayAwakeOnPowerEnabled({ WATCHTOWER_STAY_AWAKE_ON_POWER: '0' })).toBe(false);
+    expect(isStayAwakeOnPowerEnabled({ WATCHTOWER_STAY_AWAKE_ON_POWER: 'off' })).toBe(false);
+    expect(isStayAwakeOnPowerEnabled({}, 'off')).toBe(false);
+    expect(isStayAwakeOnPowerEnabled({}, '0')).toBe(false);
   });
 });
 

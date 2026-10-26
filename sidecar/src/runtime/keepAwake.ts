@@ -83,3 +83,117 @@ export class KeepAwake {
 }
 
 export const keepAwake = new KeepAwake();
+
+/**
+ * Keeps the Mac awake for as long as the sidecar runs and the Mac is on mains
+ * power, so miniOG stays reachable between jobs (issue #727; it was offline
+ * whenever the laptop slept, #585). `caffeinate -s` is honoured only on AC
+ * power: on battery the Mac sleeps as before. Closing the lid still sleeps it
+ * unless an external display is attached; no assertion changes that.
+ *
+ * `-w <sidecar pid>` ends it with the sidecar. If caffeinate exits on its own
+ * it is started again after a short wait, a few times, then left off with a
+ * warning. Off with `WATCHTOWER_STAY_AWAKE_ON_POWER=0` or the sidecar_state
+ * key `stay_awake_on_power` set to `off`.
+ */
+export const STAY_AWAKE_ON_POWER_STATE_KEY = 'stay_awake_on_power';
+const RESTART_DELAYS_MS = [1_000, 5_000, 30_000];
+/** A caffeinate that ran this long before exiting counts as healthy: the retries start over. */
+const HEALTHY_RUN_MS = 60_000;
+
+export function isStayAwakeOnPowerEnabled(env: NodeJS.ProcessEnv = process.env, stateValue?: string): boolean {
+  const off = (raw: string | undefined) => {
+    const value = raw?.trim().toLowerCase();
+    return value === '0' || value === 'false' || value === 'off';
+  };
+  return !off(env.WATCHTOWER_STAY_AWAKE_ON_POWER) && !off(stateValue);
+}
+
+export class StayAwakeOnPower {
+  private child: ChildProcess | undefined;
+  private stopped = true;
+  private restarts = 0;
+  private restartTimer: ReturnType<typeof setTimeout> | undefined;
+
+  constructor(
+    private readonly deps: {
+      spawnFn?: typeof spawn;
+      platform?: NodeJS.Platform;
+      available?: () => boolean;
+      pid?: number;
+      enabled?: () => boolean;
+      now?: () => number;
+      setTimeoutFn?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
+      clearTimeoutFn?: (timer: ReturnType<typeof setTimeout>) => void;
+    } = {},
+  ) {}
+
+  /** Whether caffeinate is running now. */
+  get awake(): boolean {
+    return Boolean(this.child);
+  }
+
+  start(): void {
+    if (!this.stopped) return;
+    const platform = this.deps.platform ?? process.platform;
+    const enabled = this.deps.enabled ?? (() => isStayAwakeOnPowerEnabled());
+    const available = this.deps.available ?? (() => fs.existsSync(CAFFEINATE));
+    if (platform !== 'darwin' || !enabled() || !available()) return;
+    this.stopped = false;
+    this.restarts = 0;
+    if (this.spawn()) logger.info("keep-awake: keeping the Mac awake while it's on power");
+  }
+
+  stop(): void {
+    this.stopped = true;
+    if (this.restartTimer) {
+      (this.deps.clearTimeoutFn ?? clearTimeout)(this.restartTimer);
+      this.restartTimer = undefined;
+    }
+    const child = this.child;
+    this.child = undefined;
+    child?.kill();
+  }
+
+  private spawn(): boolean {
+    const now = this.deps.now ?? Date.now;
+    try {
+      const child = (this.deps.spawnFn ?? spawn)(CAFFEINATE, ['-s', '-w', String(this.deps.pid ?? process.pid)], {
+        stdio: 'ignore',
+      });
+      const startedAt = now();
+      const ended = (reason: string) => {
+        if (this.child !== child) return;
+        this.child = undefined;
+        if (this.stopped) return;
+        if (now() - startedAt >= HEALTHY_RUN_MS) this.restarts = 0;
+        this.scheduleRestart(reason);
+      };
+      child.on('exit', code => ended(`exited (${String(code)})`));
+      child.on('error', error => ended(String(error)));
+      this.child = child;
+      return true;
+    } catch (error) {
+      this.scheduleRestart(String(error));
+      return false;
+    }
+  }
+
+  private scheduleRestart(reason: string): void {
+    if (this.stopped || this.restartTimer) return;
+    const delay = RESTART_DELAYS_MS[this.restarts];
+    if (delay === undefined) {
+      logger.warn({ reason }, 'keep-awake: caffeinate keeps stopping; the Mac may sleep on power');
+      return;
+    }
+    this.restarts += 1;
+    const timer = (this.deps.setTimeoutFn ?? setTimeout)(() => {
+      this.restartTimer = undefined;
+      if (!this.stopped && !this.child) this.spawn();
+    }, delay);
+    (timer as { unref?: () => void }).unref?.();
+    this.restartTimer = timer;
+  }
+}
+
+export const stayAwakeOnPower = new StayAwakeOnPower();
