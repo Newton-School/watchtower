@@ -752,8 +752,10 @@ export async function runAgent(rawRequest: CodexRunRequest, backend: AgentBacken
       request.signal.removeEventListener('abort', onAbort);
     }
     child.removeAllListeners();
-    // A run with no tools starts nothing.
-    if (!request.noTools && isLeftoverSweepEnabled()) {
+    // A Claude Code run with no tools starts nothing; Codex ignores `noTools`
+    // and always has a shell.
+    const couldStartProcesses = !(request.noTools && backend.id === 'claude-code');
+    if (couldStartProcesses && isLeftoverSweepEnabled()) {
       await stopWhatTheRunLeft(runId, request, backend);
     }
     request.onLog?.({

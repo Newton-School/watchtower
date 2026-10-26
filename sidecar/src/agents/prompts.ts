@@ -25,9 +25,10 @@ function serializePreviousSteps(ctx: AgentContext): string {
 export const PROCESS_HYGIENE_RULE =
   'Other jobs run on this machine as the same user. Stop only processes you started, and only by PID (`kill <pid>`). ' +
   'A later command cannot stop a process an earlier command started (the sandbox refuses: "operation not permitted"), ' +
-  'so to stop a dev server yourself, start it, use it and stop it in one command ' +
-  '(`npm run dev > /tmp/dev.log 2>&1 & PID=$!; …; kill $PID`). ' +
-  'Anything still running when you finish is stopped for you: never ask anyone to stop a process or run a command for you. ' +
+  'so start a dev server, use it and stop it in the same command ' +
+  '(`LOG=$(mktemp); npm run dev > "$LOG" 2>&1 & PID=$!; …; kill $PID`), ' +
+  'and leave nothing running between commands: some repos forbid a build while a dev server runs. ' +
+  'miniOG stops what is left when the run ends, so never ask anyone to stop or kill a process for you. ' +
   "Never use `pkill`, `killall` or `kill -1`: they stop other jobs' agents too, and are blocked.";
 
 /**

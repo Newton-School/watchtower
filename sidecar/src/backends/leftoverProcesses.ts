@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { sanitizeStatusFragment } from '../slack/statusNarrator.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -25,7 +26,8 @@ const execFileAsync = promisify(execFile);
  * Limits: macOS hides the environment of its own binaries (`/bin/sleep`,
  * `/bin/sh`), so one of those left running on its own is not found; its
  * children and parents that are not Apple's are. Dev servers (node, Homebrew
- * and Xcode binaries) are found. Kill switch:
+ * and Xcode binaries) are found. Shared servers are spared (below). A run cut
+ * short by the sidecar itself stopping is not cleaned up. Kill switch:
  * `WATCHTOWER_STOP_LEFTOVER_PROCESSES=0`.
  */
 export const AGENT_RUN_ENV = 'WATCHTOWER_AGENT_RUN';
@@ -52,19 +54,40 @@ export function parsePsRows(raw: string): ProcessRow[] {
 }
 
 /**
- * Claude Code's shared daemon and the hosts it keeps: an agent's CLI may be
- * the one that starts it, but the owner's own sessions use it afterwards.
- * Seen as `…/claude daemon run …`, `…/claude --bg-pty-host …`,
- * `claude bg-pty-host …` and `claude bg-spare …`.
+ * Servers a run may start that other sessions then use, spared with
+ * everything under them, whatever started them:
+ * - Claude Code's daemon and the hosts it keeps (`claude daemon run`,
+ *   `--bg-pty-host`, `bg-spare`), whatever the program is called: a
+ *   development build runs as `node …/cli.js`, a release as `…/versions/<v>`.
+ *   Sessions it hosts carry `CLAUDE_BG_*` variables; spares inherit the
+ *   environment of whichever CLI started the daemon.
+ * - tmux and screen servers.
+ * - Apps (`/Applications/<app>.app/Contents/MacOS/…`): VS Code, Chrome.
+ *   Playwright's browsers live under `~/Library/Caches` and are stopped.
+ * A dev server an agent starts inside one of these is left running too.
  */
-const SHARED_DAEMON_RE = /^(?:\S*\/)?claude\s+(?:daemon\b|--bg-|bg-)/;
+const SHARED_SERVER_ARG_RE = /(?:^|\s)(?:daemon\s+run|--bg-pty-host|--bg-spare|bg-pty-host|bg-spare)(?=\s|$)/;
+const SHARED_SERVER_PROGRAM_RE =
+  /^(?:\S*\/)?(?:tmux|screen)(?:\s|$)|^(?:\/Users\/[^/]+)?\/Applications\/.+?\.app\/Contents\/MacOS\//;
 
-const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function isSharedServer(row: ProcessRow): boolean {
+  return SHARED_SERVER_ARG_RE.test(row.command) || SHARED_SERVER_PROGRAM_RE.test(row.command);
+}
+
+function tokensOf(command: string): string[] {
+  return command.split(/\s+/);
+}
+
+function carriesRunId(row: ProcessRow, runId: string): boolean {
+  return tokensOf(row.command).includes(`${AGENT_RUN_ENV}=${runId}`);
+}
 
 /**
  * The processes a run left: those carrying its id, and their descendants.
- * Never the sidecar or anything above it, and never Claude Code's shared
- * daemon or anything under it.
+ * Never the sidecar or anything above it, never a shared server (above) or
+ * anything under it; the walk never passes through any of them. The app and
+ * any tmux or Claude Code session the sidecar itself runs under are only
+ * spared as its ancestors: the agents it starts are under them too.
  */
 export function leftoverProcesses(params: {
   runId: string;
@@ -73,42 +96,62 @@ export function leftoverProcesses(params: {
   /** `ps -E`: the same with each process's environment. */
   envRows: ProcessRow[];
   selfPid: number;
+  /** The sidecar's environment: `CLAUDE_BG_*` values it has, every agent inherits. */
+  selfEnv?: NodeJS.ProcessEnv;
 }): ProcessRow[] {
-  const marker = new RegExp(`(?:^|\\s)${escapeRegExp(`${AGENT_RUN_ENV}=${params.runId}`)}(?=\\s|$)`);
   const byPid = new Map(params.rows.map(row => [row.pid, row]));
   const children = new Map<number, number[]>();
   for (const row of params.rows) {
     children.set(row.ppid, [...(children.get(row.ppid) ?? []), row.pid]);
   }
-  const subtree = (roots: number[]): Set<number> => {
+  const walk = (roots: number[], skip: Set<number>): Set<number> => {
     const seen = new Set<number>();
-    const queue = [...roots];
+    const queue = roots.filter(pid => !skip.has(pid));
     while (queue.length > 0) {
       const pid = queue.shift() as number;
       if (seen.has(pid)) continue;
       seen.add(pid);
-      queue.push(...(children.get(pid) ?? []));
+      queue.push(...(children.get(pid) ?? []).filter(child => !skip.has(child)));
     }
     return seen;
   };
 
-  const spared = subtree(params.rows.filter(row => SHARED_DAEMON_RE.test(row.command)).map(row => row.pid));
-  for (let pid: number | undefined = params.selfPid; pid !== undefined && pid > 1 && !spared.has(pid); ) {
-    spared.add(pid);
+  const ancestors = new Set<number>([0, 1]);
+  for (let pid: number | undefined = params.selfPid; pid !== undefined && !ancestors.has(pid); ) {
+    ancestors.add(pid);
     pid = byPid.get(pid)?.ppid;
   }
+  const inherited = new Set(
+    Object.entries(params.selfEnv ?? {})
+      .filter(([key]) => key.startsWith('CLAUDE_BG_'))
+      .map(([key, value]) => `${key}=${value}`),
+  );
+  const hostedByDaemon = params.envRows
+    .filter(row =>
+      tokensOf(row.command).some(
+        token => token.startsWith('CLAUDE_BG_') && token.includes('=') && !inherited.has(token),
+      ),
+    )
+    .map(row => row.pid);
+  const sharedRoots = [...params.rows.filter(isSharedServer).map(row => row.pid), ...hostedByDaemon];
+  const spared = walk(
+    sharedRoots.filter(pid => !ancestors.has(pid)),
+    ancestors,
+  );
+  for (const pid of ancestors) spared.add(pid);
 
-  const marked = params.envRows.filter(row => marker.test(row.command)).map(row => row.pid);
-  return [...subtree(marked)]
-    .filter(pid => pid > 1 && !spared.has(pid))
-    .map(pid => byPid.get(pid))
-    .filter((row): row is ProcessRow => row !== undefined);
+  const marked = params.envRows.filter(row => carriesRunId(row, params.runId)).map(row => row.pid);
+  return [...walk(marked, spared)].map(pid => byPid.get(pid)).filter((row): row is ProcessRow => row !== undefined);
 }
 
-/** The executable's name and its first two arguments: enough to recognise, never a token further along. */
+/**
+ * The executable's name and its first two arguments, with secrets and paths
+ * taken out as for the Slack status line, and credentials in URLs too.
+ */
 export function processLabel(command: string): string {
-  const [executable = '', ...args] = command.split(/\s+/);
-  return [path.basename(executable), ...args.slice(0, 2)].join(' ').slice(0, 100);
+  const [executable = '', ...args] = tokensOf(command);
+  const label = [path.basename(executable), ...args.slice(0, 2)].join(' ');
+  return sanitizeStatusFragment(label.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi, '$1[redacted]@'), 100);
 }
 
 async function listProcesses(withEnv: boolean): Promise<string> {
@@ -121,34 +164,44 @@ async function listProcesses(withEnv: boolean): Promise<string> {
   return stdout;
 }
 
+/** Still there and still this user's: EPERM means the pid now belongs to someone else. */
 function isAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  } catch {
+    return false;
   }
 }
 
-function sendSignal(pid: number, signal: NodeJS.Signals): void {
+/** Whether the signal was delivered. */
+function sendSignal(pid: number, signal: NodeJS.Signals): boolean {
   try {
     process.kill(pid, signal);
+    return true;
   } catch {
-    // Already gone.
+    // Gone, or no longer this user's.
+    return false;
   }
 }
 
 export interface StopLeftoverDeps {
   listProcesses?: (withEnv: boolean) => Promise<string>;
-  signal?: (pid: number, signal: NodeJS.Signals) => void;
+  signal?: (pid: number, signal: NodeJS.Signals) => boolean;
   isAlive?: (pid: number) => boolean;
   sleep?: (ms: number) => Promise<void>;
   /** How long SIGTERM gets before SIGKILL. */
   graceMs?: number;
   selfPid?: number;
+  selfEnv?: NodeJS.ProcessEnv;
 }
 
-/** Stop what a run left running: SIGTERM, then SIGKILL for what is still there after the grace period. */
+/**
+ * Stop what a run left running: SIGTERM, then after the grace period one more
+ * listing, and SIGKILL for everything of the run's it finds, processes started
+ * since included (a watcher restarting its worker). Returns the processes
+ * actually signalled.
+ */
 export async function stopLeftoverProcesses(
   runId: string,
   deps: StopLeftoverDeps = {},
@@ -159,23 +212,24 @@ export async function stopLeftoverProcesses(
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
   const graceMs = deps.graceMs ?? 2_000;
   const selfPid = deps.selfPid ?? process.pid;
+  const selfEnv = deps.selfEnv ?? process.env;
   const find = async (): Promise<ProcessRow[]> => {
     const envRows = parsePsRows(await list(true));
+    // The usual case: nothing carries the id, and nothing else is listed.
+    if (!envRows.some(row => carriesRunId(row, runId))) return [];
     const rows = parsePsRows(await list(false));
-    return leftoverProcesses({ runId, rows, envRows, selfPid });
+    return leftoverProcesses({ runId, rows, envRows, selfPid, selfEnv });
   };
 
-  const stopped = await find();
-  if (stopped.length === 0) return { stopped, forced: [] };
-  for (const row of stopped) signal(row.pid, 'SIGTERM');
-  for (let waited = 0; waited < graceMs && stopped.some(row => alive(row.pid)); waited += 100) {
+  const terminated = (await find()).filter(row => signal(row.pid, 'SIGTERM'));
+  if (terminated.length === 0) return { stopped: [], forced: [] };
+  for (let waited = 0; waited < graceMs && terminated.some(row => alive(row.pid)); waited += 100) {
     await sleep(100);
   }
-  const survivors = stopped.filter(row => alive(row.pid));
-  if (survivors.length === 0) return { stopped, forced: [] };
-  // Only what is still this run's: a pid that exited may have been reused.
-  const stillLeft = new Set((await find()).map(row => row.pid));
-  const forced = survivors.filter(row => stillLeft.has(row.pid));
-  for (const row of forced) signal(row.pid, 'SIGKILL');
-  return { stopped, forced };
+  if (!terminated.some(row => alive(row.pid))) return { stopped: terminated, forced: [] };
+  // One more pass, and only one: what is still the run's (a pid that exited
+  // may have been reused), and what it started meanwhile.
+  const forced = (await find()).filter(row => signal(row.pid, 'SIGKILL'));
+  const terminatedPids = new Set(terminated.map(row => row.pid));
+  return { stopped: [...terminated, ...forced.filter(row => !terminatedPids.has(row.pid))], forced };
 }

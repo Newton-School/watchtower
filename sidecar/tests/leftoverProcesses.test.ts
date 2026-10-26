@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import { describe, expect, it, vi } from 'vitest';
 import {
@@ -13,6 +14,8 @@ import { runAgent } from '../src/codex/runCodex.js';
 import type { AgentBackend } from '../src/backends/types.js';
 import type { WorkflowStepLog } from '../src/types/contracts.js';
 
+// Fixed ids only for the tests on made-up process lists: real processes get
+// random ids, so concurrent runs of this suite never stop each other's.
 const RUN = '0b9f6a52-5d7e-4c1e-9a43-2f1d6c8e7a10';
 const OTHER_RUN = '7d3c1e0a-1b2c-4d5e-8f90-a1b2c3d4e5f6';
 const SIDECAR = 500;
@@ -21,8 +24,8 @@ const row = (pid: number, ppid: number, command: string): ProcessRow => ({ pid, 
 const marked = (pid: number, ppid: number, command: string, runId = RUN): ProcessRow =>
   row(pid, ppid, `${command} HOME=/Users/x ${AGENT_RUN_ENV}=${runId} PATH=/usr/bin`);
 
-function pick(rows: ProcessRow[], envRows: ProcessRow[]): number[] {
-  return leftoverProcesses({ runId: RUN, rows, envRows, selfPid: SIDECAR })
+function pick(rows: ProcessRow[], envRows: ProcessRow[], selfEnv?: NodeJS.ProcessEnv): number[] {
+  return leftoverProcesses({ runId: RUN, rows, envRows, selfPid: SIDECAR, selfEnv })
     .map(p => p.pid)
     .sort((a, b) => a - b);
 }
@@ -60,29 +63,85 @@ describe('finding what a run left running (issue #608)', () => {
     expect(pick(rows, envRows)).toEqual([]);
   });
 
-  it('never picks the sidecar or anything above it, even when they carry the id', () => {
-    const rows = [row(1, 0, '/sbin/launchd'), row(400, 1, 'watchtower'), row(SIDECAR, 400, 'node index.js')];
+  it('never picks the sidecar or anything above it, nor walks through them to their other children', () => {
+    const rows = [
+      row(1, 0, '/sbin/launchd'),
+      row(400, 1, 'watchtower'),
+      row(SIDECAR, 400, 'node index.js'),
+      // Another run's agent, a child of the sidecar.
+      row(510, SIDECAR, '/Users/x/.local/bin/claude -p review'),
+      // Another child of the app.
+      row(410, 400, 'node other-helper.js'),
+    ];
     const envRows = [marked(400, 1, 'watchtower'), marked(SIDECAR, 400, 'node index.js'), marked(1, 0, 'launchd')];
     expect(pick(rows, envRows)).toEqual([]);
   });
 
-  it("spares Claude Code's shared daemon and everything under it", () => {
+  it('picks what a live agent of this run started, under the app the sidecar runs in', () => {
+    const rows = [
+      row(400, 1, '/Applications/watchtower.app/Contents/MacOS/watchtower'),
+      row(SIDECAR, 400, 'node /Applications/watchtower.app/Contents/Resources/_up_/sidecar/dist/index.js'),
+      row(520, SIDECAR, '/Users/x/.local/bin/claude -p change'),
+      row(521, 520, 'node node_modules/.bin/next dev'),
+    ];
+    const envRows = [marked(520, SIDECAR, 'claude -p change'), marked(521, 520, 'node next dev')];
+    expect(pick(rows, envRows)).toEqual([520, 521]);
+  });
+
+  it("spares Claude Code's shared daemon and everything under it, whatever the program is called", () => {
     const rows = [
       row(900, 1, '/Users/x/.local/bin/claude daemon run --json-path /Users/x/.claude/daemon.json --spawn'),
       row(901, 900, 'claude bg-pty-host --bg-pty-host /tmp/cc-daemon-501/a/spare/b.sock 200 50'),
       row(902, 901, 'claude bg-spare --bg-spare /tmp/cc-daemon-501/a/spare/b.claim.sock'),
       row(903, 1, '/Users/x/.local/share/claude/ClaudeCode.app/Contents/MacOS/claude --bg-pty-host /tmp/x.sock'),
       row(904, 903, '/bin/zsh -l'),
+      row(910, 1, 'node /Users/x/claude-code/cli.js daemon run --spawn'),
+      row(911, 910, 'node /Users/x/project/server.js'),
+      row(920, 1, '/Users/x/.local/share/claude/versions/2.1.320 daemon run --origin transient'),
       row(905, 1, '/Users/x/.local/bin/claude -p hello'),
     ];
     const envRows = rows.map(r => marked(r.pid, r.ppid, r.command));
     expect(pick(rows, envRows)).toEqual([905]);
   });
 
-  it('labels a process by its executable and first arguments only', () => {
-    expect(processLabel('/opt/homebrew/bin/node node_modules/.bin/next dev --port 3000 --token abc')).toBe(
+  it('spares a session the daemon hosts, and what it started, by its CLAUDE_BG_ variables', () => {
+    const rows = [row(930, 1, '/Users/x/.local/bin/claude'), row(931, 930, 'node server.js')];
+    const envRows = [
+      row(930, 1, `/Users/x/.local/bin/claude CLAUDE_BG_SESSION=abc ${AGENT_RUN_ENV}=${RUN}`),
+      marked(931, 930, 'node server.js'),
+    ];
+    expect(pick(rows, envRows)).toEqual([]);
+  });
+
+  it('ignores CLAUDE_BG_ values the sidecar itself has, which every agent inherits', () => {
+    const rows = [row(940, 1, 'node server.js')];
+    const envRows = [row(940, 1, `node server.js CLAUDE_BG_SESSION=abc ${AGENT_RUN_ENV}=${RUN}`)];
+    expect(pick(rows, envRows, { CLAUDE_BG_SESSION: 'abc' })).toEqual([940]);
+    expect(pick(rows, envRows, { CLAUDE_BG_SESSION: 'other' })).toEqual([]);
+  });
+
+  it('spares tmux and screen servers and apps, with everything under them', () => {
+    const rows = [
+      row(950, 1, 'tmux new-session -d -s dev'),
+      row(951, 950, 'node node_modules/.bin/next dev'),
+      row(952, 1, '/opt/homebrew/bin/screen -dmS dev'),
+      row(960, 1, '/Applications/Visual Studio Code.app/Contents/MacOS/Electron'),
+      row(961, 960, '/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code'),
+      row(970, 1, '/Users/x/Library/Caches/ms-playwright/chromium-1/chrome-mac/Chromium.app/Contents/MacOS/Chromium'),
+    ];
+    const envRows = rows.map(r => marked(r.pid, r.ppid, r.command));
+    expect(pick(rows, envRows)).toEqual([970]);
+  });
+
+  it('labels a process by its executable and first arguments, without secrets or home paths', () => {
+    expect(processLabel('/opt/homebrew/bin/node node_modules/.bin/next dev --port 3000')).toBe(
       'node node_modules/.bin/next dev',
     );
+    expect(processLabel('/usr/local/bin/psql postgres://admin:hunter2@db.internal/app -c')).toBe(
+      'psql postgres://[redacted]@db.internal/app -c',
+    );
+    expect(processLabel('node -e token=abc123;run()')).toBe('node -e [redacted]');
+    expect(processLabel('node /Users/someone/work/server.js')).not.toContain('someone');
   });
 });
 
@@ -90,18 +149,21 @@ describe('stopping what a run left', () => {
   const listing = (rows: ProcessRow[]) => async (withEnv: boolean) =>
     rows.map(r => `${r.pid} ${r.ppid} ${withEnv ? `${r.command} ${AGENT_RUN_ENV}=${RUN}` : r.command}`).join('\n');
 
-  it('does nothing when the run left nothing', async () => {
-    const signal = vi.fn();
-    const result = await stopLeftoverProcesses(RUN, { listProcesses: async () => '1 0 /sbin/launchd\n', signal });
+  it('does nothing, and lists once, when nothing carries the id', async () => {
+    const signal = vi.fn(() => true);
+    const list = vi.fn(async () => '1 0 /sbin/launchd\n');
+    const result = await stopLeftoverProcesses(RUN, { listProcesses: list, signal });
     expect(result).toEqual({ stopped: [], forced: [] });
     expect(signal).not.toHaveBeenCalled();
+    expect(list.mock.calls).toEqual([[true]]);
   });
 
-  it('sends SIGTERM, then SIGKILL to what is still there and still this run’s', async () => {
+  it('sends SIGTERM, then SIGKILL to what is still there and still the run’s', async () => {
     const alive = new Set([700, 710]);
     let rows = [row(700, 1, 'node a.js'), row(710, 1, 'node b.js')];
     const signal = vi.fn((pid: number, sig: NodeJS.Signals) => {
       if (sig === 'SIGTERM' && pid === 700) alive.delete(pid);
+      return true;
     });
     const result = await stopLeftoverProcesses(RUN, {
       listProcesses: async withEnv => listing(rows)(withEnv),
@@ -122,9 +184,38 @@ describe('stopping what a run left', () => {
     ]);
   });
 
-  it('does not SIGKILL a pid that is no longer this run’s', async () => {
+  it('also stops a process of the run started during the grace period (a watcher restarting its worker)', async () => {
+    let rows = [row(700, 1, 'nodemon server.js'), row(701, 700, 'node server.js')];
+    const alive = new Set([700, 701]);
+    const signal = vi.fn((pid: number, sig: NodeJS.Signals) => {
+      if (sig === 'SIGTERM' && pid === 701) alive.delete(pid);
+      return true;
+    });
+    const result = await stopLeftoverProcesses(RUN, {
+      listProcesses: async withEnv => listing(rows)(withEnv),
+      signal,
+      isAlive: pid => alive.has(pid),
+      sleep: async () => {
+        // nodemon ignores SIGTERM and restarts its worker.
+        rows = [row(700, 1, 'nodemon server.js'), row(702, 700, 'node server.js')];
+        alive.add(702);
+      },
+      graceMs: 100,
+      selfPid: SIDECAR,
+    });
+    expect(signal.mock.calls).toEqual([
+      [700, 'SIGTERM'],
+      [701, 'SIGTERM'],
+      [700, 'SIGKILL'],
+      [702, 'SIGKILL'],
+    ]);
+    expect(result.stopped.map(r => r.pid)).toEqual([700, 701, 702]);
+    expect(result.forced.map(r => r.pid)).toEqual([700, 702]);
+  });
+
+  it('does not SIGKILL a pid that is no longer the run’s', async () => {
     let call = 0;
-    const signal = vi.fn();
+    const signal = vi.fn(() => true);
     await stopLeftoverProcesses(RUN, {
       // First listing: 710 is the run's. After the grace period, 710 is someone else's.
       listProcesses: async withEnv => {
@@ -139,6 +230,20 @@ describe('stopping what a run left', () => {
       selfPid: SIDECAR,
     });
     expect(signal.mock.calls).toEqual([[710, 'SIGTERM']]);
+  });
+
+  it('reports and waits for only the processes it could signal', async () => {
+    const sleep = vi.fn(async () => {});
+    const result = await stopLeftoverProcesses(RUN, {
+      listProcesses: listing([row(700, 1, 'node a.js'), row(710, 1, 'node b.js')]),
+      // 710 exited (or is no longer this user's) before the signal reached it.
+      signal: pid => pid === 700,
+      isAlive: pid => pid === 710,
+      sleep,
+      selfPid: SIDECAR,
+    });
+    expect(result).toEqual({ stopped: [row(700, 1, 'node a.js')], forced: [] });
+    expect(sleep).not.toHaveBeenCalled();
   });
 });
 
@@ -176,11 +281,13 @@ const waitUntil = async (check: () => boolean, ms = 3_000): Promise<boolean> => 
 
 describe.skipIf(process.platform !== 'darwin')('on this machine', () => {
   it("stops a detached process carrying the run id and leaves another run's", async () => {
-    const mine = await startDetached({ [AGENT_RUN_ENV]: RUN });
-    const theirs = await startDetached({ [AGENT_RUN_ENV]: OTHER_RUN });
+    const run = randomUUID();
+    const otherRun = randomUUID();
+    const mine = await startDetached({ [AGENT_RUN_ENV]: run });
+    const theirs = await startDetached({ [AGENT_RUN_ENV]: otherRun });
     try {
       expect(isAlive(mine)).toBe(true);
-      const result = await stopLeftoverProcesses(RUN);
+      const result = await stopLeftoverProcesses(run);
       expect(result.stopped.map(r => r.pid)).toEqual([mine]);
       expect(await waitUntil(() => !isAlive(mine))).toBe(true);
       expect(isAlive(theirs)).toBe(true);
@@ -189,8 +296,8 @@ describe.skipIf(process.platform !== 'darwin')('on this machine', () => {
     }
   });
 
-  const leaver = (): AgentBackend => ({
-    id: 'codex',
+  const leaver = (id: AgentBackend['id'] = 'codex'): AgentBackend => ({
+    id,
     displayName: 'leaver',
     resolveBinary: () => '/bin/sh',
     isAvailable: () => true,
@@ -220,15 +327,30 @@ describe.skipIf(process.platform !== 'darwin')('on this machine', () => {
     }
   });
 
-  it('skips the check for a run with no tools', async () => {
+  it('skips the check for a Claude Code run with no tools', async () => {
     const logs: WorkflowStepLog[] = [];
     const result = await runAgent(
       { cwd: os.tmpdir(), prompt: 'unused', noTools: true, onLog: entry => logs.push(entry as WorkflowStepLog) },
-      leaver(),
+      leaver('claude-code'),
     );
     const pid = Number(result.stdout.trim());
     try {
       expect(logs.some(l => l.stage.startsWith('agent.leftover_processes'))).toBe(false);
+    } finally {
+      if (pid > 1 && isAlive(pid)) process.kill(pid, 'SIGKILL');
+    }
+  });
+
+  it('still checks a Codex run marked no-tools: Codex always has a shell', async () => {
+    const logs: WorkflowStepLog[] = [];
+    const result = await runAgent(
+      { cwd: os.tmpdir(), prompt: 'unused', noTools: true, onLog: entry => logs.push(entry as WorkflowStepLog) },
+      leaver('codex'),
+    );
+    const pid = Number(result.stdout.trim());
+    try {
+      expect(await waitUntil(() => !isAlive(pid))).toBe(true);
+      expect(logs.some(l => l.stage === 'agent.leftover_processes')).toBe(true);
     } finally {
       if (pid > 1 && isAlive(pid)) process.kill(pid, 'SIGKILL');
     }

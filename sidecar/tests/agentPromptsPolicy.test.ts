@@ -104,9 +104,13 @@ describe('process rule on every agent prompt (issue #445)', () => {
 
   it('says a later command cannot stop a server, that leftovers are stopped for it, and never to ask the requester (issue #608)', () => {
     expect(PROCESS_HYGIENE_RULE).toContain('A later command cannot stop a process an earlier command started');
-    expect(PROCESS_HYGIENE_RULE).toContain('start it, use it and stop it in one command');
-    expect(PROCESS_HYGIENE_RULE).toContain('Anything still running when you finish is stopped for you');
-    expect(PROCESS_HYGIENE_RULE).toContain('never ask anyone to stop a process or run a command for you');
+    expect(PROCESS_HYGIENE_RULE).toContain('start a dev server, use it and stop it in the same command');
+    expect(PROCESS_HYGIENE_RULE).toContain('LOG=$(mktemp)');
+    expect(PROCESS_HYGIENE_RULE).toContain('leave nothing running between commands');
+    expect(PROCESS_HYGIENE_RULE).toContain('miniOG stops what is left when the run ends');
+    expect(PROCESS_HYGIENE_RULE).toContain('never ask anyone to stop or kill a process for you');
+    expect(PROCESS_HYGIENE_RULE).not.toContain('run a command for you');
+    expect(PROCESS_HYGIENE_RULE).not.toContain('/tmp/dev.log');
     expect(PROCESS_HYGIENE_RULE).not.toContain('stop that PID before you finish');
   });
 
