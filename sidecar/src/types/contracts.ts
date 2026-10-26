@@ -507,6 +507,12 @@ export interface CodexRunRequest {
    * `agentSandbox.ts`. The Codex backend ignores this.
    */
   sandbox?: boolean;
+  /**
+   * Extra environment variables for the agent process, applied last (issue
+   * #730: a follow-up's coder gets git config that blocks pushes). Both
+   * backends.
+   */
+  extraEnv?: Readonly<Record<string, string>>;
 }
 
 export type McpServerConfig =

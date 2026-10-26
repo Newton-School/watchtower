@@ -53,7 +53,34 @@ import type { ClarificationRound } from './shared/clarificationGuards.js';
 import { profileForAgentRole } from '../codex/modelProfiles.js';
 import { buildPlannerPrompt, buildPlannerPlanModePrompt } from '../agents/prompts.js';
 import { refreshWorktreeToBase, resolveWorkspace } from '../workspaces/workspaceManager.js';
-import { createPrFromWorkspace, findRunPr } from '../github/postPipelinePr.js';
+import {
+  commentFollowUpOnPr,
+  createPrFromWorkspace,
+  findRunPr,
+  keepFollowUpOnSideBranch,
+  pushFollowUpToPr,
+  relandFollowUpAsNewPr,
+  settleUnfinishedFollowUp,
+  type PrBranchState,
+} from '../github/postPipelinePr.js';
+import {
+  checkoutFollowUpBranch,
+  findFollowUpPr,
+  followUpNoteFor,
+  followUpPlanNote,
+  followUpPlannerBlock,
+  originSlug,
+  prStatePart,
+  readPrNow,
+  savedPart,
+  STAGING_STILL_OLD,
+  stagingShowsBranch,
+  strayPrLine,
+  unfinishedFollowUpLine,
+  unfinishedFollowUpSummary,
+  whichPrQuestion,
+  type FollowUpPr,
+} from './shared/followUpPr.js';
 import { buildUnfinishedRunMessage, coderReportedPrUrl } from '../agents/unfinishedRun.js';
 import {
   fetchChecksState,
@@ -806,6 +833,8 @@ async function confirmQuickPrAction(params: {
   return stop('SKIPPED', msg, await say(msg));
 }
 type ImplementationStore = PipelineStore & {
+  /** PRs earlier change runs in a thread opened, newest first, and who each was for (issue #730). */
+  changeRunPrsInThread?: (channelId: string, threadTs: string) => Array<{ prUrl: string; requesterId?: string }>;
   getState?: (key: string) => string | undefined;
   setState?: (key: string, value: string) => void;
   getAccessCacheSignalAt?: () => string | undefined;
@@ -1899,11 +1928,80 @@ export async function prepareForCoder(params: {
   threadTexts: string[];
   slack: WebClient;
   logStep?: WorkflowStepLogger;
+  /** The open PR from this thread the change adds to (issue #730). */
+  followUp?: FollowUpPr;
   /** Test seams. */
-  deps?: { listOpenPrs?: (cwd: string) => Promise<OpenPr[]>; refresh?: typeof refreshWorktreeToBase };
-}): Promise<void> {
-  const { jobId, task, config, pipelineCwd, planMarkdown, slack, logStep } = params;
+  deps?: {
+    listOpenPrs?: (cwd: string) => Promise<OpenPr[]>;
+    refresh?: typeof refreshWorktreeToBase;
+    checkoutBranch?: typeof checkoutFollowUpBranch;
+    readPr?: typeof readPrNow;
+    originOf?: typeof originSlug;
+  };
+}): Promise<{
+  /** Set when the worktree is on the PR's branch: the coder adds to that PR. */
+  followUp?: { pr: FollowUpPr; startHead: string };
+  /** Why the change gets a new PR after all, for the reply. */
+  followUpFallback?: string;
+}> {
+  const { jobId, task, config, pipelineCwd, planMarkdown, slack, logStep, followUp } = params;
   const repoKey = repoKeyForWorkspacePath(pipelineCwd, config);
+
+  // A follow-up works on the PR's branch, never reset to the default branch (issue #730).
+  let active: { pr: FollowUpPr; startHead: string } | undefined;
+  let followUpFallback: string | undefined;
+  const fallBack = (reason: string, note: string, detail?: string) => {
+    followUpFallback = note;
+    logStep?.({
+      stage: 'implementation.followup.fallback',
+      message: `${note} (${reason})`,
+      level: reason === 'checkout_failed' || reason === 'unreadable' ? 'WARN' : 'INFO',
+      data: { prUrl: followUp?.url, reason, ...(detail ? { detail } : {}) },
+    });
+  };
+  if (followUp) {
+    const origin = await (params.deps?.originOf ?? originSlug)(pipelineCwd);
+    const prSlug = `${followUp.owner}/${followUp.repo}`.toLowerCase();
+    const otherRepo = origin ? origin !== prSlug : Boolean(followUp.repoKey && repoKey && followUp.repoKey !== repoKey);
+    // The plan may have waited hours: the PR may be merged or closed by now.
+    const now = otherRepo ? undefined : await (params.deps?.readPr ?? readPrNow)(followUp.url);
+    if (otherRepo) {
+      fallBack(
+        'other_repo',
+        `This change is in ${repoKey ?? origin ?? 'another repository'}, so it has its own pull request rather than going onto ${followUp.url}.`,
+      );
+    } else if (!now) {
+      fallBack('unreadable', `I couldn't check ${followUp.url} on GitHub, so this change is in a new pull request.`);
+    } else if (now.state !== 'OPEN' || now.crossRepo || !now.branch) {
+      fallBack(
+        now.state.toLowerCase(),
+        `${followUp.url} was ${now.state === 'MERGED' ? 'merged' : 'closed'} while the plan waited, so this change is in a new pull request.`,
+      );
+    } else {
+      const pr = { ...followUp, branch: now.branch };
+      const checkout = await (params.deps?.checkoutBranch ?? checkoutFollowUpBranch)(pipelineCwd, pr.branch);
+      if (checkout.ok) {
+        active = { pr, startHead: checkout.head };
+        logStep?.({
+          stage: 'implementation.followup.checked_out',
+          message: `The coder works on ${pr.branch}, the branch of ${pr.url}.`,
+          data: { prUrl: pr.url, branch: pr.branch, head: checkout.head },
+        });
+      } else {
+        fallBack(
+          'checkout_failed',
+          `I couldn't check out the branch of ${followUp.url}, so this change is in a new pull request.`,
+          checkout.reason,
+        );
+      }
+    }
+  }
+
+  // The PR this change adds to is never "someone else changing this file";
+  // when the change gets its own PR after all, that PR is, so the thread's
+  // mention of it no longer hides it from the heads-up.
+  const threadTexts =
+    followUp && !active ? params.threadTexts.map(text => text.split(followUp.url).join('')) : params.threadTexts;
   await headsUpOnSameFiles({
     jobId,
     channelId: task.event.channelId,
@@ -1912,11 +2010,13 @@ export async function prepareForCoder(params: {
     cwd: pipelineCwd,
     // Files the plan lists, never a guess from every path in it.
     files: planListsFiles(planMarkdown) ? params.planAffectedFiles : [],
-    context: [task.event.text ?? '', ...params.threadTexts, planMarkdown],
+    context: [task.event.text ?? '', ...threadTexts, planMarkdown, active?.pr.url ?? ''],
     slack,
     logStep,
     listOpenPrs: params.deps?.listOpenPrs,
   });
+  if (active) return { followUp: active };
+
   const refresh = await (params.deps?.refresh ?? refreshWorktreeToBase)(pipelineCwd);
   if (refresh.ok) {
     logStep?.({
@@ -1931,6 +2031,202 @@ export async function prepareForCoder(params: {
       level: 'WARN',
       data: { pipelineCwd, reason: refresh.reason },
     });
+  }
+  return followUpFallback ? { followUpFallback } : {};
+}
+
+export type LandedFollowUp =
+  | {
+      kind: 'added';
+      ontoNewerCommits: boolean;
+      commented: boolean;
+      stagingStillOld: boolean;
+      /** The PR merged in the moment between the push and the re-read: this commit isn't in it. */
+      mergedMeanwhile: boolean;
+    }
+  | { kind: 'conflict'; wipBranch?: string; prState?: PrBranchState }
+  | { kind: 'relanded'; prUrl: string }
+  | { kind: 'already' }
+  | { kind: 'closed'; wipBranch?: string }
+  | { kind: 'nothing' }
+  | { kind: 'rewritten'; wipBranch?: string; prState?: PrBranchState }
+  | { kind: 'failed'; reason: string; wipBranch?: string; prState?: PrBranchState; mergedMeanwhile?: boolean };
+
+/**
+ * Lands a follow-up whose checks passed (issue #730). The PR is read again
+ * first (asked twice). Merged while the run worked: pushing to its branch
+ * would land on a dead branch, so the new commits become a fresh PR from the
+ * default branch. Closed: the work is kept on a side branch and the person is
+ * asked, not revived. Otherwise the commits go onto the PR's branch, the PR is
+ * read once more in case it merged in that moment, and the engineering
+ * account goes on the PR as a comment.
+ */
+export async function landFollowUp(params: {
+  followUp: { pr: FollowUpPr; startHead: string };
+  repoPath: string;
+  task: NormalizedTask;
+  summary: string;
+  requestedBy?: string;
+  store?: ImplementationStore;
+  logStep?: WorkflowStepLogger;
+  onLog?: (msg: string) => void;
+  /** Test seams. */
+  deps?: {
+    readPr?: typeof readPrNow;
+    push?: typeof pushFollowUpToPr;
+    reland?: typeof relandFollowUpAsNewPr;
+    keep?: typeof keepFollowUpOnSideBranch;
+    comment?: typeof commentFollowUpOnPr;
+  };
+}): Promise<LandedFollowUp> {
+  const { followUp, repoPath, task, summary, requestedBy, store, logStep, onLog, deps } = params;
+  const { pr, startHead } = followUp;
+  const readPr = deps?.readPr ?? readPrNow;
+  const common = {
+    repoPath,
+    startHead,
+    uniqueTs: task.event.eventTs,
+    threadTs: task.event.threadTs,
+    summary,
+    requestedBy,
+  };
+  const fallback = (
+    reason: string,
+    message: string,
+    data: Record<string, unknown> = {},
+    level: 'INFO' | 'WARN' | 'ERROR' = 'INFO',
+  ) =>
+    logStep?.({ stage: 'implementation.followup.fallback', message, level, data: { prUrl: pr.url, reason, ...data } });
+
+  const now = await readPr(pr.url);
+  if (now?.state === 'MERGED') {
+    const relanded = await (deps?.reland ?? relandFollowUpAsNewPr)({
+      ...common,
+      originalPrUrl: pr.url,
+      channelId: task.event.channelId,
+      onLog,
+    });
+    fallback(
+      'merged',
+      `${pr.url} was merged while the run worked — ${relanded.kind === 'opened' ? `opened ${relanded.prUrl} from the default branch` : relanded.kind}.`,
+      { result: relanded },
+      relanded.kind === 'failed' ? 'ERROR' : 'INFO',
+    );
+    if (relanded.kind === 'opened') return { kind: 'relanded', prUrl: relanded.prUrl };
+    if (relanded.kind === 'already') return { kind: 'already' };
+    if (relanded.kind === 'nothing') return { kind: 'nothing' };
+    return { kind: 'failed', reason: relanded.reason, wipBranch: relanded.wipBranch, mergedMeanwhile: true };
+  }
+  if (now?.state === 'CLOSED') {
+    const kept = await (deps?.keep ?? keepFollowUpOnSideBranch)({ ...common, onLog });
+    fallback('closed', `${pr.url} was closed while the run worked — kept the change on a side branch and asked.`, {
+      wipBranch: kept.wipBranch,
+    });
+    return kept.nothing ? { kind: 'nothing' } : { kind: 'closed', wipBranch: kept.wipBranch };
+  }
+
+  const push = await (deps?.push ?? pushFollowUpToPr)({ ...common, branch: pr.branch, prUrl: pr.url, onLog });
+  if (push.kind === 'pushed') {
+    // It may have merged in the moment between the read above and the push.
+    const after = await readPr(pr.url);
+    const mergedMeanwhile = after?.state === 'MERGED';
+    const commented = mergedMeanwhile
+      ? false
+      : await (deps?.comment ?? commentFollowUpOnPr)({
+          repoPath,
+          prUrl: pr.url,
+          summary,
+          requestedBy,
+          channelId: task.event.channelId,
+          threadTs: task.event.threadTs,
+        });
+    logStep?.({
+      stage: mergedMeanwhile ? 'implementation.followup.merged_meanwhile' : 'implementation.followup.pushed',
+      message: mergedMeanwhile
+        ? `${pr.url} merged just as the follow-up was pushed to ${pr.branch}: the commit isn't in it.`
+        : `Added the change to ${pr.url} (${pr.branch})${push.ontoNewerCommits ? ', on top of changes made meanwhile' : ''}.`,
+      level: mergedMeanwhile ? 'WARN' : 'INFO',
+      data: { prUrl: pr.url, branch: pr.branch, ontoNewerCommits: push.ontoNewerCommits, commented },
+    });
+    return {
+      kind: 'added',
+      ontoNewerCommits: push.ontoNewerCommits,
+      commented,
+      stagingStillOld: !mergedMeanwhile && stagingShowsBranch(deployStoreOf(store), pr),
+      mergedMeanwhile,
+    };
+  }
+  if (push.kind === 'nothing') {
+    logStep?.({
+      stage: 'implementation.followup.nothing',
+      message: `The run left nothing new on top of ${pr.url}.`,
+      data: { prUrl: pr.url },
+    });
+    return push;
+  }
+  // Our own unchecked commits reached the PR (the coder got a push through):
+  // the loudest case, whatever else went wrong.
+  const level = push.prState?.ours ? 'ERROR' : push.kind === 'failed' ? 'ERROR' : 'WARN';
+  const reason =
+    push.kind === 'conflict'
+      ? 'branch_moved_conflict'
+      : push.kind === 'rewritten'
+        ? 'history_rewritten'
+        : 'push_failed';
+  fallback(
+    reason,
+    push.kind === 'conflict'
+      ? `${pr.branch} changed and the follow-up clashes with it — kept on a side branch, nothing pushed.`
+      : push.kind === 'rewritten'
+        ? `The coder rewrote ${pr.url}'s history instead of adding a commit — not pushed.`
+        : `Couldn't push the follow-up to ${pr.url}: ${push.reason}`,
+    {
+      ...(push.kind === 'failed' ? { detail: push.reason } : {}),
+      wipBranch: push.wipBranch,
+      prState: push.prState,
+      ...(push.prState?.ours ? { uncheckedCommitsOnPr: true } : {}),
+    },
+    level,
+  );
+  return push;
+}
+
+/** What the thread is told after a follow-up's checks passed (issue #730), in plain words. */
+export function landedFollowUpText(params: {
+  outcome: LandedFollowUp;
+  prUrl: string;
+  /** The usual change reply for a given PR link (`composeChangeReply`). */
+  reply: (prUrl: string, opts?: { addedTo?: boolean; notesInPr?: boolean }) => string;
+  /** A PR the coder opened although it was told not to. */
+  strayPrUrl?: string;
+}): string {
+  const { outcome, prUrl, reply } = params;
+  const stray = strayPrLine(params.strayPrUrl, prUrl);
+  switch (outcome.kind) {
+    case 'added': {
+      if (outcome.mergedMeanwhile) {
+        return `${reply('')}\n\n${prUrl} was merged just as I added this, so this change isn't in it. Mention me and I'll open it as its own pull request.${stray}`;
+      }
+      const lines = [reply(prUrl, { addedTo: true, notesInPr: outcome.commented })];
+      if (outcome.ontoNewerCommits)
+        lines.push('It had changed since I started; this change is on top of those changes.');
+      if (outcome.stagingStillOld) lines.push(STAGING_STILL_OLD);
+      return `${lines.join('\n')}${stray}`;
+    }
+    case 'conflict':
+      return `${reply('')}\n\nThis clashes with what's on ${prUrl} now, so I didn't add it.${savedPart(outcome.wipBranch, 'it')} Mention me and I'll redo it on top of the latest version.${outcome.prState?.ours ? ` ${prStatePart(prUrl, { prUntouched: false, landed: outcome.prState.landed, ours: true })}` : ''}${stray}`;
+    case 'relanded':
+      return `${reply(outcome.prUrl)}\n\n${prUrl} was merged while I worked, so this change is in a new pull request.${stray}`;
+    case 'already':
+      return `${reply('')}\n\n${prUrl} was merged while I worked, and everything this change does is already in the main branch, so there's nothing new to add.${stray}`;
+    case 'closed':
+      return `${reply('')}\n\n${prUrl} was closed while I worked, so I didn't add this to it.${savedPart(outcome.wipBranch, 'the change')} Want it as a new pull request? Mention me and say so.${stray}`;
+    case 'nothing':
+      return `${reply('')}\n\nNothing new was added to ${prUrl}.${stray}`;
+    case 'rewritten':
+      return `${reply('')}\n\nI didn't add this to ${prUrl}: it was saved in a way that would have replaced what's already there. ${prStatePart(prUrl, outcome.prState ? { prUntouched: outcome.prState.untouched, landed: outcome.prState.landed, ours: outcome.prState.ours } : { landed: [] })}${savedPart(outcome.wipBranch, 'the change')}${stray}`;
+    default:
+      return `${reply('')}\n\n${outcome.mergedMeanwhile ? `${prUrl} was merged while I worked, and I couldn't open this as a new pull request.` : `I couldn't add this to ${prUrl}.`}${outcome.prState ? ` ${prStatePart(prUrl, { prUntouched: outcome.prState.untouched, landed: outcome.prState.landed, ours: outcome.prState.ours })}` : ''}${savedPart(outcome.wipBranch, 'the change')}${stray}`;
   }
 }
 
@@ -2111,6 +2407,61 @@ async function runImplementationWorkflowBody(params: {
         prs: [prActionAsk.pr],
         checkPr: prActionAsk.pr,
         action: prActionAsk.action,
+      });
+    }
+
+    // A change asked in a thread whose earlier change run left an open PR goes
+    // onto that PR, not a second one that conflicts with it (issue #730).
+    const followUpRequester = requesterOf(task);
+    const followUpLookup = await findFollowUpPr({
+      task,
+      store,
+      requesterId: followUpRequester,
+      // The owner or an admin may add to anyone's PR; others only to their own (S4).
+      mayAddToOthers: getAdminUserIds(config).includes(followUpRequester),
+      logStep,
+    });
+    if (followUpLookup.kind === 'several') {
+      const question = whichPrQuestion(followUpLookup.prUrls);
+      logStep?.({
+        stage: 'implementation.followup.ask',
+        message: 'More than one open PR from this thread could take the change — asking which.',
+        data: { prUrls: followUpLookup.prUrls },
+      });
+      const posted = await slack.chat
+        .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: question })
+        .then(() => true)
+        .catch(() => false);
+      return {
+        workflow: 'IMPLEMENTATION',
+        status: 'SKIPPED',
+        message: question,
+        notifyDesktop: false,
+        slackPosted: posted,
+      };
+    }
+    const followUpCandidate = followUpLookup.kind === 'followup' ? followUpLookup.pr : undefined;
+    // Said at the end when the change lands in a new PR for a reason the person would not guess.
+    let followUpNote = followUpNoteFor(followUpLookup);
+    // The coder reads the thread without the follow-up block when the change gets its own PR.
+    const threadContextWithoutFollowUp = ctx.threadContext;
+    if (followUpCandidate) {
+      logStep?.({
+        stage: 'implementation.followup.detected',
+        message: `This thread has an open PR from an earlier change: ${followUpCandidate.url} — planning this as a follow-up on it.`,
+        data: { prUrl: followUpCandidate.url, branch: followUpCandidate.branch },
+      });
+      ctx.threadContext = `${ctx.threadContext}${followUpPlannerBlock(followUpCandidate)}`;
+    } else if (followUpNote) {
+      const prUrl =
+        followUpLookup.kind === 'others' ? followUpLookup.pr.url : (followUpLookup as { prUrl: string }).prUrl;
+      logStep?.({
+        stage: 'implementation.followup.fallback',
+        message: `${followUpNote} (${followUpLookup.kind})`,
+        data: {
+          prUrl,
+          reason: followUpLookup.kind === 'ended' ? followUpLookup.state.toLowerCase() : followUpLookup.kind,
+        },
       });
     }
 
@@ -2515,6 +2866,8 @@ async function runImplementationWorkflowBody(params: {
         planMarkdown,
         threadMessages: ctx.threadMessages,
         repoAffinity,
+        // A follow-up belongs in its PR's repo unless the plan's files say otherwise (issue #730).
+        preferredRepo: followUpCandidate?.repoKey,
         signal,
       });
 
@@ -2578,6 +2931,7 @@ async function runImplementationWorkflowBody(params: {
           scope: planScope,
           repoPath: pipelineCwd,
           requesterToConfirm: requesterToConfirmFor(planMarkdown, config, requesterOf(task)),
+          ...(followUpCandidate ? { note: followUpPlanNote(followUpCandidate) } : {}),
           logStep,
         });
       } catch (error) {
@@ -2730,7 +3084,7 @@ async function runImplementationWorkflowBody(params: {
     // initial repo classification.
     pipelineCwd = loopOutcome.pipelineCwd;
 
-    await prepareForCoder({
+    const prepared = await prepareForCoder({
       jobId,
       task,
       config,
@@ -2740,7 +3094,19 @@ async function runImplementationWorkflowBody(params: {
       threadTexts: (ctx.threadMessages ?? []).map(message => message.text),
       slack,
       logStep,
+      followUp: followUpCandidate,
     });
+    const activeFollowUp = prepared.followUp;
+    const followUpLog = (msg: string) => logStep?.({ stage: 'implementation.pr.progress', message: msg });
+    const settleFollowUp = (followUp: { pr: FollowUpPr; startHead: string }) =>
+      settleUnfinishedFollowUp({
+        repoPath: pipelineCwd,
+        branch: followUp.pr.branch,
+        startHead: followUp.startHead,
+        uniqueTs: task.event.eventTs,
+        onLog: followUpLog,
+      });
+    if (prepared.followUpFallback) followUpNote = prepared.followUpFallback;
     if (signal?.aborted) {
       return cancelledResult('IMPLEMENTATION');
     }
@@ -2800,9 +3166,14 @@ async function runImplementationWorkflowBody(params: {
       // which the backend also reads in the worktree). Derived from the final
       // pipelineCwd because plan revisions may have swapped repos mid-flight.
       policyPack: repoPolicyPackForCwd(pipelineCwd, config),
+      // The coder commits to the thread's open PR instead of opening one (issue #730).
+      followUp: activeFollowUp ? { prUrl: activeFollowUp.pr.url, branch: activeFollowUp.pr.branch } : undefined,
+      // Every commit since the PR commit it started from is reviewed, also after a coder question.
+      diffBaseSha: activeFollowUp?.startHead,
     });
 
-    let currentThreadContext = ctx.threadContext;
+    // The follow-up block is the coder's only when it really adds to that PR.
+    let currentThreadContext = activeFollowUp ? ctx.threadContext : threadContextWithoutFollowUp;
     let fullResult = await runAgentPipeline({
       ctx: buildPipelineCtx(currentThreadContext),
       slack,
@@ -2984,7 +3355,60 @@ async function runImplementationWorkflowBody(params: {
         level: 'WARN',
         data: { finalStatus: fullResult.finalStatus },
       });
+      // A stopped follow-up pushed nothing to its PR: say so, and keep the work (issue #730).
+      if (activeFollowUp) {
+        const settled = await settleFollowUp(activeFollowUp);
+        if (settled.ours) {
+          logStep?.({
+            stage: 'implementation.followup.unfinished',
+            message: `The follow-up was stopped, and its unchecked commits are on ${activeFollowUp.pr.url}.`,
+            level: 'ERROR',
+            data: { prUrl: activeFollowUp.pr.url, ...settled },
+          });
+        }
+        await slack.chat
+          .postMessage({
+            channel: task.event.channelId,
+            thread_ts: task.event.threadTs,
+            text: `${unfinishedFollowUpLine(activeFollowUp.pr.url, settled)}${strayPrLine(coderReportedPrUrl(fullResult.steps), activeFollowUp.pr.url)}`,
+          })
+          .catch(() => {});
+      }
       return cancelledResult('IMPLEMENTATION');
+    }
+
+    // A follow-up that didn't pass: the coder only committed, so the PR is
+    // normally untouched; the unreviewed work goes to a side branch (issue #730).
+    if (fullResult.finalStatus !== 'passed' && activeFollowUp) {
+      const settled = await settleFollowUp(activeFollowUp);
+      const interruptedReason =
+        fullResult.interrupted?.kind === 'connection_lost'
+          ? connectionLostReply(`the ${fullResult.interrupted.role} was running`)
+          : fullResult.interrupted
+            ? killedFromOutsideReply(`The ${fullResult.interrupted.role}`)
+            : undefined;
+      const failureSummary = `${unfinishedFollowUpSummary(fullResult, interruptedReason, activeFollowUp.pr.url, settled)}${strayPrLine(coderReportedPrUrl(fullResult.steps), activeFollowUp.pr.url)}`;
+      logStep?.({
+        stage: 'implementation.followup.unfinished',
+        message: settled.ours
+          ? `The follow-up did not pass, and its unchecked commits are on ${activeFollowUp.pr.url}.`
+          : `The follow-up did not pass; ${activeFollowUp.pr.url} ${settled.prUntouched ? 'is as it was' : 'was not confirmed unchanged'}.`,
+        level: settled.ours ? 'ERROR' : 'WARN',
+        data: { finalStatus: fullResult.finalStatus, prUrl: activeFollowUp.pr.url, ...settled },
+      });
+      await slack.chat.postMessage({
+        channel: task.event.channelId,
+        thread_ts: task.event.threadTs,
+        text: failureSummary,
+      });
+      return {
+        workflow: 'IMPLEMENTATION',
+        status: 'FAILED',
+        message: failureSummary,
+        // Unchecked commits on someone's PR need an admin's eyes.
+        notifyDesktop: Boolean(settled.ours),
+        slackPosted: true,
+      };
     }
 
     if (fullResult.finalStatus !== 'passed') {
@@ -3055,7 +3479,13 @@ async function runImplementationWorkflowBody(params: {
       // A dossier read must not decide whether the run reports.
     }
     const engineerReads = requesterIsEngineer({ userId: requesterUserId, config, role: requesterRole });
-    const replyFor = (prUrlForReply: string, external: string, prFailed = false): string =>
+    const replyFor = (
+      prUrlForReply: string,
+      external: string,
+      prFailed = false,
+      addedTo = false,
+      notesInPr = true,
+    ): string =>
       composeChangeReply({
         summary,
         requesterSummary,
@@ -3063,6 +3493,8 @@ async function runImplementationWorkflowBody(params: {
         prUrl: prUrlForReply,
         externalBlock: external,
         prFailed,
+        addedTo,
+        notesInPr,
       });
 
     let prUrl = coderReportedPrUrl(fullResult.steps) ?? '';
@@ -3118,6 +3550,43 @@ async function runImplementationWorkflowBody(params: {
       };
     }
 
+    // A follow-up lands on the thread's open PR once its checks passed (issue
+    // #730): the only push of a follow-up, never over someone else's commits.
+    if (activeFollowUp) {
+      const outcome = await landFollowUp({
+        followUp: activeFollowUp,
+        repoPath: pipelineCwd,
+        task,
+        summary,
+        requestedBy: ctx.requestedBy,
+        store,
+        logStep,
+        onLog: followUpLog,
+      });
+      const text = landedFollowUpText({
+        outcome,
+        prUrl: activeFollowUp.pr.url,
+        // Plain words for the person who asked: no "could not open a pull request" warning here.
+        reply: (link, opts) => replyFor(link, externalBlock, false, opts?.addedTo ?? false, opts?.notesInPr ?? true),
+        strayPrUrl: prUrl || undefined,
+      });
+      const delivered = (outcome.kind === 'added' && !outcome.mergedMeanwhile) || outcome.kind === 'relanded';
+      const quiet = outcome.kind === 'nothing' || outcome.kind === 'already' || outcome.kind === 'closed';
+      await slack.chat.postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text });
+      return {
+        workflow: 'IMPLEMENTATION',
+        status: delivered || quiet ? 'SUCCESS' : 'FAILED',
+        message: summary,
+        notifyDesktop: !delivered && !quiet,
+        slackPosted: true,
+        ...(outcome.kind === 'added' && !outcome.mergedMeanwhile
+          ? { result: { prUrl: activeFollowUp.pr.url } }
+          : outcome.kind === 'relanded'
+            ? { result: { prUrl: outcome.prUrl } }
+            : {}),
+      };
+    }
+
     if (!prUrl) {
       logStep?.({
         stage: 'implementation.pr.creating',
@@ -3143,7 +3612,7 @@ async function runImplementationWorkflowBody(params: {
     await slack.chat.postMessage({
       channel: task.event.channelId,
       thread_ts: task.event.threadTs,
-      text: replyFor(prUrl, externalBlock, prUrl === ''),
+      text: `${replyFor(prUrl, externalBlock, prUrl === '')}${followUpNote ? `\n\n${followUpNote}` : ''}`,
     });
 
     return {

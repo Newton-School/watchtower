@@ -108,9 +108,7 @@ describe('prepareForCoder', () => {
     const refresh = vi.fn(
       async (): Promise<WorktreeRefresh> => ({ ok: false, reason: 'fatal: unable to access origin' }),
     );
-    await expect(
-      run({ logStep, deps: { listOpenPrs: vi.fn().mockResolvedValue([]), refresh } }),
-    ).resolves.toBeUndefined();
+    await expect(run({ logStep, deps: { listOpenPrs: vi.fn().mockResolvedValue([]), refresh } })).resolves.toEqual({});
     expect(logStep).toHaveBeenCalledWith(
       expect.objectContaining({ stage: 'implementation.refresh.failed', level: 'WARN' }),
     );
@@ -147,5 +145,138 @@ describe('prepareForCoder', () => {
       deps: { listOpenPrs: vi.fn().mockResolvedValue([otherPr]), refresh: vi.fn(async () => refreshed) },
     });
     expect(slack.chat.postMessage).not.toHaveBeenCalled();
+  });
+
+  // Issue #730: a follow-up works on the thread's open PR's branch.
+  describe('a follow-up on the thread PR', () => {
+    const threadPr = {
+      url: 'https://github.com/o/newton-web/pull/1404',
+      owner: 'o',
+      repo: 'newton-web',
+      number: 1404,
+      branch: 'pm/hero-111-1',
+      repoKey: 'newton-web' as const,
+      files: [FILE],
+    };
+
+    const openNow = vi.fn(async () => ({ state: 'OPEN', branch: 'pm/hero-111-1', head: 'prhead1', crossRepo: false }));
+    const sameOrigin = vi.fn(async () => 'o/newton-web');
+
+    it('checks out the PR branch and never resets to the base', async () => {
+      const refresh = vi.fn(async () => refreshed);
+      const checkoutBranch = vi.fn(async () => ({ ok: true as const, head: 'prhead1' }));
+      const logStep = vi.fn();
+      const slack = makeSlack();
+      const result = await run({
+        slack: slack as never,
+        logStep,
+        followUp: threadPr,
+        deps: {
+          listOpenPrs: vi.fn().mockResolvedValue([otherPr]),
+          refresh,
+          checkoutBranch,
+          readPr: openNow,
+          originOf: sameOrigin,
+        },
+      });
+      expect(result).toEqual({ followUp: { pr: threadPr, startHead: 'prhead1' } });
+      expect(checkoutBranch).toHaveBeenCalledWith(CWD, 'pm/hero-111-1');
+      expect(refresh).not.toHaveBeenCalled();
+      // Its own PR is never "another PR changing the same files".
+      expect(slack.chat.postMessage).not.toHaveBeenCalled();
+      expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'implementation.followup.checked_out' }));
+    });
+
+    it("compares the clone's origin with the PR's repo: another repo gets its own PR, from a refreshed base", async () => {
+      const refresh = vi.fn(async () => refreshed);
+      const checkoutBranch = vi.fn();
+      const logStep = vi.fn();
+      const result = await run({
+        logStep,
+        followUp: threadPr,
+        deps: {
+          listOpenPrs: vi.fn().mockResolvedValue([]),
+          refresh,
+          checkoutBranch,
+          readPr: openNow,
+          originOf: vi.fn(async () => 'o/newton-marketing-web'),
+        },
+      });
+      expect(checkoutBranch).not.toHaveBeenCalled();
+      expect(refresh).toHaveBeenCalledWith(CWD);
+      expect(result.followUp).toBeUndefined();
+      expect(result.followUpFallback).toBe(
+        'This change is in newton-web, so it has its own pull request rather than going onto https://github.com/o/newton-web/pull/1404.',
+      );
+      expect(logStep).toHaveBeenCalledWith(
+        expect.objectContaining({
+          stage: 'implementation.followup.fallback',
+          data: expect.objectContaining({ reason: 'other_repo' }),
+        }),
+      );
+    });
+
+    it('a PR merged while the plan waited gets a new PR, and the thread PR is in the heads-up again', async () => {
+      const refresh = vi.fn(async () => refreshed);
+      const checkoutBranch = vi.fn();
+      const slack = makeSlack();
+      const result = await run({
+        slack: slack as never,
+        followUp: threadPr,
+        // The thread names the PR, which would normally keep it out of the heads-up.
+        threadTexts: [`Done: ${threadPr.url}`],
+        deps: {
+          listOpenPrs: vi.fn().mockResolvedValue([{ ...otherPr, url: threadPr.url }]),
+          refresh,
+          checkoutBranch,
+          readPr: vi.fn(async () => ({ state: 'MERGED', branch: 'pm/hero-111-1', crossRepo: false })),
+          originOf: sameOrigin,
+        },
+      });
+      expect(checkoutBranch).not.toHaveBeenCalled();
+      expect(refresh).toHaveBeenCalledWith(CWD);
+      expect(result).toEqual({
+        followUpFallback: `${threadPr.url} was merged while the plan waited, so this change is in a new pull request.`,
+      });
+      expect((slack.chat.postMessage.mock.calls[0][0] as { text: string }).text).toMatch(
+        /^Heads-up: <[^|]+\|PR #1404>/,
+      );
+    });
+
+    it("falls back to a new PR when the branch can't be checked out or GitHub can't be read", async () => {
+      const refresh = vi.fn(async () => refreshed);
+      const checkoutBranch = vi.fn(async () => ({ ok: false as const, reason: "fatal: couldn't find remote ref" }));
+      expect(
+        await run({
+          followUp: threadPr,
+          deps: {
+            listOpenPrs: vi.fn().mockResolvedValue([]),
+            refresh,
+            checkoutBranch,
+            readPr: openNow,
+            originOf: sameOrigin,
+          },
+        }),
+      ).toEqual({
+        followUpFallback:
+          "I couldn't check out the branch of https://github.com/o/newton-web/pull/1404, so this change is in a new pull request.",
+      });
+      expect(
+        await run({
+          followUp: threadPr,
+          deps: {
+            listOpenPrs: vi.fn().mockResolvedValue([]),
+            refresh,
+            checkoutBranch,
+            readPr: vi.fn(async () => undefined),
+            originOf: sameOrigin,
+          },
+        }),
+      ).toEqual({
+        followUpFallback:
+          "I couldn't check https://github.com/o/newton-web/pull/1404 on GitHub, so this change is in a new pull request.",
+      });
+      expect(refresh).toHaveBeenCalledTimes(2);
+    });
   });
 });

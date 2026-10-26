@@ -35,6 +35,7 @@ import { createProgressMessage, formatElapsed, type ProgressMessage } from '../s
 import { clipText, splitSlackText } from '../slack/replyParts.js';
 import { currentHead, checkCoderProducedChanges, getDiffVsBase } from '../workspaces/gitState.js';
 import { prepareWorktreeDeps } from '../workspaces/depCache.js';
+import { NO_PUSH_TO_GITHUB_ENV } from '../github/noPush.js';
 
 export type PipelineStore = {
   createPipelineRun(input: {
@@ -298,20 +299,23 @@ export async function postPlanForApproval(params: {
   repoPath?: string;
   /** Set only when the requester has to confirm (`planNeedsRequesterConfirmation`). */
   requesterToConfirm?: string;
+  /** One more line for the approver, e.g. that the change goes onto an open PR (issue #730). */
+  note?: string;
   logStep?: WorkflowStepLogger;
 }): Promise<string | undefined> {
   const { slack, channelId, threadTs, planMarkdown, logStep } = params;
+  const planText = formatPlanMessage(
+    planMarkdown,
+    params.affectedFiles,
+    params.scope,
+    params.repoPath,
+    false,
+    params.requesterToConfirm,
+  );
   const posted = await slack.chat.postMessage({
     channel: channelId,
     thread_ts: threadTs,
-    text: formatPlanMessage(
-      planMarkdown,
-      params.affectedFiles,
-      params.scope,
-      params.repoPath,
-      false,
-      params.requesterToConfirm,
-    ),
+    text: params.note ? `${planText}\n${params.note}` : planText,
   });
   const ts = posted.ts ?? undefined;
   const detail = formatPlanDetail(planMarkdown);
@@ -1820,10 +1824,15 @@ async function runAgentPipelineBody(
         : undefined;
 
     if (role === 'coder' && coderBaseSha === undefined) {
-      try {
-        coderBaseSha = await currentHead(ctx.repoPath);
-      } catch {
-        coderBaseSha = undefined;
+      // A follow-up reviews everything since the PR's commit it started from,
+      // across a coder question and answer that restarts the pipeline (issue #730).
+      if (ctx.diffBaseSha) coderBaseSha = ctx.diffBaseSha;
+      else {
+        try {
+          coderBaseSha = await currentHead(ctx.repoPath);
+        } catch {
+          coderBaseSha = undefined;
+        }
       }
     }
 
@@ -1846,6 +1855,8 @@ async function runAgentPipelineBody(
             // coder shipped the wrong PDF and plans said "could not open" (#595).
             imagePaths: ctx.imagePaths && ctx.imagePaths.length > 0 ? ctx.imagePaths : undefined,
             ...profile,
+            // A follow-up's coder only commits: its git can't push to GitHub (issue #730).
+            ...(role === 'coder' && ctx.followUp ? { extraEnv: NO_PUSH_TO_GITHUB_ENV } : {}),
             // timeoutMs: perAgentTimeoutMs,
             onLog: logStep,
             signal,
@@ -2175,6 +2186,7 @@ async function runAgentPipelineBody(
               githubToken: ctx.githubToken,
               imagePaths: ctx.imagePaths && ctx.imagePaths.length > 0 ? ctx.imagePaths : undefined,
               ...coderProfile,
+              ...(ctx.followUp ? { extraEnv: NO_PUSH_TO_GITHUB_ENV } : {}),
               onLog: logStep,
               signal,
             },
