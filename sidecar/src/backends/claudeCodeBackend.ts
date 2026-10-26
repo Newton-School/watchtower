@@ -398,7 +398,7 @@ export const claudeCodeBackend: AgentBackend = {
         ...(sandboxed ? sandboxReadDenyRules() : []),
         // The Write and Edit tools are refused what runs code outside the sandbox, sandboxed run or
         // not (issues #609, #743).
-        ...fileWriteDenyRules(),
+        ...fileWriteDenyRules({ cwd: request.cwd, executables: [resolveClaudeCodeBinary()] }),
         ...(request.disallowedTools ?? []),
       );
     }
