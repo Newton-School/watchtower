@@ -22,11 +22,20 @@ import path from 'node:path';
  * The file tools (Read, Write, Edit) are not sandboxed: the same secrets are
  * denied to Read by permission rule (`sandboxReadDenyRules`). So a change
  * run updates a file a repo keeps under `.claude/skills/` (a skill's ledger)
- * with the Write or Edit tool (issue #609). Of that config, the file tools are
- * refused only what runs code outside the sandbox (`SETTINGS_WRITE_DENY_RULES`).
+ * with the Write or Edit tool (issue #609). With permissions bypassed the file
+ * tools also skip the CLI's own checks on `.git` and `.claude`; deny rules are
+ * what they still obey. They are refused the files outside the worktree that
+ * run code outside the sandbox or load into the owner's own sessions
+ * (`fileWriteDenyRules`, issues #609 and #743), on every run with tools.
+ *
+ * Still open by design: the PR build gate installs and builds the PR's own code
+ * outside the sandbox, so a change's package scripts run there. Confining the
+ * file tools to the worktree and /tmp would take an allow-list, which bypassed
+ * permissions ignore: change runs would have to leave bypass first.
  *
  * Not sandboxed: browser QA (headless Chromium does not start inside it) and
- * deploys. Kill switch: `WATCHTOWER_AGENT_SANDBOX=0`.
+ * deploys. Kill switch: `WATCHTOWER_AGENT_SANDBOX=0` (the file-tool write
+ * rules stay).
  */
 
 const state: { readRoot?: string; repoPaths: string[]; appDataDir?: string } = { repoPaths: [] };
@@ -149,6 +158,103 @@ export const SETTINGS_WRITE_DENY_RULES = [
   'Edit(//**/.claude/settings.local.json)',
   'Edit(//**/.claude/hooks/**)',
 ];
+
+/**
+ * Files outside the worktree that are read as config naming a command to run,
+ * by the sidecar outside the sandbox or by the owner's own tools (issue #743).
+ * Home paths are anchored at `~/`, so the same names inside a worktree (its
+ * `.claude/skills`, #609) stay writable.
+ */
+export const HOST_CONFIG_WRITE_DENY_RULES = [
+  // Every clone's git config and hooks, submodules' and worktrees' included:
+  // the sidecar runs git on the shared clones outside the sandbox (fetch,
+  // worktree add and remove, push). And the user's own git config.
+  'Edit(//**/.git/config)',
+  'Edit(//**/.git/**/config)',
+  'Edit(//**/.git/**/config.worktree)',
+  'Edit(//**/.git/hooks/**)',
+  'Edit(//**/.git/**/hooks/**)',
+  'Edit(~/.gitconfig)',
+  'Edit(~/.config/git/**)',
+  // Shell start-up files: the PR build gate runs a login bash outside the
+  // sandbox, and the owner's own shells read them. npm's user config: that
+  // gate's install reads it.
+  'Edit(~/.profile)',
+  'Edit(~/.bash_profile)',
+  'Edit(~/.bash_login)',
+  'Edit(~/.bashrc)',
+  'Edit(~/.bash_logout)',
+  'Edit(~/.zshenv)',
+  'Edit(~/.zprofile)',
+  'Edit(~/.zshrc)',
+  'Edit(~/.zlogin)',
+  'Edit(~/.zlogout)',
+  'Edit(~/.npmrc)',
+  // What launchd starts at login.
+  'Edit(~/Library/LaunchAgents/**)',
+  // Tools' config that can name a command (ssh's ProxyCommand, credential
+  // helpers, kubectl exec plugins), and gh's.
+  'Edit(~/.ssh/**)',
+  'Edit(~/.aws/**)',
+  'Edit(~/.docker/**)',
+  'Edit(~/.kube/**)',
+  'Edit(~/.gnupg/**)',
+  'Edit(~/.config/gh/**)',
+  // The owner's own Claude Code config, which loads into his sessions. Not
+  // `~/.claude/plans`: a planner in plan mode writes its plan there.
+  'Edit(~/.claude.json)',
+  'Edit(~/.claude/CLAUDE.md)',
+  'Edit(~/.claude/commands/**)',
+  'Edit(~/.claude/agents/**)',
+  'Edit(~/.claude/skills/**)',
+  'Edit(~/.claude/plugins/**)',
+];
+
+/** miniOG's own folders under `~/.watchtower`. Not `workspaces`: change runs work there. */
+const MINIOG_DATA_DIRS = [
+  'app-backups',
+  'autostash',
+  'dep-cache',
+  'egress',
+  'logs',
+  'lookup-workspaces',
+  'replay-snapshots',
+  'vault',
+];
+
+/** A path as a permission rule takes it: `~/…` inside home, `//…` from the root. */
+const toRuleForm = (absolute: string): string => {
+  const homeForm = toHomeForm(absolute);
+  return homeForm.startsWith('~/') ? homeForm : `/${absolute}`;
+};
+
+/**
+ * miniOG's own records, caches and settings: its database, the dependency
+ * cache later worktrees are cloned from, its exports and backups. Files by
+ * name, not `~/.watchtower/*`: a rule that matches the `workspaces` folder
+ * would refuse every file under it.
+ */
+function miniOgDataWriteDenyRules(): string[] {
+  const rules = [
+    ...['watchtower.db', 'watchtower.db-wal', 'watchtower.db-shm', 'watchtower.db-journal'].map(
+      file => `Edit(~/.watchtower/${file})`,
+    ),
+    ...MINIOG_DATA_DIRS.map(dir => `Edit(~/.watchtower/${dir}/**)`),
+  ];
+  // The app's data folder, unless the worktrees are inside it.
+  const workspaces = path.join(os.homedir(), '.watchtower', 'workspaces');
+  const appData = state.appDataDir ? path.resolve(state.appDataDir) : undefined;
+  if (appData && path.relative(appData, workspaces).startsWith('..')) rules.push(`Edit(${toRuleForm(appData)}/**)`);
+  return rules;
+}
+
+/**
+ * Every write the file tools are refused, on any run with tools, sandboxed or
+ * not: a run with the sandbox off (browser QA, deploys) runs the same tools.
+ */
+export function fileWriteDenyRules(): string[] {
+  return [...SETTINGS_WRITE_DENY_RULES, ...HOST_CONFIG_WRITE_DENY_RULES, ...miniOgDataWriteDenyRules()];
+}
 
 /**
  * The checkouts beside the miniOG root (the owner's own clones in `~/code`)
