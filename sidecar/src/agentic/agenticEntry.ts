@@ -26,6 +26,7 @@ import {
 } from '../slack/fileAttachments.js';
 import type { AttachmentLimits, UndeliveredAttachment } from '../slack/fileAttachments.js';
 import { buildUndeliveredFollowUp, INLINE_MAX_CHARS } from '../slack/attachmentFollowUp.js';
+import { attachReplyTablesAsCsv, CSV_MIN_ROWS } from '../slack/tableCsv.js';
 import { botScopes } from '../slack/botScopes.js';
 import { connectorPromptBlock, connectorsFor, NO_CONNECTORS, withConnectors } from '../backends/connectors.js';
 import { collectThreadAttachments, filesForTrigger, type ThreadAttachments } from '../slack/threadAttachments.js';
@@ -254,6 +255,7 @@ Constraints:
 - Stay terse. The user reads on Slack; long answers get skipped.
 - Never fabricate file paths or line numbers — only cite things you actually opened.
 - Never trigger a deploy or a GitHub Actions workflow, staging or production, and never push, merge or edit anything in a repo or an outside system. When asked for one, say how it is done.
+- A table of ${CSV_MIN_ROWS} or more rows in your reply (or any table, when they asked for a sheet or a CSV) is attached under it as a CSV automatically: when they want a sheet, say the CSV below imports into one (you can't create a Google Sheet itself). When you show only part of a longer table, attach the full table as a .csv file yourself (see "Attaching files"); then that file is the CSV and nothing else is added.
 
 ${STE_REPLY_STYLE_BLOCK}
 
@@ -558,6 +560,19 @@ async function runAgenticTurn(params: RunAgenticEntryParams, workspace?: LookupW
         ? { filesInlined: followUp.inlined.length, filesLost: followUp.lost.length }
         : {}),
     };
+  }
+
+  // A lookup's tables also go in the thread as CSV files, for a sheet (issue #731).
+  if (mode === 'informational' && slackPosted && result.ok) {
+    await attachReplyTablesAsCsv({
+      slack,
+      channelId: task.event.channelId,
+      threadTs: task.event.threadTs,
+      replyText,
+      askText: task.event.text ?? '',
+      csvAlreadyAttached: attachments.some(attachment => attachment.path.toLowerCase().endsWith('.csv')),
+      logStep,
+    });
   }
 
   return {

@@ -180,6 +180,36 @@ describe('runInvestigationWorkflow thread images', () => {
     expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'investigation.nothing_to_fix' }));
   });
 
+  it('attaches a table in the findings as a CSV (issue #731)', async () => {
+    runCodex.mockReset().mockResolvedValue({
+      ok: true,
+      exitCode: 0,
+      parsedJson: {
+        rootCauseHypothesis: [
+          'Five batches lost leads:',
+          '| Batch | Lost |',
+          '|---|---|',
+          ...Array.from({ length: 5 }, (_, i) => `| B${i} | ${i} |`),
+        ].join('\n'),
+        evidence: [],
+        recommendedFix: 'none',
+        fixLocation: 'none',
+        summary: 'Leads were dropped by a filter.',
+      },
+    });
+    const filesUploadV2 = vi.fn().mockResolvedValue({ ok: true });
+    const slack = { ...slackStub(), filesUploadV2 };
+    await runInvestigationWorkflow({
+      task: makeTask('why did leads drop?'),
+      config,
+      slack: slack as any,
+      investigationStore: { save: vi.fn(), clear: vi.fn() } as any,
+      jobId: 'job-1',
+    });
+    expect(filesUploadV2).toHaveBeenCalledTimes(1);
+    expect(filesUploadV2.mock.calls[0][0].file_uploads[0].filename).toBe('root-cause-five-batches-lost-leads.csv');
+  });
+
   it('drops an earlier investigation in the thread when this one finds nothing to fix', async () => {
     const rows = new Map<string, any>([['1.1', { threadTs: '1.1', summary: 'an older diagnosis' }]]);
     const investigationStore = {

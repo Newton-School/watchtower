@@ -19,6 +19,7 @@ import { classifyInvestigationScope, type InvestigationScope } from '../router/i
 import { enabledRepoPaths } from '../repos/registry.js';
 import { connectorsFor, NO_CONNECTORS } from '../backends/connectors.js';
 import { refreshSharedClones } from '../workspaces/staleCheckout.js';
+import { attachReplyTablesAsCsv } from '../slack/tableCsv.js';
 import type { PipelineStore } from '../agents/pipeline.js';
 import type { InvestigationStore } from '../state/investigationStore.js';
 import type { RecallCapableStore } from '../state/dossierStore.js';
@@ -333,13 +334,25 @@ Return strict JSON:
   const message = formatInvestigationMessage(findings);
   const nextStep = investigationNextStep(findings);
 
-  await slack.chat
+  const findingsPosted = await slack.chat
     .postMessage({
       channel: task.event.channelId,
       thread_ts: task.event.threadTs,
       text: message,
     })
-    .catch(() => {});
+    .then(() => true)
+    .catch(() => false);
+  // A table in the findings also goes in the thread as a CSV (issue #731).
+  if (findingsPosted) {
+    await attachReplyTablesAsCsv({
+      slack,
+      channelId: task.event.channelId,
+      threadTs: task.event.threadTs,
+      replyText: message,
+      askText: task.event.text ?? '',
+      logStep,
+    });
+  }
 
   let promptMessageTs: string | undefined;
   if (nextStep === 'fix_outside_repos') {
