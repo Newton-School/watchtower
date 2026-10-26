@@ -1699,6 +1699,7 @@ async function main(): Promise<void> {
     miniOgRepoRoot: config.miniOgRepoRoot,
     repoPaths: enabledRepoPaths(config).map(repo => repo.path),
     appDataDir: path.dirname(path.resolve(dbPath)),
+    vaultPath: store.readVaultSettings().vaultPath,
   });
   await cleanupStaleWorkspaces();
   // Dependency installs a restart left half-deleted (issue #611): gigabytes, so not waited on.
