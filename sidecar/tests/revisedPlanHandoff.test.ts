@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import { stampApprovedPlan } from '../src/workflows/implementationWorkflow.js';
 import { normalizePlannerOutput } from '../src/agents/normalizePlannerOutput.js';
-import { buildCoderPrompt } from '../src/agents/prompts.js';
+import { buildCoderPrompt, buildVerifierPrompt } from '../src/agents/prompts.js';
 import type { AgentContext, AgentStepResult } from '../src/agents/types.js';
 import type { NormalizedTask } from '../src/types/contracts.js';
 
@@ -146,14 +146,22 @@ describe('the coder on a follow-up', () => {
     followUp,
   });
 
-  it('works on the PR branch: no new branch, no new PR, a plain push, never forced', () => {
+  it('works on the PR branch and only commits: no new branch, no PR, no push before the checks', () => {
     const prompt = buildCoderPrompt(ctx({ prUrl: PR, branch: 'raj/hero-copy-1-1' }));
     expect(prompt).toContain(`You are already on the branch of the open pull request ${PR} (\`raj/hero-copy-1-1\`)`);
     expect(prompt).toContain('do NOT create a new branch and do NOT open a new pull request');
-    expect(prompt).toContain('Push with `git push origin HEAD:raj/hero-copy-1-1`. Never force-push.');
-    expect(prompt).toContain('Never amend, rebase or squash');
+    expect(prompt).toContain('Do NOT push');
+    expect(prompt).toContain('miniOG pushes them to the pull request once they pass');
+    expect(prompt).toContain('Never amend, rebase, reset or squash');
+    expect(prompt).not.toContain('git push origin');
     expect(prompt).not.toContain('gh pr create');
     expect(prompt).not.toContain('Create a NEW branch');
+  });
+
+  it('tells the final check the commits are not on the PR yet', () => {
+    const verifier = buildVerifierPrompt(ctx({ prUrl: PR, branch: 'raj/hero-copy-1-1' }));
+    expect(verifier).toContain(`new commits for the open pull request ${PR}, not pushed yet`);
+    expect(buildVerifierPrompt(ctx())).toContain('No PR yet is not a reason to reject');
   });
 
   it('opens a new PR as before when it is not a follow-up', () => {

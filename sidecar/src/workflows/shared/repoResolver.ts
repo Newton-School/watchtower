@@ -20,7 +20,7 @@ export type RepoResolution =
   | { outcome: 'desktop_only'; reason: string }
   | { outcome: 'cancelled' };
 
-export type ResolutionSource = 'plan-affected-files' | 'classifier' | 'admin-choice';
+export type ResolutionSource = 'plan-affected-files' | 'follow-up-pr' | 'classifier' | 'admin-choice';
 
 /** The one-word reply we suggest for each repo in the admin clarify prompt. */
 const REPO_SHORT_REPLY: Record<RepoKey, string> = {
@@ -108,6 +108,11 @@ export async function resolveRepoOrAsk(params: {
    * the current task always dominates.
    */
   repoAffinity?: RepoAffinity;
+  /**
+   * The repo of the open PR this change follows up (issue #730): when the
+   * plan's files don't name a repo, this one wins over the classifier.
+   */
+  preferredRepo?: RepoKey | null;
 }): Promise<RepoResolution> {
   const {
     task,
@@ -120,6 +125,7 @@ export async function resolveRepoOrAsk(params: {
     signal,
     askAdminsOnUncertain = true,
     repoAffinity,
+    preferredRepo,
   } = params;
 
   // Fast path: the planner already named a path that lives in a known repo.
@@ -128,6 +134,9 @@ export async function resolveRepoOrAsk(params: {
   const fromFiles = inferRepoFromAffectedFiles(planAffectedFiles);
   if (fromFiles && isRepoEnabled(config, fromFiles)) {
     return resolved(fromFiles, config, 'plan-affected-files');
+  }
+  if (preferredRepo && isRepoEnabled(config, preferredRepo)) {
+    return resolved(preferredRepo, config, 'follow-up-pr');
   }
 
   const classification = await classifyRepo({

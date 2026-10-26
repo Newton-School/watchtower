@@ -102,6 +102,7 @@ const plannerNoCode = {
 
 describe('a change asked in a thread with an earlier change run PR (issue #730)', () => {
   const realView = __followUpDeps.viewPr;
+  const realDiff = __followUpDeps.prDiff;
   beforeEach(() => {
     vi.mocked(runCodex).mockReset();
     vi.mocked(runCodex).mockResolvedValue(plannerNoCode);
@@ -113,19 +114,37 @@ describe('a change asked in a thread with an earlier change run PR (issue #730)'
       notifyDesktop: false,
       slackPosted: true,
     });
+    __followUpDeps.prDiff = vi.fn(async () => '+Learn at top companies');
   });
   afterEach(() => {
     __followUpDeps.viewPr = realView;
+    __followUpDeps.prDiff = realDiff;
   });
 
-  const run = (urls: string[], logStep = vi.fn(), slack = makeSlack()) =>
+  // The earlier change runs were for the same builder unless a test says otherwise.
+  const run = (urls: string[], logStep = vi.fn(), slack = makeSlack(), requesterId = 'UBUILDER') =>
     runImplementationWorkflow({
       task,
       config,
       slack: slack as unknown as import('@slack/web-api').WebClient,
-      store: { changeRunPrUrlsInThread: vi.fn(() => urls) } as never,
+      store: { changeRunPrsInThread: vi.fn(() => urls.map(prUrl => ({ prUrl, requesterId }))) } as never,
       logStep,
     });
+
+  it("gives another person's change its own PR and says why (S4)", async () => {
+    __followUpDeps.viewPr = vi.fn(async () => ({
+      state: 'OPEN',
+      headRefName: 'pm/hero-111-22',
+      isCrossRepository: false,
+    }));
+    const logStep = vi.fn();
+    await run([PR1], logStep, makeSlack(), 'UOTHERPM');
+
+    expect(vi.mocked(runCodex).mock.calls[0][0].prompt).not.toContain('FOLLOW-UP ON AN OPEN PULL REQUEST');
+    expect(logStep).toHaveBeenCalledWith(
+      expect.objectContaining({ stage: 'implementation.followup.fallback', data: { prUrl: PR1, reason: 'others' } }),
+    );
+  });
 
   it('tells the planner it is a follow-up on the open PR, on top of its branch', async () => {
     __followUpDeps.viewPr = vi.fn(async () => ({
@@ -140,6 +159,7 @@ describe('a change asked in a thread with an earlier change run PR (issue #730)'
     const plannerPrompt = vi.mocked(runCodex).mock.calls[0][0].prompt;
     expect(plannerPrompt).toContain('=== FOLLOW-UP ON AN OPEN PULL REQUEST ===');
     expect(plannerPrompt).toContain(`opened ${PR1} (Newton-School/newton-web, branch \`pm/hero-111-22\`)`);
+    expect(plannerPrompt).toContain('```diff\n+Learn at top companies\n```');
     expect(logStep).toHaveBeenCalledWith(
       expect.objectContaining({
         stage: 'implementation.followup.detected',
@@ -156,7 +176,7 @@ describe('a change asked in a thread with an earlier change run PR (issue #730)'
     expect(result.status).toBe('SKIPPED');
     expect(runCodex).not.toHaveBeenCalled();
     expect((slack.chat.postMessage.mock.calls[0][0] as { text: string }).text).toBe(
-      `This thread has 2 open pull requests I made: <${PR2}>, <${PR1}>. Mention me again with the link of the one this change belongs to, so I add it there.`,
+      `This thread has 2 open pull requests I made: <${PR2}>, <${PR1}>. Mention me again with the link of the one this change belongs to and the change, in one message, so I add it there.`,
     );
   });
 

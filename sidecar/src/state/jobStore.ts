@@ -3286,15 +3286,16 @@ export class JobStore {
   }
 
   /**
-   * The pull requests change runs in this thread opened, newest first (issue
-   * #730): a later change asked in the thread is added to one of them instead
-   * of opening another. Only a change run's result carries a `prUrl`; a run
-   * that failed after the coder opened its PR counts too.
+   * The pull requests change runs in this thread opened, newest first, with
+   * who each run was for (issue #730): a later change asked in the thread is
+   * added to one of them instead of opening another. Only a change run's
+   * result carries a `prUrl`; a run that failed after the coder opened its PR
+   * counts too. The requester is the earliest run's for that PR.
    */
-  changeRunPrUrlsInThread(channelId: string, threadTs: string): string[] {
+  changeRunPrsInThread(channelId: string, threadTs: string): Array<{ prUrl: string; requesterId?: string }> {
     const rows = this.db
       .prepare(
-        `SELECT result_json
+        `SELECT result_json, payload_json
          FROM jobs
          WHERE COALESCE(executed_workflow, workflow) = 'IMPLEMENTATION'
            AND status IN ('SUCCESS', 'FAILED')
@@ -3304,17 +3305,31 @@ export class JobStore {
          ORDER BY updated_at DESC
          LIMIT 20`,
       )
-      .all(channelId, threadTs) as Array<{ result_json?: string | null }>;
-    const urls: string[] = [];
+      .all(channelId, threadTs) as Array<{ result_json?: string | null; payload_json?: string | null }>;
+    const prs: Array<{ prUrl: string; requesterId?: string }> = [];
     for (const row of rows) {
       try {
         const prUrl = (JSON.parse(row.result_json ?? '{}') as { prUrl?: unknown }).prUrl;
-        if (typeof prUrl === 'string' && prUrl && !urls.includes(prUrl)) urls.push(prUrl);
+        if (typeof prUrl !== 'string' || !prUrl) continue;
+        const payload = JSON.parse(row.payload_json ?? '{}') as {
+          requestUserId?: unknown;
+          requestedForUserId?: unknown;
+        };
+        const requester = [payload.requestedForUserId, payload.requestUserId].find(
+          (id): id is string => typeof id === 'string' && id !== '',
+        );
+        const existing = prs.find(pr => pr.prUrl === prUrl);
+        // Rows run newest first: an older run for the same PR is the one that opened it.
+        if (existing) {
+          if (requester) existing.requesterId = requester;
+        } else {
+          prs.push({ prUrl, ...(requester ? { requesterId: requester } : {}) });
+        }
       } catch {
         // A result that isn't JSON names no PR.
       }
     }
-    return urls;
+    return prs;
   }
 
   findLatestReviewedPrHeadSha(input: {

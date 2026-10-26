@@ -54,6 +54,8 @@ export function composeChangeReply(params: {
   prFailed?: boolean;
   /** The change was added to this open PR rather than a new one (issue #730). */
   addedTo?: boolean;
+  /** The engineering account is on the PR (default). False when it couldn't be put there. */
+  notesInPr?: boolean;
 }): string {
   const { summary, requesterSummary, engineerReads, prUrl, externalBlock, prFailed, addedTo } = params;
   const forRequester = !engineerReads && requesterSummary.trim() !== '';
@@ -61,7 +63,7 @@ export function composeChangeReply(params: {
   const lead = addedTo && prUrl ? `Added to ${prUrl}: ${text}` : text;
   const prBlock = prUrl && !addedTo ? `\n${prUrl}` : '';
   const pointer =
-    forRequester && prUrl && requesterSummary.trim() !== summary.trim()
+    forRequester && prUrl && requesterSummary.trim() !== summary.trim() && params.notesInPr !== false
       ? '\n_The engineering notes are in the PR._'
       : '';
   const noPr =

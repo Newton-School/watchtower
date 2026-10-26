@@ -298,20 +298,23 @@ export async function postPlanForApproval(params: {
   repoPath?: string;
   /** Set only when the requester has to confirm (`planNeedsRequesterConfirmation`). */
   requesterToConfirm?: string;
+  /** One more line for the approver, e.g. that the change goes onto an open PR (issue #730). */
+  note?: string;
   logStep?: WorkflowStepLogger;
 }): Promise<string | undefined> {
   const { slack, channelId, threadTs, planMarkdown, logStep } = params;
+  const planText = formatPlanMessage(
+    planMarkdown,
+    params.affectedFiles,
+    params.scope,
+    params.repoPath,
+    false,
+    params.requesterToConfirm,
+  );
   const posted = await slack.chat.postMessage({
     channel: channelId,
     thread_ts: threadTs,
-    text: formatPlanMessage(
-      planMarkdown,
-      params.affectedFiles,
-      params.scope,
-      params.repoPath,
-      false,
-      params.requesterToConfirm,
-    ),
+    text: params.note ? `${planText}\n${params.note}` : planText,
   });
   const ts = posted.ts ?? undefined;
   const detail = formatPlanDetail(planMarkdown);

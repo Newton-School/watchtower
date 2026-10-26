@@ -44,7 +44,14 @@ describe('jobStore', () => {
   // Issue #730: a change asked later in the thread adds to the PR an earlier change run opened.
   it("lists the PRs a thread's change runs opened, newest first, without other workflows' links", () => {
     const store = new JobStore(tempDbPath());
-    const job = (id: string, threadTs: string, workflow: string, status: 'SUCCESS' | 'FAILED', result: object) => {
+    const job = (
+      id: string,
+      threadTs: string,
+      workflow: string,
+      status: 'SUCCESS' | 'FAILED',
+      result: object,
+      payload: object = { requestUserId: 'UPM', requestedForUserId: null },
+    ) => {
       store.createJob({
         id,
         eventId: `e-${id}`,
@@ -52,22 +59,39 @@ describe('jobStore', () => {
         workflow: 'IMPLEMENTATION',
         channelId: 'C1',
         threadTs,
-        payload: {},
+        payload,
       });
       store.markJob(id, status, { result, executedWorkflow: workflow as never });
     };
-    job('first', '1.1', 'IMPLEMENTATION', 'SUCCESS', { prUrl: 'https://github.com/o/r/pull/1' });
+    job(
+      'first',
+      '1.1',
+      'IMPLEMENTATION',
+      'SUCCESS',
+      { prUrl: 'https://github.com/o/r/pull/1' },
+      {
+        requestUserId: 'UOWNER',
+        requestedForUserId: 'UPM2',
+      },
+    );
     job('failed-with-pr', '1.1', 'IMPLEMENTATION', 'FAILED', { prUrl: 'https://github.com/o/r/pull/2' });
     job('again', '1.1', 'IMPLEMENTATION', 'SUCCESS', { prUrl: 'https://github.com/o/r/pull/2' });
     job('review', '1.1', 'PR_REVIEW', 'SUCCESS', { prUrl: 'https://github.com/o/r/pull/9', prHeadSha: 'abc' });
     job('no-pr', '1.1', 'IMPLEMENTATION', 'SUCCESS', { externalChanges: [] });
     job('other-thread', '2.2', 'IMPLEMENTATION', 'SUCCESS', { prUrl: 'https://github.com/o/r/pull/3' });
 
-    expect(new Set(store.changeRunPrUrlsInThread('C1', '1.1'))).toEqual(
-      new Set(['https://github.com/o/r/pull/1', 'https://github.com/o/r/pull/2']),
-    );
-    expect(store.changeRunPrUrlsInThread('C1', '1.1')).toHaveLength(2);
-    expect(store.changeRunPrUrlsInThread('C1', '9.9')).toEqual([]);
+    const prs = store.changeRunPrsInThread('C1', '1.1');
+    expect(prs).toHaveLength(2);
+    // Who the run was for, not who typed it.
+    expect(prs.find(pr => pr.prUrl.endsWith('/1'))).toEqual({
+      prUrl: 'https://github.com/o/r/pull/1',
+      requesterId: 'UPM2',
+    });
+    expect(prs.find(pr => pr.prUrl.endsWith('/2'))).toEqual({
+      prUrl: 'https://github.com/o/r/pull/2',
+      requesterId: 'UPM',
+    });
+    expect(store.changeRunPrsInThread('C1', '9.9')).toEqual([]);
     store.close();
   });
 

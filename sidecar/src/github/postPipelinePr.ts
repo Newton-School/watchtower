@@ -105,86 +105,158 @@ async function existingPrUrl(cwd: string): Promise<string | undefined> {
 }
 
 export type FollowUpPush =
-  /** The change is on the PR's branch, pushed by the coder or here. */
-  | { kind: 'pushed' }
+  /**
+   * The change is on the PR's branch. `ontoNewerCommits`: someone else had
+   * pushed meanwhile, and this change was replayed on top of their commits.
+   */
+  | { kind: 'pushed'; ontoNewerCommits: boolean }
   /** The run left nothing new on top of the PR. */
   | { kind: 'nothing' }
   /**
-   * Someone else pushed to the PR's branch meanwhile: nothing was pushed over
-   * it. The change went to a new branch and a PR into that branch instead.
+   * Someone else pushed to the PR's branch meanwhile and this change conflicts
+   * with it: nothing was pushed over it. The change went to a new branch and a
+   * PR into that branch, to be merged before the original.
    */
   | { kind: 'stacked'; prUrl: string }
-  | { kind: 'failed'; reason: string };
+  /** The coder rewrote the PR's history instead of adding a commit: nothing was pushed. */
+  | { kind: 'rewritten'; wipBranch?: string }
+  | { kind: 'failed'; reason: string; wipBranch?: string };
 
 /** Test seams for the follow-up push. */
 export const __followUpPushDeps = {
   git,
   createPullRequest,
+  commentOnPr: async (repoPath: string, prUrl: string, body: string): Promise<void> => {
+    await execFileAsync('gh', ['pr', 'comment', prUrl, '--body', body], {
+      cwd: repoPath,
+      timeout: 30_000,
+      maxBuffer: 1024 * 1024,
+      env: toolchainEnv(),
+    });
+  },
 };
 
+/** A Slack event ts as a branch-name suffix. */
+function branchTs(ts: string): string {
+  return ts.replace(/[^a-zA-Z0-9]/g, '-');
+}
+
+function titleOf(summary: string): string {
+  return summary.length > 72 ? `${summary.slice(0, 69)}...` : summary;
+}
+
+/** Commits what the coder left uncommitted, never symlinks or never-commit paths. */
+async function commitLeftovers(repoPath: string, message: string, onLog?: (msg: string) => void): Promise<void> {
+  if (!(await hasUncommittedChanges(repoPath))) return;
+  const run = (args: string[]) => __followUpPushDeps.git(repoPath, args);
+  await run(['add', '-A']);
+  const skipped = await unstageUnsafePaths(repoPath);
+  if (skipped.length > 0) onLog?.(`Left out of the commit (symlink or never-commit path): ${skipped.join(', ')}.`);
+  const staged = await run(['diff', '--cached', '--name-only']);
+  if (staged.length > 0) {
+    await run(['commit', '-m', titleOf(message)]);
+    onLog?.('Committed the follow-up change.');
+  }
+}
+
+async function isAncestor(repoPath: string, ancestor: string, of: string): Promise<boolean> {
+  return __followUpPushDeps.git(repoPath, ['merge-base', '--is-ancestor', ancestor, of]).then(
+    () => true,
+    () => false,
+  );
+}
+
 /**
- * Lands a follow-up change (issue #730) on the open PR's branch. The worktree
- * was detached at the branch's head (`startHead`) before the coder ran.
- * Uncommitted changes are committed; the commits are pushed with a plain
- * fast-forward push, never forced. When the branch moved under us and the
- * push can't fast-forward, the work goes to a new branch with a PR into the
- * original branch, so it shows only this change and nobody's commits are
- * overwritten.
+ * Pushes unreviewed or unpushable work to a branch with no PR, so it isn't
+ * lost with the worktree. Returns its name, or undefined when that failed too.
+ */
+async function saveWorkInProgress(
+  repoPath: string,
+  uniqueTs: string,
+  onLog?: (msg: string) => void,
+): Promise<string | undefined> {
+  const wip = `miniog/followup-wip-${branchTs(uniqueTs)}`;
+  try {
+    await __followUpPushDeps.git(repoPath, ['push', 'origin', `HEAD:refs/heads/${wip}`]);
+    onLog?.(`Kept the unpushed work on ${wip} (no pull request).`);
+    return wip;
+  } catch (error) {
+    logger.warn({ repoPath, wip, error: String(error) }, 'could not keep follow-up work on a side branch');
+    return undefined;
+  }
+}
+
+/**
+ * Lands a follow-up change (issue #730) on the open PR's branch once the
+ * pipeline has passed: the only push of a follow-up. The worktree was
+ * detached at the branch's head (`startHead`) before the coder ran, and the
+ * coder only commits. What's uncommitted is committed; the commits are pushed
+ * with a plain fast-forward push, never forced.
+ *
+ * - Our commits don't descend from `startHead` (the coder amended or rebased
+ *   the PR's own commits): nothing is pushed.
+ * - The branch moved since `startHead` (someone else pushed): our commits are
+ *   replayed onto its new tip and pushed normally. Only when that conflicts do
+ *   they go to their own branch with a PR into the original one.
  */
 export async function pushFollowUpToPr(params: {
   repoPath: string;
   branch: string;
   prUrl: string;
   startHead: string;
+  /** Makes side-branch names unique: the triggering message's ts. */
+  uniqueTs: string;
   threadTs: string;
   summary: string;
   requestedBy?: string;
   onLog?: (msg: string) => void;
 }): Promise<FollowUpPush> {
-  const { repoPath, branch, prUrl, startHead, threadTs, summary, requestedBy, onLog } = params;
+  const { repoPath, branch, prUrl, startHead, uniqueTs, threadTs, summary, requestedBy, onLog } = params;
   const run = (args: string[]) => __followUpPushDeps.git(repoPath, args);
   try {
-    if (await hasUncommittedChanges(repoPath)) {
-      await run(['add', '-A']);
-      const skipped = await unstageUnsafePaths(repoPath);
-      if (skipped.length > 0) onLog?.(`Left out of the commit (symlink or never-commit path): ${skipped.join(', ')}.`);
-      const staged = await run(['diff', '--cached', '--name-only']);
-      if (staged.length > 0) {
-        const title = summary.length > 72 ? `${summary.slice(0, 69)}...` : summary;
-        await run(['commit', '-m', title]);
-        onLog?.('Committed the follow-up change.');
-      }
-    }
+    await commitLeftovers(repoPath, summary, onLog);
     const head = await run(['rev-parse', 'HEAD']);
-    await run(['fetch', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
-    const remote = await run(['rev-parse', `origin/${branch}`]);
     if (head === startHead) {
       onLog?.('Nothing new on top of the pull request.');
       return { kind: 'nothing' };
     }
-    const isAncestor = async (ancestor: string, of: string) =>
-      run(['merge-base', '--is-ancestor', ancestor, of]).then(
-        () => true,
-        () => false,
-      );
-    // The coder pushed already.
-    if (await isAncestor(head, remote)) return { kind: 'pushed' };
-    // A plain push fast-forwards the branch.
-    if (await isAncestor(remote, head)) {
+    if (!(await isAncestor(repoPath, startHead, head))) {
+      onLog?.("The commits don't build on the pull request's latest commit (its history was rewritten); not pushing.");
+      return { kind: 'rewritten', wipBranch: await saveWorkInProgress(repoPath, uniqueTs, onLog) };
+    }
+    await run(['fetch', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+    const remote = await run(['rev-parse', `origin/${branch}`]);
+    // Already there (pushed by hand, or a retry).
+    if (await isAncestor(repoPath, head, remote)) return { kind: 'pushed', ontoNewerCommits: false };
+    if (remote === startHead || (await isAncestor(repoPath, remote, head))) {
       await run(['push', 'origin', `HEAD:refs/heads/${branch}`]);
       onLog?.(`Pushed the follow-up to origin/${branch}.`);
-      return { kind: 'pushed' };
+      return { kind: 'pushed', ontoNewerCommits: false };
     }
-    // The branch moved under us: never push over it.
-    const safeTs = threadTs.replace(/[^a-zA-Z0-9.-]/g, '-');
-    const stackedBranch = `${branch}-followup-${safeTs}`;
+
+    // Someone else pushed meanwhile: replay our commits on top of theirs.
+    const replayed = await run(['rebase', '--onto', `origin/${branch}`, startHead]).then(
+      () => true,
+      async () => {
+        await run(['rebase', '--abort']).catch(() => undefined);
+        return false;
+      },
+    );
+    if (replayed) {
+      await run(['push', 'origin', `HEAD:refs/heads/${branch}`]);
+      onLog?.(`${branch} had moved; replayed the follow-up on top of it and pushed.`);
+      return { kind: 'pushed', ontoNewerCommits: true };
+    }
+
+    // It conflicts with what they pushed: never push over it.
+    const stackedBranch = `${branch}-followup-${branchTs(uniqueTs)}`;
     await run(['push', 'origin', `HEAD:refs/heads/${stackedBranch}`]);
-    const rawTitle = summary.length > 72 ? `${summary.slice(0, 69)}...` : summary;
+    const rawTitle = titleOf(summary);
     const { prUrl: stackedUrl } = await __followUpPushDeps.createPullRequest({
       repoPath,
       title: requestedBy ? `[${requestedBy} via miniOG] ${rawTitle}` : rawTitle,
       body: [
-        `Follow-up to ${prUrl}. That branch moved while this change was being made, so it goes in as its own PR into \`${branch}\` instead of being pushed over it.`,
+        `Follow-up to ${prUrl}. Someone else pushed to \`${branch}\` while this change was being made and it conflicts with their commits, so it comes as its own PR into \`${branch}\` instead of being pushed over them. Merge this one first, then ${prUrl}.`,
         '',
         '## Summary',
         summary,
@@ -197,11 +269,181 @@ export async function pushFollowUpToPr(params: {
       baseBranch: branch,
       labels: ['miniog'],
     });
-    onLog?.(`The branch moved; opened ${stackedUrl} into ${branch} instead.`);
+    onLog?.(`The follow-up conflicts with new commits on ${branch}; opened ${stackedUrl} into it instead.`);
     return { kind: 'stacked', prUrl: stackedUrl };
   } catch (error) {
     logger.warn({ repoPath, branch, error: String(error) }, 'failed to push a follow-up to its PR');
-    return { kind: 'failed', reason: String(error).split('\n')[0] };
+    return {
+      kind: 'failed',
+      reason: String(error).split('\n')[0],
+      wipBranch: await saveWorkInProgress(repoPath, uniqueTs, onLog),
+    };
+  }
+}
+
+export type FollowUpRelanded =
+  | { kind: 'opened'; prUrl: string }
+  | { kind: 'nothing' }
+  | { kind: 'failed'; reason: string; wipBranch?: string };
+
+/**
+ * The PR a follow-up was meant for was merged or closed while it was being
+ * made (issue #730). Pushing to its branch would land on a dead branch (the
+ * marketing repo keeps branches after a merge), so the new commits are
+ * cherry-picked onto the default branch in a fresh branch and opened as an
+ * ordinary PR that says why.
+ */
+export async function relandFollowUpAsNewPr(params: {
+  repoPath: string;
+  startHead: string;
+  uniqueTs: string;
+  threadTs: string;
+  summary: string;
+  originalPrUrl: string;
+  originalState: 'MERGED' | 'CLOSED';
+  requestedBy?: string;
+  channelId?: string;
+  onLog?: (msg: string) => void;
+}): Promise<FollowUpRelanded> {
+  const { repoPath, startHead, uniqueTs, threadTs, summary, originalPrUrl, originalState, requestedBy, onLog } = params;
+  const run = (args: string[]) => __followUpPushDeps.git(repoPath, args);
+  try {
+    await commitLeftovers(repoPath, summary, onLog);
+    const head = await run(['rev-parse', 'HEAD']);
+    if (head === startHead) return { kind: 'nothing' };
+    const commits = (await run(['rev-list', '--reverse', `${startHead}..${head}`])).split('\n').filter(Boolean);
+    const base = await getDefaultBranch(repoPath);
+    await run(['fetch', 'origin', `+refs/heads/${base}:refs/remotes/origin/${base}`]);
+    await run(['checkout', '--detach', '--force', `origin/${base}`]);
+    const picked = await run(['cherry-pick', ...commits]).then(
+      () => true,
+      async () => {
+        await run(['cherry-pick', '--abort']).catch(() => undefined);
+        return false;
+      },
+    );
+    if (!picked) {
+      await run(['checkout', '--detach', '--force', head]);
+      return {
+        kind: 'failed',
+        reason: `the change conflicts with ${base}`,
+        wipBranch: await saveWorkInProgress(repoPath, uniqueTs, onLog),
+      };
+    }
+    const branchPrefix = requestedBy ? `${sanitizeForBranch(requestedBy)}/` : 'miniog/';
+    const newBranch = `${branchPrefix}followup-${branchTs(uniqueTs)}`;
+    await run(['push', 'origin', `HEAD:refs/heads/${newBranch}`]);
+    const word = originalState === 'MERGED' ? 'merged' : 'closed';
+    const slackLink = params.channelId ? buildSlackThreadLink(params.channelId, threadTs) : '';
+    const rawTitle = titleOf(summary);
+    const { prUrl } = await __followUpPushDeps.createPullRequest({
+      repoPath,
+      title: requestedBy ? `[${requestedBy} via miniOG] ${rawTitle}` : rawTitle,
+      body: [
+        `> Requested by **${requestedBy ?? 'Unknown'}** via Slack${slackLink ? ` · [View thread](${slackLink})` : ''}`,
+        '',
+        `Follow-up to ${originalPrUrl}, which was ${word} before this change was ready, so it comes as a new pull request.`,
+        '',
+        '## Summary',
+        summary,
+        '',
+        '---',
+        '**Raised by:** miniOG (Watchtower)',
+        `**Thread:** ${threadTs}`,
+      ].join('\n'),
+      branch: newBranch,
+      baseBranch: base,
+      labels: ['miniog'],
+    });
+    onLog?.(`${originalPrUrl} was ${word}; opened ${prUrl} from ${base} instead.`);
+    return { kind: 'opened', prUrl };
+  } catch (error) {
+    logger.warn({ repoPath, error: String(error) }, 'failed to reland a follow-up as a new PR');
+    return {
+      kind: 'failed',
+      reason: String(error).split('\n')[0],
+      wipBranch: await saveWorkInProgress(repoPath, uniqueTs, onLog),
+    };
+  }
+}
+
+/** What a follow-up that didn't pass left behind (issue #730). */
+export interface UnfinishedFollowUp {
+  /** The PR's branch still points where it did when the coder started; undefined when GitHub can't say. */
+  prUntouched?: boolean;
+  /** Commits on the PR's branch that weren't there when the coder started, `<sha> <subject>`. */
+  landed: string[];
+  /** The unreviewed work, kept on a branch with no PR. */
+  wipBranch?: string;
+}
+
+/**
+ * A follow-up whose checks didn't pass, or that was stopped: nothing of it was
+ * pushed to the PR (the coder only commits). Says whether the PR's branch is
+ * as it was, and keeps the unreviewed work on a side branch so it isn't lost
+ * with the worktree.
+ */
+export async function settleUnfinishedFollowUp(params: {
+  repoPath: string;
+  branch: string;
+  startHead: string;
+  uniqueTs: string;
+  onLog?: (msg: string) => void;
+}): Promise<UnfinishedFollowUp> {
+  const { repoPath, branch, startHead, uniqueTs, onLog } = params;
+  const run = (args: string[]) => __followUpPushDeps.git(repoPath, args);
+  const settled: UnfinishedFollowUp = { landed: [] };
+  let remote: string | undefined;
+  try {
+    await commitLeftovers(repoPath, 'Unfinished follow-up (not reviewed)', onLog);
+  } catch {
+    // What can't be committed stays in the worktree.
+  }
+  try {
+    await run(['fetch', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+    remote = await run(['rev-parse', `origin/${branch}`]);
+    settled.prUntouched = remote === startHead;
+    if (!settled.prUntouched) {
+      const log = await run(['log', '--format=%h %s', '-n', '5', `${startHead}..${remote}`]).catch(() => '');
+      settled.landed = log.split('\n').filter(Boolean);
+    }
+  } catch {
+    // GitHub can't say: prUntouched stays undefined.
+  }
+  try {
+    const head = await run(['rev-parse', 'HEAD']);
+    const alreadyThere = remote ? await isAncestor(repoPath, head, remote) : false;
+    if (head !== startHead && !alreadyThere) settled.wipBranch = await saveWorkInProgress(repoPath, uniqueTs, onLog);
+  } catch {
+    // Nothing to keep.
+  }
+  return settled;
+}
+
+/**
+ * The engineering account of a follow-up, as a comment on the PR it was added
+ * to (`gh pr comment` works where `gh pr edit` doesn't). True when posted.
+ */
+export async function commentFollowUpOnPr(params: {
+  repoPath: string;
+  prUrl: string;
+  summary: string;
+  requestedBy?: string;
+  channelId: string;
+  threadTs: string;
+}): Promise<boolean> {
+  const link = buildSlackThreadLink(params.channelId, params.threadTs);
+  const body = [
+    `**Follow-up added by miniOG** for ${params.requestedBy ?? 'Unknown'} via Slack · [View thread](${link})`,
+    '',
+    params.summary,
+  ].join('\n');
+  try {
+    await __followUpPushDeps.commentOnPr(params.repoPath, params.prUrl, body);
+    return true;
+  } catch (error) {
+    logger.warn({ prUrl: params.prUrl, error: String(error) }, 'could not comment the follow-up on its PR');
+    return false;
   }
 }
 

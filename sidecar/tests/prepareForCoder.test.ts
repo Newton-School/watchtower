@@ -159,6 +159,9 @@ describe('prepareForCoder', () => {
       files: [FILE],
     };
 
+    const openNow = vi.fn(async () => ({ state: 'OPEN', branch: 'pm/hero-111-1', head: 'prhead1', crossRepo: false }));
+    const sameOrigin = vi.fn(async () => 'o/newton-web');
+
     it('checks out the PR branch and never resets to the base', async () => {
       const refresh = vi.fn(async () => refreshed);
       const checkoutBranch = vi.fn(async () => ({ ok: true as const, head: 'prhead1' }));
@@ -168,7 +171,13 @@ describe('prepareForCoder', () => {
         slack: slack as never,
         logStep,
         followUp: threadPr,
-        deps: { listOpenPrs: vi.fn().mockResolvedValue([otherPr]), refresh, checkoutBranch },
+        deps: {
+          listOpenPrs: vi.fn().mockResolvedValue([otherPr]),
+          refresh,
+          checkoutBranch,
+          readPr: openNow,
+          originOf: sameOrigin,
+        },
       });
       expect(result).toEqual({ followUp: { pr: threadPr, startHead: 'prhead1' } });
       expect(checkoutBranch).toHaveBeenCalledWith(CWD, 'pm/hero-111-1');
@@ -178,14 +187,20 @@ describe('prepareForCoder', () => {
       expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'implementation.followup.checked_out' }));
     });
 
-    it('a plan for another repo gets its own PR, from a refreshed base', async () => {
+    it("compares the clone's origin with the PR's repo: another repo gets its own PR, from a refreshed base", async () => {
       const refresh = vi.fn(async () => refreshed);
       const checkoutBranch = vi.fn();
       const logStep = vi.fn();
       const result = await run({
         logStep,
-        followUp: { ...threadPr, repo: 'newton-marketing-web', repoKey: 'newton-marketing-web' },
-        deps: { listOpenPrs: vi.fn().mockResolvedValue([]), refresh, checkoutBranch },
+        followUp: threadPr,
+        deps: {
+          listOpenPrs: vi.fn().mockResolvedValue([]),
+          refresh,
+          checkoutBranch,
+          readPr: openNow,
+          originOf: vi.fn(async () => 'o/newton-marketing-web'),
+        },
       });
       expect(checkoutBranch).not.toHaveBeenCalled();
       expect(refresh).toHaveBeenCalledWith(CWD);
@@ -201,18 +216,67 @@ describe('prepareForCoder', () => {
       );
     });
 
-    it("falls back to a new PR when the branch can't be checked out", async () => {
+    it('a PR merged while the plan waited gets a new PR, and the thread PR is in the heads-up again', async () => {
       const refresh = vi.fn(async () => refreshed);
-      const checkoutBranch = vi.fn(async () => ({ ok: false as const, reason: "fatal: couldn't find remote ref" }));
+      const checkoutBranch = vi.fn();
+      const slack = makeSlack();
       const result = await run({
+        slack: slack as never,
         followUp: threadPr,
-        deps: { listOpenPrs: vi.fn().mockResolvedValue([]), refresh, checkoutBranch },
+        // The thread names the PR, which would normally keep it out of the heads-up.
+        threadTexts: [`Done: ${threadPr.url}`],
+        deps: {
+          listOpenPrs: vi.fn().mockResolvedValue([{ ...otherPr, url: threadPr.url }]),
+          refresh,
+          checkoutBranch,
+          readPr: vi.fn(async () => ({ state: 'MERGED', branch: 'pm/hero-111-1', crossRepo: false })),
+          originOf: sameOrigin,
+        },
       });
+      expect(checkoutBranch).not.toHaveBeenCalled();
       expect(refresh).toHaveBeenCalledWith(CWD);
       expect(result).toEqual({
+        followUpFallback: `${threadPr.url} was merged while the plan waited, so this change is in a new pull request.`,
+      });
+      expect((slack.chat.postMessage.mock.calls[0][0] as { text: string }).text).toMatch(
+        /^Heads-up: <[^|]+\|PR #1404>/,
+      );
+    });
+
+    it("falls back to a new PR when the branch can't be checked out or GitHub can't be read", async () => {
+      const refresh = vi.fn(async () => refreshed);
+      const checkoutBranch = vi.fn(async () => ({ ok: false as const, reason: "fatal: couldn't find remote ref" }));
+      expect(
+        await run({
+          followUp: threadPr,
+          deps: {
+            listOpenPrs: vi.fn().mockResolvedValue([]),
+            refresh,
+            checkoutBranch,
+            readPr: openNow,
+            originOf: sameOrigin,
+          },
+        }),
+      ).toEqual({
         followUpFallback:
           "I couldn't check out the branch of https://github.com/o/newton-web/pull/1404, so this change is in a new pull request.",
       });
+      expect(
+        await run({
+          followUp: threadPr,
+          deps: {
+            listOpenPrs: vi.fn().mockResolvedValue([]),
+            refresh,
+            checkoutBranch,
+            readPr: vi.fn(async () => undefined),
+            originOf: sameOrigin,
+          },
+        }),
+      ).toEqual({
+        followUpFallback:
+          "I couldn't check https://github.com/o/newton-web/pull/1404 on GitHub, so this change is in a new pull request.",
+      });
+      expect(refresh).toHaveBeenCalledTimes(2);
     });
   });
 });

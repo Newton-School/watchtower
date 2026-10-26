@@ -154,8 +154,8 @@ function coderBranchStep(ctx: AgentContext): string {
 /** Requirements 4 and 5: open a PR, or, for a follow-up, add a commit to the open one. */
 function coderPublishSteps(ctx: AgentContext): string {
   if (ctx.followUp) {
-    return `4. Commit the change as a new commit on top of the pull request's latest commit. Never amend, rebase or squash its existing commits.
-5. Push with \`git push origin HEAD:${ctx.followUp.branch}\`. Never force-push. If the push is rejected (someone else pushed meanwhile), do not retry with force and do not pull: leave your commit as it is and say in the summary that the push was rejected. Report "branch" as \`${ctx.followUp.branch}\` and "prUrl" as ${ctx.followUp.prUrl} once pushed ("" if the push failed).`;
+    return `4. Commit the change as one or more new commits on top of the pull request's latest commit. Never amend, rebase, reset or squash its existing commits.
+5. Do NOT push, and do not run \`gh pr\` commands: the reviewer and the final check look at your commits first, and miniOG pushes them to the pull request once they pass. Report "branch" as \`${ctx.followUp.branch}\` and "prUrl" as "".`;
   }
   return `4. Commit and open a PR to the default branch.${ctx.requestedBy ? ` Prefix the PR title with [${ctx.requestedBy} via miniOG], e.g. "[${ctx.requestedBy} via miniOG] Fix button text".` : ''}
    In the PR description, always include this at the top:
@@ -381,7 +381,11 @@ Verification checklist:
 1. Run the project's test suite and confirm tests pass
 2. PLAN CONFORMANCE: confirm the ACTUAL diff above fulfils the approved plan's intent — not just that some files changed. If the diff implements a different or narrower change than the approved plan, set "verified": false, "requirementsMet": false, and add a { "severity": "high", "category": "plan-mismatch", "message": "<plan vs diff>" } finding.
 3. Confirm the reviewer's and security agent's findings of severity "medium" or higher were addressed. "low" and "info" findings are informational: never a reason to set "verified": false.
-4. If a PR was opened, check it is in a mergeable state. No PR yet is not a reason to reject: miniOG opens it once you pass.
+4. ${
+    ctx.followUp
+      ? `This change is new commits for the open pull request ${ctx.followUp.prUrl}, not pushed yet: miniOG pushes them once you pass. Their not being on the pull request yet is not a reason to reject.`
+      : 'If a PR was opened, check it is in a mergeable state. No PR yet is not a reason to reject: miniOG opens it once you pass.'
+  }
 5. Check that no regressions were introduced
 
 Return strict JSON:
