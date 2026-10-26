@@ -16,6 +16,11 @@ import path from 'node:path';
  * - github.com SSH URLs rewritten to HTTPS, and a credential helper for
  *   github.com that answers with GH_TOKEN (helpers set before it, such as the
  *   owner's, are reset for github.com, so the result doesn't depend on them).
+ * Every run also gets settings that keep common commands from writing the
+ * main clone's `.git/config`, which a linked worktree's shell may not write:
+ * `git checkout -b x origin/master` created the branch, then failed to record
+ * its upstream and stopped before switching, so the coder lost a turn and
+ * explained it to the requester.
  * The git settings go through `GIT_CONFIG_COUNT` (no config file written)
  * and are merged with the caller's own entries, such as a follow-up's push
  * block (#730): git matches `pushInsteadOf` against the remote's own URL
@@ -28,9 +33,24 @@ export type GitConfigEntry = readonly [key: string, value: string];
 
 const GIT_CONFIG_VAR_RE = /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$/;
 
-/** Answers git's `get` with the token in the run's environment; the token is never on a command line. */
+/**
+ * Answers git's `get` with the token in the run's environment. `printf` is a
+ * shell builtin, so the token is never on a command line, and unlike `echo`
+ * it prints the value as it is.
+ */
 const TOKEN_CREDENTIAL_HELPER =
-  '!f() { test "$1" = get && echo username=x-access-token && echo "password=$GH_TOKEN"; }; f';
+  '!f() { test "$1" = get && echo username=x-access-token && printf \'password=%s\\n\' "$GH_TOKEN"; }; f';
+
+/**
+ * No upstream recorded by `git checkout -b <branch> origin/<base>`, nor by a
+ * plain `git push` (the owner's own config turns `push.autoSetupRemote` on):
+ * both write `.git/config`. The coder pushes with `git push origin
+ * HEAD:<branch>`, which needs neither.
+ */
+export const NO_UPSTREAM_WRITES_GIT_CONFIG: readonly GitConfigEntry[] = [
+  ['branch.autoSetupMerge', 'false'],
+  ['push.autoSetupRemote', 'false'],
+];
 
 export const GITHUB_OVER_HTTPS_GIT_CONFIG: readonly GitConfigEntry[] = [
   ['url.https://github.com/.insteadOf', 'git@github.com:'],
@@ -87,6 +107,11 @@ export function mergeAgentEnv(layers: ReadonlyArray<EnvLayer | undefined>): Node
   return { ...merged, ...gitConfigEnv(entries) };
 }
 
+/** The git settings every agent run gets, token or not. */
+export function agentGitDefaultsEnv(): Record<string, string> {
+  return gitConfigEnv(NO_UPSTREAM_WRITES_GIT_CONFIG);
+}
+
 /** The git settings a run with a GitHub token gets; none without one. */
 export function githubAccessGitEnv(githubToken: string | undefined): Record<string, string> {
   if (!githubToken) return {};
@@ -96,18 +121,21 @@ export function githubAccessGitEnv(githubToken: string | undefined): Record<stri
 /**
  * The run's own empty gh config folder, inside its private temp folder (so it
  * goes when that does), or undefined without a token: gh then keeps reading
- * its usual config, as before.
+ * its usual config, as before. When the folder can't be made, `onError` gets
+ * the error code: the run goes on, but its gh calls fail as in #746.
  */
 export async function makeGhConfigDir(
   runTempDir: string,
   githubToken: string | undefined,
+  onError?: (code: string) => void,
 ): Promise<string | undefined> {
   if (!githubToken) return undefined;
   const dir = path.join(runTempDir, 'gh');
   try {
     await fs.mkdir(dir, { mode: 0o700 });
     return dir;
-  } catch {
+  } catch (error) {
+    onError?.((error as NodeJS.ErrnoException).code ?? 'unknown');
     return undefined;
   }
 }
