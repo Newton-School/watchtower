@@ -19,6 +19,8 @@ import { classifyInvestigationScope, type InvestigationScope } from '../router/i
 import { enabledRepoPaths } from '../repos/registry.js';
 import { connectorsFor, NO_CONNECTORS } from '../backends/connectors.js';
 import { refreshSharedClones } from '../workspaces/staleCheckout.js';
+import { attachReplyTablesAsCsv } from '../slack/tableCsv.js';
+import { recentChangesNear, RECENT_COMMITS_RULE } from './shared/recentChanges.js';
 import type { PipelineStore } from '../agents/pipeline.js';
 import type { InvestigationStore } from '../state/investigationStore.js';
 import type { RecallCapableStore } from '../state/dossierStore.js';
@@ -165,6 +167,29 @@ export async function runInvestigationWorkflow(params: {
       ? await refreshSharedClones({ config, stage: 'investigation.repo_refresh', logStep })
       : undefined;
 
+  // Recent commits near what the report names, so a symptom fixed days ago is
+  // found by reading the history, not by rounds of "cannot reproduce" (issue #621).
+  const recentChangesRepos =
+    scope.scope === 'broad'
+      ? enabledRepoPaths(config).filter(repo => repo.key === 'newton-web' || repo.key === 'newton-api')
+      : [{ key: scope.scope, path: repoPath }];
+  const recentChanges = await recentChangesNear({
+    repos: recentChangesRepos,
+    reportText: [task.event.text ?? '', ...scopeThread.map(m => m.text ?? '')].join('\n').slice(0, 4_000),
+  });
+  const recentChangesBlock = recentChanges.block;
+  if (recentChanges.matched.length > 0) {
+    const commits = recentChanges.matched.reduce((sum, repo) => sum + repo.commits, 0);
+    logStep?.({
+      stage: 'investigation.recent_changes',
+      message:
+        commits > 0
+          ? `Found ${commits} recent commit(s) near what was reported; they go to the investigator as hints.`
+          : 'The report names files or folders in the repo, but none changed recently.',
+      data: { matched: recentChanges.matched },
+    });
+  }
+
   const investigatorPrompt = `${recallBlock}${`
 ${buildMentionSystemPrompt({ task, workflow: 'INVESTIGATION', toneMode: task.toneMode, dossierRole: task.dossierRole })}
 
@@ -172,8 +197,10 @@ You are the INVESTIGATOR agent.
 
 Your job is to DIAGNOSE — not to fix. Read code, run read-only queries (git log / git show / grep / ls), and form a concrete hypothesis about what is wrong. Do NOT modify any files. Do NOT create branches. Do NOT run destructive commands. If you cannot form a hypothesis because the user's report is too vague, say so in \`requiresMoreInfo\` and list what you'd need.
 
+${RECENT_COMMITS_RULE}
+
 Environment:
-${environmentBlock}${staleBlock ? `\n\n${staleBlock}` : ''}
+${environmentBlock}${staleBlock ? `\n\n${staleBlock}` : ''}${recentChangesBlock ? `\n\n${recentChangesBlock}` : ''}
 
 ${READ_ONLY_RUN_NOTE}
 
@@ -333,13 +360,26 @@ Return strict JSON:
   const message = formatInvestigationMessage(findings);
   const nextStep = investigationNextStep(findings);
 
-  await slack.chat
+  const findingsPosted = await slack.chat
     .postMessage({
       channel: task.event.channelId,
       thread_ts: task.event.threadTs,
       text: message,
     })
-    .catch(() => {});
+    // Slack can turn a post down without throwing (the thread is gone): no CSV then.
+    .then(response => (response as { ok?: boolean } | undefined)?.ok !== false)
+    .catch(() => false);
+  // A table in the findings also goes in the thread as a CSV (issue #731).
+  if (findingsPosted) {
+    await attachReplyTablesAsCsv({
+      slack,
+      channelId: task.event.channelId,
+      threadTs: task.event.threadTs,
+      replyText: message,
+      askText: task.event.text ?? '',
+      logStep,
+    });
+  }
 
   let promptMessageTs: string | undefined;
   if (nextStep === 'fix_outside_repos') {
@@ -502,6 +542,14 @@ function scopeAckText(scope: InvestigationScope, useMetabase: boolean): string {
     : 'Tracing this end-to-end through *newton-web* and *newton-api*. I’ll share what I find.';
 }
 
+/**
+ * A label and its text. Text that opens with a table or a code block goes on
+ * the next line, so the label doesn't join the table's header (issue #731).
+ */
+function labelled(label: string, text: string): string {
+  return /^\s*(\||```)/.test(text) ? `${label}\n${text.trimStart()}` : `${label} ${text}`;
+}
+
 function formatInvestigationMessage(findings: {
   rootCauseHypothesis?: string;
   evidence?: Array<{ file?: string; line?: number; snippet?: string; why?: string }>;
@@ -511,7 +559,7 @@ function formatInvestigationMessage(findings: {
 }): string {
   const parts: string[] = [];
   if (findings.summary) parts.push(`*${findings.summary}*`);
-  if (findings.rootCauseHypothesis) parts.push(`*Root cause:* ${findings.rootCauseHypothesis}`);
+  if (findings.rootCauseHypothesis) parts.push(labelled('*Root cause:*', findings.rootCauseHypothesis));
 
   if (findings.evidence && findings.evidence.length > 0) {
     const items = findings.evidence
@@ -525,7 +573,7 @@ function formatInvestigationMessage(findings: {
     parts.push(`*Evidence:*\n${items}`);
   }
 
-  if (findings.recommendedFix) parts.push(`*Recommended fix:* ${findings.recommendedFix}`);
+  if (findings.recommendedFix) parts.push(labelled('*Recommended fix:*', findings.recommendedFix));
   if (findings.confidence) parts.push(`_Confidence: ${findings.confidence}_`);
 
   return parts.join('\n\n');

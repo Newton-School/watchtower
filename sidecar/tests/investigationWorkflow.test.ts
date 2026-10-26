@@ -1,4 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -178,6 +179,38 @@ describe('runInvestigationWorkflow thread images', () => {
     expect(investigationStore.save).not.toHaveBeenCalled();
     expect(investigationStore.clear).toHaveBeenCalledWith('1.1');
     expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'investigation.nothing_to_fix' }));
+  });
+
+  it('attaches a table in the findings as a CSV (issue #731)', async () => {
+    runCodex.mockReset().mockResolvedValue({
+      ok: true,
+      exitCode: 0,
+      parsedJson: {
+        // The table opens the field: it must not join the "Root cause:" label.
+        rootCauseHypothesis: [
+          '| Batch | Lost |',
+          '|---|---|',
+          ...Array.from({ length: 5 }, (_, i) => `| B${i} | ${i} |`),
+        ].join('\n'),
+        evidence: [],
+        recommendedFix: 'none',
+        fixLocation: 'none',
+        summary: 'Leads were dropped by a filter.',
+      },
+    });
+    const filesUploadV2 = vi.fn().mockResolvedValue({ ok: true });
+    const slack = { ...slackStub(), filesUploadV2 };
+    await runInvestigationWorkflow({
+      task: makeTask('why did leads drop?'),
+      config,
+      slack: slack as any,
+      investigationStore: { save: vi.fn(), clear: vi.fn() } as any,
+      jobId: 'job-1',
+    });
+    expect(filesUploadV2).toHaveBeenCalledTimes(1);
+    const upload = filesUploadV2.mock.calls[0][0];
+    expect(upload.file_uploads[0].filename).toBe('root-cause.csv');
+    expect(upload.file_uploads[0].file.toString('utf8')).toContain('Batch,Lost\r\nB0,0\r\n');
   });
 
   it('drops an earlier investigation in the thread when this one finds nothing to fix', async () => {
@@ -709,5 +742,68 @@ describe('investigationNextStep (issues #432, #624)', () => {
   it('offers nothing for a missing or unknown verdict', () => {
     expect(investigationNextStep({ recommendedFix: 'x' })).toBe('no_offer');
     expect(investigationNextStep({ fixLocation: 'maybe', recommendedFix: 'x' })).toBe('no_offer');
+  });
+});
+
+// A symptom fixed days earlier is found by reading the history (issue #621).
+describe('runInvestigationWorkflow recent commits', () => {
+  let repo: string;
+
+  beforeEach(() => {
+    repo = fs.mkdtempSync(path.join(os.tmpdir(), 'wt-inv-recent-'));
+    const run = (args: string[], env: Record<string, string> = {}) =>
+      execFileSync('git', args, { cwd: repo, env: { ...process.env, ...env } });
+    run(['init', '-q', '-b', 'main']);
+    run(['config', 'user.email', 'test@example.com']);
+    run(['config', 'user.name', 'Test']);
+    fs.mkdirSync(path.join(repo, 'src/features/agentic-ai-course'), { recursive: true });
+    fs.writeFileSync(path.join(repo, 'src/features/agentic-ai-course/content.ts'), 'fee 1.5L\n');
+    run(['add', '.']);
+    const date = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+    run(['commit', '-q', '-m', 'admission fee total 1.3L -> 1.5L (#1483)'], {
+      GIT_AUTHOR_DATE: date,
+      GIT_COMMITTER_DATE: date,
+    });
+    classifyInvestigationScope.mockResolvedValue({ scope: 'newton-marketing-web', confidence: 0.9, source: 'llm' });
+    prepareWorkflowContext.mockResolvedValue({ ...baseCtx, cwd: repo, repoName: 'newton-marketing-web' });
+  });
+
+  afterEach(() => {
+    fs.rmSync(repo, { recursive: true, force: true });
+  });
+
+  it('tells the investigator to check the history before "cannot reproduce"', async () => {
+    const logStep = vi.fn();
+    await runInvestigationWorkflow({
+      task: makeTask('the admission fee on the Agentic AI course page changed, is this a bug?'),
+      config,
+      slack: slackStub() as any,
+      logStep,
+    });
+    const prompt = runCodex.mock.calls[0][0].prompt as string;
+    expect(prompt).toContain('do not conclude "cannot reproduce"');
+    // The commit near what was reported is handed over up front, as a hint.
+    expect(prompt).toContain('unchecked hints');
+    expect(prompt).toContain('src/features/agentic-ai-course ("agentic ai course")');
+    expect(prompt).toContain('admission fee total 1.3L -> 1.5L (#1483)');
+    expect(logStep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stage: 'investigation.recent_changes',
+        data: {
+          matched: [{ repo: 'newton-marketing-web', pathspecs: ['src/features/agentic-ai-course'], commits: 1 }],
+        },
+      }),
+    );
+  });
+
+  it('adds no block when the report names nothing in the repo', async () => {
+    await runInvestigationWorkflow({
+      task: makeTask('something on the site looks off'),
+      config,
+      slack: slackStub() as any,
+    });
+    const prompt = runCodex.mock.calls[0][0].prompt as string;
+    expect(prompt).toContain('do not conclude "cannot reproduce"');
+    expect(prompt).not.toContain('unchecked hints');
   });
 });
