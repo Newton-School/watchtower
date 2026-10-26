@@ -5,7 +5,12 @@ import type { AgentBackend, AgentRunRequest, ParseOutputOptions, ParsedBackendOu
 import type { TokenUsage } from '../types/contracts.js';
 import { buildCodexPath, parseStructuredOutput } from './codexBackend.js';
 import { personalSkillDenyRules } from './personalSkills.js';
-import { agentSandboxSettings, isAgentSandboxEnabled, sandboxReadDenyRules } from './agentSandbox.js';
+import {
+  SETTINGS_WRITE_DENY_RULES,
+  agentSandboxSettings,
+  isAgentSandboxEnabled,
+  sandboxReadDenyRules,
+} from './agentSandbox.js';
 import { isTerminalShimDir } from './launchEnv.js';
 import { highReasoningProfile, lightweightProfile } from '../codex/modelProfiles.js';
 
@@ -389,8 +394,9 @@ export const claudeCodeBackend: AgentBackend = {
         '--disallowedTools',
         ...PROCESS_KILL_DENY_RULES,
         ...personalSkillDenyRules(request.cwd),
-        // The sandbox covers shell commands only; the Read tool is refused the same secrets by rule.
-        ...(sandboxed ? sandboxReadDenyRules() : []),
+        // The sandbox covers shell commands only; the Read tool is refused the same secrets by rule,
+        // and the Write and Edit tools Claude Code's settings and hooks (issue #609).
+        ...(sandboxed ? [...sandboxReadDenyRules(), ...SETTINGS_WRITE_DENY_RULES] : []),
         ...(request.disallowedTools ?? []),
       );
     }
