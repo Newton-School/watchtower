@@ -19,6 +19,7 @@ import { classifyInvestigationScope, type InvestigationScope } from '../router/i
 import { enabledRepoPaths } from '../repos/registry.js';
 import { connectorsFor, NO_CONNECTORS } from '../backends/connectors.js';
 import { refreshSharedClones } from '../workspaces/staleCheckout.js';
+import { recentChangesNear, RECENT_COMMITS_RULE } from './shared/recentChanges.js';
 import type { PipelineStore } from '../agents/pipeline.js';
 import type { InvestigationStore } from '../state/investigationStore.js';
 import type { RecallCapableStore } from '../state/dossierStore.js';
@@ -165,6 +166,24 @@ export async function runInvestigationWorkflow(params: {
       ? await refreshSharedClones({ config, stage: 'investigation.repo_refresh', logStep })
       : undefined;
 
+  // Recent commits near what the report names, so a symptom fixed days ago is
+  // found by reading the history, not by rounds of "cannot reproduce" (issue #621).
+  const recentChangesRepos =
+    scope.scope === 'broad'
+      ? enabledRepoPaths(config).filter(repo => repo.key === 'newton-web' || repo.key === 'newton-api')
+      : [{ key: scope.scope, path: repoPath }];
+  const recentChangesBlock = await recentChangesNear({
+    repos: recentChangesRepos,
+    reportText: [task.event.text ?? '', ...scopeThread.map(m => m.text ?? '')].join('\n').slice(0, 4_000),
+  });
+  if (recentChangesBlock) {
+    logStep?.({
+      stage: 'investigation.recent_changes',
+      message: 'Found recent commits near what was reported; they go to the investigator.',
+      data: { lines: recentChangesBlock.split('\n').filter(line => line.startsWith('- ')).length },
+    });
+  }
+
   const investigatorPrompt = `${recallBlock}${`
 ${buildMentionSystemPrompt({ task, workflow: 'INVESTIGATION', toneMode: task.toneMode, dossierRole: task.dossierRole })}
 
@@ -172,8 +191,10 @@ You are the INVESTIGATOR agent.
 
 Your job is to DIAGNOSE — not to fix. Read code, run read-only queries (git log / git show / grep / ls), and form a concrete hypothesis about what is wrong. Do NOT modify any files. Do NOT create branches. Do NOT run destructive commands. If you cannot form a hypothesis because the user's report is too vague, say so in \`requiresMoreInfo\` and list what you'd need.
 
+${RECENT_COMMITS_RULE}
+
 Environment:
-${environmentBlock}${staleBlock ? `\n\n${staleBlock}` : ''}
+${environmentBlock}${staleBlock ? `\n\n${staleBlock}` : ''}${recentChangesBlock ? `\n\n${recentChangesBlock}` : ''}
 
 ${READ_ONLY_RUN_NOTE}
 
