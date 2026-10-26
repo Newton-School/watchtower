@@ -152,6 +152,8 @@ describe('the coder on a follow-up', () => {
     expect(prompt).toContain('do NOT create a new branch and do NOT open a new pull request');
     expect(prompt).toContain('Do NOT push');
     expect(prompt).toContain('miniOG pushes them to the pull request once they pass');
+    // The summaries are read after the push, so they must not say it is still to come (live test, 26 Oct).
+    expect(prompt).toContain("don't mention pushing or say the change still has to reach the pull request");
     expect(prompt).toContain('Never amend, rebase, reset or squash');
     expect(prompt).not.toContain('git push origin');
     expect(prompt).not.toContain('gh pr create');
