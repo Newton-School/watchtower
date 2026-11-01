@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { describe, expect, it } from 'vitest';
 import { claudeCodeBackend, claudePermissionMode } from '../src/backends/claudeCodeBackend.js';
 import { settingsProblem } from '../src/backends/personalSlack.js';
+import { currentConnectors, NO_CONNECTORS, withConnectors } from '../src/backends/connectors.js';
 import { reportsConnectors, withoutGithubWrites } from '../src/codex/runCodex.js';
 import { readToolCalls, transcriptDir, type ToolCall } from '../src/personal/agentTranscript.js';
 import { draftOutcomes, draftTarget, isConfirmedAsk, oneDraftPerConversation } from '../src/personal/drafts.js';
@@ -877,6 +878,14 @@ describe('what a My day job is asked to do', () => {
     expect(reviewTagLine({ askerId: 'U01ABCDEF' }, result)).not.toContain('#14');
   });
 
+  it('says so plainly when a review found nothing, and asks for no check', () => {
+    const line = reviewTagLine(
+      { askerId: 'U01ABCDEF' },
+      { outcomes: [posted({ commentsPosted: 0, severityCounts: {} })] },
+    );
+    expect(line).toBe(`<@U01ABCDEF> reviewed <${pr}|#12>: no comments.`);
+  });
+
   it('tags nobody without a real person and a real PR', () => {
     const result = { outcomes: [posted()] };
     expect(reviewTagLine({ askerId: undefined }, result)).toBeUndefined();
@@ -972,6 +981,8 @@ describe('what a My day job is asked to do', () => {
     expect(deciderJob({ action: 'review_pr' }, [chat])).toBe(chat);
     expect(deciderJob({ action: undefined }, [review, chat])).toBe(chat);
     expect(deciderJob({ action: 'review_pr' }, [])).toBeUndefined();
+    const seeded = job('change', 'OWNER_AUTOPILOT');
+    expect(deciderJob({ action: 'open_pr' }, [chat, seeded])).toBe(seeded);
   });
 });
 
@@ -987,6 +998,28 @@ describe('a My day run has no way to write to GitHub', () => {
 
   it('leaves every other run as it was', () => {
     expect(withoutGithubWrites(given, undefined)).toBe(given);
+  });
+
+  it('keeps its limits inside a nested list, which is how review roles get their connectors', async () => {
+    const limited = { ...NO_CONNECTORS, noGithubWrites: true, disallowedTools: ['Bash(security:*)'] };
+    const inner = await withConnectors(limited, () => withConnectors(NO_CONNECTORS, async () => currentConnectors()));
+    expect(inner.noGithubWrites).toBe(true);
+    expect(inner.disallowedTools).toContain('Bash(security:*)');
+    const nestedAgain = await withConnectors(limited, () =>
+      withConnectors({ ...NO_CONNECTORS, disallowedTools: ['x'] }, () =>
+        withConnectors(NO_CONNECTORS, async () => currentConnectors()),
+      ),
+    );
+    expect(nestedAgain.noGithubWrites).toBe(true);
+    expect(nestedAgain.disallowedTools).toEqual(expect.arrayContaining(['x', 'Bash(security:*)']));
+  });
+
+  it("doesn't change an ordinary run's nesting", async () => {
+    const inner = await withConnectors({ ...NO_CONNECTORS, disallowedTools: ['outer'] }, () =>
+      withConnectors(NO_CONNECTORS, async () => currentConnectors()),
+    );
+    expect(inner.noGithubWrites).toBeUndefined();
+    expect(inner.disallowedTools).toEqual([]);
   });
 });
 

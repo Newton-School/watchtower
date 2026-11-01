@@ -150,6 +150,7 @@ function severityText(counts: Record<string, number> | undefined): string {
 }
 
 function comments(count: number): string {
+  if (count === 0) return 'no comments';
   return `${count} comment${count === 1 ? '' : 's'}`;
 }
 
@@ -193,13 +194,19 @@ export function reviewTagLine(
     outcome =>
       `<${outcome.prUrl}|#${outcome.number}>: ${comments(outcomeCount(outcome))}${severityText(outcome.severityCounts)}`,
   );
-  return `<@${item.askerId}> reviewed ${parts.join(', ')}. Please check.`;
+  const anyComments = posted.some(outcome => outcomeCount(outcome) > 0);
+  return `<@${item.askerId}> reviewed ${parts.join(', ')}.${anyComments ? ' Please check.' : ''}`;
 }
 
 /** The PR a change job landed on, if it's a real link. */
 function prUrlFrom(result: Record<string, unknown> | undefined): string | undefined {
   const url = result?.prUrl;
   return typeof url === 'string' && PR_URL.test(url) ? url : undefined;
+}
+
+/** A change job is recorded under its seed until it ends, and the owner's seed reads OWNER_AUTOPILOT. */
+function sameKind(workflow: string, expected: WorkflowIntent): boolean {
+  return workflow === expected || (expected === 'IMPLEMENTATION' && workflow === 'OWNER_AUTOPILOT');
 }
 
 export function expectedWorkflow(item: Pick<PersonalItem, 'action'>): WorkflowIntent | undefined {
@@ -216,7 +223,7 @@ export function expectedWorkflow(item: Pick<PersonalItem, 'action'>): WorkflowIn
 export function deciderJob(item: Pick<PersonalItem, 'action'>, jobs: MiniogJob[]): MiniogJob | undefined {
   const expected = expectedWorkflow(item);
   if (!expected) return jobs.at(-1);
-  return jobs.filter(job => job.workflow === expected).at(-1) ?? jobs[0];
+  return jobs.filter(job => sameKind(job.workflow, expected)).at(-1) ?? jobs[0];
 }
 
 export interface Settled {
@@ -238,7 +245,7 @@ export function settleItem(
     return { state: 'needs_you', nextStep: `The run didn't finish: ${why} See the run, then answer or run it again.` };
   }
   const expected = expectedWorkflow(item);
-  if (expected && job.workflow !== expected) {
+  if (expected && !sameKind(job.workflow, expected)) {
     return {
       state: 'needs_you',
       nextStep: `This ran as ${job.workflow}, not the ${expected} it was meant to be, so nothing is counted as done. See the run.`,
