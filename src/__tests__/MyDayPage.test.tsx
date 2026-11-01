@@ -29,6 +29,7 @@ function item(overrides: Partial<MyDayItem>): MyDayItem {
     draftError: null,
     prStates: {},
     action: null,
+    jobStatus: null,
     firstSeenAt: '2026-11-01T00:00:00.000Z',
     ...overrides,
   };
@@ -211,6 +212,27 @@ describe('MyDayPage', () => {
     render(<MyDayPage />);
     fireEvent.click(await screen.findByRole('button', { name: 'Review it' }));
     await waitFor(() => expect(invoke).toHaveBeenCalledWith('start_my_day_item', { key: 'k', text: null }));
+  });
+
+  it('offers no second start while a run waits for his answer, and hides a reply naming no PR yet', async () => {
+    serve(
+      day({
+        items: [
+          item({
+            key: 'k',
+            action: 'review_pr',
+            jobId: 'j',
+            jobStatus: 'PAUSED',
+            replyText: 'Raised {PR_URL} for this.',
+          }),
+        ],
+      }),
+    );
+    render(<MyDayPage />);
+    expect(await screen.findByRole('button', { name: 'Answer' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Review it' })).toBeNull();
+    expect(screen.queryByText(/\{PR_URL\}/)).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Copy reply' })).toBeNull();
   });
 
   it('sends his answer, and only with something typed', async () => {

@@ -14,6 +14,7 @@ import type { AgentBackend, AgentBackendId } from '../backends/types.js';
 import { getBackend } from '../backends/registry.js';
 import { claudePermissionMode } from '../backends/claudeCodeBackend.js';
 import { currentConnectors } from '../backends/connectors.js';
+import { NO_PUSH_TO_GITHUB_ENV } from '../github/noPush.js';
 import { agentBaseEnv } from '../backends/launchEnv.js';
 import { agentGitDefaultsEnv, githubAccessGitEnv, makeGhConfigDir, mergeAgentEnv } from '../backends/agentGitHubEnv.js';
 import {
@@ -816,7 +817,14 @@ export function reportsConnectors(request: Pick<CodexRunRequest, 'personalSlack'
   return !request.personalSlack;
 }
 
-export async function runCodex(request: CodexRunRequest): Promise<CodexRunResult> {
+/** A run under `noGithubWrites` has no token and can't push, whatever role its agent has. */
+export function withoutGithubWrites(request: CodexRunRequest, noGithubWrites: boolean | undefined): CodexRunRequest {
+  if (!noGithubWrites) return request;
+  return { ...request, githubToken: undefined, extraEnv: { ...request.extraEnv, ...NO_PUSH_TO_GITHUB_ENV } };
+}
+
+export async function runCodex(given: CodexRunRequest): Promise<CodexRunResult> {
+  const request = withoutGithubWrites(given, currentConnectors().noGithubWrites);
   // `backendOverride` lets a single run pin a backend (e.g. webapp-QA forces
   // `claude-code` for Bash-driven Playwright) without flipping the global
   // active backend that every other workflow relies on.

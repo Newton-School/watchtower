@@ -34,6 +34,12 @@ export interface RunConnectors {
   disallowedTools: string[];
   /** Connectors the profile names that this host cannot provide. */
   unavailable: string[];
+  /**
+   * The run's agents get no GitHub token, and git refuses to push: whatever
+   * reaches GitHub is done by miniOG itself, after its own checks. For runs whose
+   * prompt came through an agent that read Slack.
+   */
+  noGithubWrites?: boolean;
 }
 
 export const NO_CONNECTORS: RunConnectors = { mcpServers: {}, disallowedTools: [], unavailable: [] };

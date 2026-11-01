@@ -278,6 +278,8 @@ export interface SlackEventEnvelope {
 }
 
 export interface LaunchpadRequestRecord {
+  /** The My day item this request works on. */
+  personalItemKey?: string;
   id: string;
   target: LaunchpadTarget;
   prompt: string;

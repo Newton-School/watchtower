@@ -1,3 +1,4 @@
+import { NO_CONNECTORS, withConnectors } from '../backends/connectors.js';
 import { isIntentAllowedForPersonalJob } from '../personal/work.js';
 import type { WebClient } from '@slack/web-api';
 import type {
@@ -933,6 +934,11 @@ export async function routeTask(params: {
       const message = `A My day run can't do this (${resolvedIntent}). Nothing was started.`;
       logStep?.({ stage: 'personal.intent_refused', level: 'WARN', message, data: { resolvedIntent } });
       return { workflow: resolvedIntent, status: 'SKIPPED', message, notifyDesktop: false, slackPosted: false };
+    }
+    if (task.event.personalItemKey) {
+      return withConnectors({ ...NO_CONNECTORS, noGithubWrites: true }, () =>
+        runWorkflow({ task: routedTask, config, slack, store, jobId, logStep, signal }),
+      );
     }
     return runWorkflow({ task: routedTask, config, slack, store, jobId, logStep, signal });
   }

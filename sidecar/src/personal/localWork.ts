@@ -68,15 +68,22 @@ export async function localWorkOnBranch(repo: string, branch: string, roots?: st
       hasRemote ? `^${remote}` : '--not',
       ...(hasRemote ? [] : ['--remotes']),
     ]);
-    const count = Number(ahead?.trim() ?? 0);
+    // Anything git couldn't answer counts as a reason: a slow status mustn't let a push through.
+    if (ahead === undefined) {
+      reasons.push(`couldn't check ${clone}`);
+      continue;
+    }
+    const count = Number(ahead.trim());
     if (count > 0) reasons.push(`${count} unpushed commit${count === 1 ? '' : 's'} in ${clone}`);
     const worktrees = await git(clone, ['worktree', 'list', '--porcelain']);
+    if (worktrees === undefined) reasons.push(`couldn't check ${clone}`);
     let current: string | undefined;
     for (const line of `${worktrees ?? ''}`.split('\n')) {
       if (line.startsWith('worktree ')) current = line.slice('worktree '.length);
       if (line === `branch ${local}` && current) {
-        const status = await git(current, ['status', '--porcelain', '--untracked-files=no']);
-        if (status?.trim()) reasons.push(`uncommitted changes in ${current}`);
+        const status = await git(current, ['status', '--porcelain']);
+        if (status === undefined) reasons.push(`couldn't check ${current}`);
+        else if (status.trim()) reasons.push(`uncommitted changes in ${current}`);
       }
     }
   }

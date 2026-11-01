@@ -1848,6 +1848,7 @@ export async function reviewSinglePr(params: {
       pullNumber: prContext.number,
       commitId: prHeadSha,
       findingsByRole: postingPlan.toSubmit,
+      neverApprove: Boolean(task.event.personalItemKey),
       findingsInBody: allFindings.length - postingPlan.toSubmit.reduce((sum, r) => sum + r.findings.length, 0),
       summary: buildGithubReviewSummary(normalizedOutputs, appliedSkills, postingPlan, followUpLine),
       githubToken,

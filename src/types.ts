@@ -19,6 +19,7 @@ export type MyDayItem = {
   draftError: string | null;
   prStates: Record<string, string>;
   action: string | null;
+  jobStatus: string | null;
   firstSeenAt: string;
 };
 

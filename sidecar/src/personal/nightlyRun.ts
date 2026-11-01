@@ -23,7 +23,7 @@ import {
 } from './drafts.js';
 import { collectGithubInventory } from './githubInventory.js';
 import { fetchPrStates } from './prStates.js';
-import { policyOf, reconcileWork, startItemNow, startWaitingWork, type PolicyName } from './work.js';
+import { policyNameFor, policyOf, reconcileWork, startItemNow, startWaitingWork } from './work.js';
 import { isRunDue, runWindow } from './schedule.js';
 import { findUnfinishedSessions } from './sessions.js';
 import { standDownForMiniog } from './standDown.js';
@@ -41,6 +41,7 @@ export const PERSONAL_RUN_TIME_KEY = 'personal.run_time';
 /** The workspace's id, which the app needs to open the Slack app on a thread. */
 export const PERSONAL_TEAM_ID_KEY = 'personal.team_id';
 
+const workAwake = new KeepAwake();
 const SESSION_KEY_PREFIX = 'session:';
 const TICK_MS = 15_000;
 /** The agent reads dozens of threads one call at a time, and a three-day window is slow. */
@@ -268,20 +269,23 @@ async function advanceWork(deps: NightlyRunDeps): Promise<void> {
   const personal = deps.store.personalStore();
   await reconcileWork(deps);
   const run = personal.lastRun();
+  // The Mac stays awake from the moment a run ends until its work and drafts are done.
+  workAwake.set(personal.workInFlight().length > 0);
   if (!run || run.status !== 'OK' || run.prepareOnly) return;
   await startWaitingWork(deps, run.id);
   await reconcileWork(deps);
   // Replies can name what the work produced, so they wait for it. Work set to wait for his
   // button doesn't hold them up.
   const stillToStart = personal.workToStart(run.id).filter(item => willStartItself(deps, item.action));
+  const drafts = personal.repliesToDraft(run.id).length;
+  workAwake.set(personal.workInFlight().length > 0 || stillToStart.length > 0 || drafts > 0);
   if (personal.workInFlight().length > 0 || stillToStart.length > 0) return;
-  if (personal.repliesToDraft(run.id).length > 0) await saveDrafts(deps, run);
+  if (drafts > 0) await saveDrafts(deps, run);
+  workAwake.set(false);
 }
 
 function willStartItself(deps: NightlyRunDeps, action: PersonalWorkKind | undefined): boolean {
-  if (!action) return false;
-  const name: PolicyName = action === 'review_pr' || action === 're_review_pr' ? 'review' : action;
-  return policyOf(deps.store, name) === 'auto';
+  return Boolean(action) && policyOf(deps.store, policyNameFor(action as PersonalWorkKind)) === 'auto';
 }
 
 /** One run start to finish. Never throws: a failure is recorded and told to the owner. */
@@ -339,47 +343,38 @@ export function startNightlyRuns(deps: NightlyRunDeps): void {
   personal.failInterruptedRuns('Watchtower restarted during the run.');
   let running = false;
 
-  const start = (params: { trigger: PersonalRun['trigger']; span?: string; prepareOnly?: boolean }) => {
-    running = true;
-    void runNightly(deps, params)
-      .catch(error => logger.error({ error: String(error) }, 'my day: run crashed'))
-      .finally(() => {
-        running = false;
-      });
+  const step = async () => {
+    const actions: PersonalAction[] = personal.takeActions();
+    for (const action of actions) {
+      if (action.kind === 'start_item') await startItemNow(deps, action);
+    }
+    const runNow = actions.find(action => action.kind === 'run_now');
+    if (runNow) {
+      await runNightly(deps, { trigger: 'manual', span: runNow.span, prepareOnly: runNow.prepareOnly });
+      return;
+    }
+    const due = isRunDue({
+      now: new Date(),
+      enabled: store.getState(PERSONAL_ENABLED_KEY) === '1',
+      runTime: store.getState(PERSONAL_RUN_TIME_KEY),
+      enabledAt: store.getState(PERSONAL_ENABLED_AT_KEY),
+      lastStartedAt: personal.lastRun()?.startedAt,
+    });
+    if (due) {
+      await runNightly(deps, { trigger: 'schedule' });
+      return;
+    }
+    await advanceWork(deps);
   };
 
   const tick = () => {
     if (running) return;
-    try {
-      const actions: PersonalAction[] = personal.takeActions();
-      for (const action of actions) {
-        if (action.kind === 'start_item') startItemNow(deps, action);
-      }
-      const runNow = actions.find(action => action.kind === 'run_now');
-      if (runNow) {
-        start({ trigger: 'manual', span: runNow.span, prepareOnly: runNow.prepareOnly });
-        return;
-      }
-      const due = isRunDue({
-        now: new Date(),
-        enabled: store.getState(PERSONAL_ENABLED_KEY) === '1',
-        runTime: store.getState(PERSONAL_RUN_TIME_KEY),
-        enabledAt: store.getState(PERSONAL_ENABLED_AT_KEY),
-        lastStartedAt: personal.lastRun()?.startedAt,
+    running = true;
+    void step()
+      .catch(error => logger.warn({ error: String(error) }, 'my day: tick failed'))
+      .finally(() => {
+        running = false;
       });
-      if (due) {
-        start({ trigger: 'schedule' });
-        return;
-      }
-      running = true;
-      void advanceWork(deps)
-        .catch(error => logger.warn({ error: String(error) }, 'my day: following the work failed'))
-        .finally(() => {
-          running = false;
-        });
-    } catch (error) {
-      logger.warn({ error: String(error) }, 'my day: tick failed');
-    }
   };
 
   setInterval(tick, TICK_MS);

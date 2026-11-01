@@ -1,3 +1,4 @@
+import { jobSlots } from '../../runtime/jobSlots.js';
 import type { WebClient } from '@slack/web-api';
 import { fetchThreadContext } from '../../slack/threadContext.js';
 import { withButtonReplies } from '../../slack/buttonReplies.js';
@@ -54,7 +55,10 @@ export function waitForClarificationWithIdle(params: ClarificationWait): Promise
     promptTs: params.promptTs,
     allowedUserIds: [...params.allowedUserIds],
   };
-  return whileWaitingForAnswer(wait, () => pollForClarificationWithIdle(params));
+  // A question can wait for hours: it shouldn't hold a job slot while it does.
+  return jobSlots.whileWaitingOnHuman(() => whileWaitingForAnswer(wait, () => pollForClarificationWithIdle(params)), {
+    logStep: params.logStep,
+  });
 }
 
 async function pollForClarificationWithIdle(params: {

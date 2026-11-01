@@ -14,6 +14,7 @@ export function buildLaunchpadEnvelope(params: {
     prompt: string;
     requestedForUserId?: string;
     answerForJobId?: string;
+    personalItemKey?: string;
   };
   channelId: string;
   anchorTs: string;
@@ -38,6 +39,7 @@ export function buildLaunchpadEnvelope(params: {
     userId: request.ownerUserId,
     requestedForUserId: request.requestedForUserId,
     answersJobId: request.answerForJobId,
+    personalItemKey: request.personalItemKey,
     text: `<@${config.botUserId}> ${request.prompt}`.trim(),
     ingestSource: 'launchpad',
     launchpadRequestId: request.id,

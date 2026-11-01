@@ -384,6 +384,8 @@ export async function runAgenticPrReview(params: {
       channelId: task.event.channelId,
       threadTs: task.event.threadTs,
       prUrl: target.url,
+      // A My day run has a new thread of its own, and its earlier reviews were elsewhere.
+      anyThread: Boolean(task.event.personalItemKey),
     });
 
     // Prior findings feed the orchestrator's PRIOR REVIEW section on

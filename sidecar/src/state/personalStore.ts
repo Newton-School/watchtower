@@ -110,6 +110,7 @@ export interface PersonalRequest {
   channelId?: string;
   anchorTs?: string;
   errorMessage?: string;
+  createdAt: string;
 }
 
 /** What a piece of work came to, for its item. */
@@ -164,6 +165,9 @@ export interface PersonalStore {
   setItemState(key: string, state: PersonalItemState): void;
   finishWork(key: string, outcome: WorkOutcome): void;
   requestOf(requestId: string): PersonalRequest | undefined;
+  /** PRs this run has already started work on, so two asks don't review one PR twice. */
+  startedPrUrls(runId: string): string[];
+  transaction(work: () => void): void;
   /** The item whose work runs in this thread. */
   itemKeyForAnchor(channelId: string, threadTs: string): string | undefined;
   jobResult(jobId: string): Record<string, unknown> | undefined;
@@ -343,9 +347,10 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
     ON CONFLICT(item_key) DO UPDATE SET
       source = excluded.source,
       -- What he closed stays closed, and work under way decides its own state when it ends.
+      -- Work that stopped and is waiting on him can still turn out to be done.
       state = CASE
-        WHEN personal_items.owner_closed IS NOT NULL OR personal_items.state = 'working' OR personal_items.request_id IS NOT NULL
-          THEN personal_items.state
+        WHEN personal_items.owner_closed IS NOT NULL OR personal_items.state = 'working' THEN personal_items.state
+        WHEN personal_items.request_id IS NOT NULL AND excluded.state != 'done' THEN personal_items.state
         ELSE excluded.state
       END,
       channel_id = excluded.channel_id,
@@ -356,14 +361,14 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
       asker = excluded.asker,
       asked_at = excluded.asked_at,
       ask = excluded.ask,
-      done_summary = excluded.done_summary,
+      done_summary = CASE WHEN personal_items.request_id IS NOT NULL THEN personal_items.done_summary ELSE excluded.done_summary END,
       -- A saved draft's text stays what Slack holds. Any other outcome gets another try.
-      reply_text = CASE WHEN personal_items.draft_status = 'saved' THEN personal_items.reply_text ELSE excluded.reply_text END,
+      reply_text = CASE WHEN personal_items.draft_status = 'saved' OR personal_items.request_id IS NOT NULL THEN personal_items.reply_text ELSE excluded.reply_text END,
       draft_status = CASE WHEN personal_items.draft_status = 'saved' THEN 'saved' ELSE NULL END,
-      draft_error = CASE WHEN personal_items.draft_status = 'saved' THEN NULL ELSE NULL END,
+      draft_error = NULL,
       next_step = CASE WHEN personal_items.request_id IS NOT NULL THEN personal_items.next_step ELSE excluded.next_step END,
       evidence = excluded.evidence,
-      pr_urls_json = excluded.pr_urls_json,
+      pr_urls_json = CASE WHEN personal_items.request_id IS NOT NULL THEN personal_items.pr_urls_json ELSE excluded.pr_urls_json END,
       job_id = COALESCE(personal_items.job_id, excluded.job_id),
       action = CASE WHEN personal_items.request_id IS NOT NULL THEN personal_items.action ELSE excluded.action END,
       action_detail = CASE WHEN personal_items.request_id IS NOT NULL THEN personal_items.action_detail ELSE excluded.action_detail END,
@@ -572,7 +577,7 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
         outcome.state,
         outcome.doneSummary ?? item.done_summary,
         outcome.nextStep ?? (outcome.state === 'done' || outcome.state === 'ready' ? null : item.next_step),
-        'replyText' in outcome ? (outcome.replyText ?? null) : item.reply_text,
+        outcome.replyText ?? item.reply_text,
         outcome.prUrls ? JSON.stringify(outcome.prUrls) : item.pr_urls_json,
         outcome.jobId ?? item.job_id,
         outcome.settled ?? item.settled_on,
@@ -584,9 +589,17 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
 
     requestOf(requestId) {
       const row = db
-        .prepare(`SELECT status, slack_channel_id, anchor_ts, error_message FROM launchpad_requests WHERE id = ?`)
+        .prepare(
+          `SELECT status, slack_channel_id, anchor_ts, error_message, created_at FROM launchpad_requests WHERE id = ?`,
+        )
         .get(requestId) as
-        | { status: string; slack_channel_id: string | null; anchor_ts: string | null; error_message: string | null }
+        | {
+            status: string;
+            slack_channel_id: string | null;
+            anchor_ts: string | null;
+            error_message: string | null;
+            created_at: string;
+          }
         | undefined;
       return row
         ? {
@@ -594,21 +607,32 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
             channelId: row.slack_channel_id ?? undefined,
             anchorTs: row.anchor_ts ?? undefined,
             errorMessage: row.error_message ?? undefined,
+            createdAt: row.created_at,
           }
         : undefined;
     },
 
+    startedPrUrls(runId) {
+      const rows = db
+        .prepare(`SELECT pr_urls_json FROM personal_items WHERE last_run_id = ? AND request_id IS NOT NULL`)
+        .all(runId) as Array<{ pr_urls_json: string }>;
+      return rows.flatMap(row => parseStrings(row.pr_urls_json));
+    },
+
+    transaction(work) {
+      db.transaction(work)();
+    },
+
     itemKeyForAnchor(channelId, threadTs) {
+      // From the request itself, so every thread an item has ever run in keeps its limits.
       const row = db
         .prepare(
-          `SELECT item.item_key AS item_key
-             FROM personal_items item
-             JOIN launchpad_requests request ON request.id = item.request_id
-            WHERE request.slack_channel_id = ? AND request.anchor_ts = ?
+          `SELECT personal_item_key FROM launchpad_requests
+            WHERE slack_channel_id = ? AND anchor_ts = ? AND personal_item_key IS NOT NULL
             LIMIT 1`,
         )
-        .get(channelId, threadTs) as { item_key: string } | undefined;
-      return row?.item_key;
+        .get(channelId, threadTs) as { personal_item_key: string } | undefined;
+      return row?.personal_item_key;
     },
 
     jobResult(jobId) {

@@ -31,6 +31,7 @@ pub struct MyDayItem {
     pub draft_error: Option<String>,
     pub pr_states: std::collections::HashMap<String, String>,
     pub action: Option<String>,
+    pub job_status: Option<String>,
     pub source: String,
     pub state: String,
     pub channel_name: Option<String>,
@@ -144,7 +145,8 @@ fn read_items(
         .prepare(
             "SELECT item_key, source, state, channel_name, permalink, asker, asked_at, ask, done_summary,
                     reply_text, next_step, evidence, pr_urls_json, job_id, session_id, first_seen_at,
-                    owner_closed, draft_status, draft_error, pr_states_json, action
+                    owner_closed, draft_status, draft_error, pr_states_json, action,
+                    (SELECT status FROM jobs WHERE jobs.id = personal_items.job_id)
                FROM personal_items
               WHERE state != 'done' OR last_seen_at >= ?1
               ORDER BY first_seen_at DESC",
@@ -174,6 +176,7 @@ fn read_items(
                 draft_error: row.get(18)?,
                 pr_states: serde_json::from_str(&row.get::<_, String>(19)?).unwrap_or_default(),
                 action: row.get(20)?,
+                job_status: row.get(21)?,
             })
         })
         .map_err(|err| format!("db read failed: {err}"))?;
@@ -300,7 +303,12 @@ fn start_plan(connection: &Connection, key: &str) -> Result<StartPlan, String> {
         return Err("that item is already done".to_string());
     }
     let Some(job_id) = job_id else {
-        return Ok(StartPlan::StartNew);
+        // Started, with no job yet: a second start would run it twice.
+        return if state == "working" {
+            Err("its run is starting.".to_string())
+        } else {
+            Ok(StartPlan::StartNew)
+        };
     };
     let status: Option<String> = connection
         .query_row(
@@ -471,7 +479,35 @@ fn set_closed(connection: &Connection, key: &str, how: &str, now: &str) -> Resul
     if changed == 0 {
         return Err("that item is no longer in the list".to_string());
     }
+    if how != "reopen" {
+        stop_its_run(connection, key, now)?;
+    }
     Ok(())
+}
+
+/// Closing an item stops its run: otherwise it would go on to push and open a PR.
+fn stop_its_run(connection: &Connection, key: &str, now: &str) -> Result<(), String> {
+    if !has_table(connection, "jobs")? {
+        return Ok(());
+    }
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS pending_cancel_jobs (
+               job_id TEXT PRIMARY KEY, created_at TEXT NOT NULL
+             )",
+        )
+        .map_err(|err| format!("db schema failed: {err}"))?;
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO pending_cancel_jobs (job_id, created_at)
+             SELECT item.job_id, ?2
+               FROM personal_items item
+               JOIN jobs ON jobs.id = item.job_id
+              WHERE item.item_key = ?1 AND jobs.status IN ('RUNNING', 'PAUSED')",
+            params![key, now],
+        )
+        .map(|_| ())
+        .map_err(|err| format!("db write failed: {err}"))
 }
 
 fn is_slack_id(value: &str, first: &[u8]) -> bool {
@@ -1000,6 +1036,26 @@ mod tests {
         assert_eq!(state, "needs_you");
         assert!(set_closed(&connection, "a", "nonsense", "now").is_err());
         assert!(set_closed(&connection, "missing", "done", "now").is_err());
+    }
+
+    #[test]
+    fn closing_an_item_stops_its_run() {
+        let connection = database();
+        add_item_with_job(&connection, Some(("j", "RUNNING")));
+        set_closed(&connection, "a", "skipped", "now").expect("close");
+        let job: String = connection
+            .query_row("SELECT job_id FROM pending_cancel_jobs", [], |row| {
+                row.get(0)
+            })
+            .expect("queued");
+        assert_eq!(job, "j");
+    }
+
+    #[test]
+    fn a_started_item_with_no_job_yet_cannot_start_again() {
+        let connection = database();
+        add_item(&connection, "a", "working", "2026-11-01");
+        assert!(start_plan(&connection, "a").is_err());
     }
 
     #[test]

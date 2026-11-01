@@ -370,13 +370,17 @@ export async function submitPrReview(params: {
    * grepping process stdout.
    */
   logStep?: WorkflowStepLogger;
+  /** Only ever comment, even with nothing found: approving is a person's call on this run. */
+  neverApprove?: boolean;
 }): Promise<SubmitPrReviewResult> {
   const { owner, repo, pullNumber, commitId, findingsByRole, summary, githubToken, prDiff, logStep } = params;
   const errorContext = { owner, repo, pullNumber };
 
   const allFindings = findingsByRole.flatMap(r => r.findings);
   const event: ReviewEvent =
-    allFindings.length + (params.findingsInBody ?? 0) > 0 ? 'COMMENT' : determineReviewEvent(allFindings);
+    params.neverApprove || allFindings.length + (params.findingsInBody ?? 0) > 0
+      ? 'COMMENT'
+      : determineReviewEvent(allFindings);
   const hunkIndex = prDiff ? parseDiffHunks(prDiff) : undefined;
 
   const { inlineComments, fileLevelFindings, droppedOutsideDiff } = classifyFindings(findingsByRole, hunkIndex);

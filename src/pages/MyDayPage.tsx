@@ -26,7 +26,7 @@ const ACTION_LABELS: Record<string, string> = {
 
 const POLICY_ROWS: Array<{ name: string; label: string }> = [
   { name: 'review', label: 'Reviews and re-reviews, posted on GitHub' },
-  { name: 'fix_own_pr', label: 'Fixes pushed to your PRs, with replies on the comments' },
+  { name: 'fix_own_pr', label: 'Fixes pushed to your PRs' },
   { name: 'open_pr', label: 'New PRs for clear asks' },
   { name: 'tag', label: "miniOG's line in the thread after a review" },
 ];
@@ -142,6 +142,10 @@ export function MyDayRow({
     : [item.asker, item.channelName, item.askedAt].filter(Boolean).join(' · ') || 'GitHub';
   const isOpen = item.state !== 'done';
   const canAnswer = item.state === 'needs_you' && !isSession;
+  // A run waiting for an answer takes the answer, not a second start.
+  const jobIsLive = item.jobStatus === 'RUNNING' || item.jobStatus === 'PAUSED';
+  // A reply still naming a PR that hasn't been opened isn't one yet.
+  const replyText = item.replyText?.includes('{PR_URL}') ? null : item.replyText;
 
   const sendAnswer = async () => {
     try {
@@ -178,7 +182,7 @@ export function MyDayRow({
               See the run
             </button>
           ) : null}
-          {canAnswer && item.action ? (
+          {canAnswer && item.action && !jobIsLive ? (
             <button
               className="ghost-button"
               type="button"
@@ -233,9 +237,9 @@ export function MyDayRow({
       {item.nextStep && isOpen ? <Line label="Next">{item.nextStep}</Line> : null}
       {item.state === 'waiting' && item.evidence ? <Line label="Waiting">{item.evidence}</Line> : null}
       {item.state === 'working' ? <Line label="Working">miniOG is on this now.</Line> : null}
-      {item.replyText ? (
+      {replyText ? (
         <Line label="Reply">
-          <p className="my-day-reply">{item.replyText}</p>
+          <p className="my-day-reply">{replyText}</p>
           <ReplyStatus item={item} />
           <button className="ghost-button" type="button" onClick={() => void copyReply()}>
             {copied ? 'Copied' : 'Copy reply'}
