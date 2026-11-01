@@ -12,7 +12,15 @@ import type { JobStore } from '../state/jobStore.js';
 import { spendKey, type PersonalAction, type PersonalRun } from '../state/personalStore.js';
 import { agentCallContext } from '../state/runContext.js';
 import type { AppConfig, WorkflowStepLog } from '../types/contracts.js';
-import { buildDraftPrompt, draftTarget, parseDraftReply, type DraftTarget } from './drafts.js';
+import { readToolCalls, type ToolCall } from './agentTranscript.js';
+import {
+  buildDraftPrompt,
+  draftOutcomes,
+  draftTarget,
+  isConfirmedAsk,
+  oneDraftPerConversation,
+  type DraftTarget,
+} from './drafts.js';
 import { collectGithubInventory } from './githubInventory.js';
 import { fetchPrStates } from './prStates.js';
 import { isRunDue, runWindow } from './schedule.js';
@@ -107,7 +115,8 @@ function logStepToLogger(step: WorkflowStepLog): void {
   logger.info({ stage: step.stage, level: step.level }, `my day: ${step.message}`);
 }
 
-async function triage(deps: NightlyRunDeps, run: PersonalRun, result: RunGaps): Promise<void> {
+/** Returns the agent's Slack reads, which later show whether a reply's destination is real. */
+async function triage(deps: NightlyRunDeps, run: PersonalRun, result: RunGaps): Promise<ToolCall[]> {
   const { store, config } = deps;
   const personal = store.personalStore();
   const ownerId = config.ownerSlackUserIds[0];
@@ -137,6 +146,7 @@ async function triage(deps: NightlyRunDeps, run: PersonalRun, result: RunGaps): 
     github,
     miniogJobs: jobs,
     openItems,
+    closedAsks: personal.closedByOwner().map(item => item.ask),
   });
 
   // An empty folder: this agent has no business in a repo, and no tools to read one with.
@@ -167,6 +177,7 @@ async function triage(deps: NightlyRunDeps, run: PersonalRun, result: RunGaps): 
         doneSummary: decided.doneSummary ?? item.doneSummary,
       });
     }
+    return readToolCalls(cwd);
   } finally {
     fs.rmSync(cwd, { recursive: true, force: true });
   }
@@ -188,22 +199,43 @@ async function refreshPrStates(deps: NightlyRunDeps): Promise<void> {
 }
 
 /**
- * Saves the night's replies as Slack drafts, once the facts are final. A failure
+ * Saves tonight's replies as Slack drafts, once the facts are final. A failure
  * here costs a draft, which the inbox still shows to copy, not the night's work.
+ * A reply only goes to a conversation the triage agent really read.
  */
-async function saveDrafts(deps: NightlyRunDeps, run: PersonalRun, result: RunGaps): Promise<void> {
+async function saveDrafts(
+  deps: NightlyRunDeps,
+  run: PersonalRun,
+  result: RunGaps,
+  readCalls: ToolCall[],
+): Promise<void> {
   const personal = deps.store.personalStore();
-  const targets = personal
-    .repliesToDraft()
-    .map(item => draftTarget(item))
-    .filter((target): target is DraftTarget => Boolean(target));
-  if (targets.length === 0) return;
+  const targets: DraftTarget[] = [];
+  let unconfirmed = 0;
+  for (const item of personal.repliesToDraft(run.id)) {
+    const target = draftTarget(item);
+    if (target && isConfirmedAsk(item, readCalls)) {
+      targets.push(target);
+    } else {
+      unconfirmed += 1;
+      personal.setDraftResult(item.key, {
+        status: 'failed',
+        error: "Couldn't confirm this is the conversation the ask came from, so no draft was saved.",
+      });
+    }
+  }
+  if (unconfirmed > 0)
+    result.gaps.push(`${unconfirmed} replies weren't saved as drafts: their ask couldn't be confirmed.`);
+  const { send, waiting } = oneDraftPerConversation(targets);
+  for (const target of waiting) personal.setDraftResult(target.key, { status: 'blocked' });
+  if (send.length === 0) return;
+
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'watchtower-my-day-'));
   try {
     const agent = await agentCallContext.run({ jobId: spendKey(run.id), store: deps.store }, () =>
       runClaudeAgentic({
-        systemPrompt: buildDraftPrompt(targets),
-        userMessage: 'Save the drafts now and reply with the JSON.',
+        systemPrompt: buildDraftPrompt(send),
+        userMessage: 'Save the drafts now.',
         cwd,
         forceBackend: 'claude-code',
         tier: 'light',
@@ -213,16 +245,20 @@ async function saveDrafts(deps: NightlyRunDeps, run: PersonalRun, result: RunGap
         logStep: logStepToLogger,
       }),
     );
-    const results = parseDraftReply(agent.ok ? agent.reply : '', targets);
-    for (const draft of results) {
-      personal.setDraftResult(draft.key, {
-        status: draft.status,
-        error: draft.status === 'failed' ? (draft.error ?? agent.error) : undefined,
-      });
-    }
+    const { results, strays } = draftOutcomes(send, readToolCalls(cwd), agent.error);
+    for (const draft of results) personal.setDraftResult(draft.key, draft);
     const failed = results.filter(draft => draft.status === 'failed').length;
-    if (failed > 0)
+    if (failed > 0) {
       result.gaps.push(`${failed} of ${results.length} drafts couldn't be saved. Copy them from the inbox.`);
+    }
+    if (strays.length > 0) {
+      const where = strays.map(call => String(call.input.channel_id)).join(', ');
+      result.gaps.push(`A draft nobody asked for was saved in ${where}. Check Drafts in Slack, and don't send it.`);
+      await alertOwner(
+        deps,
+        `My day saved a draft nobody asked for in ${where}. Check Drafts in Slack, and don't send it.`,
+      );
+    }
   } finally {
     fs.rmSync(cwd, { recursive: true, force: true });
   }
@@ -252,12 +288,15 @@ export async function runNightly(
       result.gaps.push(`Claude sessions couldn't be checked: ${String(error)}`);
     });
     await rememberTeamId(deps);
-    await triage(deps, run, result);
+    const readCalls = await triage(deps, run, result);
     await refreshPrStates(deps).catch(error => {
       result.gaps.push(`PR states couldn't be checked: ${String(error)}`);
     });
-    if (!params.prepareOnly) {
-      await saveDrafts(deps, run, result).catch(error => {
+    // Replies written without every source could be wrong, so they wait for a run that has them.
+    if (result.sourceFailed) {
+      result.gaps.push('No drafts were saved, because a source was missing. They wait for the next run.');
+    } else if (!params.prepareOnly) {
+      await saveDrafts(deps, run, result, readCalls).catch(error => {
         result.gaps.push(`Drafts couldn't be saved: ${String(error)}`);
       });
     }

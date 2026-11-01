@@ -68,6 +68,9 @@ const BUILT_IN_TOOLS = [
   'Skill',
   'SendMessage',
   'Monitor',
+  'ListMcpResourcesTool',
+  'ReadMcpResourceTool',
+  'LSP',
 ];
 
 function forEachServer(tools: string[]): string[] {

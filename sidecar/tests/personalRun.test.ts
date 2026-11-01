@@ -7,7 +7,8 @@ import { describe, expect, it } from 'vitest';
 import { claudeCodeBackend, claudePermissionMode } from '../src/backends/claudeCodeBackend.js';
 import { settingsProblem } from '../src/backends/personalSlack.js';
 import { reportsConnectors } from '../src/codex/runCodex.js';
-import { draftTarget, parseDraftReply } from '../src/personal/drafts.js';
+import { readToolCalls, transcriptDir, type ToolCall } from '../src/personal/agentTranscript.js';
+import { draftOutcomes, draftTarget, isConfirmedAsk, oneDraftPerConversation } from '../src/personal/drafts.js';
 import { ownPrAsks } from '../src/personal/githubInventory.js';
 import { fetchPrStates } from '../src/personal/prStates.js';
 import { isRunDue, latestRunTime, runWindow } from '../src/personal/schedule.js';
@@ -139,17 +140,169 @@ describe('where a reply goes', () => {
     expect(draftTarget({ ...base, channelId: 'C01ABCDEF', replyText: '  ' })).toBeUndefined();
   });
 
-  it('counts a draft the agent did not report as failed', () => {
-    const targets = [
-      { key: 'a', channel_id: 'C01ABCDEF', text: 'x' },
-      { key: 'b', channel_id: 'C01ABCDEF', text: 'y' },
-    ];
-    const reply = JSON.stringify({ results: [{ key: 'a', status: 'saved' }] });
-    expect(parseDraftReply(reply, targets)).toEqual([
-      { key: 'a', status: 'saved', error: undefined },
-      { key: 'b', status: 'failed', error: 'The agent did not report on it.' },
+  it('sends a thread reply in a DM to the thread, even with no message id', () => {
+    const item = { ...base, channelId: 'D01ABCDEF', messageTs: undefined };
+    expect(draftTarget(item)?.thread_ts).toBe('1793000000.000100');
+  });
+
+  it('sends one reply per conversation, since Slack refuses a second', () => {
+    const target = (key: string, channel: string, thread?: string) => ({
+      key,
+      channel_id: channel,
+      ...(thread ? { thread_ts: thread } : {}),
+      text: 'x',
+    });
+    const { send, waiting } = oneDraftPerConversation([
+      target('a', 'D1'),
+      target('b', 'D1'),
+      target('c', 'C1', '1.1'),
+      target('d', 'C1', '2.2'),
+      target('e', 'C1', '1.1'),
     ]);
-    expect(parseDraftReply('no json', targets).every(result => result.status === 'failed')).toBe(true);
+    expect(send.map(draft => draft.key)).toEqual(['a', 'c', 'd']);
+    expect(waiting.map(draft => draft.key)).toEqual(['b', 'e']);
+  });
+});
+
+describe('what happened to a draft comes from the calls made', () => {
+  const target = { key: 'a', channel_id: 'C01ABCDEF', thread_ts: '1793000000.000100', text: 'Sure' };
+  const call = (overrides: Partial<ToolCall>): ToolCall => ({
+    name: 'mcp__claude_ai_Slack__slack_send_message_draft',
+    input: { channel_id: target.channel_id, thread_ts: target.thread_ts, message: target.text },
+    ok: true,
+    text: '{"draft_id":"Dr1"}',
+    ...overrides,
+  });
+
+  it('counts a draft Slack saved', () => {
+    expect(draftOutcomes([target], [call({})]).results).toEqual([{ key: 'a', status: 'saved' }]);
+  });
+
+  it("doesn't take a call with different text or another thread as this draft", () => {
+    const other = call({ input: { channel_id: target.channel_id, thread_ts: target.thread_ts, message: 'changed' } });
+    const { results, strays } = draftOutcomes([target], [other]);
+    expect(results[0].status).toBe('failed');
+    expect(strays).toEqual([other]);
+  });
+
+  it('flags a draft saved anywhere nobody asked', () => {
+    const stray = call({ input: { channel_id: 'C0OTHER000', message: 'hello' } });
+    expect(draftOutcomes([target], [call({}), stray]).strays).toEqual([stray]);
+  });
+
+  it('counts a retry refused because the first worked as saved', () => {
+    const refused = call({ ok: false, text: 'attached_draft_exists' });
+    expect(draftOutcomes([target], [call({}), refused]).results[0].status).toBe('saved');
+  });
+
+  it('tells a draft already there from a failure', () => {
+    expect(draftOutcomes([target], [call({ ok: false, text: 'attached_draft_exists' })]).results[0].status).toBe(
+      'blocked',
+    );
+    expect(draftOutcomes([target], [call({ ok: false, text: 'not_in_channel' })]).results[0]).toMatchObject({
+      status: 'failed',
+      error: 'not_in_channel',
+    });
+  });
+
+  it("doesn't count an answer that names no draft, or no call at all", () => {
+    expect(draftOutcomes([target], [call({ text: 'sure, done' })]).results[0].status).toBe('failed');
+    expect(draftOutcomes([target], [], 'usage limit').results[0]).toMatchObject({
+      status: 'failed',
+      error: 'usage limit',
+    });
+  });
+});
+
+describe('a reply only goes where the ask really was', () => {
+  const channel = 'C01ABCDEF';
+  const ts = '1793000000.000100';
+  const item = { key: `slack:${channel}:${ts}`, channelId: channel, threadTs: ts, messageTs: ts, replyText: 'x' };
+  const read = (input: Record<string, unknown>, text = ''): ToolCall => ({
+    name: 'mcp__claude_ai_Slack__slack_read_thread',
+    input,
+    ok: true,
+    text,
+  });
+
+  it('confirms a message the agent read, by its inputs or in a search result', () => {
+    expect(isConfirmedAsk(item, [read({ channel_id: channel, message_ts: ts })])).toBe(true);
+    expect(isConfirmedAsk(item, [read({}, `Channel: #x (ID: ${channel}) ... Message_ts: ${ts}`)])).toBe(true);
+    expect(isConfirmedAsk(item, [read({}, `/archives/${channel}/p1793000000000100`)])).toBe(true);
+  });
+
+  it('refuses a channel it never read, a failed read, and a key naming somewhere else', () => {
+    expect(isConfirmedAsk(item, [read({ channel_id: 'C0OTHER000', message_ts: ts })])).toBe(false);
+    expect(isConfirmedAsk(item, [{ ...read({ channel_id: channel, message_ts: ts }), ok: false }])).toBe(false);
+    const elsewhere = { ...item, key: `slack:C0OTHER000:${ts}` };
+    expect(isConfirmedAsk(elsewhere, [read({ channel_id: channel, message_ts: ts })])).toBe(false);
+    expect(
+      isConfirmedAsk({ ...item, key: `slack:${channel}:1793000999.000100` }, [
+        read({ channel_id: channel, message_ts: ts }),
+      ]),
+    ).toBe(false);
+  });
+
+  it("doesn't count a tool that isn't Slack's", () => {
+    const other: ToolCall = { name: 'ToolSearch', input: {}, ok: true, text: `${channel} ${ts}` };
+    expect(isConfirmedAsk(item, [other])).toBe(false);
+  });
+});
+
+describe("reading an agent's transcript", () => {
+  it('finds each call once, follows a long result to its file, and keeps retries', () => {
+    const projects = tempDir();
+    const cwd = fs.realpathSync(tempDir());
+    const dir = transcriptDir(cwd, projects);
+    fs.mkdirSync(dir, { recursive: true });
+    const longResult = path.join(dir, 'session', 'tool-results', 'long.txt');
+    fs.mkdirSync(path.dirname(longResult), { recursive: true });
+    fs.writeFileSync(longResult, 'the whole long result');
+    const assistant = (id: string, name: string) =>
+      JSON.stringify({ message: { content: [{ type: 'tool_use', id, name, input: { a: 1 } }] } });
+    const user = (id: string, content: string, isError = false) =>
+      JSON.stringify({ message: { content: [{ type: 'tool_result', tool_use_id: id, content, is_error: isError }] } });
+    fs.writeFileSync(
+      path.join(dir, 'one.jsonl'),
+      [
+        assistant('1', 'mcp__x__slack_read_thread'),
+        assistant('1', 'mcp__x__slack_read_thread'),
+        user('1', `<persisted-output> Full output saved to: ${longResult}\n`),
+        assistant('2', 'mcp__x__slack_read_channel'),
+        'not json',
+      ].join('\n'),
+    );
+    fs.writeFileSync(
+      path.join(dir, 'two.jsonl'),
+      [assistant('3', 'mcp__x__draft'), user('3', 'refused', true)].join('\n'),
+    );
+    const calls = readToolCalls(cwd, projects);
+    expect(calls).toHaveLength(3);
+    expect(calls[0]).toMatchObject({ ok: true, text: 'the whole long result' });
+    expect(calls[1]).toMatchObject({ ok: false, text: '' });
+    expect(calls[2]).toMatchObject({ ok: false, text: 'refused' });
+  });
+
+  it("doesn't follow a result out of its own folder", () => {
+    const projects = tempDir();
+    const cwd = fs.realpathSync(tempDir());
+    const dir = transcriptDir(cwd, projects);
+    fs.mkdirSync(dir, { recursive: true });
+    const outside = path.join(tempDir(), 'secret.txt');
+    fs.writeFileSync(outside, 'secret');
+    const lines = [
+      JSON.stringify({ message: { content: [{ type: 'tool_use', id: '1', name: 'x', input: {} }] } }),
+      JSON.stringify({
+        message: { content: [{ type: 'tool_result', tool_use_id: '1', content: `Full output saved to: ${outside}` }] },
+      }),
+    ];
+    fs.writeFileSync(path.join(dir, 'one.jsonl'), lines.join('\n'));
+    expect(readToolCalls(cwd, projects)[0].text).not.toContain('secret\n');
+    expect(readToolCalls(cwd, projects)[0].text).toContain('Full output saved to');
+  });
+
+  it('has no calls for a run with no transcript', () => {
+    expect(readToolCalls(tempDir(), tempDir())).toEqual([]);
   });
 });
 
@@ -629,9 +782,10 @@ describe('the personal store', () => {
     expect(personal.openItems()).toEqual([]);
 
     personal.upsertItem({ ...item, key: 'b', state: 'ready', replyText: 'first' });
-    expect(personal.repliesToDraft().map(reply => reply.key)).toEqual(['b']);
+    expect(personal.repliesToDraft('run-1').map(reply => reply.key)).toEqual(['b']);
+    expect(personal.repliesToDraft('another-run')).toEqual([]);
     personal.setDraftResult('b', { status: 'saved' });
-    expect(personal.repliesToDraft()).toEqual([]);
+    expect(personal.repliesToDraft('run-1')).toEqual([]);
     personal.upsertItem({ ...item, key: 'b', state: 'ready', replyText: 'second' });
     expect(personal.openItems()[0]).toMatchObject({ replyText: 'first', draftStatus: 'saved' });
   });
@@ -640,7 +794,7 @@ describe('the personal store', () => {
     const personal = store();
     personal.upsertItem({ ...item, key: 'b', state: 'ready', replyText: 'text' });
     personal.setDraftResult('b', { status: 'failed', error: 'attached_draft_exists' });
-    expect(personal.repliesToDraft()[0]).toMatchObject({ draftError: 'attached_draft_exists' });
+    expect(personal.repliesToDraft('run-1')[0]).toMatchObject({ draftError: 'attached_draft_exists' });
     personal.setPrStates('b', { url: 'merged' });
     expect(personal.openItems()[0].prStates).toEqual({ url: 'merged' });
   });

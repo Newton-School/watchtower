@@ -140,7 +140,7 @@ describe('MyDayPage', () => {
     );
     render(<MyDayPage />);
     fireEvent.click(await screen.findByRole('button', { name: /Ready to send/ }));
-    expect(screen.getByText(/Saved as a draft in that thread/)).toBeTruthy();
+    expect(screen.getByText(/Saved as a draft in that conversation/)).toBeTruthy();
     expect(screen.getByText(/attached_draft_exists/)).toBeTruthy();
   });
 
@@ -164,6 +164,37 @@ describe('MyDayPage', () => {
     expect(screen.getAllByRole('button', { name: 'Reopen' })).toHaveLength(1);
     fireEvent.click(screen.getByRole('button', { name: 'Reopen' }));
     await waitFor(() => expect(invoke).toHaveBeenCalledWith('close_my_day_item', { key: 'his', how: 'reopen' }));
+  });
+
+  it('shows a closed session in Done, where it can be reopened', async () => {
+    serve(
+      day({
+        items: [item({ key: 'session:x', source: 'session', state: 'done', ownerClosed: 'done', ask: 'old work' })],
+      }),
+    );
+    render(<MyDayPage />);
+    fireEvent.click(await screen.findByRole('button', { name: /^Done/ }));
+    expect(screen.getByText('old work')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Reopen' })).toBeTruthy();
+  });
+
+  it("warns about a draft left in Slack once the item is closed, and doesn't say to send it", async () => {
+    serve(day({ items: [item({ key: 'a', state: 'done', replyText: 'One', draftStatus: 'saved' })] }));
+    render(<MyDayPage />);
+    fireEvent.click(await screen.findByRole('button', { name: /^Done/ }));
+    expect(screen.getByText(/its draft is still in Slack/)).toBeTruthy();
+    expect(screen.queryByText(/Send it from Slack/)).toBeNull();
+  });
+
+  it('clears a load error once a later load works', async () => {
+    invoke.mockRejectedValueOnce('no such column: owner_closed');
+    invoke.mockImplementation(async () => day());
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(<MyDayPage />);
+    expect(await screen.findByText(/no such column/)).toBeTruthy();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await waitFor(() => expect(screen.queryByText(/no such column/)).toBeNull());
+    vi.useRealTimers();
   });
 
   it('sends Prepare only with Run now', async () => {

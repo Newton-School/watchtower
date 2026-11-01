@@ -55,8 +55,9 @@ export function buildTriagePrompt(params: {
   github: GithubInventory;
   miniogJobs: MiniogJob[];
   openItems: PersonalItem[];
+  closedAsks?: string[];
 }): string {
-  const { ownerSlackId, ownerNames, windowStart, windowEnd, github, miniogJobs, openItems } = params;
+  const { ownerSlackId, ownerNames, windowStart, windowEnd, github, miniogJobs, openItems, closedAsks = [] } = params;
   const startSeconds = Math.floor(windowStart.getTime() / 1000);
   const after = new Date(windowStart.getTime() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const threadsAfter = new Date(windowStart.getTime() - 4 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
@@ -112,6 +113,9 @@ ${JSON.stringify(jobs)}
 
 Items still open from earlier nights. Re-check each one and return it under the same key. Only mark it done with evidence:
 ${JSON.stringify(carried)}
+
+Asks he closed himself. Don't raise these again, unless someone has asked again since:
+${JSON.stringify(closedAsks)}
 
 ## Decide
 

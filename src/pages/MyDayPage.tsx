@@ -18,7 +18,7 @@ const EMPTY_COPY: Record<TabId, string> = {
 };
 
 function inTab(item: MyDayItem, tab: TabId): boolean {
-  if (item.source === 'session') return tab === 'sessions' && item.state !== 'done';
+  if (item.source === 'session') return tab === (item.state === 'done' ? 'done' : 'sessions');
   return item.state === tab;
 }
 
@@ -63,12 +63,24 @@ function Line({ label, children }: { label: string; children: ReactNode }) {
 }
 
 function ReplyStatus({ item }: { item: MyDayItem }) {
+  if (item.state === 'done') {
+    return item.draftStatus === 'saved' ? (
+      <p className="muted">If you haven't sent it, its draft is still in Slack.</p>
+    ) : null;
+  }
   if (item.draftStatus === 'saved')
-    return <p className="muted">Saved as a draft in that thread. Send it from Slack.</p>;
+    return <p className="muted">Saved as a draft in that conversation. Send it from Slack.</p>;
+  if (item.draftStatus === 'blocked') {
+    return (
+      <p className="muted">
+        A draft is already there, yours or an earlier one, and Slack keeps one. Copy this instead.
+      </p>
+    );
+  }
   if (item.draftStatus === 'failed') {
     return (
       <p className="my-day-draft-failed">
-        Couldn't save the draft: {item.draftError ?? 'unknown error'}. Copy it instead.
+        Couldn't save the draft: {item.draftError ?? 'unknown error'} Copy it instead.
       </p>
     );
   }
@@ -194,6 +206,8 @@ export function MyDayPage() {
   const [day, setDay] = useState<MyDay | null>(null);
   const [tab, setTab] = useState<TabId>('needs_you');
   const [error, setError] = useState<string | null>(null);
+  // Separate from the actions' errors: this one clears itself when a later poll works.
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [span, setSpan] = useState('');
   const [prepareOnly, setPrepareOnly] = useState(false);
   // Saved on leaving the field: typing passes through times that aren't the one meant.
@@ -202,8 +216,9 @@ export function MyDayPage() {
   const load = useCallback(async () => {
     try {
       setDay(await invoke<MyDay>('get_my_day'));
+      setLoadError(null);
     } catch (err) {
-      setError(String(err));
+      setLoadError(String(err));
     }
   }, []);
 
@@ -254,6 +269,7 @@ export function MyDayPage() {
       />
 
       {error ? <div className="my-day-error">{error}</div> : null}
+      {loadError ? <div className="my-day-error">{loadError}</div> : null}
       {day?.lastRun?.status === 'FAILED' && day.lastRun.error ? (
         <div className="my-day-error">The last run failed: {day.lastRun.error}</div>
       ) : null}

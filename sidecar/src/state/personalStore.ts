@@ -5,7 +5,8 @@ import type Database from 'better-sqlite3';
 export type PersonalItemState = 'needs_you' | 'ready' | 'waiting' | 'done';
 export type PersonalItemSource = 'slack' | 'github' | 'session';
 export type PersonalRunStatus = 'RUNNING' | 'OK' | 'PARTIAL' | 'FAILED';
-export type DraftStatus = 'saved' | 'failed';
+/** `blocked`: a draft is already in that conversation, an earlier one or his own. */
+export type DraftStatus = 'saved' | 'failed' | 'blocked';
 
 export interface PersonalItem {
   /** Stable from night to night: how a later run recognises the same ask. */
@@ -94,8 +95,10 @@ export interface PersonalStore {
   closeItem(key: string, runId: string, doneSummary: string): void;
   openItems(): PersonalItem[];
   openSessionKeys(): string[];
-  /** Replies waiting to be saved as drafts: a saved one is never saved twice. */
-  repliesToDraft(): PersonalItem[];
+  /** Replies this run's triage confirmed, waiting to be saved: a saved one is never saved twice. */
+  repliesToDraft(runId: string): PersonalItem[];
+  /** What he closed himself lately, so a later run doesn't raise it again under a new key. */
+  closedByOwner(): PersonalItem[];
   setDraftResult(key: string, result: { status: DraftStatus; error?: string }): void;
   setPrStates(key: string, states: Record<string, string>): void;
   takeActions(): PersonalAction[];
@@ -370,15 +373,22 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
       return rows.map(row => row.item_key);
     },
 
-    repliesToDraft() {
+    closedByOwner() {
+      const rows = db
+        .prepare(`SELECT * FROM personal_items WHERE owner_closed IS NOT NULL ORDER BY last_seen_at DESC LIMIT 100`)
+        .all() as ItemRow[];
+      return rows.map(toItem);
+    },
+
+    repliesToDraft(runId) {
       const rows = db
         .prepare(
           `SELECT * FROM personal_items
-            WHERE state = 'ready' AND source = 'slack' AND owner_closed IS NULL
+            WHERE last_run_id = ? AND state = 'ready' AND source = 'slack' AND owner_closed IS NULL
               AND reply_text IS NOT NULL AND COALESCE(draft_status, '') != 'saved'
             ORDER BY first_seen_at`,
         )
-        .all() as ItemRow[];
+        .all(runId) as ItemRow[];
       return rows.map(toItem);
     },
 
