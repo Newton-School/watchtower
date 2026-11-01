@@ -74,6 +74,8 @@ export interface RunClaudeAgenticRequest {
   doing?: string;
   /** The run only reads: no bypassed permissions, an allow-list instead (issue #443). */
   readOnly?: boolean;
+  /** The run reads the owner's own Slack and can do nothing else (`backends/personalSlack.ts`). */
+  personalSlack?: 'read';
   /** False for a run the shell sandbox breaks, such as browser QA (issue #445). */
   sandbox?: boolean;
 }
@@ -114,6 +116,7 @@ export async function runClaudeAgentic(request: RunClaudeAgenticRequest): Promis
     imagePaths,
     doing = 'answering this',
     readOnly,
+    personalSlack,
     sandbox,
   } = request;
 
@@ -137,6 +140,7 @@ export async function runClaudeAgentic(request: RunClaudeAgenticRequest): Promis
         timeoutMs,
         imagePaths: imagePaths && imagePaths.length > 0 ? imagePaths : undefined,
         readOnly,
+        personalSlack,
         sandbox,
         onLog: logStep,
         signal,
@@ -187,7 +191,10 @@ export async function runClaudeAgentic(request: RunClaudeAgenticRequest): Promis
         ok: false,
         reason: 'error',
         reply: reply || 'Agent finished with no output.',
-        error: `runCodex returned ok=false (exitCode=${result.exitCode ?? 'unknown'})`,
+        error: `runCodex returned ok=false (exitCode=${result.exitCode ?? 'unknown'})${
+          // This run's flags are all its own, so a CLI that rejects one has to be readable.
+          personalSlack && result.stderr.trim() ? `: ${result.stderr.trim().slice(-300)}` : ''
+        }`,
       };
     }
 

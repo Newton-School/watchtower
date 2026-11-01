@@ -1,4 +1,44 @@
+export type MyDayItem = {
+  key: string;
+  source: string;
+  state: string;
+  channelName: string | null;
+  permalink: string | null;
+  asker: string | null;
+  askedAt: string | null;
+  ask: string;
+  doneSummary: string | null;
+  replyText: string | null;
+  nextStep: string | null;
+  evidence: string | null;
+  prUrls: string[];
+  jobId: string | null;
+  sessionId: string | null;
+  firstSeenAt: string;
+};
+
+export type MyDayRun = {
+  status: string;
+  trigger: string;
+  windowStart: string;
+  windowEnd: string;
+  startedAt: string;
+  finishedAt: string | null;
+  gaps: string[];
+  error: string | null;
+  costUsd: number;
+};
+
+export type MyDay = {
+  enabled: boolean;
+  runTime: string;
+  runQueued: boolean;
+  lastRun: MyDayRun | null;
+  items: MyDayItem[];
+};
+
 export type AppView =
+  | 'myday'
   | 'overview'
   | 'launchpad'
   | 'runs'

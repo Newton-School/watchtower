@@ -9,6 +9,7 @@ import { applyAppTheme } from './lib/theme';
 import { formatSidecarLine } from './lib/formatters';
 import { IntelligencePage } from './pages/IntelligencePage';
 import { PerformancePage } from './pages/PerformancePage';
+import { MyDayPage } from './pages/MyDayPage';
 import { UxMetricsPage } from './pages/UxMetricsPage';
 import { LaunchpadPage } from './pages/LaunchpadPage';
 import { OverviewPage } from './pages/OverviewPage';
@@ -552,6 +553,8 @@ function App() {
       {view === 'performance' ? (
         <PerformancePage onSelectRun={setSelectedRunId} onNavigateRuns={() => navigateToView('runs')} />
       ) : null}
+
+      {view === 'myday' ? <MyDayPage /> : null}
 
       {view === 'ux' ? <UxMetricsPage /> : null}
 

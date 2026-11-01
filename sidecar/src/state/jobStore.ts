@@ -24,6 +24,7 @@ import type {
   WorkflowIntent,
 } from '../types/contracts.js';
 import { createInvestigationStore, type InvestigationStore } from './investigationStore.js';
+import { createPersonalStore, type PersonalStore } from './personalStore.js';
 import { createDossierStore, type DossierStore } from './dossierStore.js';
 import { createConversationStore, type ConversationStore } from './conversationStore.js';
 import { createExportLog, type ExportLog } from '../egress/exportLog.js';
@@ -154,6 +155,7 @@ export class JobStore {
   private _investigationStore?: InvestigationStore;
   private _dossierStore?: DossierStore;
   private _conversationStore?: ConversationStore;
+  private _personalStore?: PersonalStore;
   private _exportLog?: ExportLog;
 
   // Hot-path statements compiled once. better-sqlite3 does NOT cache prepared
@@ -212,6 +214,13 @@ export class JobStore {
       this._conversationStore = createConversationStore(this.db);
     }
     return this._conversationStore;
+  }
+
+  personalStore(): PersonalStore {
+    if (!this._personalStore) {
+      this._personalStore = createPersonalStore(this.db);
+    }
+    return this._personalStore;
   }
 
   exportLog(): ExportLog {
@@ -505,6 +514,54 @@ export class JobStore {
       CREATE INDEX IF NOT EXISTS idx_agent_calls_job_id ON agent_calls(job_id);
       CREATE INDEX IF NOT EXISTS idx_agent_calls_created_at ON agent_calls(created_at);
       CREATE INDEX IF NOT EXISTS idx_agent_calls_pipeline_run ON agent_calls(pipeline_run_id);
+
+      CREATE TABLE IF NOT EXISTS personal_runs (
+        id TEXT PRIMARY KEY,
+        trigger TEXT NOT NULL,
+        status TEXT NOT NULL,
+        window_start TEXT NOT NULL,
+        window_end TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        gaps_json TEXT NOT NULL DEFAULT '[]',
+        error_message TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_personal_runs_started_at ON personal_runs(started_at);
+
+      CREATE TABLE IF NOT EXISTS personal_items (
+        item_key TEXT PRIMARY KEY,
+        source TEXT NOT NULL,
+        state TEXT NOT NULL,
+        channel_id TEXT,
+        channel_name TEXT,
+        thread_ts TEXT,
+        message_ts TEXT,
+        permalink TEXT,
+        asker TEXT,
+        asked_at TEXT,
+        ask TEXT NOT NULL,
+        done_summary TEXT,
+        reply_text TEXT,
+        next_step TEXT,
+        evidence TEXT,
+        pr_urls_json TEXT NOT NULL DEFAULT '[]',
+        job_id TEXT,
+        session_id TEXT,
+        session_cwd TEXT,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        last_run_id TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_personal_items_state ON personal_items(state, first_seen_at);
+
+      CREATE TABLE IF NOT EXISTS personal_actions (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        span TEXT,
+        created_at TEXT NOT NULL,
+        taken_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_personal_actions_taken ON personal_actions(taken_at, created_at);
 
       CREATE TABLE IF NOT EXISTS investigation_findings (
         thread_ts TEXT PRIMARY KEY,

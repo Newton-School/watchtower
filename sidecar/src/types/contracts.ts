@@ -501,6 +501,11 @@ export interface CodexRunRequest {
    */
   readOnly?: boolean;
   /**
+   * The run reads the owner's own Slack and can do nothing else: My day's
+   * triage (`backends/personalSlack.ts`). Claude Code only.
+   */
+  personalSlack?: 'read';
+  /**
    * Directories outside `cwd` the run may read: the other repos' clones for
    * a run in one repo's worktree (issue #610). Only honored by the
    * claude-code backend (`--add-dir`), where a read-only run is otherwise

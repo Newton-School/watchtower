@@ -2,6 +2,7 @@ import type { SVGProps } from 'react';
 import {
   Activity,
   Gauge,
+  Sun,
   LayoutDashboard,
   Lightbulb,
   Menu,
@@ -60,6 +61,10 @@ export function IntelligenceIcon() {
 
 export function PerformanceIcon() {
   return <Activity size={ICON_SIZE} strokeWidth={ICON_STROKE} />;
+}
+
+export function MyDayIcon() {
+  return <Sun size={ICON_SIZE} strokeWidth={ICON_STROKE} />;
 }
 
 export function UxMetricsIcon() {

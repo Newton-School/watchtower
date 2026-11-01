@@ -5161,3 +5161,72 @@ h3 {
     max-height: none;
   }
 }
+
+.my-day-error {
+  padding: 10px 14px;
+  border: 1px solid rgba(var(--danger-rgb), 0.2);
+  border-radius: 10px;
+  color: var(--danger);
+  background: rgba(var(--danger-rgb), 0.08);
+}
+
+.my-day-schedule {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.my-day-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.my-day-item {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+
+.my-day-item-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.my-day-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.my-day-line {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  gap: 10px;
+  overflow-wrap: anywhere;
+}
+
+.my-day-label {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  opacity: 0.6;
+}
+
+.my-day-reply {
+  margin: 0 0 8px;
+  white-space: pre-wrap;
+}
+
+.my-day-gaps {
+  margin: 8px 0 0;
+  padding-left: 18px;
+}
