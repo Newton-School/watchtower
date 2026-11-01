@@ -250,6 +250,12 @@ export interface SlackEventEnvelope {
    */
   answersJobId?: string;
   /**
+   * The My day item this run works on, set when it runs in that item's thread.
+   * It keeps the owner's authority with a non-owner's guarded execution, takes the
+   * plan as it is, and limits which intents it can become.
+   */
+  personalItemKey?: string;
+  /**
    * For `message_deleted` subtypes: the ts of the message that was deleted
    * (Slack puts the deletion event itself in `event.ts`, and the original
    * message's ts in `event.deleted_ts` / `event.previous_message.ts`).

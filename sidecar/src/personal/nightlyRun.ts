@@ -9,10 +9,10 @@ import { logger } from '../logging/logger.js';
 import { notifyDesktop } from '../notify/desktopNotifier.js';
 import { KeepAwake } from '../runtime/keepAwake.js';
 import type { JobStore } from '../state/jobStore.js';
-import { spendKey, type PersonalAction, type PersonalRun } from '../state/personalStore.js';
+import { spendKey, type PersonalAction, type PersonalRun, type PersonalWorkKind } from '../state/personalStore.js';
 import { agentCallContext } from '../state/runContext.js';
 import type { AppConfig, WorkflowStepLog } from '../types/contracts.js';
-import { readToolCalls, type ToolCall } from './agentTranscript.js';
+import { readToolCalls } from './agentTranscript.js';
 import {
   buildDraftPrompt,
   draftOutcomes,
@@ -23,6 +23,7 @@ import {
 } from './drafts.js';
 import { collectGithubInventory } from './githubInventory.js';
 import { fetchPrStates } from './prStates.js';
+import { policyOf, reconcileWork, startItemNow, startWaitingWork, type PolicyName } from './work.js';
 import { isRunDue, runWindow } from './schedule.js';
 import { findUnfinishedSessions } from './sessions.js';
 import { standDownForMiniog } from './standDown.js';
@@ -115,8 +116,7 @@ function logStepToLogger(step: WorkflowStepLog): void {
   logger.info({ stage: step.stage, level: step.level }, `my day: ${step.message}`);
 }
 
-/** Returns the agent's Slack reads, which later show whether a reply's destination is real. */
-async function triage(deps: NightlyRunDeps, run: PersonalRun, result: RunGaps): Promise<ToolCall[]> {
+async function triage(deps: NightlyRunDeps, run: PersonalRun, result: RunGaps): Promise<void> {
   const { store, config } = deps;
   const personal = store.personalStore();
   const ownerId = config.ownerSlackUserIds[0];
@@ -167,6 +167,7 @@ async function triage(deps: NightlyRunDeps, run: PersonalRun, result: RunGaps): 
     if (!agent.ok) throw new Error(agent.error ?? 'the triage agent failed');
     const reply = parseTriageReply(agent.reply);
     result.gaps.push(...reply.gaps);
+    const readCalls = readToolCalls(cwd);
     for (const triaged of reply.items) {
       const item = toPersonalItem(triaged, run.id);
       const decided = standDownForMiniog(item, jobs);
@@ -176,8 +177,8 @@ async function triage(deps: NightlyRunDeps, run: PersonalRun, result: RunGaps): 
         jobId: decided.jobId,
         doneSummary: decided.doneSummary ?? item.doneSummary,
       });
+      personal.setAskConfirmed(item.key, isConfirmedAsk(item, readCalls));
     }
-    return readToolCalls(cwd);
   } finally {
     fs.rmSync(cwd, { recursive: true, force: true });
   }
@@ -199,22 +200,18 @@ async function refreshPrStates(deps: NightlyRunDeps): Promise<void> {
 }
 
 /**
- * Saves tonight's replies as Slack drafts, once the facts are final. A failure
- * here costs a draft, which the inbox still shows to copy, not the night's work.
- * A reply only goes to a conversation the triage agent really read.
+ * Saves a run's replies as Slack drafts, once its work has finished and the facts
+ * are final. A failure here costs a draft, which the inbox still shows to copy, not
+ * the night's work. A reply only goes to a conversation triage really read.
  */
-async function saveDrafts(
-  deps: NightlyRunDeps,
-  run: PersonalRun,
-  result: RunGaps,
-  readCalls: ToolCall[],
-): Promise<void> {
+async function saveDrafts(deps: NightlyRunDeps, run: PersonalRun): Promise<void> {
   const personal = deps.store.personalStore();
+  const gaps: string[] = [];
   const targets: DraftTarget[] = [];
   let unconfirmed = 0;
   for (const item of personal.repliesToDraft(run.id)) {
     const target = draftTarget(item);
-    if (target && isConfirmedAsk(item, readCalls)) {
+    if (target && item.askConfirmed) {
       targets.push(target);
     } else {
       unconfirmed += 1;
@@ -224,44 +221,67 @@ async function saveDrafts(
       });
     }
   }
-  if (unconfirmed > 0)
-    result.gaps.push(`${unconfirmed} replies weren't saved as drafts: their ask couldn't be confirmed.`);
+  if (unconfirmed > 0) gaps.push(`${unconfirmed} replies weren't saved as drafts: their ask couldn't be confirmed.`);
   const { send, waiting } = oneDraftPerConversation(targets);
   for (const target of waiting) personal.setDraftResult(target.key, { status: 'blocked' });
-  if (send.length === 0) return;
-
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'watchtower-my-day-'));
-  try {
-    const agent = await agentCallContext.run({ jobId: spendKey(run.id), store: deps.store }, () =>
-      runClaudeAgentic({
-        systemPrompt: buildDraftPrompt(send),
-        userMessage: 'Save the drafts now.',
-        cwd,
-        forceBackend: 'claude-code',
-        tier: 'light',
-        timeoutMs: DRAFT_TIMEOUT_MS,
-        personalSlack: 'draft',
-        doing: 'saving your drafts',
-        logStep: logStepToLogger,
-      }),
-    );
-    const { results, strays } = draftOutcomes(send, readToolCalls(cwd), agent.error);
-    for (const draft of results) personal.setDraftResult(draft.key, draft);
-    const failed = results.filter(draft => draft.status === 'failed').length;
-    if (failed > 0) {
-      result.gaps.push(`${failed} of ${results.length} drafts couldn't be saved. Copy them from the inbox.`);
-    }
-    if (strays.length > 0) {
-      const where = strays.map(call => String(call.input.channel_id)).join(', ');
-      result.gaps.push(`A draft nobody asked for was saved in ${where}. Check Drafts in Slack, and don't send it.`);
-      await alertOwner(
-        deps,
-        `My day saved a draft nobody asked for in ${where}. Check Drafts in Slack, and don't send it.`,
+  if (send.length > 0) {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'watchtower-my-day-'));
+    try {
+      const agent = await agentCallContext.run({ jobId: spendKey(run.id), store: deps.store }, () =>
+        runClaudeAgentic({
+          systemPrompt: buildDraftPrompt(send),
+          userMessage: 'Save the drafts now.',
+          cwd,
+          forceBackend: 'claude-code',
+          tier: 'light',
+          timeoutMs: DRAFT_TIMEOUT_MS,
+          personalSlack: 'draft',
+          doing: 'saving your drafts',
+          logStep: logStepToLogger,
+        }),
       );
+      const { results, strays } = draftOutcomes(send, readToolCalls(cwd), agent.error);
+      for (const draft of results) personal.setDraftResult(draft.key, draft);
+      const failed = results.filter(draft => draft.status === 'failed').length;
+      if (failed > 0) gaps.push(`${failed} of ${results.length} drafts couldn't be saved. Copy them from the inbox.`);
+      if (strays.length > 0) {
+        const where = strays.map(call => String(call.input.channel_id)).join(', ');
+        gaps.push(`A draft nobody asked for was saved in ${where}. Check Drafts in Slack, and don't send it.`);
+        await alertOwner(
+          deps,
+          `My day saved a draft nobody asked for in ${where}. Check Drafts in Slack, and don't send it.`,
+        );
+      }
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
     }
-  } finally {
-    fs.rmSync(cwd, { recursive: true, force: true });
   }
+  personal.addGaps(run.id, gaps);
+}
+
+/**
+ * The part that goes on after a run ends: starts its work, follows every job, and
+ * saves its drafts once nothing is left in flight. Polled, so a restart loses
+ * nothing. A run that missed a source or was Prepare only starts nothing and drafts nothing.
+ */
+async function advanceWork(deps: NightlyRunDeps): Promise<void> {
+  const personal = deps.store.personalStore();
+  await reconcileWork(deps);
+  const run = personal.lastRun();
+  if (!run || run.status !== 'OK' || run.prepareOnly) return;
+  await startWaitingWork(deps, run.id);
+  await reconcileWork(deps);
+  // Replies can name what the work produced, so they wait for it. Work set to wait for his
+  // button doesn't hold them up.
+  const stillToStart = personal.workToStart(run.id).filter(item => willStartItself(deps, item.action));
+  if (personal.workInFlight().length > 0 || stillToStart.length > 0) return;
+  if (personal.repliesToDraft(run.id).length > 0) await saveDrafts(deps, run);
+}
+
+function willStartItself(deps: NightlyRunDeps, action: PersonalWorkKind | undefined): boolean {
+  if (!action) return false;
+  const name: PolicyName = action === 'review_pr' || action === 're_review_pr' ? 'review' : action;
+  return policyOf(deps.store, name) === 'auto';
 }
 
 /** One run start to finish. Never throws: a failure is recorded and told to the owner. */
@@ -274,6 +294,7 @@ export async function runNightly(
   const window = runWindow({ now, lastWindowEnd: personal.lastFinishedRun()?.windowEnd, span: params.span });
   const run = personal.startRun({
     trigger: params.trigger,
+    prepareOnly: params.prepareOnly,
     windowStart: window.start.toISOString(),
     windowEnd: window.end.toISOString(),
   });
@@ -288,18 +309,12 @@ export async function runNightly(
       result.gaps.push(`Claude sessions couldn't be checked: ${String(error)}`);
     });
     await rememberTeamId(deps);
-    const readCalls = await triage(deps, run, result);
+    await triage(deps, run, result);
     await refreshPrStates(deps).catch(error => {
       result.gaps.push(`PR states couldn't be checked: ${String(error)}`);
     });
-    // Replies written without every source could be wrong, so they wait for a run that has them.
-    if (result.sourceFailed) {
-      result.gaps.push('No drafts were saved, because a source was missing. They wait for the next run.');
-    } else if (!params.prepareOnly) {
-      await saveDrafts(deps, run, result, readCalls).catch(error => {
-        result.gaps.push(`Drafts couldn't be saved: ${String(error)}`);
-      });
-    }
+    // Without every source a reply or a review could be wrong, so that waits for a run that has them.
+    if (result.sourceFailed) result.gaps.push('No work was started and no drafts saved, because a source was missing.');
   } catch (error) {
     failure = error instanceof Error ? error.message : String(error);
   } finally {
@@ -337,6 +352,9 @@ export function startNightlyRuns(deps: NightlyRunDeps): void {
     if (running) return;
     try {
       const actions: PersonalAction[] = personal.takeActions();
+      for (const action of actions) {
+        if (action.kind === 'start_item') startItemNow(deps, action);
+      }
       const runNow = actions.find(action => action.kind === 'run_now');
       if (runNow) {
         start({ trigger: 'manual', span: runNow.span, prepareOnly: runNow.prepareOnly });
@@ -349,7 +367,16 @@ export function startNightlyRuns(deps: NightlyRunDeps): void {
         enabledAt: store.getState(PERSONAL_ENABLED_AT_KEY),
         lastStartedAt: personal.lastRun()?.startedAt,
       });
-      if (due) start({ trigger: 'schedule' });
+      if (due) {
+        start({ trigger: 'schedule' });
+        return;
+      }
+      running = true;
+      void advanceWork(deps)
+        .catch(error => logger.warn({ error: String(error) }, 'my day: following the work failed'))
+        .finally(() => {
+          running = false;
+        });
     } catch (error) {
       logger.warn({ error: String(error) }, 'my day: tick failed');
     }

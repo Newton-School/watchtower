@@ -1461,6 +1461,22 @@ export async function runApprovalLoop(input: {
   let overrideNextPromptTs: string | undefined;
 
   for (let iteration = iterationStart; iteration < MAX_FEEDBACK_ITERATIONS; iteration++) {
+    // A My day run takes its plan as it is: he asked for work to go ahead unless it truly
+    // needs him, and questions the planner has still stop it before this point.
+    if (task.event.personalItemKey) {
+      logStep?.({ stage: 'personal.plan_taken', message: 'A My day run: going ahead with the plan.' });
+      return {
+        kind: 'approved',
+        feedbackRounds,
+        planMarkdown,
+        planAffectedFiles,
+        planScope,
+        plannerOutput,
+        plannerSessionId,
+        planMessageTs,
+        pipelineCwd,
+      };
+    }
     // Worked out for each version of the plan: a revision can add or remove a behaviour change.
     const requesterToConfirm = requesterToConfirmFor(planMarkdown, config, requesterOf(task));
     let approvalPromptTs: string | undefined;
@@ -2236,6 +2252,20 @@ export function landedFollowUpText(params: {
  * starts gets that list instead of the host user's connectors (issue #443);
  * the pipeline narrows it again to none for the roles that only review.
  */
+/** What a My day change run can never do, whatever its prompt says. */
+const PERSONAL_JOB_DENY_RULES = [
+  'Bash(gh pr merge:*)',
+  'Bash(gh pr review:*)',
+  'Bash(gh pr close:*)',
+  'Bash(gh workflow:*)',
+  'Bash(gh run rerun:*)',
+  'Bash(gh repo delete:*)',
+  'Bash(gh secret:*)',
+  'Bash(git push --force:*)',
+  'Bash(git push -f:*)',
+  'Bash(git push --force-with-lease:*)',
+];
+
 export async function runImplementationWorkflow(
   params: Parameters<typeof runImplementationWorkflowBody>[0],
 ): Promise<WorkflowResult> {
@@ -2251,7 +2281,10 @@ export async function runImplementationWorkflow(
     level: connectors.unavailable.length > 0 ? 'WARN' : 'INFO',
     data: { servers: Object.keys(connectors.mcpServers), unavailable: connectors.unavailable, adminTier: isAdmin },
   });
-  return withConnectors(connectors, () => runImplementationWorkflowBody(params));
+  const limited = params.task.event.personalItemKey
+    ? { ...connectors, disallowedTools: [...connectors.disallowedTools, ...PERSONAL_JOB_DENY_RULES] }
+    : connectors;
+  return withConnectors(limited, () => runImplementationWorkflowBody(params));
 }
 
 async function runImplementationWorkflowBody(params: {

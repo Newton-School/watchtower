@@ -150,6 +150,8 @@ function parseResumeContext(raw: unknown): ResumeContext | undefined {
   return parsed.success ? (parsed.data as ResumeContext) : undefined;
 }
 
+const PERSONAL_PAUSE_MAX_MINUTES = 7 * 24 * 60;
+
 export class JobStore {
   private db: Database.Database;
   private _investigationStore?: InvestigationStore;
@@ -524,7 +526,8 @@ export class JobStore {
         started_at TEXT NOT NULL,
         finished_at TEXT,
         gaps_json TEXT NOT NULL DEFAULT '[]',
-        error_message TEXT
+        error_message TEXT,
+        prepare_only INTEGER NOT NULL DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS idx_personal_runs_started_at ON personal_runs(started_at);
 
@@ -552,6 +555,12 @@ export class JobStore {
         draft_status TEXT,
         draft_error TEXT,
         pr_states_json TEXT NOT NULL DEFAULT '{}',
+        action TEXT,
+        action_detail TEXT,
+        asker_id TEXT,
+        ask_confirmed INTEGER NOT NULL DEFAULT 0,
+        request_id TEXT,
+        settled_on TEXT,
         first_seen_at TEXT NOT NULL,
         last_seen_at TEXT NOT NULL,
         last_run_id TEXT NOT NULL
@@ -563,6 +572,8 @@ export class JobStore {
         kind TEXT NOT NULL,
         span TEXT,
         prepare_only INTEGER NOT NULL DEFAULT 0,
+        item_key TEXT,
+        text TEXT,
         created_at TEXT NOT NULL,
         taken_at TEXT
       );
@@ -900,6 +911,15 @@ export class JobStore {
       'personal_items ADD COLUMN draft_error TEXT',
       "personal_items ADD COLUMN pr_states_json TEXT NOT NULL DEFAULT '{}'",
       'personal_actions ADD COLUMN prepare_only INTEGER NOT NULL DEFAULT 0',
+      'personal_actions ADD COLUMN item_key TEXT',
+      'personal_actions ADD COLUMN text TEXT',
+      'personal_runs ADD COLUMN prepare_only INTEGER NOT NULL DEFAULT 0',
+      'personal_items ADD COLUMN action TEXT',
+      'personal_items ADD COLUMN action_detail TEXT',
+      'personal_items ADD COLUMN asker_id TEXT',
+      'personal_items ADD COLUMN ask_confirmed INTEGER NOT NULL DEFAULT 0',
+      'personal_items ADD COLUMN request_id TEXT',
+      'personal_items ADD COLUMN settled_on TEXT',
     ]) {
       try {
         this.db.exec(`ALTER TABLE ${column}`);
@@ -1910,12 +1930,17 @@ export class JobStore {
    * worktree if it persisted one in the resume context).
    */
   stalePausedJobs(maxAgeMinutes: number): Array<{ id: string; channelId: string; threadTs: string }> {
+    // A My day run waiting on the owner waits for him: he answers from the inbox, and
+    // nobody else's reply lands in that thread. A week is long enough to say he won't.
     return this.db
       .prepare(
         `SELECT id, channel_id AS channelId, thread_ts AS threadTs
          FROM jobs
          WHERE status = 'PAUSED'
-           AND updated_at < datetime('now', '-' || ? || ' minutes')
+           AND updated_at < datetime('now', '-' || CASE
+             WHEN json_extract(payload_json, '$.personalItemKey') IS NOT NULL THEN ${PERSONAL_PAUSE_MAX_MINUTES}
+             ELSE ?
+           END || ' minutes')
          ORDER BY updated_at ASC`,
       )
       .all(maxAgeMinutes) as Array<{ id: string; channelId: string; threadTs: string }>;

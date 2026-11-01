@@ -649,6 +649,8 @@ async function enqueueSlackEvent(
   if (source !== 'launchpad' && (await tryHandleStopControl(event, client))) {
     return;
   }
+  // A reply in a My day item's thread, or a run resumed by his answer, stays under its limits.
+  event.personalItemKey ??= store.personalStore().itemKeyForAnchor(event.channelId, event.threadTs);
   const item: (typeof queue)[number] = { event, client };
   const processed = opts.untilProcessed
     ? new Promise<void>(resolve => {
@@ -1091,6 +1093,7 @@ async function processEventClaimed(event: SlackEventEnvelope, client: WebClient)
       eventTs: event.eventTs,
       ingestSource: event.ingestSource ?? 'socket',
       launchpadRequestId: event.launchpadRequestId ?? null,
+      personalItemKey: event.personalItemKey ?? null,
     },
   });
 

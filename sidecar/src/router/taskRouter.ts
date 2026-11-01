@@ -1,3 +1,4 @@
+import { isIntentAllowedForPersonalJob } from '../personal/work.js';
 import type { WebClient } from '@slack/web-api';
 import type {
   AppConfig,
@@ -295,7 +296,7 @@ export async function routeTask(params: {
     (!task.resumedPausedJob &&
       ((task.event.text ?? '').includes(`<@${config.botUserId}`) || task.event.channelType === 'im'));
   const prActionAsk =
-    directAsk && !helpRequested && !stagingAsked && addressedToMiniog
+    directAsk && !helpRequested && !stagingAsked && addressedToMiniog && !task.event.personalItemKey
       ? readPrActionAsk(task, { botUserId: config.botUserId, ownerUserIds: config.ownerSlackUserIds })
       : undefined;
   // STAGING_DEPLOY is seeded only by an answer to the staging tool's "which
@@ -927,6 +928,11 @@ export async function routeTask(params: {
             data: { error: String(error) },
           }),
         );
+    }
+    if (task.event.personalItemKey && !isIntentAllowedForPersonalJob(resolvedIntent)) {
+      const message = `A My day run can't do this (${resolvedIntent}). Nothing was started.`;
+      logStep?.({ stage: 'personal.intent_refused', level: 'WARN', message, data: { resolvedIntent } });
+      return { workflow: resolvedIntent, status: 'SKIPPED', message, notifyDesktop: false, slackPosted: false };
     }
     return runWorkflow({ task: routedTask, config, slack, store, jobId, logStep, signal });
   }

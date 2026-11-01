@@ -2,7 +2,9 @@ import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 
 /** What the owner sees an item as: the inbox's tabs. Sessions have their own tab. */
-export type PersonalItemState = 'needs_you' | 'ready' | 'waiting' | 'done';
+export type PersonalItemState = 'needs_you' | 'ready' | 'waiting' | 'working' | 'done';
+/** Work the nightly run can do for him. */
+export type PersonalWorkKind = 'review_pr' | 're_review_pr' | 'fix_own_pr' | 'open_pr';
 export type PersonalItemSource = 'slack' | 'github' | 'session';
 export type PersonalRunStatus = 'RUNNING' | 'OK' | 'PARTIAL' | 'FAILED';
 /** `blocked`: a draft is already in that conversation, an earlier one or his own. */
@@ -35,6 +37,15 @@ export interface PersonalItem {
   draftStatus?: DraftStatus;
   draftError?: string;
   prStates: Record<string, string>;
+  action?: PersonalWorkKind;
+  actionDetail?: string;
+  askerId?: string;
+  /** Triage's own reads showed it this message, so a reply can be drafted there. */
+  askConfirmed: boolean;
+  /** The launchpad request its work runs under. */
+  requestId?: string;
+  /** The job or question the item was last brought up to date with. */
+  settledOn?: string;
   firstSeenAt: string;
   lastSeenAt: string;
   lastRunId: string;
@@ -42,7 +53,15 @@ export interface PersonalItem {
 
 export type PersonalItemInput = Omit<
   PersonalItem,
-  'firstSeenAt' | 'lastSeenAt' | 'ownerClosed' | 'draftStatus' | 'draftError' | 'prStates'
+  | 'firstSeenAt'
+  | 'lastSeenAt'
+  | 'ownerClosed'
+  | 'draftStatus'
+  | 'draftError'
+  | 'prStates'
+  | 'askConfirmed'
+  | 'requestId'
+  | 'settledOn'
 >;
 
 export interface PersonalRun {
@@ -55,16 +74,20 @@ export interface PersonalRun {
   finishedAt?: string;
   gaps: string[];
   error?: string;
+  prepareOnly: boolean;
 }
 
 /** A request from the app for the sidecar to act on, polled like launchpad requests. */
 export interface PersonalAction {
   id: string;
-  kind: 'run_now';
+  kind: 'run_now' | 'start_item';
   /** For run_now: `3d` or a date, or nothing for "since the last run". */
   span?: string;
   /** For run_now: work everything out, and leave Slack untouched. */
   prepareOnly: boolean;
+  /** For start_item: the item, and his answer if there is one. */
+  itemKey?: string;
+  text?: string;
 }
 
 /** A miniOG run, as far as deciding whether it already handled an ask. */
@@ -77,10 +100,39 @@ export interface MiniogJob {
   /** The message that started it. */
   eventTs?: string;
   createdAt: string;
+  /** Why it failed, when it did. */
+  error?: string;
+}
+
+/** The launchpad request behind an item's work. */
+export interface PersonalRequest {
+  status: string;
+  channelId?: string;
+  anchorTs?: string;
+  errorMessage?: string;
+}
+
+/** What a piece of work came to, for its item. */
+export interface WorkOutcome {
+  state: PersonalItemState;
+  doneSummary?: string;
+  nextStep?: string;
+  replyText?: string;
+  prUrls?: string[];
+  jobId?: string;
+  settled?: string;
+  /** No more to run: the item stays open for him, with nothing to start. */
+  clearAction?: boolean;
 }
 
 export interface PersonalStore {
-  startRun(params: { trigger: PersonalRun['trigger']; windowStart: string; windowEnd: string }): PersonalRun;
+  startRun(params: {
+    trigger: PersonalRun['trigger'];
+    windowStart: string;
+    windowEnd: string;
+    prepareOnly?: boolean;
+  }): PersonalRun;
+  addGaps(id: string, gaps: string[]): void;
   finishRun(
     id: string,
     params: { status: Exclude<PersonalRunStatus, 'RUNNING'>; gaps?: string[]; error?: string },
@@ -100,6 +152,21 @@ export interface PersonalStore {
   /** What he closed himself lately, so a later run doesn't raise it again under a new key. */
   closedByOwner(): PersonalItem[];
   setDraftResult(key: string, result: { status: DraftStatus; error?: string }): void;
+  setAskConfirmed(key: string, confirmed: boolean): void;
+  item(key: string): PersonalItem | undefined;
+  /** What this run found that could be started and hasn't been. */
+  workToStart(runId: string): PersonalItem[];
+  workInFlight(): PersonalItem[];
+  /** Every open item with a job to follow, whether it's working or waiting on him. */
+  itemsWithJobs(): PersonalItem[];
+  setWorkStarted(key: string, requestId: string): void;
+  setItemJob(key: string, jobId: string): void;
+  setItemState(key: string, state: PersonalItemState): void;
+  finishWork(key: string, outcome: WorkOutcome): void;
+  requestOf(requestId: string): PersonalRequest | undefined;
+  /** The item whose work runs in this thread. */
+  itemKeyForAnchor(channelId: string, threadTs: string): string | undefined;
+  jobResult(jobId: string): Record<string, unknown> | undefined;
   setPrStates(key: string, states: Record<string, string>): void;
   takeActions(): PersonalAction[];
   jobsSince(iso: string): MiniogJob[];
@@ -138,6 +205,12 @@ interface ItemRow {
   draft_status: DraftStatus | null;
   draft_error: string | null;
   pr_states_json: string;
+  action: PersonalWorkKind | null;
+  action_detail: string | null;
+  asker_id: string | null;
+  ask_confirmed: number;
+  request_id: string | null;
+  settled_on: string | null;
   first_seen_at: string;
   last_seen_at: string;
   last_run_id: string;
@@ -153,6 +226,7 @@ interface RunRow {
   finished_at: string | null;
   gaps_json: string;
   error_message: string | null;
+  prepare_only: number;
 }
 
 interface JobRow {
@@ -162,12 +236,13 @@ interface JobRow {
   channel_id: string;
   thread_ts: string;
   event_ts: string | null;
+  error_message: string | null;
   created_at: string;
 }
 
 /** `workflow` is only the router's first guess; what actually ran is in `executed_workflow`. */
 const JOB_SELECT = `SELECT id, COALESCE(NULLIF(executed_workflow, ''), workflow) AS workflow, status, channel_id, thread_ts,
-         json_extract(payload_json, '$.eventTs') AS event_ts, created_at
+         json_extract(payload_json, '$.eventTs') AS event_ts, error_message, created_at
     FROM jobs`;
 
 function toJob(row: JobRow): MiniogJob {
@@ -178,6 +253,7 @@ function toJob(row: JobRow): MiniogJob {
     channelId: row.channel_id,
     threadTs: row.thread_ts,
     eventTs: row.event_ts ?? undefined,
+    error: row.error_message ?? undefined,
     createdAt: row.created_at,
   };
 }
@@ -225,6 +301,12 @@ function toItem(row: ItemRow): PersonalItem {
     draftStatus: row.draft_status ?? undefined,
     draftError: row.draft_error ?? undefined,
     prStates: parseStates(row.pr_states_json),
+    action: row.action ?? undefined,
+    actionDetail: row.action_detail ?? undefined,
+    askerId: row.asker_id ?? undefined,
+    askConfirmed: row.ask_confirmed === 1,
+    requestId: row.request_id ?? undefined,
+    settledOn: row.settled_on ?? undefined,
     firstSeenAt: row.first_seen_at,
     lastSeenAt: row.last_seen_at,
     lastRunId: row.last_run_id,
@@ -242,6 +324,7 @@ function toRun(row: RunRow): PersonalRun {
     finishedAt: row.finished_at ?? undefined,
     gaps: parseStrings(row.gaps_json),
     error: row.error_message ?? undefined,
+    prepareOnly: row.prepare_only === 1,
   };
 }
 
@@ -250,17 +333,21 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
     INSERT INTO personal_items (
       item_key, source, state, channel_id, channel_name, thread_ts, message_ts, permalink, asker, asked_at, ask,
       done_summary, reply_text, next_step, evidence, pr_urls_json, job_id, session_id, session_cwd,
-      first_seen_at, last_seen_at, last_run_id
+      action, action_detail, asker_id, first_seen_at, last_seen_at, last_run_id
     )
     VALUES (
       @key, @source, @state, @channelId, @channelName, @threadTs, @messageTs, @permalink, @asker, @askedAt, @ask,
       @doneSummary, @replyText, @nextStep, @evidence, @prUrlsJson, @jobId, @sessionId, @sessionCwd,
-      @now, @now, @lastRunId
+      @action, @actionDetail, @askerId, @now, @now, @lastRunId
     )
     ON CONFLICT(item_key) DO UPDATE SET
       source = excluded.source,
-      -- What he closed himself stays closed, and a saved draft's text stays what Slack holds.
-      state = CASE WHEN personal_items.owner_closed IS NOT NULL THEN personal_items.state ELSE excluded.state END,
+      -- What he closed stays closed, and work under way decides its own state when it ends.
+      state = CASE
+        WHEN personal_items.owner_closed IS NOT NULL OR personal_items.state = 'working' OR personal_items.request_id IS NOT NULL
+          THEN personal_items.state
+        ELSE excluded.state
+      END,
       channel_id = excluded.channel_id,
       channel_name = excluded.channel_name,
       thread_ts = excluded.thread_ts,
@@ -270,11 +357,17 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
       asked_at = excluded.asked_at,
       ask = excluded.ask,
       done_summary = excluded.done_summary,
+      -- A saved draft's text stays what Slack holds. Any other outcome gets another try.
       reply_text = CASE WHEN personal_items.draft_status = 'saved' THEN personal_items.reply_text ELSE excluded.reply_text END,
-      next_step = excluded.next_step,
+      draft_status = CASE WHEN personal_items.draft_status = 'saved' THEN 'saved' ELSE NULL END,
+      draft_error = CASE WHEN personal_items.draft_status = 'saved' THEN NULL ELSE NULL END,
+      next_step = CASE WHEN personal_items.request_id IS NOT NULL THEN personal_items.next_step ELSE excluded.next_step END,
       evidence = excluded.evidence,
       pr_urls_json = excluded.pr_urls_json,
-      job_id = excluded.job_id,
+      job_id = COALESCE(personal_items.job_id, excluded.job_id),
+      action = CASE WHEN personal_items.request_id IS NOT NULL THEN personal_items.action ELSE excluded.action END,
+      action_detail = CASE WHEN personal_items.request_id IS NOT NULL THEN personal_items.action_detail ELSE excluded.action_detail END,
+      asker_id = COALESCE(excluded.asker_id, personal_items.asker_id),
       session_id = excluded.session_id,
       session_cwd = excluded.session_cwd,
       last_seen_at = excluded.last_seen_at,
@@ -282,7 +375,7 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
   `);
 
   return {
-    startRun({ trigger, windowStart, windowEnd }) {
+    startRun({ trigger, windowStart, windowEnd, prepareOnly = false }) {
       const run: PersonalRun = {
         id: randomUUID(),
         trigger,
@@ -291,11 +384,12 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
         windowEnd,
         startedAt: new Date().toISOString(),
         gaps: [],
+        prepareOnly,
       };
       db.prepare(
-        `INSERT INTO personal_runs (id, trigger, status, window_start, window_end, started_at, gaps_json)
-         VALUES (?, ?, 'RUNNING', ?, ?, ?, '[]')`,
-      ).run(run.id, trigger, windowStart, windowEnd, run.startedAt);
+        `INSERT INTO personal_runs (id, trigger, status, window_start, window_end, started_at, gaps_json, prepare_only)
+         VALUES (?, ?, 'RUNNING', ?, ?, ?, '[]', ?)`,
+      ).run(run.id, trigger, windowStart, windowEnd, run.startedAt, prepareOnly ? 1 : 0);
       return run;
     },
 
@@ -303,6 +397,17 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
       db.prepare(
         `UPDATE personal_runs SET status = ?, finished_at = ?, gaps_json = ?, error_message = ? WHERE id = ?`,
       ).run(status, new Date().toISOString(), JSON.stringify(gaps ?? []), error ?? null, id);
+    },
+
+    addGaps(id, gaps) {
+      const row = db.prepare(`SELECT gaps_json FROM personal_runs WHERE id = ?`).get(id) as
+        | { gaps_json: string }
+        | undefined;
+      if (!row || gaps.length === 0) return;
+      db.prepare(`UPDATE personal_runs SET gaps_json = ? WHERE id = ?`).run(
+        JSON.stringify([...parseStrings(row.gaps_json), ...gaps]),
+        id,
+      );
     },
 
     failInterruptedRuns(reason) {
@@ -348,6 +453,9 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
         jobId: item.jobId ?? null,
         sessionId: item.sessionId ?? null,
         sessionCwd: item.sessionCwd ?? null,
+        action: item.action ?? null,
+        actionDetail: item.actionDetail ?? null,
+        askerId: item.askerId ?? null,
         now: new Date().toISOString(),
         lastRunId: item.lastRunId,
       });
@@ -385,7 +493,7 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
         .prepare(
           `SELECT * FROM personal_items
             WHERE last_run_id = ? AND state = 'ready' AND source = 'slack' AND owner_closed IS NULL
-              AND reply_text IS NOT NULL AND COALESCE(draft_status, '') != 'saved'
+              AND reply_text IS NOT NULL AND draft_status IS NULL
             ORDER BY first_seen_at`,
         )
         .all(runId) as ItemRow[];
@@ -400,6 +508,122 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
       );
     },
 
+    setAskConfirmed(key, confirmed) {
+      db.prepare(`UPDATE personal_items SET ask_confirmed = ? WHERE item_key = ?`).run(confirmed ? 1 : 0, key);
+    },
+
+    item(key) {
+      const row = db.prepare(`SELECT * FROM personal_items WHERE item_key = ?`).get(key) as ItemRow | undefined;
+      return row ? toItem(row) : undefined;
+    },
+
+    workToStart(runId) {
+      const rows = db
+        .prepare(
+          `SELECT * FROM personal_items
+            WHERE last_run_id = ? AND state = 'needs_you' AND action IS NOT NULL
+              AND request_id IS NULL AND owner_closed IS NULL
+            ORDER BY first_seen_at`,
+        )
+        .all(runId) as ItemRow[];
+      return rows.map(toItem);
+    },
+
+    workInFlight() {
+      const rows = db.prepare(`SELECT * FROM personal_items WHERE state = 'working'`).all() as ItemRow[];
+      return rows.map(toItem);
+    },
+
+    itemsWithJobs() {
+      const rows = db
+        .prepare(
+          `SELECT * FROM personal_items
+            WHERE request_id IS NOT NULL AND owner_closed IS NULL AND state IN ('working', 'needs_you')`,
+        )
+        .all() as ItemRow[];
+      return rows.map(toItem);
+    },
+
+    setWorkStarted(key, requestId) {
+      db.prepare(
+        `UPDATE personal_items
+            SET state = 'working', request_id = ?, job_id = NULL, settled_on = NULL, last_seen_at = ?
+          WHERE item_key = ?`,
+      ).run(requestId, new Date().toISOString(), key);
+    },
+
+    setItemJob(key, jobId) {
+      db.prepare(`UPDATE personal_items SET job_id = ? WHERE item_key = ?`).run(jobId, key);
+    },
+
+    setItemState(key, state) {
+      db.prepare(`UPDATE personal_items SET state = ?, settled_on = NULL WHERE item_key = ?`).run(state, key);
+    },
+
+    finishWork(key, outcome) {
+      const item = db.prepare(`SELECT * FROM personal_items WHERE item_key = ?`).get(key) as ItemRow | undefined;
+      if (!item) return;
+      db.prepare(
+        `UPDATE personal_items
+            SET state = ?, done_summary = ?, next_step = ?, reply_text = ?, pr_urls_json = ?,
+                job_id = ?, settled_on = ?, action = ?, last_seen_at = ?
+          WHERE item_key = ?`,
+      ).run(
+        outcome.state,
+        outcome.doneSummary ?? item.done_summary,
+        outcome.nextStep ?? (outcome.state === 'done' || outcome.state === 'ready' ? null : item.next_step),
+        'replyText' in outcome ? (outcome.replyText ?? null) : item.reply_text,
+        outcome.prUrls ? JSON.stringify(outcome.prUrls) : item.pr_urls_json,
+        outcome.jobId ?? item.job_id,
+        outcome.settled ?? item.settled_on,
+        outcome.clearAction ? null : item.action,
+        new Date().toISOString(),
+        key,
+      );
+    },
+
+    requestOf(requestId) {
+      const row = db
+        .prepare(`SELECT status, slack_channel_id, anchor_ts, error_message FROM launchpad_requests WHERE id = ?`)
+        .get(requestId) as
+        | { status: string; slack_channel_id: string | null; anchor_ts: string | null; error_message: string | null }
+        | undefined;
+      return row
+        ? {
+            status: row.status,
+            channelId: row.slack_channel_id ?? undefined,
+            anchorTs: row.anchor_ts ?? undefined,
+            errorMessage: row.error_message ?? undefined,
+          }
+        : undefined;
+    },
+
+    itemKeyForAnchor(channelId, threadTs) {
+      const row = db
+        .prepare(
+          `SELECT item.item_key AS item_key
+             FROM personal_items item
+             JOIN launchpad_requests request ON request.id = item.request_id
+            WHERE request.slack_channel_id = ? AND request.anchor_ts = ?
+            LIMIT 1`,
+        )
+        .get(channelId, threadTs) as { item_key: string } | undefined;
+      return row?.item_key;
+    },
+
+    jobResult(jobId) {
+      const row = db.prepare(`SELECT result_json FROM jobs WHERE id = ?`).get(jobId) as
+        | { result_json: string | null }
+        | undefined;
+      if (!row?.result_json) return undefined;
+      try {
+        const value: unknown = JSON.parse(row.result_json);
+        return value && typeof value === 'object' ? (value as Record<string, unknown>) : undefined;
+      } catch {
+        return undefined;
+      }
+    },
+
     setPrStates(key, states) {
       db.prepare(`UPDATE personal_items SET pr_states_json = ? WHERE item_key = ?`).run(JSON.stringify(states), key);
     },
@@ -408,9 +632,16 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
       return db.transaction(() => {
         const rows = db
           .prepare(
-            `SELECT id, kind, span, prepare_only FROM personal_actions WHERE taken_at IS NULL ORDER BY created_at`,
+            `SELECT id, kind, span, prepare_only, item_key, text FROM personal_actions WHERE taken_at IS NULL ORDER BY created_at`,
           )
-          .all() as Array<{ id: string; kind: PersonalAction['kind']; span: string | null; prepare_only: number }>;
+          .all() as Array<{
+          id: string;
+          kind: PersonalAction['kind'];
+          span: string | null;
+          prepare_only: number;
+          item_key: string | null;
+          text: string | null;
+        }>;
         const mark = db.prepare(`UPDATE personal_actions SET taken_at = ? WHERE id = ?`);
         for (const row of rows) mark.run(new Date().toISOString(), row.id);
         return rows.map(row => ({
@@ -418,6 +649,8 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
           kind: row.kind,
           span: row.span ?? undefined,
           prepareOnly: row.prepare_only === 1,
+          itemKey: row.item_key ?? undefined,
+          text: row.text ?? undefined,
         }));
       })();
     },
