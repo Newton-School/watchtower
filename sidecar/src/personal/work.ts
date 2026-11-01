@@ -411,7 +411,24 @@ export async function startItemNow(deps: WorkDeps, action: PersonalAction): Prom
   await startOne(deps, item, action.text);
 }
 
-/** What miniOG last said in a thread: the question a waiting job has put. */
+/**
+ * What to show him from miniOG's messages in a thread, oldest first. A plan's
+ * question comes before the gate's own "Here's my plan" line, which says nothing.
+ */
+export function questionFrom(messages: string[]): string | undefined {
+  for (const text of [...messages].reverse()) {
+    const at = text.search(/QUESTION\b:?/i);
+    if (at >= 0)
+      return text
+        .slice(at)
+        .replace(/^QUESTION\b:?\s*/i, '')
+        .trim()
+        .slice(0, 1500);
+  }
+  return messages.at(-1)?.slice(0, 1500);
+}
+
+/** The question a waiting job has put, from what miniOG has said in its thread. */
 async function lastBotMessage(deps: WorkDeps, channel: string, ts: string, upTo?: string): Promise<string | undefined> {
   try {
     const replies = await deps.webClient.conversations.replies({
@@ -423,7 +440,7 @@ async function lastBotMessage(deps: WorkDeps, channel: string, ts: string, upTo?
     const messages = (replies.messages ?? []).filter(
       message => message.user === deps.config.botUserId || message.bot_id,
     );
-    return messages[messages.length - 1]?.text?.slice(0, 1500);
+    return questionFrom(messages.map(message => message.text ?? ''));
   } catch {
     return undefined;
   }

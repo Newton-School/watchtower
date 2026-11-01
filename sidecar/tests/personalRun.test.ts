@@ -9,6 +9,7 @@ import { settingsProblem } from '../src/backends/personalSlack.js';
 import { currentConnectors, NO_CONNECTORS, withConnectors } from '../src/backends/connectors.js';
 import { reportsConnectors, withoutGithubWrites } from '../src/codex/runCodex.js';
 import { readToolCalls, transcriptDir, type ToolCall } from '../src/personal/agentTranscript.js';
+import { buildCoderPrompt } from '../src/agents/prompts.js';
 import { draftOutcomes, draftTarget, isConfirmedAsk, oneDraftPerConversation } from '../src/personal/drafts.js';
 import { ownPrAsks } from '../src/personal/githubInventory.js';
 import { clonesOf, localWorkOnBranch } from '../src/personal/localWork.js';
@@ -19,6 +20,7 @@ import {
   deciderJob,
   isIntentAllowedForPersonalJob,
   planAsksOwner,
+  questionFrom,
   reviewSummary,
   reviewTagLine,
   settleItem,
@@ -966,6 +968,13 @@ describe('what a My day job is asked to do', () => {
     expect(settled).not.toHaveProperty('replyText');
   });
 
+  it("shows the question a plan asked, not the gate's line after it", () => {
+    const gate = "Here's my plan. Anyone here can approve it:";
+    expect(questionFrom(['On it.', '*Plan* (scope: medium)\nQUESTION: a or b?', gate])).toBe('a or b?');
+    expect(questionFrom(['On it.', 'Which repo is this for?'])).toBe('Which repo is this for?');
+    expect(questionFrom([])).toBeUndefined();
+  });
+
   it('follows the job of the kind it asked for, not a later chat in the thread', () => {
     const job = (id: string, workflow: string): MiniogJob => ({
       id,
@@ -1020,6 +1029,29 @@ describe('a My day run has no way to write to GitHub', () => {
     );
     expect(inner.noGithubWrites).toBeUndefined();
     expect(inner.disallowedTools).toEqual([]);
+  });
+});
+
+describe('what a My day coder is told', () => {
+  const context = (personalItemKey?: string) =>
+    ({
+      repoPath: '/repo',
+      workflowIntent: 'IMPLEMENTATION',
+      previousSteps: [],
+      task: { event: { channelId: 'D1', threadTs: '1.2', personalItemKey } },
+    }) as never;
+
+  it("only commits, since it can't push, and a refused push isn't a blocker", () => {
+    const prompt = buildCoderPrompt(context('slack:C1:1.2'));
+    expect(prompt).toContain('Do NOT push');
+    expect(prompt).toContain('miniOG itself pushes the branch');
+    expect(prompt).not.toContain('gh pr create');
+  });
+
+  it('leaves an ordinary coder as it was', () => {
+    const prompt = buildCoderPrompt(context());
+    expect(prompt).toContain('gh pr create');
+    expect(prompt).not.toContain('miniOG itself pushes');
   });
 });
 
