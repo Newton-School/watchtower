@@ -5178,6 +5178,15 @@ h3 {
   margin-bottom: 8px;
 }
 
+.my-day-schedule input:not([type='checkbox']) {
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--input-bg);
+  color: var(--text-strong);
+  color-scheme: dark;
+}
+
 .my-day-list {
   display: flex;
   flex-direction: column;

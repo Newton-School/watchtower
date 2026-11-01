@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+
 /**
  * Flags for the one kind of run that sees the owner's own Slack: My day's
  * triage (it reads the DMs and threads the bot token can't).
@@ -12,12 +14,14 @@
  *   be removed outright;
  * - a tool on `--disallowedTools` is gone from the run ("No such tool").
  *
- * The run therefore has three separate limits: `--tools` for the built-ins, a
- * deny rule for each built-in and each Slack tool that writes, and an allow-list
- * of the exact Slack tools that read. It gets its data in the prompt. Settings
- * files are skipped too: an allow rule added to the user's settings would
- * otherwise join this list without anyone noticing. It runs in an empty folder,
- * so there are no project settings to load instead.
+ * So the run has two limits that work alone: deny rules for the built-ins and
+ * every Slack tool that writes, and an allow-list of the exact Slack tools that
+ * read. It gets its data in the prompt.
+ *
+ * `--tools ToolSearch` plus `--setting-sources project` left a run with no tools
+ * at all (2026-11-02), Slack included, so neither is used. Without them an allow
+ * rule in the user's settings would join this list, which `settingsProblem`
+ * catches before a run starts.
  */
 
 /** The connector's name in a headless session, and the plugin's in a terminal one. */
@@ -74,11 +78,6 @@ export function personalSlackReadArgs(): string[] {
   return [
     '--permission-mode',
     'dontAsk',
-    '--setting-sources',
-    'project',
-    '--tools',
-    'ToolSearch',
-    '--disable-slash-commands',
     '--allowedTools',
     'ToolSearch',
     ...forEachServer(SLACK_READ_TOOLS),
@@ -86,4 +85,28 @@ export function personalSlackReadArgs(): string[] {
     ...BUILT_IN_TOOLS,
     ...forEachServer(SLACK_WRITE_TOOLS),
   ];
+}
+
+/**
+ * What in the user's settings would widen the run: an allow rule for a connector
+ * tool it wasn't given. Built-ins and Slack's writes don't count, since a deny
+ * rule beats an allow rule. Undefined when nothing does, or there's no such file.
+ */
+export function settingsProblem(settingsPath: string): string | undefined {
+  let allow: unknown;
+  try {
+    allow = (JSON.parse(fs.readFileSync(settingsPath, 'utf8')) as { permissions?: { allow?: unknown } }).permissions
+      ?.allow;
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(allow)) return undefined;
+  const readTools = new Set(forEachServer(SLACK_READ_TOOLS));
+  const wider = allow.filter(
+    (rule): rule is string =>
+      typeof rule === 'string' && (rule === '*' || rule.startsWith('mcp__')) && !readTools.has(rule),
+  );
+  return wider.length > 0
+    ? `${settingsPath} allows ${wider.join(', ')}, which would also apply to the run that reads your Slack. Remove it to use My day.`
+    : undefined;
 }
