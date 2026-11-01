@@ -10,7 +10,11 @@ import { buildSlackThreadLink } from '../workflows/shared/workflowUtils.js';
  */
 
 const triagedItemSchema = z.object({
-  key: z.string().min(1).max(200),
+  // Only these shapes: a `session:` key would overwrite that session's row.
+  key: z
+    .string()
+    .max(200)
+    .regex(/^(slack:[A-Z0-9]+:\d+\.\d+|gh:[\w.-]+\/[\w.-]+#\d+:[a-z]+)(:[a-z0-9_-]+)?$/),
   source: z.enum(['slack', 'github']),
   state: z.enum(['needs_you', 'ready', 'waiting', 'done']),
   channel_id: z.string().nullish(),
@@ -75,6 +79,7 @@ export function buildTriagePrompt(params: {
     status: job.status,
     channel_id: job.channelId,
     thread_ts: job.threadTs,
+    started_by_message_ts: job.eventTs,
     created_at: job.createdAt,
   }));
 
@@ -161,7 +166,12 @@ function firstJsonObject(text: string): string | undefined {
 export function parseTriageReply(text: string): TriageReply {
   const json = firstJsonObject(text);
   if (!json) throw new Error(`triage gave no result: ${text.trim().slice(0, 200) || 'empty reply'}`);
-  const reply = triageReplySchema.parse(JSON.parse(json));
+  let reply: z.infer<typeof triageReplySchema>;
+  try {
+    reply = triageReplySchema.parse(JSON.parse(json));
+  } catch {
+    throw new Error(`triage reply wasn't the expected shape: ${text.trim().slice(0, 200)}`);
+  }
   const items: TriagedItem[] = [];
   const gaps = [...(reply.gaps ?? [])];
   let rejected = 0;
@@ -194,9 +204,9 @@ export function itemPermalink(
 }
 
 export function toPersonalItem(item: TriagedItem, runId: string) {
-  const channelId = item.channel_id ?? undefined;
-  const threadTs = item.thread_ts ?? item.message_ts ?? undefined;
-  const messageTs = item.message_ts ?? undefined;
+  const channelId = item.channel_id || undefined;
+  const threadTs = item.thread_ts || item.message_ts || undefined;
+  const messageTs = item.message_ts || undefined;
   return {
     key: item.key,
     source: item.source as PersonalItemSource,

@@ -14,7 +14,10 @@
  *
  * The run therefore has three separate limits: `--tools` for the built-ins, a
  * deny rule for each built-in and each Slack tool that writes, and an allow-list
- * of the exact Slack tools that read. It gets its data in the prompt.
+ * of the exact Slack tools that read. It gets its data in the prompt. Settings
+ * files are skipped too: an allow rule added to the user's settings would
+ * otherwise join this list without anyone noticing. It runs in an empty folder,
+ * so there are no project settings to load instead.
  */
 
 /** The connector's name in a headless session, and the plugin's in a terminal one. */
@@ -71,6 +74,8 @@ export function personalSlackReadArgs(): string[] {
   return [
     '--permission-mode',
     'dontAsk',
+    '--setting-sources',
+    'project',
     '--tools',
     'ToolSearch',
     '--disable-slash-commands',

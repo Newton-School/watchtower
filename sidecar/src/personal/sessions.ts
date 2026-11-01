@@ -17,7 +17,12 @@ const execFileAsync = promisify(execFile);
 
 export interface SessionFacts {
   sessionId: string;
+  /** Where the session started: where `claude --resume` finds it. */
   cwd: string;
+  /** Where it ended up, which may be a worktree: where its work is. */
+  workDir: string;
+  /** Files it edited with the file tools, to tell its changes from others' in a shared clone. */
+  editedFiles: string[];
   title: string;
   branch?: string;
   lastActivityAt: string;
@@ -32,7 +37,15 @@ export interface UnfinishedSession extends SessionFacts {
 
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const QUESTION_TOOLS = new Set(['AskUserQuestion', 'ExitPlanMode']);
-const NOISE_PREFIXES = ['<local-command', '<command-message>', '<task-notification>', '<system-reminder>'];
+const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+const NOISE_PREFIXES = [
+  '<local-command',
+  '<command-message>',
+  '<task-notification>',
+  '<system-reminder>',
+  '[Request interrupted',
+  'This session is being continued',
+];
 
 function textOf(content: unknown): string {
   if (typeof content === 'string') return content;
@@ -58,6 +71,8 @@ export async function readSession(transcript: string, sinceIso: string): Promise
   const sessionId = path.basename(transcript, '.jsonl');
   if (!SESSION_ID.test(sessionId)) return undefined;
   let cwd: string | undefined;
+  let workDir: string | undefined;
+  const editedFiles = new Set<string>();
   let entrypoint: string | undefined;
   let branch: string | undefined;
   let title: string | undefined;
@@ -66,11 +81,12 @@ export async function readSession(transcript: string, sinceIso: string): Promise
   let lastReply = '';
   let lastTool: string | undefined;
 
-  const lines = readline.createInterface({ input: fs.createReadStream(transcript), crlfDelay: Infinity });
+  const input = fs.createReadStream(transcript);
+  const lines = readline.createInterface({ input, crlfDelay: Infinity });
   for await (const line of lines) {
     let entry: {
       type?: string;
-      summary?: string;
+      aiTitle?: string;
       timestamp?: string;
       cwd?: string;
       entrypoint?: string;
@@ -84,12 +100,15 @@ export async function readSession(transcript: string, sinceIso: string): Promise
     } catch {
       continue;
     }
-    if (entry.type === 'summary' && entry.summary) title = entry.summary;
+    if (entry.aiTitle) title = entry.aiTitle;
     cwd ??= entry.cwd;
+    if (entry.cwd) workDir = entry.cwd;
     entrypoint ??= entry.entrypoint;
     // Most transcripts are headless runs, and some are huge: stop reading as soon as that shows.
     if (entrypoint && entrypoint !== 'cli') {
+      // `close` alone leaves the file open, and this happens hundreds of times a night.
       lines.close();
+      input.destroy();
       return undefined;
     }
     if (entry.gitBranch) branch = entry.gitBranch;
@@ -99,13 +118,21 @@ export async function readSession(transcript: string, sinceIso: string): Promise
     if (entry.type === 'user' && !entry.isMeta && isRealPrompt(content)) {
       if (entry.timestamp && entry.timestamp >= sinceIso) firstPromptInWindow ??= textOf(content).trim();
       lastTool = undefined;
+      lastReply = '';
     } else if (entry.type === 'assistant' && Array.isArray(content)) {
-      for (const part of content as Array<{ type?: string; name?: string; text?: string }>) {
+      for (const part of content as Array<{
+        type?: string;
+        name?: string;
+        text?: string;
+        input?: { file_path?: unknown; notebook_path?: unknown };
+      }>) {
         if (part.type === 'text' && part.text?.trim()) {
           lastReply = part.text.trim();
           lastTool = undefined;
         } else if (part.type === 'tool_use') {
           lastTool = part.name;
+          const edited = part.input?.file_path ?? part.input?.notebook_path;
+          if (part.name && EDIT_TOOLS.has(part.name) && typeof edited === 'string') editedFiles.add(edited);
         }
       }
     }
@@ -115,6 +142,8 @@ export async function readSession(transcript: string, sinceIso: string): Promise
   return {
     sessionId,
     cwd,
+    workDir: workDir ?? cwd,
+    editedFiles: [...editedFiles],
     title: (title ?? firstPromptInWindow).replace(/\s+/g, ' ').slice(0, 140),
     branch,
     lastActivityAt,
@@ -137,16 +166,38 @@ function plural(count: number, one: string, many: string): string {
   return `${count} ${count === 1 ? one : many}`;
 }
 
-/** What a session left unfinished, checked against the repo as it is now. */
+/** Uncommitted paths in `git status --porcelain` output, made absolute. */
+export function dirtyPaths(porcelain: string, root: string): string[] {
+  return porcelain
+    .split('\n')
+    .filter(Boolean)
+    .map(line => {
+      const entry = line.slice(3);
+      const target = entry.includes(' -> ') ? (entry.split(' -> ').pop() ?? entry) : entry;
+      return path.resolve(root, target.replace(/^"|"$/g, ''));
+    });
+}
+
+/**
+ * What a session left unfinished, checked against the repo as it is now. Only
+ * the files it edited count as its uncommitted work: a shared clone is often
+ * dirty for other reasons, and that says nothing about this session.
+ */
 export async function unfinishedReasons(facts: SessionFacts): Promise<string[]> {
   const reasons: string[] = [];
   if (facts.endedOnQuestion) reasons.push('Ended on a question you never answered.');
-  if (!fs.existsSync(facts.cwd)) return reasons;
-  const status = await git(facts.cwd, ['status', '--porcelain', '--untracked-files=no']);
-  const dirty = status ? status.split('\n').filter(Boolean).length : 0;
-  if (dirty > 0) reasons.push(`${plural(dirty, 'uncommitted file', 'uncommitted files')} in ${facts.cwd}.`);
+  if (!fs.existsSync(facts.workDir)) return reasons;
+  const [status, root] = await Promise.all([
+    git(facts.workDir, ['status', '--porcelain', '--untracked-files=all']),
+    git(facts.workDir, ['rev-parse', '--show-toplevel']),
+  ]);
+  if (status && root) {
+    const edited = new Set(facts.editedFiles.map(file => path.resolve(facts.workDir, file)));
+    const dirty = dirtyPaths(status, root.trim()).filter(file => edited.has(file)).length;
+    if (dirty > 0) reasons.push(`${plural(dirty, 'uncommitted file', 'uncommitted files')} in ${facts.workDir}.`);
+  }
   if (facts.branch && facts.branch !== 'HEAD') {
-    const count = await git(facts.cwd, ['rev-list', '--count', facts.branch, '--not', '--remotes']);
+    const count = await git(facts.workDir, ['rev-list', '--count', facts.branch, '--not', '--remotes']);
     const unpushed = Number(count?.trim() ?? 0);
     if (unpushed > 0) reasons.push(`${plural(unpushed, 'commit', 'commits')} on ${facts.branch} not pushed.`);
   }

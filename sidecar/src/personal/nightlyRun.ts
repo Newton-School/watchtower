@@ -10,7 +10,7 @@ import { KeepAwake } from '../runtime/keepAwake.js';
 import type { JobStore } from '../state/jobStore.js';
 import { spendKey, type PersonalAction, type PersonalRun } from '../state/personalStore.js';
 import { agentCallContext } from '../state/runContext.js';
-import type { AppConfig } from '../types/contracts.js';
+import type { AppConfig, WorkflowStepLog } from '../types/contracts.js';
 import { collectGithubInventory } from './githubInventory.js';
 import { isRunDue, runWindow } from './schedule.js';
 import { findUnfinishedSessions } from './sessions.js';
@@ -86,7 +86,17 @@ async function collectSessions(deps: NightlyRunDeps, run: PersonalRun): Promise<
   }
 }
 
-async function triage(deps: NightlyRunDeps, run: PersonalRun, gaps: string[]): Promise<void> {
+/** What a run couldn't read. A missed source keeps the run from moving the window: see `runWindow`. */
+interface RunGaps {
+  gaps: string[];
+  sourceFailed: boolean;
+}
+
+function logStepToLogger(step: WorkflowStepLog): void {
+  logger.info({ stage: step.stage, level: step.level }, `my day: ${step.message}`);
+}
+
+async function triage(deps: NightlyRunDeps, run: PersonalRun, result: RunGaps): Promise<void> {
   const { store, config } = deps;
   const personal = store.personalStore();
   const ownerId = config.ownerSlackUserIds[0];
@@ -96,10 +106,16 @@ async function triage(deps: NightlyRunDeps, run: PersonalRun, gaps: string[]): P
     sinceIso: run.windowStart,
     githubToken: await resolveGithubTokenForCodex(),
   });
-  gaps.push(...github.errors.map(error => `GitHub: ${error}`));
-  if (github.otherOpenPrs > 0) gaps.push(`${github.otherOpenPrs} other open PRs of yours had nothing new.`);
+  result.gaps.push(...github.errors.map(error => `GitHub: ${error}`));
+  result.sourceFailed ||= github.errors.length > 0;
 
-  const jobs = personal.jobsSince(run.windowStart);
+  const openItems = personal.openItems();
+  const jobsById = new Map(personal.jobsSince(run.windowStart).map(job => [job.id, job]));
+  for (const item of openItems) {
+    if (!item.channelId || !item.threadTs) continue;
+    for (const job of personal.jobsInThread(item.channelId, item.threadTs)) jobsById.set(job.id, job);
+  }
+  const jobs = [...jobsById.values()];
   const prompt = buildTriagePrompt({
     ownerSlackId: ownerId,
     ownerNames: await ownerNames(deps, ownerId),
@@ -107,13 +123,13 @@ async function triage(deps: NightlyRunDeps, run: PersonalRun, gaps: string[]): P
     windowEnd: new Date(run.windowEnd),
     github,
     miniogJobs: jobs,
-    openItems: personal.openItems(),
+    openItems,
   });
 
   // An empty folder: this agent has no business in a repo, and no tools to read one with.
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'watchtower-my-day-'));
   try {
-    const result = await agentCallContext.run({ jobId: spendKey(run.id), store }, () =>
+    const agent = await agentCallContext.run({ jobId: spendKey(run.id), store }, () =>
       runClaudeAgentic({
         systemPrompt: prompt,
         userMessage: 'Triage the window now and reply with the JSON.',
@@ -122,11 +138,12 @@ async function triage(deps: NightlyRunDeps, run: PersonalRun, gaps: string[]): P
         timeoutMs: TRIAGE_TIMEOUT_MS,
         personalSlack: 'read',
         doing: 'reading your Slack',
+        logStep: logStepToLogger,
       }),
     );
-    if (!result.ok) throw new Error(result.error ?? 'the triage agent failed');
-    const reply = parseTriageReply(result.reply);
-    gaps.push(...reply.gaps);
+    if (!agent.ok) throw new Error(agent.error ?? 'the triage agent failed');
+    const reply = parseTriageReply(agent.reply);
+    result.gaps.push(...reply.gaps);
     for (const triaged of reply.items) {
       const item = toPersonalItem(triaged, run.id);
       const decided = standDownForMiniog(item, jobs);
@@ -159,28 +176,28 @@ export async function runNightly(
   // A separate hold from the job one: that one follows the count of running jobs.
   const awake = new KeepAwake();
   awake.set(true);
-  const gaps: string[] = [];
+  const result: RunGaps = { gaps: [], sourceFailed: false };
   let failure: string | undefined;
   try {
     await collectSessions(deps, run).catch(error => {
-      gaps.push(`Claude sessions couldn't be checked: ${String(error)}`);
+      result.gaps.push(`Claude sessions couldn't be checked: ${String(error)}`);
     });
-    await triage(deps, run, gaps);
+    await triage(deps, run, result);
   } catch (error) {
     failure = error instanceof Error ? error.message : String(error);
   } finally {
     awake.set(false);
   }
+  const status = failure ? 'FAILED' : result.sourceFailed ? 'PARTIAL' : 'OK';
+  personal.finishRun(run.id, { status, gaps: result.gaps, error: failure });
   if (failure) {
-    personal.finishRun(run.id, { status: 'FAILED', gaps, error: failure });
     logger.warn({ runId: run.id, failure }, 'my day: run failed');
     await alertOwner(deps, `Tonight's My day run failed: ${failure}`);
   } else {
-    personal.finishRun(run.id, { status: gaps.length > 0 ? 'PARTIAL' : 'OK', gaps });
-    logger.info({ runId: run.id, costUsd: personal.runCostUsd(run.id) }, 'my day: run finished');
+    logger.info({ runId: run.id, status, costUsd: personal.runCostUsd(run.id) }, 'my day: run finished');
     notifyDesktop('My day', 'Your inbox is ready.', 'success');
   }
-  return { ...run, status: failure ? 'FAILED' : gaps.length > 0 ? 'PARTIAL' : 'OK' };
+  return { ...run, status };
 }
 
 /** Starts the schedule and the app's Run now. Only one run at a time. */

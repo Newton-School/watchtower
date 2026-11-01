@@ -1,16 +1,20 @@
+import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { describe, expect, it } from 'vitest';
 import { claudeCodeBackend, claudePermissionMode } from '../src/backends/claudeCodeBackend.js';
 import { reportsConnectors } from '../src/codex/runCodex.js';
 import { ownPrAsks } from '../src/personal/githubInventory.js';
 import { isRunDue, latestRunTime, runWindow } from '../src/personal/schedule.js';
-import { findUnfinishedSessions, readSession } from '../src/personal/sessions.js';
+import { dirtyPaths, findUnfinishedSessions, readSession, unfinishedReasons } from '../src/personal/sessions.js';
 import { standDownForMiniog } from '../src/personal/standDown.js';
 import { itemPermalink, parseTriageReply, toPersonalItem } from '../src/personal/triage.js';
 import { JobStore } from '../src/state/jobStore.js';
 import { spendKey, type MiniogJob } from '../src/state/personalStore.js';
+
+const execFileAsync = promisify(execFile);
 
 function tempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'watchtower-personal-'));
@@ -104,6 +108,13 @@ describe('when a run is due', () => {
     expect(due('2026-11-03T22:00', { enabledAt })).toBe(true);
   });
 
+  it('stays off for a time moved past tonight, or changed since', () => {
+    const justRan = { lastStartedAt: at('2026-11-02T22:00').toISOString(), runTime: '23:30' };
+    expect(due('2026-11-02T23:31', justRan)).toBe(false);
+    const moved = { enabledAt: at('2026-11-02T15:00').toISOString(), runTime: '09:30' };
+    expect(due('2026-11-02T15:01', moved)).toBe(false);
+  });
+
   it('reads a bad time as the default', () => {
     expect(latestRunTime(at('2026-11-02T23:00'), 'soon').getHours()).toBe(22);
   });
@@ -117,11 +128,18 @@ describe('what a run covers', () => {
     expect(start.toISOString()).toBe(new Date('2026-11-01T21:30:00').toISOString());
   });
 
-  it('covers today with no run yet, or a last run over a week old', () => {
-    const today = new Date('2026-11-02T00:00:00').toISOString();
-    expect(runWindow({ now, lastWindowEnd: undefined, span: undefined }).start.toISOString()).toBe(today);
+  it('covers the last day with no run yet, or a last run over a week old', () => {
+    const lastDay = new Date('2026-11-01T22:00:00').toISOString();
+    expect(runWindow({ now, lastWindowEnd: undefined, span: undefined }).start.toISOString()).toBe(lastDay);
     const old = new Date('2026-10-01T22:00:00').toISOString();
-    expect(runWindow({ now, lastWindowEnd: old, span: undefined }).start.toISOString()).toBe(today);
+    expect(runWindow({ now, lastWindowEnd: old, span: undefined }).start.toISOString()).toBe(lastDay);
+  });
+
+  it('never narrows with a span: the next run starts from this one', () => {
+    const fiveDaysAgo = new Date('2026-10-28T22:00:00').toISOString();
+    const usual = new Date('2026-10-28T21:30:00').toISOString();
+    expect(runWindow({ now, lastWindowEnd: fiveDaysAgo, span: '0d' }).start.toISOString()).toBe(usual);
+    expect(runWindow({ now, lastWindowEnd: fiveDaysAgo, span: '2026-11-02' }).start.toISOString()).toBe(usual);
   });
 
   it('widens to a span, and ignores one it cannot read', () => {
@@ -139,23 +157,20 @@ describe('what a run covers', () => {
 });
 
 describe('standing down for miniOG', () => {
-  const item = {
-    state: 'needs_you' as const,
-    channelId: 'C1',
-    threadTs: '1793000000.000100',
-    messageTs: '1793000000.000100',
-  };
+  const ask = '1793000000.000100';
+  const item = { state: 'needs_you' as const, channelId: 'C1', threadTs: ask, messageTs: ask };
   const job = (overrides: Partial<MiniogJob>): MiniogJob => ({
     id: 'job-1',
     workflow: 'PR_REVIEW',
     status: 'SUCCESS',
     channelId: 'C1',
-    threadTs: '1793000000.000100',
+    threadTs: ask,
+    eventTs: ask,
     createdAt: new Date(1793000100 * 1000).toISOString(),
     ...overrides,
   });
 
-  it('closes an ask miniOG finished, linking the run', () => {
+  it('closes an ask its own run finished, linking the run', () => {
     expect(standDownForMiniog(item, [job({})])).toEqual({
       state: 'done',
       jobId: 'job-1',
@@ -163,8 +178,21 @@ describe('standing down for miniOG', () => {
     });
   });
 
-  it('waits on a run still going', () => {
-    expect(standDownForMiniog(item, [job({ status: 'PAUSED' })])).toEqual({ state: 'waiting', jobId: 'job-1' });
+  it("leaves an ask alone when another run in the thread succeeded: it may be someone else's", () => {
+    expect(standDownForMiniog(item, [job({ eventTs: '1793000500.000200' })]).state).toBe('needs_you');
+  });
+
+  it('matches a reply in a thread by the message, not the thread', () => {
+    const reply = { ...item, messageTs: '1793000500.000200' };
+    expect(standDownForMiniog(reply, [job({ eventTs: ask })]).state).toBe('needs_you');
+    expect(standDownForMiniog(reply, [job({ eventTs: '1793000500.000200' })]).state).toBe('done');
+  });
+
+  it('waits on its run still going, whatever the router first guessed', () => {
+    expect(standDownForMiniog(item, [job({ status: 'PAUSED', workflow: 'UNKNOWN' })])).toEqual({
+      state: 'waiting',
+      jobId: 'job-1',
+    });
   });
 
   it('keeps an ask open when miniOG failed: that is a missed ask', () => {
@@ -172,11 +200,9 @@ describe('standing down for miniOG', () => {
     expect(standDownForMiniog(item, [job({ status: 'CANCELLED' })]).state).toBe('needs_you');
   });
 
-  it('ignores runs that decided nothing, other threads, and runs before the ask', () => {
+  it('ignores a finished run that decided nothing, and other channels', () => {
     expect(standDownForMiniog(item, [job({ workflow: 'NONE' })]).state).toBe('needs_you');
-    expect(standDownForMiniog(item, [job({ threadTs: '1793000000.000999' })]).state).toBe('needs_you');
-    const before = new Date(1792000000 * 1000).toISOString();
-    expect(standDownForMiniog(item, [job({ createdAt: before })]).state).toBe('needs_you');
+    expect(standDownForMiniog(item, [job({ channelId: 'C2' })]).state).toBe('needs_you');
   });
 
   it('never reopens an item already done', () => {
@@ -185,7 +211,7 @@ describe('standing down for miniOG', () => {
 });
 
 describe("the triage agent's reply", () => {
-  const good = { key: 'slack:C1:1.2', source: 'slack', state: 'ready', ask: 'Can you check this?' };
+  const good = { key: 'slack:C1:1793000000.000100', source: 'slack', state: 'ready', ask: 'Can you check this?' };
 
   it('reads JSON after a sentence or in a fence, with braces inside strings', () => {
     const body = JSON.stringify({ items: [{ ...good, ask: 'uses {curly} and "quotes"' }], gaps: ['one'] });
@@ -198,6 +224,18 @@ describe("the triage agent's reply", () => {
     const reply = parseTriageReply(JSON.stringify({ items: [good, { key: 'x', state: 'nonsense' }] }));
     expect(reply.items).toHaveLength(1);
     expect(reply.gaps[0]).toContain('1 item');
+  });
+
+  it('refuses a key that could overwrite a session', () => {
+    const reply = parseTriageReply(JSON.stringify({ items: [{ ...good, key: 'session:abc' }] }));
+    expect(reply.items).toEqual([]);
+    const github = { ...good, key: 'gh:o/r#12:review', source: 'github' };
+    expect(parseTriageReply(JSON.stringify({ items: [github] })).items).toHaveLength(1);
+  });
+
+  it('treats an empty thread id as missing', () => {
+    const triaged = { ...good, source: 'slack', state: 'ready', thread_ts: '', message_ts: '1793000000.000100' };
+    expect(toPersonalItem(triaged as never, 'run').threadTs).toBe('1793000000.000100');
   });
 
   it("throws rather than report an empty inbox when it isn't the shape at all", () => {
@@ -273,6 +311,14 @@ describe('asks on his own PRs', () => {
     ]);
   });
 
+  it('keeps a request for changes when the reviewer later only commented', () => {
+    const review = (state: string, submittedAt: string) => ({ author: { login: 'rev' }, state, submittedAt, url: 'r' });
+    const reviews = [review('CHANGES_REQUESTED', '2026-11-02T00:00:00Z'), review('COMMENTED', '2026-11-02T01:00:00Z')];
+    expect(ownPrAsks(detail({ reviews: { nodes: reviews } }) as never, 'me', '2026-11-01')).toMatchObject([
+      { kind: 'changes_requested' },
+    ]);
+  });
+
   it('counts changes requested only after his last commit', () => {
     const review = (submittedAt: string) => ({
       author: { login: 'rev' },
@@ -320,6 +366,66 @@ describe('sessions left unfinished', () => {
     expect(await readSession(headless.file, '2026-11-02T00:00:00Z')).toBeUndefined();
     const old = write([prompt(cwd, '2026-10-01T10:00:00Z')]);
     expect(await readSession(old.file, '2026-11-02T00:00:00Z')).toBeUndefined();
+  });
+
+  it('counts only the files the session edited as its uncommitted work, where it ended up', async () => {
+    const repo = fs.realpathSync(tempDir());
+    await execFileAsync('git', ['init', '-q', repo]);
+    await execFileAsync('git', ['-C', repo, 'config', 'user.email', 'a@example.com']);
+    await execFileAsync('git', ['-C', repo, 'config', 'user.name', 'a']);
+    fs.writeFileSync(path.join(repo, 'mine.ts'), 'one');
+    fs.writeFileSync(path.join(repo, 'other.ts'), 'one');
+    await execFileAsync('git', ['-C', repo, 'add', '.']);
+    await execFileAsync('git', ['-C', repo, 'commit', '-qm', 'start']);
+    fs.writeFileSync(path.join(repo, 'other.ts'), 'someone else');
+    const facts = {
+      sessionId: id,
+      cwd: '/somewhere/else',
+      workDir: repo,
+      editedFiles: [path.join(repo, 'mine.ts')],
+      title: 't',
+      lastActivityAt: '',
+      lastReply: '',
+      endedOnQuestion: false,
+    };
+    expect(await unfinishedReasons(facts)).toEqual([]);
+    fs.writeFileSync(path.join(repo, 'mine.ts'), 'changed');
+    expect(await unfinishedReasons(facts)).toEqual([`1 uncommitted file in ${repo}.`]);
+  });
+
+  it('resumes where the session started, and checks where it ended up', async () => {
+    const start = tempDir();
+    const worktree = tempDir();
+    const moved = line({
+      type: 'user',
+      timestamp: '2026-11-02T10:02:00Z',
+      cwd: worktree,
+      message: { content: 'go on' },
+    });
+    const { file } = write([prompt(start, '2026-11-02T10:00:00Z'), moved]);
+    expect(await readSession(file, '2026-11-02T00:00:00Z')).toMatchObject({ cwd: start, workDir: worktree });
+  });
+
+  it("doesn't count a question he answered, and titles from the session's own title", async () => {
+    const cwd = tempDir();
+    const { file } = write([
+      prompt(cwd, '2026-11-02T10:00:00Z'),
+      reply('2026-11-02T10:01:00Z', 'Should I push?'),
+      line({ type: 'ai-title', aiTitle: 'Fix the login', timestamp: '2026-11-02T10:01:30Z' }),
+      prompt(cwd, '2026-11-02T10:02:00Z'),
+    ]);
+    expect(await readSession(file, '2026-11-02T00:00:00Z')).toMatchObject({
+      endedOnQuestion: false,
+      title: 'Fix the login',
+    });
+  });
+
+  it('parses renames and quoted paths out of the status output', () => {
+    expect(dirtyPaths(' M a.ts\nR  old.ts -> new.ts\n?? "with space.ts"\n', '/r')).toEqual([
+      '/r/a.ts',
+      '/r/new.ts',
+      '/r/with space.ts',
+    ]);
   });
 
   it('skips a file whose name is not a session id', async () => {
@@ -370,6 +476,16 @@ describe('the personal store', () => {
     personal.upsertItem({ ...item, key: 'session:x', source: 'session' });
     expect(personal.openItems()).toEqual([]);
     expect(personal.openSessionKeys()).toEqual(['session:x']);
+  });
+
+  it("doesn't move the window from a run that missed a source", () => {
+    const personal = store();
+    const window = { trigger: 'schedule' as const, windowStart: 'a', windowEnd: 'b' };
+    const ok = personal.startRun(window);
+    personal.finishRun(ok.id, { status: 'OK' });
+    const partial = personal.startRun(window);
+    personal.finishRun(partial.id, { status: 'PARTIAL', gaps: ['GitHub: down'] });
+    expect(personal.lastFinishedRun()?.id).toBe(ok.id);
   });
 
   it('only moves the window from a run that finished', () => {

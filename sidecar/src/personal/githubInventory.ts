@@ -151,7 +151,10 @@ export function ownPrAsks(detail: OwnPrDetail['repository']['pullRequest'], logi
   const latestByReviewer = new Map<string, OwnPrDetail['repository']['pullRequest']['reviews']['nodes'][number]>();
   for (const review of detail.reviews.nodes) {
     const author = review.author?.login;
-    if (author && author !== login) latestByReviewer.set(author, review);
+    // A later comment doesn't take back a request for changes: GitHub still shows it.
+    if (author && author !== login && review.state !== 'COMMENTED' && review.state !== 'PENDING') {
+      latestByReviewer.set(author, review);
+    }
   }
   for (const [author, review] of latestByReviewer) {
     if (review.state === 'CHANGES_REQUESTED' && (!lastCommitAt || review.submittedAt > lastCommitAt)) {
@@ -241,32 +244,35 @@ export async function collectGithubInventory(params: {
     const items = await search(`mentions:${owner} is:open updated:>=${sinceIso.slice(0, 10)} archived:false`);
     for (const item of items) {
       const repo = repoOf(item);
-      const stamp = encodeURIComponent(sinceIso);
-      const comments = await getJson<Comment[]>(
-        `${API}/repos/${repo}/issues/${item.number}/comments?since=${stamp}&per_page=100`,
-      );
-      const inline = item.pull_request
-        ? await getJson<Comment[]>(`${API}/repos/${repo}/pulls/${item.number}/comments?since=${stamp}&per_page=100`)
-        : [];
-      const texts = [
-        { html_url: item.html_url, created_at: item.created_at, body: item.body, user: item.user },
-        ...comments,
-        ...inline,
-      ];
-      for (const text of texts) {
-        const author = text.user?.login;
-        if (author === owner || isBot(author) || text.created_at < sinceIso) continue;
-        if (!(text.body ?? '').toLowerCase().includes(handle)) continue;
-        inventory.mentions.push({
-          repo,
-          number: item.number,
-          url: text.html_url,
-          title: item.title,
-          author,
-          createdAt: text.created_at,
-          body: (text.body ?? '').slice(0, BODY_LIMIT),
-        });
-      }
+      // One PR's comments failing must not lose the mentions on the others.
+      await section(`mentions on ${repo}#${item.number}`, async () => {
+        const stamp = encodeURIComponent(sinceIso);
+        const comments = await getJson<Comment[]>(
+          `${API}/repos/${repo}/issues/${item.number}/comments?since=${stamp}&per_page=100`,
+        );
+        const inline = item.pull_request
+          ? await getJson<Comment[]>(`${API}/repos/${repo}/pulls/${item.number}/comments?since=${stamp}&per_page=100`)
+          : [];
+        const texts = [
+          { html_url: item.html_url, created_at: item.created_at, body: item.body, user: item.user },
+          ...comments,
+          ...inline,
+        ];
+        for (const text of texts) {
+          const author = text.user?.login;
+          if (author === owner || isBot(author) || text.created_at < sinceIso) continue;
+          if (!(text.body ?? '').toLowerCase().includes(handle)) continue;
+          inventory.mentions.push({
+            repo,
+            number: item.number,
+            url: text.html_url,
+            title: item.title,
+            author,
+            createdAt: text.created_at,
+            body: (text.body ?? '').slice(0, BODY_LIMIT),
+          });
+        }
+      });
     }
   });
 

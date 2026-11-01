@@ -191,7 +191,10 @@ export async function runClaudeAgentic(request: RunClaudeAgenticRequest): Promis
         ok: false,
         reason: 'error',
         reply: reply || 'Agent finished with no output.',
-        error: `runCodex returned ok=false (exitCode=${result.exitCode ?? 'unknown'})`,
+        error: `runCodex returned ok=false (exitCode=${result.exitCode ?? 'unknown'})${
+          // This run's flags are all its own, so a CLI that rejects one has to be readable.
+          personalSlack && result.stderr.trim() ? `: ${result.stderr.trim().slice(-300)}` : ''
+        }`,
       };
     }
 

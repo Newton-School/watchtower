@@ -62,6 +62,8 @@ export interface MiniogJob {
   status: string;
   channelId: string;
   threadTs: string;
+  /** The message that started it. */
+  eventTs?: string;
   createdAt: string;
 }
 
@@ -74,7 +76,7 @@ export interface PersonalStore {
   /** A run left RUNNING by a sidecar that stopped: closes it so the next one isn't blocked. */
   failInterruptedRuns(reason: string): number;
   lastRun(): PersonalRun | undefined;
-  /** The newest run that finished with a usable window, which the next window starts from. */
+  /** The newest run that read every source, which the next window starts from. */
   lastFinishedRun(): PersonalRun | undefined;
   upsertItem(item: PersonalItemInput): void;
   /** A session item that no longer has anything unfinished. */
@@ -83,6 +85,8 @@ export interface PersonalStore {
   openSessionKeys(): string[];
   takeActions(): PersonalAction[];
   jobsSince(iso: string): MiniogJob[];
+  /** However old: a carried item's run may be from before this window. */
+  jobsInThread(channelId: string, threadTs: string): MiniogJob[];
   /** What the run's agents cost, from the telemetry they record under `spendKey(run)`. */
   runCostUsd(runId: string): number;
 }
@@ -127,6 +131,33 @@ interface RunRow {
   finished_at: string | null;
   gaps_json: string;
   error_message: string | null;
+}
+
+interface JobRow {
+  id: string;
+  workflow: string;
+  status: string;
+  channel_id: string;
+  thread_ts: string;
+  event_ts: string | null;
+  created_at: string;
+}
+
+/** `workflow` is only the router's first guess; what actually ran is in `executed_workflow`. */
+const JOB_SELECT = `SELECT id, COALESCE(NULLIF(executed_workflow, ''), workflow) AS workflow, status, channel_id, thread_ts,
+         json_extract(payload_json, '$.eventTs') AS event_ts, created_at
+    FROM jobs`;
+
+function toJob(row: JobRow): MiniogJob {
+  return {
+    id: row.id,
+    workflow: row.workflow,
+    status: row.status,
+    channelId: row.channel_id,
+    threadTs: row.thread_ts,
+    eventTs: row.event_ts ?? undefined,
+    createdAt: row.created_at,
+  };
 }
 
 function parseStrings(json: string): string[] {
@@ -255,7 +286,7 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
 
     lastFinishedRun() {
       const row = db
-        .prepare(`SELECT * FROM personal_runs WHERE status IN ('OK', 'PARTIAL') ORDER BY started_at DESC LIMIT 1`)
+        .prepare(`SELECT * FROM personal_runs WHERE status = 'OK' ORDER BY started_at DESC LIMIT 1`)
         .get() as RunRow | undefined;
       return row ? toRun(row) : undefined;
     },
@@ -318,27 +349,15 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
     },
 
     jobsSince(iso) {
+      const rows = db.prepare(`${JOB_SELECT} WHERE created_at >= ? ORDER BY created_at`).all(iso) as JobRow[];
+      return rows.map(toJob);
+    },
+
+    jobsInThread(channelId, threadTs) {
       const rows = db
-        .prepare(
-          `SELECT id, workflow, status, channel_id, thread_ts, created_at
-             FROM jobs WHERE created_at >= ? ORDER BY created_at`,
-        )
-        .all(iso) as Array<{
-        id: string;
-        workflow: string;
-        status: string;
-        channel_id: string;
-        thread_ts: string;
-        created_at: string;
-      }>;
-      return rows.map(row => ({
-        id: row.id,
-        workflow: row.workflow,
-        status: row.status,
-        channelId: row.channel_id,
-        threadTs: row.thread_ts,
-        createdAt: row.created_at,
-      }));
+        .prepare(`${JOB_SELECT} WHERE channel_id = ? AND thread_ts = ? ORDER BY created_at`)
+        .all(channelId, threadTs) as JobRow[];
+      return rows.map(toJob);
     },
 
     runCostUsd(runId) {

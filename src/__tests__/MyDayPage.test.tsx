@@ -111,6 +111,19 @@ describe('MyDayPage', () => {
     );
   });
 
+  it('saves a new run time on leaving the field, not while typing', async () => {
+    serve(day({ enabled: true }));
+    render(<MyDayPage />);
+    await screen.findByText("It hasn't run yet.");
+    const time = screen.getByLabelText('Run time');
+    fireEvent.change(time, { target: { value: '23:30' } });
+    expect(invoke).not.toHaveBeenCalledWith('save_my_day_schedule', expect.anything());
+    fireEvent.blur(time);
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith('save_my_day_schedule', { enabled: true, runTime: '23:30' }),
+    );
+  });
+
   it('stops a second run while one is going, and says a failed run failed', async () => {
     const run = {
       status: 'FAILED',

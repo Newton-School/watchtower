@@ -132,6 +132,8 @@ export function MyDayPage() {
   const [tab, setTab] = useState<TabId>('needs_you');
   const [error, setError] = useState<string | null>(null);
   const [span, setSpan] = useState('');
+  // Saved on leaving the field: typing passes through times that aren't the one meant.
+  const [runTimeDraft, setRunTimeDraft] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -206,10 +208,12 @@ export function MyDayPage() {
           <input
             aria-label="Run time"
             type="time"
-            value={day?.runTime ?? '22:00'}
+            value={runTimeDraft ?? day?.runTime ?? '22:00'}
             disabled={!day}
-            onChange={event => {
-              if (event.target.value) void saveSchedule(Boolean(day?.enabled), event.target.value);
+            onChange={event => setRunTimeDraft(event.target.value)}
+            onBlur={() => {
+              if (runTimeDraft && runTimeDraft !== day?.runTime) void saveSchedule(Boolean(day?.enabled), runTimeDraft);
+              setRunTimeDraft(null);
             }}
           />
           <input

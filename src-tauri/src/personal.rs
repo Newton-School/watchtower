@@ -2,6 +2,8 @@
 //! (`sidecar/src/personal/`). This side reads what the run left, keeps the
 //! schedule's settings, and queues Run now for the sidecar to pick up.
 
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -237,8 +239,8 @@ fn is_run_time(value: &str) -> bool {
         && value[3..].bytes().all(|byte| byte.is_ascii_digit())
 }
 
-/// `enabled_at` only moves when the run is turned on: it stops that moment from
-/// firing a run for a time that had already passed, and nothing else should.
+/// `enabled_at` moves when the run is turned on or its time changes: neither
+/// should fire a run for a time that had already passed.
 fn apply_schedule(
     connection: &Connection,
     enabled: bool,
@@ -250,7 +252,8 @@ fn apply_schedule(
     }
     ensure_tables(connection)?;
     let was_enabled = read_state(connection, ENABLED_KEY)?.as_deref() == Some("1");
-    if enabled && !was_enabled {
+    let time_changed = read_state(connection, RUN_TIME_KEY)?.is_some_and(|time| time != run_time);
+    if enabled && (!was_enabled || time_changed) {
         write_state(connection, ENABLED_AT_KEY, now, now)?;
     }
     write_state(
@@ -262,19 +265,13 @@ fn apply_schedule(
     write_state(connection, RUN_TIME_KEY, run_time, now)
 }
 
-/// `3d`, a date, or nothing for "since the last run". Anything else is refused
-/// here rather than quietly covering the wrong window.
+/// `3d`, a date that exists, or nothing for "since the last run". Anything else
+/// is refused here rather than quietly covering the wrong window.
 fn is_span(value: &str) -> bool {
-    let bytes = value.as_bytes();
     let days = value.strip_suffix('d').is_some_and(|number| {
         !number.is_empty() && number.len() <= 2 && number.bytes().all(|byte| byte.is_ascii_digit())
     });
-    let date = bytes.len() == 10
-        && bytes.iter().enumerate().all(|(index, byte)| match index {
-            4 | 7 => *byte == b'-',
-            _ => byte.is_ascii_digit(),
-        });
-    days || date
+    days || (value.len() == 10 && chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok())
 }
 
 fn queue_run(connection: &Connection, span: Option<&str>, now: &str) -> Result<(), String> {
@@ -299,17 +296,18 @@ fn is_session_id(value: &str) -> bool {
     uuid::Uuid::parse_str(value).is_ok() && value.len() == 36
 }
 
-/// The AppleScript that opens a session in Terminal. The id and folder come from
-/// the database, so both are checked or quoted: neither can add to the command.
+/// The script Terminal runs for a session. It's opened as a file, not sent with
+/// AppleScript: a signed app needs an Automation permission for that, and macOS
+/// can refuse it without ever asking. The id and folder come from the database,
+/// so both are checked or quoted: neither can add to the command. It's run
+/// interactively so `claude` resolves as in his own shell, and removes itself.
 fn resume_script(session_id: &str, cwd: &str) -> Result<String, String> {
     if !is_session_id(session_id) {
         return Err("that isn't a session id".to_string());
     }
     let quoted_cwd = format!("'{}'", cwd.replace('\'', r"'\''"));
-    let command = format!("cd {quoted_cwd} && claude --resume {session_id}");
-    let escaped = command.replace('\\', r"\\").replace('"', "\\\"");
     Ok(format!(
-        "tell application \"Terminal\"\nactivate\ndo script \"{escaped}\"\nend tell"
+        "#!/bin/zsh -il\nrm -f -- \"$0\"\ncd {quoted_cwd} && exec claude --resume {session_id}\n"
     ))
 }
 
@@ -380,15 +378,30 @@ pub(crate) async fn resume_my_day_session(
         return Err(format!("{cwd} no longer exists"));
     }
     let script = resume_script(&session_id, &cwd)?;
-    let status = Command::new("osascript")
-        .arg("-e")
-        .arg(script)
+    let file = std::env::temp_dir().join(format!(
+        "watchtower-resume-{}.command",
+        uuid::Uuid::new_v4()
+    ));
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&file)
+        .map_err(|err| format!("couldn't prepare the session: {err}"))?;
+    output
+        .write_all(script.as_bytes())
+        .map_err(|err| format!("couldn't prepare the session: {err}"))?;
+    drop(output);
+    let status = Command::new("open")
+        .args(["-a", "Terminal"])
+        .arg(&file)
         .status()
         .map_err(|err| format!("couldn't open Terminal: {err}"))?;
     if status.success() {
         Ok(())
     } else {
-        Err("Terminal refused the command. Check Automation access in System Settings.".to_string())
+        let _ = std::fs::remove_file(&file);
+        Err("Terminal wouldn't open the session.".to_string())
     }
 }
 
@@ -467,24 +480,20 @@ mod tests {
     }
 
     #[test]
-    fn turning_on_sets_the_baseline_once() {
+    fn turning_on_sets_the_baseline_and_saving_again_keeps_it() {
         let connection = Connection::open_in_memory().expect("db");
         apply_schedule(&connection, true, "22:00", "first").expect("on");
         assert_eq!(
             read_state(&connection, ENABLED_AT_KEY).unwrap().as_deref(),
             Some("first")
         );
-        apply_schedule(&connection, true, "23:30", "second").expect("still on");
+        apply_schedule(&connection, true, "22:00", "second").expect("still on");
         assert_eq!(
             read_state(&connection, ENABLED_AT_KEY).unwrap().as_deref(),
             Some("first")
         );
-        assert_eq!(
-            read_state(&connection, RUN_TIME_KEY).unwrap().as_deref(),
-            Some("23:30")
-        );
-        apply_schedule(&connection, false, "23:30", "third").expect("off");
-        apply_schedule(&connection, true, "23:30", "fourth").expect("on again");
+        apply_schedule(&connection, false, "22:00", "third").expect("off");
+        apply_schedule(&connection, true, "22:00", "fourth").expect("on again");
         assert_eq!(
             read_state(&connection, ENABLED_AT_KEY).unwrap().as_deref(),
             Some("fourth")
@@ -525,9 +534,30 @@ mod tests {
     #[test]
     fn resume_script_cannot_be_extended_by_its_values() {
         assert!(resume_script("1; rm -rf ~", "/tmp").is_err());
-        let script = resume_script(SESSION, "/tmp/it's \"here\"").expect("script");
-        assert!(script.contains(&format!("&& claude --resume {SESSION}")));
-        assert!(script.contains(r#"'/tmp/it'\\''s \"here\"'"#), "{script}");
+        let script = resume_script(SESSION, "/tmp/it's $(here)").expect("script");
+        assert!(script.starts_with("#!/bin/zsh -il\n"));
+        assert!(script.contains(&format!("&& exec claude --resume {SESSION}\n")));
+        assert!(script.contains(r"cd '/tmp/it'\''s $(here)' &&"), "{script}");
+    }
+
+    #[test]
+    fn changing_the_time_moves_the_baseline() {
+        let connection = Connection::open_in_memory().expect("db");
+        apply_schedule(&connection, true, "22:00", "first").expect("on");
+        apply_schedule(&connection, true, "09:30", "second").expect("moved");
+        assert_eq!(
+            read_state(&connection, ENABLED_AT_KEY).unwrap().as_deref(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn refuses_a_date_that_does_not_exist() {
+        assert!(is_span("2026-10-28"));
+        assert!(is_span("3d"));
+        for bad in ["2026-13-45", "2026-02-31", "3", "d", "123d", "2026-1-1"] {
+            assert!(!is_span(bad), "{bad}");
+        }
     }
 
     #[test]

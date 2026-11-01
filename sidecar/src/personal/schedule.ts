@@ -6,6 +6,8 @@
 const OVERLAP_MS = 30 * 60 * 1000;
 const MAX_WINDOW_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
+/** A full run is expensive, and one a few hours ago already covered the day. */
+const MIN_HOURS_BETWEEN_RUNS_MS = 12 * 60 * 60 * 1000;
 
 export const DEFAULT_RUN_TIME = '22:00';
 
@@ -29,8 +31,9 @@ export function latestRunTime(now: Date, runTime: string | undefined): Date {
 
 /**
  * Due when the run time has passed since the last run started. That also fires
- * a run the Mac slept through as soon as it wakes. Turning the run on doesn't
- * fire one for a time that had already passed: `enabledAt` sets the baseline.
+ * a run the Mac slept through as soon as it wakes. Turning the run on, or moving
+ * its time, doesn't fire one for a time that had already passed: `enabledAt` sets
+ * that baseline. Moving tonight's time later can't start a second full run either.
  */
 export function isRunDue(params: {
   now: Date;
@@ -42,8 +45,10 @@ export function isRunDue(params: {
   const { now, enabled, runTime, enabledAt, lastStartedAt } = params;
   if (!enabled) return false;
   const passed = latestRunTime(now, runTime).getTime();
-  const baselines = [enabledAt, lastStartedAt].map(value => (value ? Date.parse(value) : Number.NaN));
-  return baselines.every(baseline => Number.isNaN(baseline) || baseline < passed);
+  const last = lastStartedAt ? Date.parse(lastStartedAt) : Number.NaN;
+  if (!Number.isNaN(last) && (last >= passed || now.getTime() - last < MIN_HOURS_BETWEEN_RUNS_MS)) return false;
+  const baseline = enabledAt ? Date.parse(enabledAt) : Number.NaN;
+  return Number.isNaN(baseline) || baseline < passed;
 }
 
 function startOfDay(date: Date): Date {
@@ -52,27 +57,32 @@ function startOfDay(date: Date): Date {
   return start;
 }
 
+/** A span's start, if it's one: `3d`, or a date that exists and isn't in the future. */
+function spanStart(span: string | undefined, now: Date): Date | undefined {
+  if (!span) return undefined;
+  const days = /^(\d{1,2})d$/.exec(span);
+  if (days) return new Date(startOfDay(now).getTime() - Number(days[1]) * DAY_MS);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(span)) return undefined;
+  const date = new Date(`${span}T00:00:00`);
+  return !Number.isNaN(date.getTime()) && date.getTime() <= now.getTime() ? date : undefined;
+}
+
 /**
- * A run covers what came in since the last finished run ended, with an overlap
- * for what arrived while that run was collecting. Failed runs don't move it, so
- * a night that failed is covered by the next one. Past a week, or with no run
- * yet, it covers today. `span` widens it: `3d`, or a date.
+ * A run covers what came in since the last complete run ended, with an overlap
+ * for what arrived while that run was collecting. Runs that failed or missed a
+ * source don't move it, so the next one covers those nights. Past a week, or with
+ * no run yet, it covers the last day. `span` can only widen it: a narrower one
+ * would skip days, because the next run starts from this one.
  */
 export function runWindow(params: { now: Date; lastWindowEnd: string | undefined; span: string | undefined }): {
   start: Date;
   end: Date;
 } {
   const { now, lastWindowEnd, span } = params;
-  const days = span ? /^(\d{1,2})d$/.exec(span) : null;
-  if (days) return { start: new Date(startOfDay(now).getTime() - Number(days[1]) * DAY_MS), end: now };
-  if (span && /^\d{4}-\d{2}-\d{2}$/.test(span)) {
-    const date = new Date(`${span}T00:00:00`);
-    if (!Number.isNaN(date.getTime()) && date.getTime() <= now.getTime()) return { start: date, end: now };
-  }
   const last = lastWindowEnd ? Date.parse(lastWindowEnd) : Number.NaN;
   const age = now.getTime() - last;
-  if (!Number.isNaN(last) && age > 0 && age <= MAX_WINDOW_AGE_MS) {
-    return { start: new Date(last - OVERLAP_MS), end: now };
-  }
-  return { start: startOfDay(now), end: now };
+  const usable = !Number.isNaN(last) && age > 0 && age <= MAX_WINDOW_AGE_MS;
+  const usual = usable ? last - OVERLAP_MS : now.getTime() - DAY_MS;
+  const widened = spanStart(span, now)?.getTime();
+  return { start: new Date(widened === undefined ? usual : Math.min(widened, usual)), end: now };
 }
