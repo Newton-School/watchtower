@@ -28,13 +28,23 @@ function item(overrides: Partial<MyDayItem>): MyDayItem {
     draftStatus: null,
     draftError: null,
     prStates: {},
+    action: null,
+    jobStatus: null,
     firstSeenAt: '2026-11-01T00:00:00.000Z',
     ...overrides,
   };
 }
 
 function day(overrides: Partial<MyDay> = {}): MyDay {
-  return { enabled: false, runTime: '22:00', runQueued: false, lastRun: null, items: [], ...overrides };
+  return {
+    enabled: false,
+    runTime: '22:00',
+    runQueued: false,
+    lastRun: null,
+    items: [],
+    policies: { review: 'auto', fix_own_pr: 'auto', open_pr: 'auto', tag: 'auto' },
+    ...overrides,
+  };
 }
 
 function serve(value: MyDay) {
@@ -195,6 +205,63 @@ describe('MyDayPage', () => {
     await vi.advanceTimersByTimeAsync(10_000);
     await waitFor(() => expect(screen.queryByText(/no such column/)).toBeNull());
     vi.useRealTimers();
+  });
+
+  it('runs the work on his button, named for what it does', async () => {
+    serve(day({ items: [item({ key: 'k', action: 'review_pr' })] }));
+    render(<MyDayPage />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Review it' }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('start_my_day_item', { key: 'k', text: null }));
+  });
+
+  it('offers no second start while a run waits for his answer, and hides a reply naming no PR yet', async () => {
+    serve(
+      day({
+        items: [
+          item({
+            key: 'k',
+            action: 'review_pr',
+            jobId: 'j',
+            jobStatus: 'PAUSED',
+            replyText: 'Raised {PR_URL} for this.',
+          }),
+        ],
+      }),
+    );
+    render(<MyDayPage />);
+    expect(await screen.findByRole('button', { name: 'Answer' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Review it' })).toBeNull();
+    expect(screen.queryByText(/\{PR_URL\}/)).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Copy reply' })).toBeNull();
+  });
+
+  it('sends his answer, and only with something typed', async () => {
+    serve(day({ items: [item({ key: 'k' })] }));
+    render(<MyDayPage />);
+    const send = await screen.findByRole<HTMLButtonElement>('button', { name: 'Answer' });
+    expect(send.disabled).toBe(true);
+    fireEvent.change(screen.getByPlaceholderText('Your answer'), { target: { value: ' keep it P1 ' } });
+    fireEvent.click(send);
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('start_my_day_item', { key: 'k', text: 'keep it P1' }));
+  });
+
+  it('shows work under way in Waiting, with its run', async () => {
+    const onOpenRun = vi.fn();
+    serve(day({ items: [item({ key: 'k', state: 'working', jobId: 'job-1', ask: 'in progress' })] }));
+    render(<MyDayPage onOpenRun={onOpenRun} />);
+    fireEvent.click(await screen.findByRole('button', { name: /^Waiting/ }));
+    expect(screen.getByText('miniOG is on this now.')).toBeTruthy();
+    expect(screen.queryByPlaceholderText('Your answer')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'See the run' }));
+    expect(onOpenRun).toHaveBeenCalledWith('job-1');
+  });
+
+  it('changes what runs on its own', async () => {
+    serve(day());
+    render(<MyDayPage />);
+    await screen.findByText("It hasn't run yet.");
+    fireEvent.change(screen.getByLabelText('New PRs for clear asks'), { target: { value: 'ask' } });
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('save_my_day_policy', { name: 'open_pr', value: 'ask' }));
   });
 
   it('sends Prepare only with Run now', async () => {

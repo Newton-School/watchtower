@@ -600,6 +600,8 @@ pub fn run() {
             personal::resume_my_day_session,
             personal::close_my_day_item,
             personal::open_my_day_in_slack,
+            personal::save_my_day_policy,
+            personal::start_my_day_item,
             list_dossiers,
             get_dossier,
             save_dossier_field,

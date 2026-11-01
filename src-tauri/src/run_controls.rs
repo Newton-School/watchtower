@@ -67,7 +67,7 @@ pub(crate) struct AnswerTarget {
 }
 
 /// The run an answer is for and the question it was written to.
-type Answering = (String, Option<String>);
+pub(crate) type Answering = (String, Option<String>);
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -428,7 +428,7 @@ fn request_stop(db_path: &Path, job_id: &str) -> Result<(), String> {
 }
 
 #[derive(Clone, Copy)]
-enum Start {
+pub(crate) enum Start {
     Rerun,
     Ask,
     Answer,
@@ -516,7 +516,7 @@ struct Prepared {
     answering: Option<Answering>,
 }
 
-async fn start_run(
+pub(crate) async fn start_run(
     db_path: &Path,
     job_id: &str,
     start: Start,

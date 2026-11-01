@@ -35,6 +35,8 @@ type DraftableItem = Pick<PersonalItem, 'key' | 'channelId' | 'threadTs' | 'mess
 export function draftTarget(item: DraftableItem): DraftTarget | undefined {
   const { key, channelId, threadTs, messageTs, replyText } = item;
   if (!replyText?.trim() || !channelId || !SLACK_ID.test(channelId)) return undefined;
+  // Still naming a PR that was never opened.
+  if (replyText.includes('{PR_URL}')) return undefined;
   const thread = threadTs ?? messageTs;
   if (!thread || !SLACK_TS.test(thread)) return undefined;
   const topLevelDm = channelId.startsWith('D') && messageTs !== undefined && thread === messageTs;

@@ -34,6 +34,12 @@ export interface RunConnectors {
   disallowedTools: string[];
   /** Connectors the profile names that this host cannot provide. */
   unavailable: string[];
+  /**
+   * The run's agents get no GitHub token, and git refuses to push: whatever
+   * reaches GitHub is done by miniOG itself, after its own checks. For runs whose
+   * prompt came through an agent that read Slack.
+   */
+  noGithubWrites?: boolean;
 }
 
 export const NO_CONNECTORS: RunConnectors = { mcpServers: {}, disallowedTools: [], unavailable: [] };
@@ -243,7 +249,21 @@ const storage = new AsyncLocalStorage<RunConnectors>();
  * of the host user's; a nested call replaces the list for its own scope.
  */
 export function withConnectors<T>(connectors: RunConnectors, fn: () => Promise<T>): Promise<T> {
-  return storage.run(connectors, fn);
+  return storage.run(keepingLimits(connectors, storage.getStore()), fn);
+}
+
+/**
+ * A nested list replaces the connectors, but never takes away a run's limits: the
+ * pipeline gives its review roles no connectors, which once handed them back a
+ * GitHub token inside a run meant to have none (seen live, 2026-11-02).
+ */
+export function keepingLimits(connectors: RunConnectors, outer: RunConnectors | undefined): RunConnectors {
+  if (!outer?.noGithubWrites) return connectors;
+  return {
+    ...connectors,
+    noGithubWrites: true,
+    disallowedTools: [...new Set([...connectors.disallowedTools, ...outer.disallowedTools])],
+  };
 }
 
 /** The connectors in force here: none unless a workflow said otherwise. */

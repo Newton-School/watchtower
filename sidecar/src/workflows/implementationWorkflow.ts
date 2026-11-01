@@ -1,3 +1,6 @@
+import { NO_CONNECTORS } from '../backends/connectors.js';
+import { planAsksOwner } from '../personal/work.js';
+import type { PersonalStore } from '../state/personalStore.js';
 import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -1461,6 +1464,22 @@ export async function runApprovalLoop(input: {
   let overrideNextPromptTs: string | undefined;
 
   for (let iteration = iterationStart; iteration < MAX_FEEDBACK_ITERATIONS; iteration++) {
+    // A My day run takes its plan as it is: he asked for work to go ahead unless it truly
+    // needs him. A plan that opens with a question stops here, as any other plan would.
+    if (task.event.personalItemKey && !planAsksOwner(planMarkdown)) {
+      logStep?.({ stage: 'personal.plan_taken', message: 'A My day run: going ahead with the plan.' });
+      return {
+        kind: 'approved',
+        feedbackRounds,
+        planMarkdown,
+        planAffectedFiles,
+        planScope,
+        plannerOutput,
+        plannerSessionId,
+        planMessageTs,
+        pipelineCwd,
+      };
+    }
     // Worked out for each version of the plan: a revision can add or remove a behaviour change.
     const requesterToConfirm = requesterToConfirmFor(planMarkdown, config, requesterOf(task));
     let approvalPromptTs: string | undefined;
@@ -2236,6 +2255,31 @@ export function landedFollowUpText(params: {
  * starts gets that list instead of the host user's connectors (issue #443);
  * the pipeline narrows it again to none for the roles that only review.
  */
+function personalFixPrUrl(task: NormalizedTask, store: unknown): string | undefined {
+  const key = task.event.personalItemKey;
+  const personal = (store as { personalStore?: () => PersonalStore } | undefined)?.personalStore?.();
+  const item = key ? personal?.item(key) : undefined;
+  return item?.action === 'fix_own_pr' ? item.prUrls[0] : undefined;
+}
+
+/**
+ * A second layer for a My day change run. What really stops these is having no
+ * token and no push (`noGithubWrites`): rules like these match command text, and
+ * can be worded around. The keychain is the one place a token might still be found.
+ */
+const PERSONAL_JOB_DENY_RULES = [
+  'Bash(gh pr merge:*)',
+  'Bash(gh pr review:*)',
+  'Bash(gh pr close:*)',
+  'Bash(gh workflow:*)',
+  'Bash(gh run rerun:*)',
+  'Bash(gh repo delete:*)',
+  'Bash(gh secret:*)',
+  'Bash(gh auth:*)',
+  'Bash(security:*)',
+  'Bash(git push:*)',
+];
+
 export async function runImplementationWorkflow(
   params: Parameters<typeof runImplementationWorkflowBody>[0],
 ): Promise<WorkflowResult> {
@@ -2251,7 +2295,21 @@ export async function runImplementationWorkflow(
     level: connectors.unavailable.length > 0 ? 'WARN' : 'INFO',
     data: { servers: Object.keys(connectors.mcpServers), unavailable: connectors.unavailable, adminTier: isAdmin },
   });
-  return withConnectors(connectors, () => runImplementationWorkflowBody(params));
+  if (!params.task.event.personalItemKey)
+    return withConnectors(connectors, () => runImplementationWorkflowBody(params));
+  // Only the agent pipeline keeps a run's agents from pushing: its legacy path pushes itself.
+  if (!params.config.multiAgentEnabled) {
+    return {
+      workflow: 'IMPLEMENTATION',
+      status: 'SKIPPED',
+      message: 'A My day change needs the agent pipeline, which is off, so nothing was started.',
+      notifyDesktop: false,
+      slackPosted: false,
+    };
+  }
+  // No connectors: these agents get what the code gives them, and no token.
+  const limited = { ...NO_CONNECTORS, noGithubWrites: true, disallowedTools: PERSONAL_JOB_DENY_RULES };
+  return withConnectors(limited, () => runImplementationWorkflowBody(params));
 }
 
 async function runImplementationWorkflowBody(params: {
@@ -2413,9 +2471,13 @@ async function runImplementationWorkflowBody(params: {
     // A change asked in a thread whose earlier change run left an open PR goes
     // onto that PR, not a second one that conflicts with it (issue #730).
     const followUpRequester = requesterOf(task);
+    // A My day fix belongs on the PR it names, which started in another thread.
+    const personalFixPr = personalFixPrUrl(task, store);
     const followUpLookup = await findFollowUpPr({
       task,
-      store,
+      store: personalFixPr
+        ? { changeRunPrsInThread: () => [{ prUrl: personalFixPr, requesterId: followUpRequester }] }
+        : store,
       requesterId: followUpRequester,
       // The owner or an admin may add to anyone's PR; others only to their own (S4).
       mayAddToOthers: getAdminUserIds(config).includes(followUpRequester),

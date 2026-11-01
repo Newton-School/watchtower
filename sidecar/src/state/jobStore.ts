@@ -95,7 +95,7 @@ const resumeContextSchema = z.discriminatedUnion('stage', [
 ]);
 
 const LAUNCHPAD_COLUMNS = `id, target, prompt, owner_user_id, status, job_id, slack_channel_id, anchor_ts,
-  requested_for_user_id, origin_channel_id, origin_thread_ts, origin_event_ts, answer_for_job_id, answer_prompt_ts,
+  requested_for_user_id, origin_channel_id, origin_thread_ts, origin_event_ts, answer_for_job_id, answer_prompt_ts, personal_item_key,
   result_json, error_message, created_at, updated_at`;
 
 interface LaunchpadRow {
@@ -111,6 +111,7 @@ interface LaunchpadRow {
   origin_channel_id?: string | null;
   origin_thread_ts?: string | null;
   origin_event_ts?: string | null;
+  personal_item_key?: string | null;
   answer_for_job_id?: string | null;
   answer_prompt_ts?: string | null;
   result_json?: string | null;
@@ -133,6 +134,7 @@ function launchpadRecord(row: LaunchpadRow): LaunchpadRequestRecord {
     originChannelId: row.origin_channel_id ?? undefined,
     originThreadTs: row.origin_thread_ts ?? undefined,
     originEventTs: row.origin_event_ts ?? undefined,
+    personalItemKey: row.personal_item_key ?? undefined,
     answerForJobId: row.answer_for_job_id ?? undefined,
     answerPromptTs: row.answer_prompt_ts ?? undefined,
     resultJson: row.result_json ?? undefined,
@@ -149,6 +151,8 @@ function parseResumeContext(raw: unknown): ResumeContext | undefined {
   const parsed = resumeContextSchema.safeParse(raw);
   return parsed.success ? (parsed.data as ResumeContext) : undefined;
 }
+
+const PERSONAL_PAUSE_MAX_MINUTES = 7 * 24 * 60;
 
 export class JobStore {
   private db: Database.Database;
@@ -524,7 +528,8 @@ export class JobStore {
         started_at TEXT NOT NULL,
         finished_at TEXT,
         gaps_json TEXT NOT NULL DEFAULT '[]',
-        error_message TEXT
+        error_message TEXT,
+        prepare_only INTEGER NOT NULL DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS idx_personal_runs_started_at ON personal_runs(started_at);
 
@@ -552,6 +557,12 @@ export class JobStore {
         draft_status TEXT,
         draft_error TEXT,
         pr_states_json TEXT NOT NULL DEFAULT '{}',
+        action TEXT,
+        action_detail TEXT,
+        asker_id TEXT,
+        ask_confirmed INTEGER NOT NULL DEFAULT 0,
+        request_id TEXT,
+        settled_on TEXT,
         first_seen_at TEXT NOT NULL,
         last_seen_at TEXT NOT NULL,
         last_run_id TEXT NOT NULL
@@ -563,6 +574,8 @@ export class JobStore {
         kind TEXT NOT NULL,
         span TEXT,
         prepare_only INTEGER NOT NULL DEFAULT 0,
+        item_key TEXT,
+        text TEXT,
         created_at TEXT NOT NULL,
         taken_at TEXT
       );
@@ -900,6 +913,16 @@ export class JobStore {
       'personal_items ADD COLUMN draft_error TEXT',
       "personal_items ADD COLUMN pr_states_json TEXT NOT NULL DEFAULT '{}'",
       'personal_actions ADD COLUMN prepare_only INTEGER NOT NULL DEFAULT 0',
+      'personal_actions ADD COLUMN item_key TEXT',
+      'personal_actions ADD COLUMN text TEXT',
+      'personal_runs ADD COLUMN prepare_only INTEGER NOT NULL DEFAULT 0',
+      'personal_items ADD COLUMN action TEXT',
+      'personal_items ADD COLUMN action_detail TEXT',
+      'personal_items ADD COLUMN asker_id TEXT',
+      'personal_items ADD COLUMN ask_confirmed INTEGER NOT NULL DEFAULT 0',
+      'personal_items ADD COLUMN request_id TEXT',
+      'personal_items ADD COLUMN settled_on TEXT',
+      'launchpad_requests ADD COLUMN personal_item_key TEXT',
     ]) {
       try {
         this.db.exec(`ALTER TABLE ${column}`);
@@ -1378,6 +1401,7 @@ export class JobStore {
     originEventTs?: string;
     answerForJobId?: string;
     answerPromptTs?: string;
+    personalItemKey?: string;
   }): void {
     const now = new Date().toISOString();
     this.db
@@ -1385,8 +1409,8 @@ export class JobStore {
         `INSERT INTO launchpad_requests(
            id, target, prompt, owner_user_id, status, slack_channel_id, anchor_ts,
            requested_for_user_id, origin_channel_id, origin_thread_ts, origin_event_ts,
-           answer_for_job_id, answer_prompt_ts, created_at, updated_at
-         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           answer_for_job_id, answer_prompt_ts, personal_item_key, created_at, updated_at
+         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.id,
@@ -1402,6 +1426,7 @@ export class JobStore {
         input.originEventTs ?? null,
         input.answerForJobId ?? null,
         input.answerPromptTs ?? null,
+        input.personalItemKey ?? null,
         now,
         now,
       );
@@ -1910,12 +1935,17 @@ export class JobStore {
    * worktree if it persisted one in the resume context).
    */
   stalePausedJobs(maxAgeMinutes: number): Array<{ id: string; channelId: string; threadTs: string }> {
+    // A My day run waiting on the owner waits for him: he answers from the inbox, and
+    // nobody else's reply lands in that thread. A week is long enough to say he won't.
     return this.db
       .prepare(
         `SELECT id, channel_id AS channelId, thread_ts AS threadTs
          FROM jobs
          WHERE status = 'PAUSED'
-           AND updated_at < datetime('now', '-' || ? || ' minutes')
+           AND updated_at < datetime('now', '-' || CASE
+             WHEN json_extract(payload_json, '$.personalItemKey') IS NOT NULL THEN ${PERSONAL_PAUSE_MAX_MINUTES}
+             ELSE ?
+           END || ' minutes')
          ORDER BY updated_at ASC`,
       )
       .all(maxAgeMinutes) as Array<{ id: string; channelId: string; threadTs: string }>;
@@ -3413,6 +3443,8 @@ export class JobStore {
     channelId: string;
     threadTs: string;
     prUrl: string;
+    /** Look at reviews from every thread, not just this one. */
+    anyThread?: boolean;
   }): { jobId: string; prHeadSha: string; updatedAt: string } | undefined {
     // COALESCE: review jobs are usually seeded as IMPLEMENTATION /
     // OWNER_AUTOPILOT pre-classifier (jobs.workflow keeps that seed for
@@ -3430,22 +3462,20 @@ export class JobStore {
        FROM jobs
        WHERE COALESCE(executed_workflow, workflow) = 'PR_REVIEW'
          AND status IN ('SUCCESS', 'FAILED')
-         AND channel_id = ?
-         AND thread_ts = ?
+         ${input.anyThread ? `AND result_json LIKE '%' || @prUrl || '%'` : 'AND channel_id = @channelId AND thread_ts = @threadTs'}
        ORDER BY updated_at DESC
        LIMIT 50`,
     ) as unknown as {
-      all: (
-        channelIdArg: string,
-        threadTsArg: string,
-      ) => Array<{
+      all: (args: Record<string, string>) => Array<{
         id: string;
         result_json?: string | null;
         updated_at: string;
       }>;
     };
 
-    const rows = stmt.all(input.channelId, input.threadTs);
+    const rows = stmt.all(
+      input.anyThread ? { prUrl: input.prUrl } : { channelId: input.channelId, threadTs: input.threadTs },
+    );
     for (const row of rows) {
       if (!row.result_json) {
         continue;

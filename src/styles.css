@@ -5235,6 +5235,38 @@ h3 {
   white-space: pre-wrap;
 }
 
+.my-day-answer {
+  display: flex;
+  gap: 8px;
+}
+
+.my-day-answer input,
+.my-day-policy select {
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--input-bg);
+  color: var(--text-strong);
+  color-scheme: dark;
+}
+
+.my-day-answer input {
+  flex: 1;
+}
+
+.my-day-policies {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.my-day-policy {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .my-day-draft-failed {
   margin: 0 0 8px;
   color: var(--danger);

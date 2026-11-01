@@ -17,9 +17,24 @@ const EMPTY_COPY: Record<TabId, string> = {
   sessions: 'No Claude sessions left unfinished.',
 };
 
+const ACTION_LABELS: Record<string, string> = {
+  review_pr: 'Review it',
+  re_review_pr: 'Re-review it',
+  fix_own_pr: 'Fix and push',
+  open_pr: 'Raise the PR',
+};
+
+const POLICY_ROWS: Array<{ name: string; label: string }> = [
+  { name: 'review', label: 'Reviews and re-reviews, posted on GitHub' },
+  { name: 'fix_own_pr', label: 'Fixes pushed to your PRs' },
+  { name: 'open_pr', label: 'New PRs for clear asks' },
+  { name: 'tag', label: "miniOG's line in the thread after a review" },
+];
+
 function inTab(item: MyDayItem, tab: TabId): boolean {
   if (item.source === 'session') return tab === (item.state === 'done' ? 'done' : 'sessions');
-  return item.state === tab;
+  // Work under way is waiting on someone too, just not on him.
+  return item.state === 'working' ? tab === 'waiting' : item.state === tab;
 }
 
 function prLabel(url: string): string {
@@ -91,12 +106,15 @@ export function MyDayRow({
   item,
   onChanged,
   onError,
+  onOpenRun,
 }: {
   item: MyDayItem;
   onChanged: () => void;
   onError: (message: string) => void;
+  onOpenRun?: (runId: string) => void;
 }) {
   const [copied, setCopied] = useState(false);
+  const [answer, setAnswer] = useState('');
 
   const copyReply = async () => {
     if (!item.replyText) return;
@@ -123,6 +141,21 @@ export function MyDayRow({
     ? 'Claude session'
     : [item.asker, item.channelName, item.askedAt].filter(Boolean).join(' · ') || 'GitHub';
   const isOpen = item.state !== 'done';
+  const canAnswer = item.state === 'needs_you' && !isSession;
+  // A run waiting for an answer takes the answer, not a second start.
+  const jobIsLive = item.jobStatus === 'RUNNING' || item.jobStatus === 'PAUSED';
+  // A reply still naming a PR that hasn't been opened isn't one yet.
+  const replyText = item.replyText?.includes('{PR_URL}') ? null : item.replyText;
+
+  const sendAnswer = async () => {
+    try {
+      await invoke('start_my_day_item', { key: item.key, text: answer.trim() });
+      setAnswer('');
+      onChanged();
+    } catch (err) {
+      onError(String(err));
+    }
+  };
 
   return (
     <article className="my-day-item">
@@ -144,6 +177,20 @@ export function MyDayRow({
               {item.prStates[url] ? ` · ${item.prStates[url]}` : ''}
             </a>
           ))}
+          {item.jobId && onOpenRun ? (
+            <button className="ghost-button" type="button" onClick={() => onOpenRun(item.jobId ?? '')}>
+              See the run
+            </button>
+          ) : null}
+          {canAnswer && item.action && !jobIsLive ? (
+            <button
+              className="ghost-button"
+              type="button"
+              onClick={() => void call('start_my_day_item', { key: item.key, text: null }, true)}
+            >
+              {ACTION_LABELS[item.action] ?? 'Run it'}
+            </button>
+          ) : null}
           {item.sessionId && isOpen ? (
             <button
               className="ghost-button"
@@ -189,20 +236,34 @@ export function MyDayRow({
       {item.doneSummary ? <Line label={isSession ? 'Left' : 'Done'}>{item.doneSummary}</Line> : null}
       {item.nextStep && isOpen ? <Line label="Next">{item.nextStep}</Line> : null}
       {item.state === 'waiting' && item.evidence ? <Line label="Waiting">{item.evidence}</Line> : null}
-      {item.replyText ? (
+      {item.state === 'working' ? <Line label="Working">miniOG is on this now.</Line> : null}
+      {replyText ? (
         <Line label="Reply">
-          <p className="my-day-reply">{item.replyText}</p>
+          <p className="my-day-reply">{replyText}</p>
           <ReplyStatus item={item} />
           <button className="ghost-button" type="button" onClick={() => void copyReply()}>
             {copied ? 'Copied' : 'Copy reply'}
           </button>
         </Line>
       ) : null}
+      {canAnswer ? (
+        <div className="my-day-answer">
+          <input
+            aria-label={`Answer about: ${item.ask}`}
+            placeholder="Your answer"
+            value={answer}
+            onChange={event => setAnswer(event.target.value)}
+          />
+          <button className="ghost-button" type="button" disabled={!answer.trim()} onClick={() => void sendAnswer()}>
+            Answer
+          </button>
+        </div>
+      ) : null}
     </article>
   );
 }
 
-export function MyDayPage() {
+export function MyDayPage({ onOpenRun }: { onOpenRun?: (runId: string) => void }) {
   const [day, setDay] = useState<MyDay | null>(null);
   const [tab, setTab] = useState<TabId>('needs_you');
   const [error, setError] = useState<string | null>(null);
@@ -238,6 +299,16 @@ export function MyDayPage() {
     }
   };
 
+  const savePolicy = async (name: string, value: string) => {
+    setError(null);
+    try {
+      await invoke('save_my_day_policy', { name, value });
+      await load();
+    } catch (err) {
+      setError(String(err));
+    }
+  };
+
   const runNow = async () => {
     setError(null);
     try {
@@ -265,7 +336,7 @@ export function MyDayPage() {
       <PageIntro
         eyebrow="Personal"
         title="My day"
-        description="What was asked of you that neither you nor miniOG finished. Replies are saved as Slack drafts for you to send: nothing is sent for you."
+        description="What was asked of you that neither you nor miniOG finished, and the work done on it. Replies wait as Slack drafts for you to send."
       />
 
       {error ? <div className="my-day-error">{error}</div> : null}
@@ -313,6 +384,30 @@ export function MyDayPage() {
         <p className="muted">{runLine(day?.lastRun ?? null, Boolean(day?.runQueued))}</p>
       </GlowCard>
 
+      <GlowCard>
+        <strong>What runs on its own</strong>
+        <p className="muted">
+          Merging, approving and deploying never do. Replies are always drafts. Prepare only does none of this.
+        </p>
+        <div className="my-day-policies">
+          {POLICY_ROWS.map(row => (
+            <label key={row.name} className="my-day-policy">
+              <span>{row.label}</span>
+              <select
+                aria-label={row.label}
+                value={day?.policies[row.name] ?? 'auto'}
+                disabled={!day}
+                onChange={event => void savePolicy(row.name, event.target.value)}
+              >
+                <option value="auto">On its own</option>
+                <option value="ask">Wait for my button</option>
+                <option value="off">Off</option>
+              </select>
+            </label>
+          ))}
+        </div>
+      </GlowCard>
+
       <TabBar tabs={tabs} value={tab} onChange={setTab} />
 
       {shown.length === 0 ? (
@@ -320,7 +415,13 @@ export function MyDayPage() {
       ) : (
         <div className="my-day-list">
           {shown.map(item => (
-            <MyDayRow key={item.key} item={item} onChanged={() => void load()} onError={setError} />
+            <MyDayRow
+              key={item.key}
+              item={item}
+              onChanged={() => void load()}
+              onError={setError}
+              onOpenRun={onOpenRun}
+            />
           ))}
         </div>
       )}

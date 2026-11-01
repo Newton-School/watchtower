@@ -672,7 +672,9 @@ export function normalizeTask(
   threadTexts: string[] = [],
 ): NormalizedTask {
   const mention = detectMention(event.text, config, event.channelType);
-  const isOwnerAuthor = config.ownerSlackUserIds.includes(event.userId);
+  // A My day run's words came through an agent that read Slack, so it runs guarded
+  // even though the owner's authority started it.
+  const isOwnerAuthor = config.ownerSlackUserIds.includes(event.userId) && !event.personalItemKey;
   const isCoreDevAuthor = getAdminUserIds(config).includes(event.userId);
   const prContexts = extractAllPrContexts({ triggerText: event.text, threadTexts });
   const first = prContexts[0];

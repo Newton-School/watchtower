@@ -554,7 +554,14 @@ function App() {
         <PerformancePage onSelectRun={setSelectedRunId} onNavigateRuns={() => navigateToView('runs')} />
       ) : null}
 
-      {view === 'myday' ? <MyDayPage /> : null}
+      {view === 'myday' ? (
+        <MyDayPage
+          onOpenRun={runId => {
+            setSelectedRunId(runId);
+            navigateToView('runs');
+          }}
+        />
+      ) : null}
 
       {view === 'ux' ? <UxMetricsPage /> : null}
 

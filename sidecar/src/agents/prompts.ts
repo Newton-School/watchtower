@@ -187,6 +187,10 @@ function coderPublishSteps(ctx: AgentContext): string {
     return `4. Commit the change as one or more new commits on top of the pull request's latest commit. Never amend, rebase, reset or squash its existing commits.
 5. Do NOT push, and do not run \`gh pr\` commands: the reviewer and the final check look at your commits first, and miniOG pushes them to the pull request once they pass. Report "branch" as \`${ctx.followUp.branch}\` and "prUrl" as "". In "summary" and "requesterSummary", don't mention pushing or say the change still has to reach the pull request: they are read after miniOG has added it.`;
   }
+  if (ctx.task.event.personalItemKey) {
+    return `4. Commit the change on your new branch.
+5. Do NOT push, and do not run \`gh\` commands: this run has no GitHub access, on purpose, and a refused push is not a problem to report. The reviewer and the final check look at your commits first, and miniOG itself pushes the branch and opens the pull request once they pass. Report "branch" as your branch and "prUrl" as "". In "summary" and "requesterSummary", don't mention pushing or say the change still has to be published: they are read after miniOG has done it.`;
+  }
   return `4. Commit and open a PR to the default branch.${ctx.requestedBy ? ` Prefix the PR title with [${ctx.requestedBy} via miniOG], e.g. "[${ctx.requestedBy} via miniOG] Fix button text".` : ''}
    In the PR description, always include this at the top:
    > Requested by **${ctx.requestedBy ?? 'Unknown'}** via Slack · [View thread](${buildSlackThreadLink(ctx.task.event.channelId, ctx.task.event.threadTs)})
@@ -206,7 +210,7 @@ export function buildCoderPrompt(ctx: AgentContext): string {
   return `
 You are the CODER agent in a multi-agent pipeline.
 
-Your role: Implement the plan from the planner agent. Write code, create tests, commit, and ${ctx.followUp ? 'add it to the open pull request' : 'open a PR'}.
+Your role: Implement the plan from the planner agent. Write code, create tests, commit, and ${ctx.followUp ? 'add it to the open pull request' : ctx.task.event.personalItemKey ? 'leave the commits for miniOG to publish' : 'open a PR'}.
 
 Workflow: ${ctx.workflowIntent}
 Repository: ${ctx.repoPath}${depsLine(ctx)}
@@ -415,7 +419,9 @@ Verification checklist:
 4. ${
     ctx.followUp
       ? `This change is new commits for the open pull request ${ctx.followUp.prUrl}, not pushed yet: miniOG pushes them once you pass. Their not being on the pull request yet is not a reason to reject.`
-      : 'If a PR was opened, check it is in a mergeable state. No PR yet is not a reason to reject: miniOG opens it once you pass.'
+      : ctx.task.event.personalItemKey
+        ? 'This change is commits on a local branch, not pushed yet, on purpose: miniOG pushes them and opens the pull request once you pass. Their not being on GitHub yet is not a reason to reject.'
+        : 'If a PR was opened, check it is in a mergeable state. No PR yet is not a reason to reject: miniOG opens it once you pass.'
   }
 5. Check that no regressions were introduced
 

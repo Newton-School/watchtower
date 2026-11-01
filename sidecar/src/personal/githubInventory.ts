@@ -173,6 +173,34 @@ export function ownPrAsks(detail: OwnPrDetail['repository']['pullRequest'], logi
   }));
 }
 
+/** One PR's unanswered review comments, for a fix to work from. */
+export async function fetchPrAsks(params: {
+  owner: string;
+  repo: string;
+  number: number;
+  login: string;
+  githubToken?: string;
+  fetcher?: Fetcher;
+}): Promise<OwnPrAsk[]> {
+  const fetcher = params.fetcher ?? fetch;
+  const response = await fetcher(`${API}/graphql`, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/vnd.github+json',
+      'Content-Type': 'application/json',
+      ...(params.githubToken ? { Authorization: `Bearer ${params.githubToken}` } : {}),
+    },
+    body: JSON.stringify({
+      query: OWN_PR_QUERY,
+      variables: { owner: params.owner, repo: params.repo, n: params.number },
+    }),
+  });
+  if (!response.ok) throw new Error(`GitHub GraphQL ${response.status}`);
+  const payload = (await response.json()) as { data?: OwnPrDetail };
+  if (!payload.data) throw new Error('GitHub GraphQL: no data');
+  return ownPrAsks(payload.data.repository.pullRequest, params.login, '');
+}
+
 export async function collectGithubInventory(params: {
   sinceIso: string;
   githubToken?: string;

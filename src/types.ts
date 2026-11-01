@@ -18,6 +18,8 @@ export type MyDayItem = {
   draftStatus: string | null;
   draftError: string | null;
   prStates: Record<string, string>;
+  action: string | null;
+  jobStatus: string | null;
   firstSeenAt: string;
 };
 
@@ -39,6 +41,7 @@ export type MyDay = {
   runQueued: boolean;
   lastRun: MyDayRun | null;
   items: MyDayItem[];
+  policies: Record<string, string>;
 };
 
 export type AppView =

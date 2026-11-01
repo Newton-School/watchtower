@@ -30,6 +30,8 @@ pub struct MyDayItem {
     pub draft_status: Option<String>,
     pub draft_error: Option<String>,
     pub pr_states: std::collections::HashMap<String, String>,
+    pub action: Option<String>,
+    pub job_status: Option<String>,
     pub source: String,
     pub state: String,
     pub channel_name: Option<String>,
@@ -70,6 +72,8 @@ pub struct MyDay {
     pub run_queued: bool,
     pub last_run: Option<MyDayRun>,
     pub items: Vec<MyDayItem>,
+    /// What runs on its own: `auto`, `ask` or `off` for each kind of work.
+    pub policies: std::collections::BTreeMap<String, String>,
 }
 
 fn ensure_tables(connection: &Connection) -> Result<(), String> {
@@ -80,6 +84,7 @@ fn ensure_tables(connection: &Connection) -> Result<(), String> {
              );
              CREATE TABLE IF NOT EXISTS personal_actions (
                id TEXT PRIMARY KEY, kind TEXT NOT NULL, span TEXT, prepare_only INTEGER NOT NULL DEFAULT 0,
+               item_key TEXT, text TEXT,
                created_at TEXT NOT NULL, taken_at TEXT
              );",
         )
@@ -140,7 +145,8 @@ fn read_items(
         .prepare(
             "SELECT item_key, source, state, channel_name, permalink, asker, asked_at, ask, done_summary,
                     reply_text, next_step, evidence, pr_urls_json, job_id, session_id, first_seen_at,
-                    owner_closed, draft_status, draft_error, pr_states_json
+                    owner_closed, draft_status, draft_error, pr_states_json, action,
+                    (SELECT status FROM jobs WHERE jobs.id = personal_items.job_id)
                FROM personal_items
               WHERE state != 'done' OR last_seen_at >= ?1
               ORDER BY first_seen_at DESC",
@@ -169,6 +175,8 @@ fn read_items(
                 draft_status: row.get(17)?,
                 draft_error: row.get(18)?,
                 pr_states: serde_json::from_str(&row.get::<_, String>(19)?).unwrap_or_default(),
+                action: row.get(20)?,
+                job_status: row.get(21)?,
             })
         })
         .map_err(|err| format!("db read failed: {err}"))?;
@@ -210,8 +218,10 @@ fn read_last_run(connection: &Connection) -> Result<Option<MyDayRun>, String> {
     if has_table(connection, "agent_calls")? {
         run.cost_usd = connection
             .query_row(
-                "SELECT COALESCE(SUM(cost_usd), 0) FROM agent_calls WHERE job_id = ?1",
-                params![format!("personal:{id}")],
+                "SELECT COALESCE(SUM(cost_usd), 0) FROM agent_calls
+                  WHERE job_id = ?1
+                     OR job_id IN (SELECT job_id FROM personal_items WHERE last_run_id = ?2 AND job_id IS NOT NULL)",
+                params![format!("personal:{id}"), id],
                 |row| row.get(0),
             )
             .map_err(|err| format!("db read failed: {err}"))?;
@@ -237,7 +247,117 @@ fn read_my_day(connection: &Connection, now: chrono::DateTime<Utc>) -> Result<My
         run_queued,
         last_run: read_last_run(connection)?,
         items: read_items(connection, now)?,
+        policies: read_policies(connection)?,
     })
+}
+
+const POLICY_NAMES: [&str; 4] = ["review", "fix_own_pr", "open_pr", "tag"];
+
+fn read_policies(
+    connection: &Connection,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    POLICY_NAMES
+        .iter()
+        .map(|name| {
+            let value = read_state(connection, &format!("personal.policy.{name}"))?
+                .filter(|value| value == "ask" || value == "off")
+                .unwrap_or_else(|| "auto".to_string());
+            Ok(((*name).to_string(), value))
+        })
+        .collect()
+}
+
+fn set_policy(connection: &Connection, name: &str, value: &str, now: &str) -> Result<(), String> {
+    if !POLICY_NAMES.contains(&name) {
+        return Err(format!("{name} isn't something that can be set"));
+    }
+    if !["auto", "ask", "off"].contains(&value) {
+        return Err(format!("{value} isn't a setting"));
+    }
+    ensure_tables(connection)?;
+    write_state(connection, &format!("personal.policy.{name}"), value, now)
+}
+
+/// What his button or answer should do for an item: answer the job waiting on him,
+/// start the work, or nothing while a job is still going by itself.
+#[derive(Debug, PartialEq)]
+enum StartPlan {
+    AnswerJob {
+        job_id: String,
+        prompt_ts: Option<String>,
+    },
+    StartNew,
+}
+
+fn start_plan(connection: &Connection, key: &str) -> Result<StartPlan, String> {
+    let item: Option<(Option<String>, String)> = connection
+        .query_row(
+            "SELECT job_id, state FROM personal_items WHERE item_key = ?1 AND owner_closed IS NULL",
+            params![key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|err| format!("db read failed: {err}"))?;
+    let (job_id, state) = item.ok_or_else(|| "that item is no longer open".to_string())?;
+    if state == "done" {
+        return Err("that item is already done".to_string());
+    }
+    let Some(job_id) = job_id else {
+        // Started, with no job yet: a second start would run it twice.
+        return if state == "working" {
+            Err("its run is starting.".to_string())
+        } else {
+            Ok(StartPlan::StartNew)
+        };
+    };
+    let status: Option<String> = connection
+        .query_row(
+            "SELECT status FROM jobs WHERE id = ?1",
+            params![job_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| format!("db read failed: {err}"))?;
+    let prompt_ts: Option<String> = if has_table(connection, "human_waits")? {
+        connection
+            .query_row(
+                "SELECT prompt_ts FROM human_waits WHERE job_id = ?1",
+                params![job_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| format!("db read failed: {err}"))?
+    } else {
+        None
+    };
+    match status.as_deref() {
+        Some("PAUSED") => Ok(StartPlan::AnswerJob {
+            job_id,
+            prompt_ts: None,
+        }),
+        Some("RUNNING") if prompt_ts.is_some() => Ok(StartPlan::AnswerJob { job_id, prompt_ts }),
+        Some("RUNNING") => Err("its run is still going. See the run.".to_string()),
+        _ => Ok(StartPlan::StartNew),
+    }
+}
+
+fn queue_start(
+    connection: &Connection,
+    key: &str,
+    text: Option<&str>,
+    now: &str,
+) -> Result<(), String> {
+    ensure_tables(connection)?;
+    connection
+        .execute(
+            "INSERT INTO personal_actions(id, kind, item_key, text, created_at)
+             SELECT ?1, 'start_item', ?2, ?3, ?4
+              WHERE NOT EXISTS (SELECT 1 FROM personal_actions
+                                 WHERE kind = 'start_item' AND item_key = ?2 AND taken_at IS NULL)",
+            params![uuid::Uuid::new_v4().to_string(), key, text, now],
+        )
+        .map(|_| ())
+        .map_err(|err| format!("db write failed: {err}"))
 }
 
 fn is_run_time(value: &str) -> bool {
@@ -359,7 +479,35 @@ fn set_closed(connection: &Connection, key: &str, how: &str, now: &str) -> Resul
     if changed == 0 {
         return Err("that item is no longer in the list".to_string());
     }
+    if how != "reopen" {
+        stop_its_run(connection, key, now)?;
+    }
     Ok(())
+}
+
+/// Closing an item stops its run: otherwise it would go on to push and open a PR.
+fn stop_its_run(connection: &Connection, key: &str, now: &str) -> Result<(), String> {
+    if !has_table(connection, "jobs")? {
+        return Ok(());
+    }
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS pending_cancel_jobs (
+               job_id TEXT PRIMARY KEY, created_at TEXT NOT NULL
+             )",
+        )
+        .map_err(|err| format!("db schema failed: {err}"))?;
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO pending_cancel_jobs (job_id, created_at)
+             SELECT item.job_id, ?2
+               FROM personal_items item
+               JOIN jobs ON jobs.id = item.job_id
+              WHERE item.item_key = ?1 AND jobs.status IN ('RUNNING', 'PAUSED')",
+            params![key, now],
+        )
+        .map(|_| ())
+        .map_err(|err| format!("db write failed: {err}"))
 }
 
 fn is_slack_id(value: &str, first: &[u8]) -> bool {
@@ -466,6 +614,56 @@ pub(crate) async fn run_my_day_now(
 }
 
 #[tauri::command]
+pub(crate) async fn save_my_day_policy(
+    name: String,
+    value: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let connection =
+        Connection::open(&*state.db_path).map_err(|err| format!("db open failed: {err}"))?;
+    set_policy(&connection, &name, &value, &now_iso())
+}
+
+/// Run it, or his answer: goes to the job waiting on him if there is one, and starts
+/// the work if not. It runs in the item's own thread, without posting his words again.
+#[tauri::command]
+pub(crate) async fn start_my_day_item(
+    key: String,
+    text: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let text = text
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let plan = {
+        let connection =
+            Connection::open(&*state.db_path).map_err(|err| format!("db open failed: {err}"))?;
+        start_plan(&connection, &key)?
+    };
+    match plan {
+        StartPlan::StartNew => {
+            let connection = Connection::open(&*state.db_path)
+                .map_err(|err| format!("db open failed: {err}"))?;
+            queue_start(&connection, &key, text.as_deref(), &now_iso())
+        }
+        StartPlan::AnswerJob { job_id, prompt_ts } => {
+            let answer = text.ok_or_else(|| "its run is waiting for your answer.".to_string())?;
+            let written_for = (job_id.clone(), prompt_ts);
+            crate::run_controls::start_run(
+                &state.db_path,
+                &job_id,
+                crate::run_controls::Start::Answer,
+                Some(answer),
+                false,
+                Some(&written_for),
+            )
+            .await
+            .map(|_| ())
+        }
+    }
+}
+
+#[tauri::command]
 pub(crate) async fn close_my_day_item(
     key: String,
     how: String,
@@ -558,9 +756,11 @@ mod tests {
                    permalink TEXT, asker TEXT, asked_at TEXT, ask TEXT, done_summary TEXT, reply_text TEXT,
                    next_step TEXT, evidence TEXT, pr_urls_json TEXT, job_id TEXT, session_id TEXT, session_cwd TEXT,
                    channel_id TEXT, thread_ts TEXT, message_ts TEXT, owner_closed TEXT, draft_status TEXT, draft_error TEXT,
-                   pr_states_json TEXT NOT NULL DEFAULT '{}',
+                   pr_states_json TEXT NOT NULL DEFAULT '{}', action TEXT, last_run_id TEXT,
                    first_seen_at TEXT, last_seen_at TEXT);
-                 CREATE TABLE agent_calls (job_id TEXT, cost_usd REAL);",
+                 CREATE TABLE agent_calls (job_id TEXT, cost_usd REAL);
+                 CREATE TABLE jobs (id TEXT PRIMARY KEY, status TEXT);
+                 CREATE TABLE human_waits (job_id TEXT, prompt_ts TEXT);",
             )
             .expect("schema");
         connection
@@ -706,6 +906,113 @@ mod tests {
     }
 
     #[test]
+    fn last_run_cost_includes_its_jobs() {
+        let connection = database();
+        connection
+            .execute_batch(
+                "INSERT INTO personal_runs VALUES ('r1', 'schedule', 'OK', 'a', 'b', '2026-11-01', NULL, '[]', NULL);
+                 INSERT INTO personal_items (item_key, source, state, ask, pr_urls_json, first_seen_at, last_seen_at, job_id, last_run_id)
+                   VALUES ('a', 'slack', 'done', 'x', '[]', 'a', 'a', 'job-1', 'r1');
+                 INSERT INTO agent_calls VALUES ('personal:r1', 1.0), ('job-1', 2.5), ('job-other', 9.0);",
+            )
+            .expect("seed");
+        let run = read_last_run(&connection).expect("read").expect("run");
+        assert!((run.cost_usd - 3.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn policies_default_to_on_and_only_take_real_values() {
+        let connection = Connection::open_in_memory().expect("db");
+        assert_eq!(read_policies(&connection).unwrap()["review"], "auto");
+        set_policy(&connection, "review", "ask", "now").expect("set");
+        assert_eq!(read_policies(&connection).unwrap()["review"], "ask");
+        assert!(set_policy(&connection, "merge", "auto", "now").is_err());
+        assert!(set_policy(&connection, "review", "yes", "now").is_err());
+    }
+
+    fn add_item_with_job(connection: &Connection, job: Option<(&str, &str)>) {
+        add_item(connection, "a", "needs_you", "2026-11-01");
+        if let Some((id, status)) = job {
+            connection
+                .execute(
+                    "UPDATE personal_items SET job_id = ?1 WHERE item_key = 'a'",
+                    params![id],
+                )
+                .expect("link");
+            connection
+                .execute("INSERT INTO jobs VALUES (?1, ?2)", params![id, status])
+                .expect("job");
+        }
+    }
+
+    #[test]
+    fn starting_an_item_goes_to_what_is_waiting() {
+        let connection = database();
+        add_item_with_job(&connection, None);
+        assert_eq!(start_plan(&connection, "a").unwrap(), StartPlan::StartNew);
+    }
+
+    #[test]
+    fn an_answer_goes_to_a_paused_job_or_a_waiting_gate() {
+        let connection = database();
+        add_item_with_job(&connection, Some(("j", "PAUSED")));
+        assert_eq!(
+            start_plan(&connection, "a").unwrap(),
+            StartPlan::AnswerJob {
+                job_id: "j".to_string(),
+                prompt_ts: None
+            }
+        );
+        connection
+            .execute_batch(
+                "UPDATE jobs SET status = 'RUNNING'; INSERT INTO human_waits VALUES ('j', '1.2');",
+            )
+            .unwrap();
+        assert_eq!(
+            start_plan(&connection, "a").unwrap(),
+            StartPlan::AnswerJob {
+                job_id: "j".to_string(),
+                prompt_ts: Some("1.2".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn a_job_going_by_itself_is_left_alone_and_a_finished_one_can_run_again() {
+        let connection = database();
+        add_item_with_job(&connection, Some(("j", "RUNNING")));
+        assert!(start_plan(&connection, "a").is_err());
+        connection
+            .execute("UPDATE jobs SET status = 'FAILED'", [])
+            .unwrap();
+        assert_eq!(start_plan(&connection, "a").unwrap(), StartPlan::StartNew);
+    }
+
+    #[test]
+    fn a_closed_or_finished_item_cannot_start() {
+        let connection = database();
+        add_item(&connection, "done", "done", "2026-11-01");
+        assert!(start_plan(&connection, "done").is_err());
+        assert!(start_plan(&connection, "missing").is_err());
+    }
+
+    #[test]
+    fn queues_one_start_per_item() {
+        let connection = database();
+        add_item(&connection, "a", "needs_you", "2026-11-01");
+        queue_start(&connection, "a", Some("yes"), "now").expect("first");
+        queue_start(&connection, "a", None, "now").expect("second is ignored");
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM personal_actions WHERE kind = 'start_item'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn closing_and_reopening_an_item() {
         let connection = database();
         add_item(&connection, "a", "needs_you", "2026-11-01");
@@ -729,6 +1036,26 @@ mod tests {
         assert_eq!(state, "needs_you");
         assert!(set_closed(&connection, "a", "nonsense", "now").is_err());
         assert!(set_closed(&connection, "missing", "done", "now").is_err());
+    }
+
+    #[test]
+    fn closing_an_item_stops_its_run() {
+        let connection = database();
+        add_item_with_job(&connection, Some(("j", "RUNNING")));
+        set_closed(&connection, "a", "skipped", "now").expect("close");
+        let job: String = connection
+            .query_row("SELECT job_id FROM pending_cancel_jobs", [], |row| {
+                row.get(0)
+            })
+            .expect("queued");
+        assert_eq!(job, "j");
+    }
+
+    #[test]
+    fn a_started_item_with_no_job_yet_cannot_start_again() {
+        let connection = database();
+        add_item(&connection, "a", "working", "2026-11-01");
+        assert!(start_plan(&connection, "a").is_err());
     }
 
     #[test]
