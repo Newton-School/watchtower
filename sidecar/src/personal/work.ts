@@ -417,13 +417,8 @@ export async function startItemNow(deps: WorkDeps, action: PersonalAction): Prom
  */
 export function questionFrom(messages: string[]): string | undefined {
   for (const text of [...messages].reverse()) {
-    const at = text.search(/QUESTION\b:?/i);
-    if (at >= 0)
-      return text
-        .slice(at)
-        .replace(/^QUESTION\b:?\s*/i, '')
-        .trim()
-        .slice(0, 1500);
+    const asked = /^\s*(?:#+\s*)?\**QUESTION\b\**:?\**\s*(.*)/ims.exec(text);
+    if (asked?.[1]?.trim()) return asked[1].trim().slice(0, 1500);
   }
   return messages.at(-1)?.slice(0, 1500);
 }
@@ -437,8 +432,9 @@ async function lastBotMessage(deps: WorkDeps, channel: string, ts: string, upTo?
       limit: 100,
       ...(upTo ? { latest: upTo, inclusive: true } : {}),
     });
+    // The thread starts with the job's own prompt, which miniOG posted but didn't say to him.
     const messages = (replies.messages ?? []).filter(
-      message => message.user === deps.config.botUserId || message.bot_id,
+      message => message.ts !== ts && (message.user === deps.config.botUserId || message.bot_id),
     );
     return questionFrom(messages.map(message => message.text ?? ''));
   } catch {

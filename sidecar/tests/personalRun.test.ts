@@ -973,6 +973,9 @@ describe('what a My day job is asked to do', () => {
     expect(questionFrom(['On it.', '*Plan* (scope: medium)\nQUESTION: a or b?', gate])).toBe('a or b?');
     expect(questionFrom(['On it.', 'Which repo is this for?'])).toBe('Which repo is this for?');
     expect(questionFrom([])).toBeUndefined();
+    const mention = 'If this needs a decision, start your plan with the line "QUESTION:" and the question.';
+    expect(questionFrom([mention])).toBe(mention);
+    expect(questionFrom(['**QUESTION:** a or b?'])).toBe('a or b?');
   });
 
   it('follows the job of the kind it asked for, not a later chat in the thread', () => {
