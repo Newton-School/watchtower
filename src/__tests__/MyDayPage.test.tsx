@@ -24,6 +24,10 @@ function item(overrides: Partial<MyDayItem>): MyDayItem {
     prUrls: ['https://github.com/o/newton-web/pull/9468'],
     jobId: null,
     sessionId: null,
+    ownerClosed: null,
+    draftStatus: null,
+    draftError: null,
+    prStates: {},
     firstSeenAt: '2026-11-01T00:00:00.000Z',
     ...overrides,
   };
@@ -48,7 +52,8 @@ describe('MyDayPage', () => {
     render(<MyDayPage />);
     expect(await screen.findByText('Review #9468')).toBeTruthy();
     expect(screen.getByText('Review the PR')).toBeTruthy();
-    expect(screen.getByRole('link', { name: 'Open in Slack' }).getAttribute('href')).toContain('/archives/C1/');
+    fireEvent.click(screen.getByRole('button', { name: 'Open in Slack' }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('open_my_day_in_slack', { key: 'slack:C1:1.2' }));
     expect(screen.getByRole('link', { name: 'newton-web#9468' })).toBeTruthy();
   });
 
@@ -104,11 +109,70 @@ describe('MyDayPage', () => {
     await screen.findByText("It hasn't run yet.");
     fireEvent.change(screen.getByLabelText('Window'), { target: { value: '3d' } });
     fireEvent.click(screen.getByRole('button', { name: 'Run now' }));
-    await waitFor(() => expect(invoke).toHaveBeenCalledWith('run_my_day_now', { span: '3d' }));
-    fireEvent.click(screen.getByRole('checkbox'));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('run_my_day_now', { span: '3d', prepareOnly: false }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /Run every night/ }));
     await waitFor(() =>
       expect(invoke).toHaveBeenCalledWith('save_my_day_schedule', { enabled: true, runTime: '22:00' }),
     );
+  });
+
+  it('shows whether each PR is open or merged', async () => {
+    const url = 'https://github.com/o/newton-web/pull/9468';
+    serve(day({ items: [item({ prStates: { [url]: 'merged' } })] }));
+    render(<MyDayPage />);
+    expect(await screen.findByRole('link', { name: 'newton-web#9468 · merged' })).toBeTruthy();
+  });
+
+  it('says where a reply went, or why it could not be saved', async () => {
+    serve(
+      day({
+        items: [
+          item({ key: 'a', state: 'ready', replyText: 'One', draftStatus: 'saved' }),
+          item({
+            key: 'b',
+            state: 'ready',
+            replyText: 'Two',
+            draftStatus: 'failed',
+            draftError: 'attached_draft_exists',
+          }),
+        ],
+      }),
+    );
+    render(<MyDayPage />);
+    fireEvent.click(await screen.findByRole('button', { name: /Ready to send/ }));
+    expect(screen.getByText(/Saved as a draft in that thread/)).toBeTruthy();
+    expect(screen.getByText(/attached_draft_exists/)).toBeTruthy();
+  });
+
+  it('skips and marks done, reloads, and only offers Reopen for what he closed', async () => {
+    serve(
+      day({
+        items: [
+          item({ key: 'open', ask: 'still open' }),
+          item({ key: 'his', ask: 'he closed', state: 'done', ownerClosed: 'skipped' }),
+          item({ key: 'run', ask: 'the run closed', state: 'done' }),
+        ],
+      }),
+    );
+    render(<MyDayPage />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Skip' }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('close_my_day_item', { key: 'open', how: 'skipped' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Mark done' }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('close_my_day_item', { key: 'open', how: 'done' }));
+    fireEvent.click(screen.getByRole('button', { name: /^Done/ }));
+    expect(await screen.findByText('You skipped this.')).toBeTruthy();
+    expect(screen.getAllByRole('button', { name: 'Reopen' })).toHaveLength(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Reopen' }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('close_my_day_item', { key: 'his', how: 'reopen' }));
+  });
+
+  it('sends Prepare only with Run now', async () => {
+    serve(day());
+    render(<MyDayPage />);
+    await screen.findByText("It hasn't run yet.");
+    fireEvent.click(screen.getByRole('checkbox', { name: /Prepare/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Run now' }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('run_my_day_now', { span: null, prepareOnly: true }));
   });
 
   it('saves a new run time on leaving the field, not while typing', async () => {

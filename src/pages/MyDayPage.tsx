@@ -62,7 +62,28 @@ function Line({ label, children }: { label: string; children: ReactNode }) {
   );
 }
 
-export function MyDayRow({ item, onError }: { item: MyDayItem; onError: (message: string) => void }) {
+function ReplyStatus({ item }: { item: MyDayItem }) {
+  if (item.draftStatus === 'saved')
+    return <p className="muted">Saved as a draft in that thread. Send it from Slack.</p>;
+  if (item.draftStatus === 'failed') {
+    return (
+      <p className="my-day-draft-failed">
+        Couldn't save the draft: {item.draftError ?? 'unknown error'}. Copy it instead.
+      </p>
+    );
+  }
+  return null;
+}
+
+export function MyDayRow({
+  item,
+  onChanged,
+  onError,
+}: {
+  item: MyDayItem;
+  onChanged: () => void;
+  onError: (message: string) => void;
+}) {
   const [copied, setCopied] = useState(false);
 
   const copyReply = async () => {
@@ -76,9 +97,10 @@ export function MyDayRow({ item, onError }: { item: MyDayItem; onError: (message
     }
   };
 
-  const resume = async () => {
+  const call = async (command: string, args: Record<string, unknown>, changes = false) => {
     try {
-      await invoke('resume_my_day_session', { key: item.key });
+      await invoke(command, args);
+      if (changes) onChanged();
     } catch (err) {
       onError(String(err));
     }
@@ -88,6 +110,7 @@ export function MyDayRow({ item, onError }: { item: MyDayItem; onError: (message
   const heading = isSession
     ? 'Claude session'
     : [item.asker, item.channelName, item.askedAt].filter(Boolean).join(' · ') || 'GitHub';
+  const isOpen = item.state !== 'done';
 
   return (
     <article className="my-day-item">
@@ -95,29 +118,69 @@ export function MyDayRow({ item, onError }: { item: MyDayItem; onError: (message
         <strong>{heading}</strong>
         <div className="my-day-actions">
           {item.permalink ? (
-            <a className="ghost-button" href={item.permalink} target="_blank" rel="noopener noreferrer">
+            <button
+              className="ghost-button"
+              type="button"
+              onClick={() => void call('open_my_day_in_slack', { key: item.key })}
+            >
               Open in Slack
-            </a>
+            </button>
           ) : null}
           {item.prUrls.map(url => (
             <a key={url} className="ghost-button" href={url} target="_blank" rel="noopener noreferrer">
               {prLabel(url)}
+              {item.prStates[url] ? ` · ${item.prStates[url]}` : ''}
             </a>
           ))}
-          {item.sessionId ? (
-            <button className="ghost-button" type="button" onClick={() => void resume()}>
+          {item.sessionId && isOpen ? (
+            <button
+              className="ghost-button"
+              type="button"
+              onClick={() => void call('resume_my_day_session', { key: item.key })}
+            >
               Resume
+            </button>
+          ) : null}
+          {isOpen ? (
+            <>
+              <button
+                className="ghost-button"
+                type="button"
+                onClick={() => void call('close_my_day_item', { key: item.key, how: 'done' }, true)}
+              >
+                Mark done
+              </button>
+              <button
+                className="ghost-button"
+                type="button"
+                onClick={() => void call('close_my_day_item', { key: item.key, how: 'skipped' }, true)}
+              >
+                Skip
+              </button>
+            </>
+          ) : null}
+          {item.ownerClosed ? (
+            <button
+              className="ghost-button"
+              type="button"
+              onClick={() => void call('close_my_day_item', { key: item.key, how: 'reopen' }, true)}
+            >
+              Reopen
             </button>
           ) : null}
         </div>
       </header>
       <Line label={isSession ? 'Session' : 'Asked'}>{item.ask}</Line>
+      {item.ownerClosed ? (
+        <Line label="Closed">{item.ownerClosed === 'skipped' ? 'You skipped this.' : 'You marked this done.'}</Line>
+      ) : null}
       {item.doneSummary ? <Line label={isSession ? 'Left' : 'Done'}>{item.doneSummary}</Line> : null}
-      {item.nextStep ? <Line label="Next">{item.nextStep}</Line> : null}
+      {item.nextStep && isOpen ? <Line label="Next">{item.nextStep}</Line> : null}
       {item.state === 'waiting' && item.evidence ? <Line label="Waiting">{item.evidence}</Line> : null}
       {item.replyText ? (
         <Line label="Reply">
           <p className="my-day-reply">{item.replyText}</p>
+          <ReplyStatus item={item} />
           <button className="ghost-button" type="button" onClick={() => void copyReply()}>
             {copied ? 'Copied' : 'Copy reply'}
           </button>
@@ -132,6 +195,7 @@ export function MyDayPage() {
   const [tab, setTab] = useState<TabId>('needs_you');
   const [error, setError] = useState<string | null>(null);
   const [span, setSpan] = useState('');
+  const [prepareOnly, setPrepareOnly] = useState(false);
   // Saved on leaving the field: typing passes through times that aren't the one meant.
   const [runTimeDraft, setRunTimeDraft] = useState<string | null>(null);
 
@@ -162,7 +226,7 @@ export function MyDayPage() {
   const runNow = async () => {
     setError(null);
     try {
-      await invoke('run_my_day_now', { span: span.trim() || null });
+      await invoke('run_my_day_now', { span: span.trim() || null, prepareOnly });
       await load();
     } catch (err) {
       setError(String(err));
@@ -186,7 +250,7 @@ export function MyDayPage() {
       <PageIntro
         eyebrow="Personal"
         title="My day"
-        description="What was asked of you that neither you nor miniOG finished. For now this only reads: nothing goes to Slack or GitHub."
+        description="What was asked of you that neither you nor miniOG finished. Replies are saved as Slack drafts for you to send: nothing is sent for you."
       />
 
       {error ? <div className="my-day-error">{error}</div> : null}
@@ -222,6 +286,10 @@ export function MyDayPage() {
             value={span}
             onChange={event => setSpan(event.target.value)}
           />
+          <label>
+            <input type="checkbox" checked={prepareOnly} onChange={event => setPrepareOnly(event.target.checked)} />{' '}
+            Prepare only
+          </label>
           <button className="primary-button" type="button" disabled={running} onClick={() => void runNow()}>
             Run now
           </button>
@@ -236,7 +304,7 @@ export function MyDayPage() {
       ) : (
         <div className="my-day-list">
           {shown.map(item => (
-            <MyDayRow key={item.key} item={item} onError={setError} />
+            <MyDayRow key={item.key} item={item} onChanged={() => void load()} onError={setError} />
           ))}
         </div>
       )}

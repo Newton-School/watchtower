@@ -12,7 +12,9 @@ import type { JobStore } from '../state/jobStore.js';
 import { spendKey, type PersonalAction, type PersonalRun } from '../state/personalStore.js';
 import { agentCallContext } from '../state/runContext.js';
 import type { AppConfig, WorkflowStepLog } from '../types/contracts.js';
+import { buildDraftPrompt, draftTarget, parseDraftReply, type DraftTarget } from './drafts.js';
 import { collectGithubInventory } from './githubInventory.js';
+import { fetchPrStates } from './prStates.js';
 import { isRunDue, runWindow } from './schedule.js';
 import { findUnfinishedSessions } from './sessions.js';
 import { standDownForMiniog } from './standDown.js';
@@ -27,11 +29,14 @@ import { buildTriagePrompt, parseTriageReply, toPersonalItem } from './triage.js
 export const PERSONAL_ENABLED_KEY = 'personal.enabled';
 export const PERSONAL_ENABLED_AT_KEY = 'personal.enabled_at';
 export const PERSONAL_RUN_TIME_KEY = 'personal.run_time';
+/** The workspace's id, which the app needs to open the Slack app on a thread. */
+export const PERSONAL_TEAM_ID_KEY = 'personal.team_id';
 
 const SESSION_KEY_PREFIX = 'session:';
 const TICK_MS = 15_000;
 /** The agent reads dozens of threads one call at a time, and a three-day window is slow. */
 const TRIAGE_TIMEOUT_MS = 90 * 60 * 1000;
+const DRAFT_TIMEOUT_MS = 20 * 60 * 1000;
 
 export interface NightlyRunDeps {
   store: JobStore;
@@ -60,6 +65,11 @@ async function ownerNames(deps: NightlyRunDeps, ownerId: string): Promise<string
   } catch {
     return [];
   }
+}
+
+async function rememberTeamId(deps: NightlyRunDeps): Promise<void> {
+  const auth = await deps.webClient.auth.test().catch(() => undefined);
+  if (auth?.team_id) deps.store.setState(PERSONAL_TEAM_ID_KEY, auth.team_id);
 }
 
 async function collectSessions(deps: NightlyRunDeps, run: PersonalRun): Promise<void> {
@@ -162,10 +172,66 @@ async function triage(deps: NightlyRunDeps, run: PersonalRun, result: RunGaps): 
   }
 }
 
+/** Each open item's PRs, looked up. A lookup that fails only leaves that PR without a state. */
+async function refreshPrStates(deps: NightlyRunDeps): Promise<void> {
+  const personal = deps.store.personalStore();
+  const items = personal.openItems().filter(item => item.prUrls.length > 0);
+  if (items.length === 0) return;
+  const states = await fetchPrStates({
+    urls: items.flatMap(item => item.prUrls),
+    githubToken: await resolveGithubTokenForCodex(),
+  });
+  for (const item of items) {
+    const known = item.prUrls.filter(url => states[url]).map(url => [url, states[url]]);
+    personal.setPrStates(item.key, Object.fromEntries(known) as Record<string, string>);
+  }
+}
+
+/**
+ * Saves the night's replies as Slack drafts, once the facts are final. A failure
+ * here costs a draft, which the inbox still shows to copy, not the night's work.
+ */
+async function saveDrafts(deps: NightlyRunDeps, run: PersonalRun, result: RunGaps): Promise<void> {
+  const personal = deps.store.personalStore();
+  const targets = personal
+    .repliesToDraft()
+    .map(item => draftTarget(item))
+    .filter((target): target is DraftTarget => Boolean(target));
+  if (targets.length === 0) return;
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'watchtower-my-day-'));
+  try {
+    const agent = await agentCallContext.run({ jobId: spendKey(run.id), store: deps.store }, () =>
+      runClaudeAgentic({
+        systemPrompt: buildDraftPrompt(targets),
+        userMessage: 'Save the drafts now and reply with the JSON.',
+        cwd,
+        forceBackend: 'claude-code',
+        tier: 'light',
+        timeoutMs: DRAFT_TIMEOUT_MS,
+        personalSlack: 'draft',
+        doing: 'saving your drafts',
+        logStep: logStepToLogger,
+      }),
+    );
+    const results = parseDraftReply(agent.ok ? agent.reply : '', targets);
+    for (const draft of results) {
+      personal.setDraftResult(draft.key, {
+        status: draft.status,
+        error: draft.status === 'failed' ? (draft.error ?? agent.error) : undefined,
+      });
+    }
+    const failed = results.filter(draft => draft.status === 'failed').length;
+    if (failed > 0)
+      result.gaps.push(`${failed} of ${results.length} drafts couldn't be saved. Copy them from the inbox.`);
+  } finally {
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+}
+
 /** One run start to finish. Never throws: a failure is recorded and told to the owner. */
 export async function runNightly(
   deps: NightlyRunDeps,
-  params: { trigger: PersonalRun['trigger']; span?: string; now?: Date },
+  params: { trigger: PersonalRun['trigger']; span?: string; prepareOnly?: boolean; now?: Date },
 ): Promise<PersonalRun> {
   const personal = deps.store.personalStore();
   const now = params.now ?? new Date();
@@ -185,7 +251,16 @@ export async function runNightly(
     await collectSessions(deps, run).catch(error => {
       result.gaps.push(`Claude sessions couldn't be checked: ${String(error)}`);
     });
+    await rememberTeamId(deps);
     await triage(deps, run, result);
+    await refreshPrStates(deps).catch(error => {
+      result.gaps.push(`PR states couldn't be checked: ${String(error)}`);
+    });
+    if (!params.prepareOnly) {
+      await saveDrafts(deps, run, result).catch(error => {
+        result.gaps.push(`Drafts couldn't be saved: ${String(error)}`);
+      });
+    }
   } catch (error) {
     failure = error instanceof Error ? error.message : String(error);
   } finally {
@@ -210,7 +285,7 @@ export function startNightlyRuns(deps: NightlyRunDeps): void {
   personal.failInterruptedRuns('Watchtower restarted during the run.');
   let running = false;
 
-  const start = (params: { trigger: PersonalRun['trigger']; span?: string }) => {
+  const start = (params: { trigger: PersonalRun['trigger']; span?: string; prepareOnly?: boolean }) => {
     running = true;
     void runNightly(deps, params)
       .catch(error => logger.error({ error: String(error) }, 'my day: run crashed'))
@@ -225,7 +300,7 @@ export function startNightlyRuns(deps: NightlyRunDeps): void {
       const actions: PersonalAction[] = personal.takeActions();
       const runNow = actions.find(action => action.kind === 'run_now');
       if (runNow) {
-        start({ trigger: 'manual', span: runNow.span });
+        start({ trigger: 'manual', span: runNow.span, prepareOnly: runNow.prepareOnly });
         return;
       }
       const due = isRunDue({

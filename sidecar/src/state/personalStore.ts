@@ -5,6 +5,7 @@ import type Database from 'better-sqlite3';
 export type PersonalItemState = 'needs_you' | 'ready' | 'waiting' | 'done';
 export type PersonalItemSource = 'slack' | 'github' | 'session';
 export type PersonalRunStatus = 'RUNNING' | 'OK' | 'PARTIAL' | 'FAILED';
+export type DraftStatus = 'saved' | 'failed';
 
 export interface PersonalItem {
   /** Stable from night to night: how a later run recognises the same ask. */
@@ -28,12 +29,20 @@ export interface PersonalItem {
   jobId?: string;
   sessionId?: string;
   sessionCwd?: string;
+  /** He closed it himself: `skipped` or `done`. A later run leaves it closed. */
+  ownerClosed?: string;
+  draftStatus?: DraftStatus;
+  draftError?: string;
+  prStates: Record<string, string>;
   firstSeenAt: string;
   lastSeenAt: string;
   lastRunId: string;
 }
 
-export type PersonalItemInput = Omit<PersonalItem, 'firstSeenAt' | 'lastSeenAt'>;
+export type PersonalItemInput = Omit<
+  PersonalItem,
+  'firstSeenAt' | 'lastSeenAt' | 'ownerClosed' | 'draftStatus' | 'draftError' | 'prStates'
+>;
 
 export interface PersonalRun {
   id: string;
@@ -53,6 +62,8 @@ export interface PersonalAction {
   kind: 'run_now';
   /** For run_now: `3d` or a date, or nothing for "since the last run". */
   span?: string;
+  /** For run_now: work everything out, and leave Slack untouched. */
+  prepareOnly: boolean;
 }
 
 /** A miniOG run, as far as deciding whether it already handled an ask. */
@@ -83,6 +94,10 @@ export interface PersonalStore {
   closeItem(key: string, runId: string, doneSummary: string): void;
   openItems(): PersonalItem[];
   openSessionKeys(): string[];
+  /** Replies waiting to be saved as drafts: a saved one is never saved twice. */
+  repliesToDraft(): PersonalItem[];
+  setDraftResult(key: string, result: { status: DraftStatus; error?: string }): void;
+  setPrStates(key: string, states: Record<string, string>): void;
   takeActions(): PersonalAction[];
   jobsSince(iso: string): MiniogJob[];
   /** However old: a carried item's run may be from before this window. */
@@ -116,6 +131,10 @@ interface ItemRow {
   job_id: string | null;
   session_id: string | null;
   session_cwd: string | null;
+  owner_closed: string | null;
+  draft_status: DraftStatus | null;
+  draft_error: string | null;
+  pr_states_json: string;
   first_seen_at: string;
   last_seen_at: string;
   last_run_id: string;
@@ -169,6 +188,15 @@ function parseStrings(json: string): string[] {
   }
 }
 
+function parseStates(json: string): Record<string, string> {
+  try {
+    const value: unknown = JSON.parse(json);
+    return value && typeof value === 'object' ? (value as Record<string, string>) : {};
+  } catch {
+    return {};
+  }
+}
+
 function toItem(row: ItemRow): PersonalItem {
   return {
     key: row.item_key,
@@ -190,6 +218,10 @@ function toItem(row: ItemRow): PersonalItem {
     jobId: row.job_id ?? undefined,
     sessionId: row.session_id ?? undefined,
     sessionCwd: row.session_cwd ?? undefined,
+    ownerClosed: row.owner_closed ?? undefined,
+    draftStatus: row.draft_status ?? undefined,
+    draftError: row.draft_error ?? undefined,
+    prStates: parseStates(row.pr_states_json),
     firstSeenAt: row.first_seen_at,
     lastSeenAt: row.last_seen_at,
     lastRunId: row.last_run_id,
@@ -224,7 +256,8 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
     )
     ON CONFLICT(item_key) DO UPDATE SET
       source = excluded.source,
-      state = excluded.state,
+      -- What he closed himself stays closed, and a saved draft's text stays what Slack holds.
+      state = CASE WHEN personal_items.owner_closed IS NOT NULL THEN personal_items.state ELSE excluded.state END,
       channel_id = excluded.channel_id,
       channel_name = excluded.channel_name,
       thread_ts = excluded.thread_ts,
@@ -234,7 +267,7 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
       asked_at = excluded.asked_at,
       ask = excluded.ask,
       done_summary = excluded.done_summary,
-      reply_text = excluded.reply_text,
+      reply_text = CASE WHEN personal_items.draft_status = 'saved' THEN personal_items.reply_text ELSE excluded.reply_text END,
       next_step = excluded.next_step,
       evidence = excluded.evidence,
       pr_urls_json = excluded.pr_urls_json,
@@ -337,14 +370,45 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
       return rows.map(row => row.item_key);
     },
 
+    repliesToDraft() {
+      const rows = db
+        .prepare(
+          `SELECT * FROM personal_items
+            WHERE state = 'ready' AND source = 'slack' AND owner_closed IS NULL
+              AND reply_text IS NOT NULL AND COALESCE(draft_status, '') != 'saved'
+            ORDER BY first_seen_at`,
+        )
+        .all() as ItemRow[];
+      return rows.map(toItem);
+    },
+
+    setDraftResult(key, { status, error }) {
+      db.prepare(`UPDATE personal_items SET draft_status = ?, draft_error = ? WHERE item_key = ?`).run(
+        status,
+        error ?? null,
+        key,
+      );
+    },
+
+    setPrStates(key, states) {
+      db.prepare(`UPDATE personal_items SET pr_states_json = ? WHERE item_key = ?`).run(JSON.stringify(states), key);
+    },
+
     takeActions() {
       return db.transaction(() => {
         const rows = db
-          .prepare(`SELECT id, kind, span FROM personal_actions WHERE taken_at IS NULL ORDER BY created_at`)
-          .all() as Array<{ id: string; kind: PersonalAction['kind']; span: string | null }>;
+          .prepare(
+            `SELECT id, kind, span, prepare_only FROM personal_actions WHERE taken_at IS NULL ORDER BY created_at`,
+          )
+          .all() as Array<{ id: string; kind: PersonalAction['kind']; span: string | null; prepare_only: number }>;
         const mark = db.prepare(`UPDATE personal_actions SET taken_at = ? WHERE id = ?`);
         for (const row of rows) mark.run(new Date().toISOString(), row.id);
-        return rows.map(row => ({ id: row.id, kind: row.kind, span: row.span ?? undefined }));
+        return rows.map(row => ({
+          id: row.id,
+          kind: row.kind,
+          span: row.span ?? undefined,
+          prepareOnly: row.prepare_only === 1,
+        }));
       })();
     },
 

@@ -36,9 +36,10 @@ const SLACK_READ_TOOLS = [
   'slack_read_file',
 ];
 
+const SLACK_DRAFT_TOOL = 'slack_send_message_draft';
+
 const SLACK_WRITE_TOOLS = [
   'slack_send_message',
-  'slack_send_message_draft',
   'slack_schedule_message',
   'slack_add_reaction',
   'slack_create_canvas',
@@ -73,17 +74,23 @@ function forEachServer(tools: string[]): string[] {
   return SLACK_SERVERS.flatMap(server => tools.map(tool => `${server}__${tool}`));
 }
 
-/** The whole permission setup of a run that reads the owner's Slack and can do nothing else. */
-export function personalSlackReadArgs(): string[] {
+/**
+ * The whole permission setup of a run on the owner's Slack that can do nothing
+ * else. `read` reads it. `draft` can only save drafts, which he sends himself,
+ * and is denied every other write. Neither can ever send a message as him.
+ */
+export function personalSlackArgs(mode: 'read' | 'draft'): string[] {
+  const allowed = mode === 'read' ? SLACK_READ_TOOLS : [SLACK_DRAFT_TOOL];
+  const deniedWrites = mode === 'read' ? [SLACK_DRAFT_TOOL, ...SLACK_WRITE_TOOLS] : SLACK_WRITE_TOOLS;
   return [
     '--permission-mode',
     'dontAsk',
     '--allowedTools',
     'ToolSearch',
-    ...forEachServer(SLACK_READ_TOOLS),
+    ...forEachServer(allowed),
     '--disallowedTools',
     ...BUILT_IN_TOOLS,
-    ...forEachServer(SLACK_WRITE_TOOLS),
+    ...forEachServer(deniedWrites),
   ];
 }
 
@@ -101,7 +108,7 @@ export function settingsProblem(settingsPath: string): string | undefined {
     return undefined;
   }
   if (!Array.isArray(allow)) return undefined;
-  const readTools = new Set(forEachServer(SLACK_READ_TOOLS));
+  const readTools = new Set(forEachServer([...SLACK_READ_TOOLS, SLACK_DRAFT_TOOL]));
   const wider = allow.filter(
     (rule): rule is string =>
       typeof rule === 'string' && (rule === '*' || rule.startsWith('mcp__')) && !readTools.has(rule),

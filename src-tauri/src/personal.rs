@@ -17,6 +17,7 @@ use crate::AppState;
 const ENABLED_KEY: &str = "personal.enabled";
 const ENABLED_AT_KEY: &str = "personal.enabled_at";
 const RUN_TIME_KEY: &str = "personal.run_time";
+const TEAM_ID_KEY: &str = "personal.team_id";
 const DEFAULT_RUN_TIME: &str = "22:00";
 /// Done items older than this drop off the inbox; the rows stay.
 const DONE_ITEM_DAYS: i64 = 7;
@@ -25,6 +26,10 @@ const DONE_ITEM_DAYS: i64 = 7;
 #[serde(rename_all = "camelCase")]
 pub struct MyDayItem {
     pub key: String,
+    pub owner_closed: Option<String>,
+    pub draft_status: Option<String>,
+    pub draft_error: Option<String>,
+    pub pr_states: std::collections::HashMap<String, String>,
     pub source: String,
     pub state: String,
     pub channel_name: Option<String>,
@@ -74,7 +79,8 @@ fn ensure_tables(connection: &Connection) -> Result<(), String> {
                key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS personal_actions (
-               id TEXT PRIMARY KEY, kind TEXT NOT NULL, span TEXT, created_at TEXT NOT NULL, taken_at TEXT
+               id TEXT PRIMARY KEY, kind TEXT NOT NULL, span TEXT, prepare_only INTEGER NOT NULL DEFAULT 0,
+               created_at TEXT NOT NULL, taken_at TEXT
              );",
         )
         .map_err(|err| format!("db schema failed: {err}"))
@@ -133,7 +139,8 @@ fn read_items(
     let mut statement = connection
         .prepare(
             "SELECT item_key, source, state, channel_name, permalink, asker, asked_at, ask, done_summary,
-                    reply_text, next_step, evidence, pr_urls_json, job_id, session_id, first_seen_at
+                    reply_text, next_step, evidence, pr_urls_json, job_id, session_id, first_seen_at,
+                    owner_closed, draft_status, draft_error, pr_states_json
                FROM personal_items
               WHERE state != 'done' OR last_seen_at >= ?1
               ORDER BY first_seen_at DESC",
@@ -158,6 +165,10 @@ fn read_items(
                 job_id: row.get(13)?,
                 session_id: row.get(14)?,
                 first_seen_at: row.get(15)?,
+                owner_closed: row.get(16)?,
+                draft_status: row.get(17)?,
+                draft_error: row.get(18)?,
+                pr_states: serde_json::from_str(&row.get::<_, String>(19)?).unwrap_or_default(),
             })
         })
         .map_err(|err| format!("db read failed: {err}"))?;
@@ -274,7 +285,12 @@ fn is_span(value: &str) -> bool {
     days || (value.len() == 10 && chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok())
 }
 
-fn queue_run(connection: &Connection, span: Option<&str>, now: &str) -> Result<(), String> {
+fn queue_run(
+    connection: &Connection,
+    span: Option<&str>,
+    prepare_only: bool,
+    now: &str,
+) -> Result<(), String> {
     if let Some(span) = span {
         if !is_span(span) {
             return Err(format!("{span} isn't a window like 3d or 2026-10-28"));
@@ -283,10 +299,10 @@ fn queue_run(connection: &Connection, span: Option<&str>, now: &str) -> Result<(
     ensure_tables(connection)?;
     connection
         .execute(
-            "INSERT INTO personal_actions(id, kind, span, created_at)
-             SELECT ?1, 'run_now', ?2, ?3
+            "INSERT INTO personal_actions(id, kind, span, prepare_only, created_at)
+             SELECT ?1, 'run_now', ?2, ?4, ?3
               WHERE NOT EXISTS (SELECT 1 FROM personal_actions WHERE kind = 'run_now' AND taken_at IS NULL)",
-            params![uuid::Uuid::new_v4().to_string(), span, now],
+            params![uuid::Uuid::new_v4().to_string(), span, now, prepare_only as i64],
         )
         .map(|_| ())
         .map_err(|err| format!("db write failed: {err}"))
@@ -324,6 +340,90 @@ fn session_of(connection: &Connection, key: &str) -> Result<(String, String), St
         .ok_or_else(|| "that session is no longer in the list".to_string())
 }
 
+/// Closes an item as he says, or reopens one he closed. A later run leaves what
+/// he closed alone. Only his own closing can be undone: a run's `done` has a reason.
+fn set_closed(connection: &Connection, key: &str, how: &str, now: &str) -> Result<(), String> {
+    let changed = match how {
+        "skipped" | "done" => connection.execute(
+            "UPDATE personal_items SET state = 'done', owner_closed = ?2, last_seen_at = ?3 WHERE item_key = ?1",
+            params![key, how, now],
+        ),
+        "reopen" => connection.execute(
+            "UPDATE personal_items SET state = 'needs_you', owner_closed = NULL, last_seen_at = ?2
+              WHERE item_key = ?1 AND owner_closed IS NOT NULL",
+            params![key, now],
+        ),
+        other => return Err(format!("{other} isn't something an item can be set to")),
+    }
+    .map_err(|err| format!("db write failed: {err}"))?;
+    if changed == 0 {
+        return Err("that item is no longer in the list".to_string());
+    }
+    Ok(())
+}
+
+fn is_slack_id(value: &str, first: &[u8]) -> bool {
+    value.len() >= 6
+        && first.contains(&value.as_bytes()[0])
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+fn is_slack_ts(value: &str) -> bool {
+    value.split_once('.').is_some_and(|(seconds, micros)| {
+        seconds.len() == 10
+            && (1..=6).contains(&micros.len())
+            && seconds
+                .bytes()
+                .chain(micros.bytes())
+                .all(|byte| byte.is_ascii_digit())
+    })
+}
+
+/// The Slack app's own link to a message. Built only from checked ids, so nothing
+/// that came out of a Slack message can choose what gets opened.
+fn slack_app_link(
+    team: &str,
+    channel: &str,
+    message: &str,
+    thread: Option<&str>,
+) -> Option<String> {
+    if !is_slack_id(team, b"TE") || !is_slack_id(channel, b"CDG") || !is_slack_ts(message) {
+        return None;
+    }
+    let mut link = format!("slack://channel?team={team}&id={channel}&message={message}");
+    if let Some(thread) = thread.filter(|thread| is_slack_ts(thread) && *thread != message) {
+        link.push_str(&format!("&thread_ts={thread}"));
+    }
+    Some(link)
+}
+
+fn item_links(
+    connection: &Connection,
+    key: &str,
+) -> Result<(Option<String>, Option<String>), String> {
+    let (channel, thread, message, permalink): (Option<String>, Option<String>, Option<String>, Option<String>) =
+        connection
+            .query_row(
+                "SELECT channel_id, thread_ts, message_ts, permalink FROM personal_items WHERE item_key = ?1",
+                params![key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|err| format!("db read failed: {err}"))?
+            .ok_or_else(|| "that item is no longer in the list".to_string())?;
+    let team = read_state(connection, TEAM_ID_KEY)?;
+    let target = message.as_deref().or(thread.as_deref());
+    let app = match (team.as_deref(), channel.as_deref(), target) {
+        (Some(team), Some(channel), Some(target)) => {
+            slack_app_link(team, channel, target, thread.as_deref())
+        }
+        _ => None,
+    };
+    Ok((app, permalink.filter(|link| link.starts_with("https://"))))
+}
+
 fn now_iso() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
@@ -352,6 +452,7 @@ pub(crate) async fn save_my_day_schedule(
 #[tauri::command]
 pub(crate) async fn run_my_day_now(
     span: Option<String>,
+    prepare_only: bool,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let connection =
@@ -359,8 +460,44 @@ pub(crate) async fn run_my_day_now(
     queue_run(
         &connection,
         span.as_deref().filter(|value| !value.is_empty()),
+        prepare_only,
         &now_iso(),
     )
+}
+
+#[tauri::command]
+pub(crate) async fn close_my_day_item(
+    key: String,
+    how: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let connection =
+        Connection::open(&*state.db_path).map_err(|err| format!("db open failed: {err}"))?;
+    set_closed(&connection, &key, &how, &now_iso())
+}
+
+/// Opens the Slack app on the item's message, or the web page if that fails.
+#[tauri::command]
+pub(crate) async fn open_my_day_in_slack(
+    key: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let connection = Connection::open_with_flags(
+        &*state.db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|err| format!("db open failed: {err}"))?;
+    let (app, web) = item_links(&connection, &key)?;
+    for link in [app, web].into_iter().flatten() {
+        let opened = Command::new("open")
+            .arg(&link)
+            .status()
+            .map(|status| status.success());
+        if matches!(opened, Ok(true)) {
+            return Ok(());
+        }
+    }
+    Err("Couldn't open that thread in Slack.".to_string())
 }
 
 #[tauri::command]
@@ -420,6 +557,8 @@ mod tests {
                  CREATE TABLE personal_items (item_key TEXT PRIMARY KEY, source TEXT, state TEXT, channel_name TEXT,
                    permalink TEXT, asker TEXT, asked_at TEXT, ask TEXT, done_summary TEXT, reply_text TEXT,
                    next_step TEXT, evidence TEXT, pr_urls_json TEXT, job_id TEXT, session_id TEXT, session_cwd TEXT,
+                   channel_id TEXT, thread_ts TEXT, message_ts TEXT, owner_closed TEXT, draft_status TEXT, draft_error TEXT,
+                   pr_states_json TEXT NOT NULL DEFAULT '{}',
                    first_seen_at TEXT, last_seen_at TEXT);
                  CREATE TABLE agent_calls (job_id TEXT, cost_usd REAL);",
             )
@@ -514,8 +653,8 @@ mod tests {
     #[test]
     fn queues_one_run_at_a_time_and_refuses_a_bad_window() {
         let connection = Connection::open_in_memory().expect("db");
-        queue_run(&connection, Some("3d"), "now").expect("first");
-        queue_run(&connection, None, "now").expect("second is ignored");
+        queue_run(&connection, Some("3d"), true, "now").expect("first");
+        queue_run(&connection, None, false, "now").expect("second is ignored");
         let count: i64 = connection
             .query_row("SELECT COUNT(*) FROM personal_actions", [], |row| {
                 row.get(0)
@@ -527,8 +666,14 @@ mod tests {
                 .expect("read")
                 .run_queued
         );
-        assert!(queue_run(&connection, Some("; rm -rf"), "now").is_err());
-        assert!(queue_run(&connection, Some("2026-10-28"), "now").is_ok());
+        let prepare_only: i64 = connection
+            .query_row("SELECT prepare_only FROM personal_actions", [], |row| {
+                row.get(0)
+            })
+            .expect("flag");
+        assert_eq!(prepare_only, 1);
+        assert!(queue_run(&connection, Some("; rm -rf"), false, "now").is_err());
+        assert!(queue_run(&connection, Some("2026-10-28"), false, "now").is_ok());
     }
 
     #[test]
@@ -558,6 +703,60 @@ mod tests {
         for bad in ["2026-13-45", "2026-02-31", "3", "d", "123d", "2026-1-1"] {
             assert!(!is_span(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn closing_and_reopening_an_item() {
+        let connection = database();
+        add_item(&connection, "a", "needs_you", "2026-11-01");
+        set_closed(&connection, "a", "skipped", "now").expect("skip");
+        let closed: (String, String) = connection
+            .query_row(
+                "SELECT state, owner_closed FROM personal_items WHERE item_key = 'a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(closed, ("done".to_string(), "skipped".to_string()));
+        set_closed(&connection, "a", "reopen", "now").expect("reopen");
+        let state: String = connection
+            .query_row(
+                "SELECT state FROM personal_items WHERE item_key = 'a'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row");
+        assert_eq!(state, "needs_you");
+        assert!(set_closed(&connection, "a", "nonsense", "now").is_err());
+        assert!(set_closed(&connection, "missing", "done", "now").is_err());
+    }
+
+    #[test]
+    fn reopen_leaves_what_a_run_closed() {
+        let connection = database();
+        add_item(&connection, "a", "done", "2026-11-01");
+        assert!(set_closed(&connection, "a", "reopen", "now").is_err());
+    }
+
+    #[test]
+    fn slack_links_are_built_only_from_checked_ids() {
+        assert_eq!(
+            slack_app_link("T01ABCDEF", "C01ABCDEF", "1793000500.000200", Some("1793000000.000100")).as_deref(),
+            Some("slack://channel?team=T01ABCDEF&id=C01ABCDEF&message=1793000500.000200&thread_ts=1793000000.000100")
+        );
+        assert_eq!(
+            slack_app_link(
+                "T01ABCDEF",
+                "D01ABCDEF",
+                "1793000500.000200",
+                Some("1793000500.000200")
+            )
+            .as_deref(),
+            Some("slack://channel?team=T01ABCDEF&id=D01ABCDEF&message=1793000500.000200")
+        );
+        assert!(slack_app_link("T01ABCDEF", "C01&evil=1", "1793000500.000200", None).is_none());
+        assert!(slack_app_link("x", "C01ABCDEF", "1793000500.000200", None).is_none());
+        assert!(slack_app_link("T01ABCDEF", "C01ABCDEF", "not-a-ts", None).is_none());
     }
 
     #[test]

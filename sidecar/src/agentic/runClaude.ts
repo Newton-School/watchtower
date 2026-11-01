@@ -74,8 +74,8 @@ export interface RunClaudeAgenticRequest {
   doing?: string;
   /** The run only reads: no bypassed permissions, an allow-list instead (issue #443). */
   readOnly?: boolean;
-  /** The run reads the owner's own Slack and can do nothing else (`backends/personalSlack.ts`). */
-  personalSlack?: 'read';
+  /** The run touches the owner's own Slack and can do nothing else (`backends/personalSlack.ts`). */
+  personalSlack?: 'read' | 'draft';
   /** False for a run the shell sandbox breaks, such as browser QA (issue #445). */
   sandbox?: boolean;
 }

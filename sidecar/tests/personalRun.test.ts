@@ -7,7 +7,9 @@ import { describe, expect, it } from 'vitest';
 import { claudeCodeBackend, claudePermissionMode } from '../src/backends/claudeCodeBackend.js';
 import { settingsProblem } from '../src/backends/personalSlack.js';
 import { reportsConnectors } from '../src/codex/runCodex.js';
+import { draftTarget, parseDraftReply } from '../src/personal/drafts.js';
 import { ownPrAsks } from '../src/personal/githubInventory.js';
+import { fetchPrStates } from '../src/personal/prStates.js';
 import { isRunDue, latestRunTime, runWindow } from '../src/personal/schedule.js';
 import { dirtyPaths, findUnfinishedSessions, readSession, unfinishedReasons } from '../src/personal/sessions.js';
 import { standDownForMiniog } from '../src/personal/standDown.js';
@@ -78,6 +80,93 @@ describe('the Slack triage agent can only read Slack', () => {
   it('leaves every other run on strict MCP', () => {
     const other = claudeCodeBackend.buildArgs({ cwd: tempDir(), prompt: 'x' }, path.join(tempDir(), 'out.json'));
     expect(other).toContain('--strict-mcp-config');
+  });
+});
+
+describe('the draft agent can only save drafts', () => {
+  const args = claudeCodeBackend.buildArgs(
+    { cwd: tempDir(), prompt: 'draft', personalSlack: 'draft' },
+    path.join(tempDir(), 'out.json'),
+  );
+  const flagValues = (flag: string): string[] => {
+    const start = args.indexOf(flag);
+    if (start < 0) return [];
+    const end = args.findIndex((arg, index) => index > start && arg.startsWith('--'));
+    return args.slice(start + 1, end < 0 ? undefined : end);
+  };
+
+  it('allows only the draft tool, beside the tool that loads it', () => {
+    expect(flagValues('--allowedTools').sort()).toEqual(
+      [
+        'ToolSearch',
+        'mcp__claude_ai_Slack__slack_send_message_draft',
+        'mcp__plugin_slack_slack__slack_send_message_draft',
+      ].sort(),
+    );
+    expect(args).not.toContain('--dangerously-skip-permissions');
+  });
+
+  it('denies sending as him by rule, and the shell', () => {
+    const denied = flagValues('--disallowedTools');
+    expect(denied).toContain('Bash');
+    expect(denied).toContain('mcp__claude_ai_Slack__slack_send_message');
+    expect(denied).toContain('mcp__plugin_slack_slack__slack_send_message');
+    expect(denied).not.toContain('mcp__claude_ai_Slack__slack_send_message_draft');
+  });
+});
+
+describe('where a reply goes', () => {
+  const base = { key: 'k', replyText: 'Sure', messageTs: '1793000000.000100', threadTs: '1793000000.000100' };
+
+  it('goes under the message in a channel', () => {
+    expect(draftTarget({ ...base, channelId: 'C01ABCDEF' })).toEqual({
+      key: 'k',
+      channel_id: 'C01ABCDEF',
+      thread_ts: '1793000000.000100',
+      text: 'Sure',
+    });
+  });
+
+  it('goes top level in a DM, unless the ask was in a thread', () => {
+    expect(draftTarget({ ...base, channelId: 'D01ABCDEF' })?.thread_ts).toBeUndefined();
+    const inThread = { ...base, channelId: 'D01ABCDEF', messageTs: '1793000500.000200' };
+    expect(draftTarget(inThread)?.thread_ts).toBe('1793000000.000100');
+  });
+
+  it("drafts nothing to ids that aren't Slack's, or with no text", () => {
+    expect(draftTarget({ ...base, channelId: 'evil' })).toBeUndefined();
+    expect(draftTarget({ ...base, channelId: 'C01ABCDEF', threadTs: 'x', messageTs: undefined })).toBeUndefined();
+    expect(draftTarget({ ...base, channelId: 'C01ABCDEF', replyText: '  ' })).toBeUndefined();
+  });
+
+  it('counts a draft the agent did not report as failed', () => {
+    const targets = [
+      { key: 'a', channel_id: 'C01ABCDEF', text: 'x' },
+      { key: 'b', channel_id: 'C01ABCDEF', text: 'y' },
+    ];
+    const reply = JSON.stringify({ results: [{ key: 'a', status: 'saved' }] });
+    expect(parseDraftReply(reply, targets)).toEqual([
+      { key: 'a', status: 'saved', error: undefined },
+      { key: 'b', status: 'failed', error: 'The agent did not report on it.' },
+    ]);
+    expect(parseDraftReply('no json', targets).every(result => result.status === 'failed')).toBe(true);
+  });
+});
+
+describe('PR states', () => {
+  const respond = (body: unknown, ok = true) => ({ ok, json: async () => body }) as Response;
+
+  it('tells merged from closed, and leaves out what it could not read', async () => {
+    const fetcher = async (url: string | URL | Request) => {
+      const text = String(url);
+      if (text.endsWith('/1')) return respond({ state: 'closed', merged_at: '2026-11-01T00:00:00Z' });
+      if (text.endsWith('/2')) return respond({ state: 'closed', merged_at: null });
+      if (text.endsWith('/3')) return respond({ state: 'open', merged_at: null });
+      return respond({}, false);
+    };
+    const pr = (n: number) => `https://github.com/o/r/pull/${n}`;
+    const states = await fetchPrStates({ urls: [pr(1), pr(2), pr(3), pr(4), 'https://evil.example/pull/1'], fetcher });
+    expect(states).toEqual({ [pr(1)]: 'merged', [pr(2)]: 'closed', [pr(3)]: 'open' });
   });
 });
 
@@ -527,6 +616,33 @@ describe('the personal store', () => {
     const failed = personal.startRun({ ...window, windowEnd: '2026-11-03T00:00:00Z' });
     personal.finishRun(failed.id, { status: 'FAILED', error: 'boom' });
     expect(personal.lastFinishedRun()?.id).toBe(ok.id);
+  });
+
+  it('leaves what he closed closed, and a saved draft as Slack holds it', () => {
+    const job = new JobStore(path.join(tempDir(), 'watchtower.db'));
+    const personal = job.personalStore();
+    personal.upsertItem({ ...item, key: 'a' });
+    (job as unknown as { db: { exec(sql: string): void } }).db.exec(
+      `UPDATE personal_items SET state = 'done', owner_closed = 'skipped' WHERE item_key = 'a'`,
+    );
+    personal.upsertItem({ ...item, key: 'a', state: 'needs_you' });
+    expect(personal.openItems()).toEqual([]);
+
+    personal.upsertItem({ ...item, key: 'b', state: 'ready', replyText: 'first' });
+    expect(personal.repliesToDraft().map(reply => reply.key)).toEqual(['b']);
+    personal.setDraftResult('b', { status: 'saved' });
+    expect(personal.repliesToDraft()).toEqual([]);
+    personal.upsertItem({ ...item, key: 'b', state: 'ready', replyText: 'second' });
+    expect(personal.openItems()[0]).toMatchObject({ replyText: 'first', draftStatus: 'saved' });
+  });
+
+  it('tries a failed draft again, and remembers PR states', () => {
+    const personal = store();
+    personal.upsertItem({ ...item, key: 'b', state: 'ready', replyText: 'text' });
+    personal.setDraftResult('b', { status: 'failed', error: 'attached_draft_exists' });
+    expect(personal.repliesToDraft()[0]).toMatchObject({ draftError: 'attached_draft_exists' });
+    personal.setPrStates('b', { url: 'merged' });
+    expect(personal.openItems()[0].prStates).toEqual({ url: 'merged' });
   });
 
   it('closes a run a restart left running, so the next is not blocked', () => {
