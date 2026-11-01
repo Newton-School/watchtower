@@ -9,6 +9,7 @@ import {
   IntelligenceIcon,
   LaunchpadIcon,
   MenuIcon,
+  MyDayIcon,
   OverviewIcon,
   PerformanceIcon,
   RunsIcon,
@@ -47,6 +48,7 @@ export function AppShell({
 }: AppShellProps) {
   const navItems: NavItem[] = [
     { view: 'launchpad', label: 'Launchpad', icon: <LaunchpadIcon /> },
+    { view: 'myday', label: 'My day', icon: <MyDayIcon /> },
     { view: 'overview', label: 'Overview', icon: <OverviewIcon /> },
     {
       view: 'runs',

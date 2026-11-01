@@ -28,6 +28,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
+mod personal;
 mod run_controls;
 mod slack;
 mod ux_metrics;
@@ -593,6 +594,10 @@ pub fn run() {
             get_job_cost_summary,
             get_performance_overview,
             get_ux_metrics,
+            personal::get_my_day,
+            personal::save_my_day_schedule,
+            personal::run_my_day_now,
+            personal::resume_my_day_session,
             list_dossiers,
             get_dossier,
             save_dossier_field,

@@ -14,6 +14,7 @@ import {
 } from './launchpad/launchpadLifecycle.js';
 import { startLaunchpadRequestPoller, takeBackPostedAsk } from './launchpad/launchpadIntake.js';
 import { startAppAnswerPoller } from './launchpad/appAnswers.js';
+import { startNightlyRuns } from './personal/nightlyRun.js';
 import { logger } from './logging/logger.js';
 import { configureButtons } from './slack/buttonReplies.js';
 import { runPrFollowUp } from './workflows/prFollowUp.js';
@@ -2202,6 +2203,8 @@ async function main(): Promise<void> {
   startLaunchpadRequestPoller(launchpadIntake);
   // Answers from the app's thread view to a run waiting on a person.
   startAppAnswerPoller(launchpadIntake);
+  // My day's nightly run and the app's Run now.
+  startNightlyRuns({ store, config, webClient: client.webClient });
 }
 
 main().catch(error => {

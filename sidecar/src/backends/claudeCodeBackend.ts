@@ -5,6 +5,7 @@ import type { AgentBackend, AgentRunRequest, ParseOutputOptions, ParsedBackendOu
 import type { TokenUsage } from '../types/contracts.js';
 import { buildCodexPath, parseStructuredOutput } from './codexBackend.js';
 import { personalSkillDenyRules } from './personalSkills.js';
+import { personalSlackReadArgs } from './personalSlack.js';
 import {
   agentSandboxSettings,
   fileWriteDenyRules,
@@ -255,9 +256,10 @@ export const READ_ONLY_ALLOW_RULES = [
  * can be checked from its job log (issue #695).
  */
 export function claudePermissionMode(
-  request: Pick<AgentRunRequest, 'noTools' | 'planMode' | 'readOnly'>,
-): 'no-tools' | 'plan' | 'read-only' | 'bypass' {
+  request: Pick<AgentRunRequest, 'noTools' | 'planMode' | 'readOnly' | 'personalSlack'>,
+): 'no-tools' | 'plan' | 'read-only' | 'personal-slack' | 'bypass' {
   if (request.noTools) return 'no-tools';
+  if (request.personalSlack) return 'personal-slack';
   if (request.planMode) return 'plan';
   if (request.readOnly) return 'read-only';
   return 'bypass';
@@ -366,7 +368,12 @@ export const claudeCodeBackend: AgentBackend = {
     // and silently wins over `--permission-mode plan`, so passing both leaves the model
     // without the ExitPlanMode tool. Choose one or the other.
     const permissions = claudePermissionMode(request);
-    if (permissions === 'no-tools') {
+    const personalSlack = permissions === 'personal-slack';
+    if (personalSlack) {
+      // The owner's Slack only loads without strict MCP, so this run's limits are all
+      // in these flags, and none of the shared flags below apply to it.
+      args.push(...personalSlackReadArgs());
+    } else if (permissions === 'no-tools') {
       // A call that only returns text gets nothing to act with (issue #443).
       // Each flag removes what the others leave in: `--tools ""` the built-in
       // tools; strict MCP with an empty config every MCP server, the account's
@@ -388,8 +395,8 @@ export const claudeCodeBackend: AgentBackend = {
     // personal skills and commands (issue #443). `--disallowedTools` is
     // variadic, so it stays ahead of the flags below.
     // Shell commands run in the sandbox unless the run opts out (issue #445).
-    const sandboxed = !request.noTools && request.sandbox !== false && isAgentSandboxEnabled();
-    if (!request.noTools) {
+    const sandboxed = !request.noTools && !personalSlack && request.sandbox !== false && isAgentSandboxEnabled();
+    if (!request.noTools && !personalSlack) {
       args.push(
         '--disallowedTools',
         ...PROCESS_KILL_DENY_RULES,
@@ -439,7 +446,7 @@ export const claudeCodeBackend: AgentBackend = {
     // (set above in non-plan mode) auto-allows the listed servers' tools;
     // OAuth HTTP servers reuse the CLI's Keychain-cached token, which requires
     // HOME in buildEnv. `--mcp-config` is variadic, so a flag must follow it.
-    if (!request.noTools) {
+    if (!request.noTools && !personalSlack) {
       args.push('--mcp-config', mcpConfigArg(request.mcpServers ?? {}, outputPath), '--strict-mcp-config');
     }
     // Claude Code writes JSON to stdout when --output-format json is set.

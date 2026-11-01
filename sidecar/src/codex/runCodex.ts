@@ -469,7 +469,7 @@ export async function runAgent(rawRequest: CodexRunRequest, backend: AgentBacken
     try {
       emitSteps(decoder.push(text));
       // A connector that needs signing in again is the owner's to fix (issue #593).
-      const connectors = connectorsReported ? undefined : decoder.connectorStatuses();
+      const connectors = connectorsReported || !reportsConnectors(request) ? undefined : decoder.connectorStatuses();
       if (connectors) {
         connectorsReported = true;
         reportConnectorStatuses(connectors, agentCallContext.getStore()?.jobId);
@@ -805,6 +805,15 @@ async function stopWhatTheRunLeft(runId: string, request: CodexRunRequest, backe
       data: { error: String(error) },
     });
   }
+}
+
+/**
+ * A run names its connectors, so one it can't reach is worth telling the owner.
+ * A run on the owner's Slack loads all of his without using them: one he has
+ * signed out of, for his own reasons, says nothing about any run.
+ */
+export function reportsConnectors(request: Pick<CodexRunRequest, 'personalSlack'>): boolean {
+  return !request.personalSlack;
 }
 
 export async function runCodex(request: CodexRunRequest): Promise<CodexRunResult> {
