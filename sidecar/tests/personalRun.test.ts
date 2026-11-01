@@ -5,6 +5,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { describe, expect, it } from 'vitest';
 import { claudeCodeBackend, claudePermissionMode } from '../src/backends/claudeCodeBackend.js';
+import { settingsProblem } from '../src/backends/personalSlack.js';
 import { reportsConnectors } from '../src/codex/runCodex.js';
 import { ownPrAsks } from '../src/personal/githubInventory.js';
 import { isRunDue, latestRunTime, runWindow } from '../src/personal/schedule.js';
@@ -32,11 +33,16 @@ describe('the Slack triage agent can only read Slack', () => {
     return args.slice(start + 1, end < 0 ? undefined : end);
   };
 
-  it('never bypasses permissions, and limits the built-ins to ToolSearch', () => {
+  it('never bypasses permissions', () => {
     expect(claudePermissionMode({ personalSlack: 'read' })).toBe('personal-slack');
     expect(args).not.toContain('--dangerously-skip-permissions');
     expect(flagValues('--permission-mode')).toEqual(['dontAsk']);
-    expect(flagValues('--tools')).toEqual(['ToolSearch']);
+  });
+
+  it('leaves out the flags that took every tool away, Slack included', () => {
+    expect(args).not.toContain('--tools');
+    expect(args).not.toContain('--setting-sources');
+    expect(flagValues('--allowedTools')).toContain('ToolSearch');
   });
 
   it('allows the Slack read tools and nothing that writes', () => {
@@ -72,6 +78,27 @@ describe('the Slack triage agent can only read Slack', () => {
   it('leaves every other run on strict MCP', () => {
     const other = claudeCodeBackend.buildArgs({ cwd: tempDir(), prompt: 'x' }, path.join(tempDir(), 'out.json'));
     expect(other).toContain('--strict-mcp-config');
+  });
+});
+
+describe('settings that would widen the Slack run', () => {
+  const settings = (content: unknown): string => {
+    const file = path.join(tempDir(), 'settings.json');
+    fs.writeFileSync(file, JSON.stringify(content));
+    return file;
+  };
+
+  it('catches another connector, or everything, being allowed', () => {
+    expect(settingsProblem(settings({ permissions: { allow: ['mcp__claude_ai_Gmail__*'] } }))).toContain('Gmail');
+    expect(settingsProblem(settings({ permissions: { allow: ['*'] } }))).toContain('*');
+    expect(settingsProblem(settings({ permissions: { allow: ['mcp__figma'] } }))).toContain('figma');
+  });
+
+  it("lets through what can't widen it", () => {
+    const allow = ['Bash(git status)', 'Read', 'mcp__claude_ai_Slack__slack_read_thread'];
+    expect(settingsProblem(settings({ permissions: { allow } }))).toBeUndefined();
+    expect(settingsProblem(settings({ model: 'opus' }))).toBeUndefined();
+    expect(settingsProblem(path.join(tempDir(), 'missing.json'))).toBeUndefined();
   });
 });
 

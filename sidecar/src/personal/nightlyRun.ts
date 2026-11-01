@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import type { WebClient } from '@slack/web-api';
 import { runClaudeAgentic } from '../agentic/runClaude.js';
+import { settingsProblem } from '../backends/personalSlack.js';
 import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
 import { logger } from '../logging/logger.js';
 import { notifyDesktop } from '../notify/desktopNotifier.js';
@@ -101,6 +102,8 @@ async function triage(deps: NightlyRunDeps, run: PersonalRun, result: RunGaps): 
   const personal = store.personalStore();
   const ownerId = config.ownerSlackUserIds[0];
   if (!ownerId) throw new Error('no owner is set in Settings');
+  const problem = settingsProblem(path.join(os.homedir(), '.claude', 'settings.json'));
+  if (problem) throw new Error(problem);
 
   const github = await collectGithubInventory({
     sinceIso: run.windowStart,
