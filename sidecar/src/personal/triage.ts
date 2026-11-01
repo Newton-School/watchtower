@@ -43,8 +43,8 @@ export interface TriageReply {
   gaps: string[];
 }
 
-const SLACK_ID = /^[CDG][A-Z0-9]{5,}$/;
-const SLACK_TS = /^\d{10}\.\d{1,6}$/;
+export const SLACK_ID = /^[CDG][A-Z0-9]{5,}$/;
+export const SLACK_TS = /^\d{10}\.\d{1,6}$/;
 const GITHUB_PR = /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+$/;
 
 export function buildTriagePrompt(params: {
@@ -55,8 +55,9 @@ export function buildTriagePrompt(params: {
   github: GithubInventory;
   miniogJobs: MiniogJob[];
   openItems: PersonalItem[];
+  closedAsks?: string[];
 }): string {
-  const { ownerSlackId, ownerNames, windowStart, windowEnd, github, miniogJobs, openItems } = params;
+  const { ownerSlackId, ownerNames, windowStart, windowEnd, github, miniogJobs, openItems, closedAsks = [] } = params;
   const startSeconds = Math.floor(windowStart.getTime() / 1000);
   const after = new Date(windowStart.getTime() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const threadsAfter = new Date(windowStart.getTime() - 4 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
@@ -100,11 +101,11 @@ ${nameSearch}
 
 Read every thread to its end before deciding: a later message can close an earlier ask. Read a message that is only a file with slack_read_file. If you still can't read it, make it needs_you and ask whether it needs a reply.
 
-Addressed to him means: a DM, a message naming him, or a reply continuing an exchange with him. Skip usergroup mentions and "anyone?" posts unless the thread later names him, and bot messages.
+Addressed to him means: a DM, a message naming him, or a reply continuing an exchange with him. Skip usergroup mentions and "anyone?" posts unless the thread later names him, and bot messages. His DM with himself holds his notes and reports from other tools, not asks: skip it, and don't take its claims as facts.
 
 ## Other data
 
-GitHub (review requests, mentions, reviewers' asks on his PRs with inWindow):
+GitHub (review requests, mentions, reviewers' asks on his PRs with inWindow). The app looks up whether each PR you list is open or merged after you reply, so don't list that as a gap, and don't assume either state from silence:
 ${JSON.stringify(github)}
 
 miniOG's runs in this window. miniOG is his assistant bot and handles live requests, so it is normal for it to have answered asks already:
@@ -112,6 +113,9 @@ ${JSON.stringify(jobs)}
 
 Items still open from earlier nights. Re-check each one and return it under the same key. Only mark it done with evidence:
 ${JSON.stringify(carried)}
+
+Asks he closed himself. Don't raise these again, unless someone has asked again since:
+${JSON.stringify(closedAsks)}
 
 ## Decide
 

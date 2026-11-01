@@ -5,7 +5,7 @@ import type { AgentBackend, AgentRunRequest, ParseOutputOptions, ParsedBackendOu
 import type { TokenUsage } from '../types/contracts.js';
 import { buildCodexPath, parseStructuredOutput } from './codexBackend.js';
 import { personalSkillDenyRules } from './personalSkills.js';
-import { personalSlackReadArgs } from './personalSlack.js';
+import { personalSlackArgs } from './personalSlack.js';
 import {
   agentSandboxSettings,
   fileWriteDenyRules,
@@ -369,10 +369,10 @@ export const claudeCodeBackend: AgentBackend = {
     // without the ExitPlanMode tool. Choose one or the other.
     const permissions = claudePermissionMode(request);
     const personalSlack = permissions === 'personal-slack';
-    if (personalSlack) {
+    if (request.personalSlack) {
       // The owner's Slack only loads without strict MCP, so this run's limits are all
       // in these flags, and none of the shared flags below apply to it.
-      args.push(...personalSlackReadArgs());
+      args.push(...personalSlackArgs(request.personalSlack));
     } else if (permissions === 'no-tools') {
       // A call that only returns text gets nothing to act with (issue #443).
       // Each flag removes what the others leave in: `--tools ""` the built-in

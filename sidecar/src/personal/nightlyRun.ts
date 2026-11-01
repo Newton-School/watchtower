@@ -12,7 +12,17 @@ import type { JobStore } from '../state/jobStore.js';
 import { spendKey, type PersonalAction, type PersonalRun } from '../state/personalStore.js';
 import { agentCallContext } from '../state/runContext.js';
 import type { AppConfig, WorkflowStepLog } from '../types/contracts.js';
+import { readToolCalls, type ToolCall } from './agentTranscript.js';
+import {
+  buildDraftPrompt,
+  draftOutcomes,
+  draftTarget,
+  isConfirmedAsk,
+  oneDraftPerConversation,
+  type DraftTarget,
+} from './drafts.js';
 import { collectGithubInventory } from './githubInventory.js';
+import { fetchPrStates } from './prStates.js';
 import { isRunDue, runWindow } from './schedule.js';
 import { findUnfinishedSessions } from './sessions.js';
 import { standDownForMiniog } from './standDown.js';
@@ -27,11 +37,14 @@ import { buildTriagePrompt, parseTriageReply, toPersonalItem } from './triage.js
 export const PERSONAL_ENABLED_KEY = 'personal.enabled';
 export const PERSONAL_ENABLED_AT_KEY = 'personal.enabled_at';
 export const PERSONAL_RUN_TIME_KEY = 'personal.run_time';
+/** The workspace's id, which the app needs to open the Slack app on a thread. */
+export const PERSONAL_TEAM_ID_KEY = 'personal.team_id';
 
 const SESSION_KEY_PREFIX = 'session:';
 const TICK_MS = 15_000;
 /** The agent reads dozens of threads one call at a time, and a three-day window is slow. */
 const TRIAGE_TIMEOUT_MS = 90 * 60 * 1000;
+const DRAFT_TIMEOUT_MS = 20 * 60 * 1000;
 
 export interface NightlyRunDeps {
   store: JobStore;
@@ -60,6 +73,11 @@ async function ownerNames(deps: NightlyRunDeps, ownerId: string): Promise<string
   } catch {
     return [];
   }
+}
+
+async function rememberTeamId(deps: NightlyRunDeps): Promise<void> {
+  const auth = await deps.webClient.auth.test().catch(() => undefined);
+  if (auth?.team_id) deps.store.setState(PERSONAL_TEAM_ID_KEY, auth.team_id);
 }
 
 async function collectSessions(deps: NightlyRunDeps, run: PersonalRun): Promise<void> {
@@ -97,7 +115,8 @@ function logStepToLogger(step: WorkflowStepLog): void {
   logger.info({ stage: step.stage, level: step.level }, `my day: ${step.message}`);
 }
 
-async function triage(deps: NightlyRunDeps, run: PersonalRun, result: RunGaps): Promise<void> {
+/** Returns the agent's Slack reads, which later show whether a reply's destination is real. */
+async function triage(deps: NightlyRunDeps, run: PersonalRun, result: RunGaps): Promise<ToolCall[]> {
   const { store, config } = deps;
   const personal = store.personalStore();
   const ownerId = config.ownerSlackUserIds[0];
@@ -127,6 +146,7 @@ async function triage(deps: NightlyRunDeps, run: PersonalRun, result: RunGaps): 
     github,
     miniogJobs: jobs,
     openItems,
+    closedAsks: personal.closedByOwner().map(item => item.ask),
   });
 
   // An empty folder: this agent has no business in a repo, and no tools to read one with.
@@ -157,6 +177,88 @@ async function triage(deps: NightlyRunDeps, run: PersonalRun, result: RunGaps): 
         doneSummary: decided.doneSummary ?? item.doneSummary,
       });
     }
+    return readToolCalls(cwd);
+  } finally {
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+}
+
+/** Each open item's PRs, looked up. A lookup that fails only leaves that PR without a state. */
+async function refreshPrStates(deps: NightlyRunDeps): Promise<void> {
+  const personal = deps.store.personalStore();
+  const items = personal.openItems().filter(item => item.prUrls.length > 0);
+  if (items.length === 0) return;
+  const states = await fetchPrStates({
+    urls: items.flatMap(item => item.prUrls),
+    githubToken: await resolveGithubTokenForCodex(),
+  });
+  for (const item of items) {
+    const known = item.prUrls.filter(url => states[url]).map(url => [url, states[url]]);
+    personal.setPrStates(item.key, Object.fromEntries(known) as Record<string, string>);
+  }
+}
+
+/**
+ * Saves tonight's replies as Slack drafts, once the facts are final. A failure
+ * here costs a draft, which the inbox still shows to copy, not the night's work.
+ * A reply only goes to a conversation the triage agent really read.
+ */
+async function saveDrafts(
+  deps: NightlyRunDeps,
+  run: PersonalRun,
+  result: RunGaps,
+  readCalls: ToolCall[],
+): Promise<void> {
+  const personal = deps.store.personalStore();
+  const targets: DraftTarget[] = [];
+  let unconfirmed = 0;
+  for (const item of personal.repliesToDraft(run.id)) {
+    const target = draftTarget(item);
+    if (target && isConfirmedAsk(item, readCalls)) {
+      targets.push(target);
+    } else {
+      unconfirmed += 1;
+      personal.setDraftResult(item.key, {
+        status: 'failed',
+        error: "Couldn't confirm this is the conversation the ask came from, so no draft was saved.",
+      });
+    }
+  }
+  if (unconfirmed > 0)
+    result.gaps.push(`${unconfirmed} replies weren't saved as drafts: their ask couldn't be confirmed.`);
+  const { send, waiting } = oneDraftPerConversation(targets);
+  for (const target of waiting) personal.setDraftResult(target.key, { status: 'blocked' });
+  if (send.length === 0) return;
+
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'watchtower-my-day-'));
+  try {
+    const agent = await agentCallContext.run({ jobId: spendKey(run.id), store: deps.store }, () =>
+      runClaudeAgentic({
+        systemPrompt: buildDraftPrompt(send),
+        userMessage: 'Save the drafts now.',
+        cwd,
+        forceBackend: 'claude-code',
+        tier: 'light',
+        timeoutMs: DRAFT_TIMEOUT_MS,
+        personalSlack: 'draft',
+        doing: 'saving your drafts',
+        logStep: logStepToLogger,
+      }),
+    );
+    const { results, strays } = draftOutcomes(send, readToolCalls(cwd), agent.error);
+    for (const draft of results) personal.setDraftResult(draft.key, draft);
+    const failed = results.filter(draft => draft.status === 'failed').length;
+    if (failed > 0) {
+      result.gaps.push(`${failed} of ${results.length} drafts couldn't be saved. Copy them from the inbox.`);
+    }
+    if (strays.length > 0) {
+      const where = strays.map(call => String(call.input.channel_id)).join(', ');
+      result.gaps.push(`A draft nobody asked for was saved in ${where}. Check Drafts in Slack, and don't send it.`);
+      await alertOwner(
+        deps,
+        `My day saved a draft nobody asked for in ${where}. Check Drafts in Slack, and don't send it.`,
+      );
+    }
   } finally {
     fs.rmSync(cwd, { recursive: true, force: true });
   }
@@ -165,7 +267,7 @@ async function triage(deps: NightlyRunDeps, run: PersonalRun, result: RunGaps): 
 /** One run start to finish. Never throws: a failure is recorded and told to the owner. */
 export async function runNightly(
   deps: NightlyRunDeps,
-  params: { trigger: PersonalRun['trigger']; span?: string; now?: Date },
+  params: { trigger: PersonalRun['trigger']; span?: string; prepareOnly?: boolean; now?: Date },
 ): Promise<PersonalRun> {
   const personal = deps.store.personalStore();
   const now = params.now ?? new Date();
@@ -185,7 +287,19 @@ export async function runNightly(
     await collectSessions(deps, run).catch(error => {
       result.gaps.push(`Claude sessions couldn't be checked: ${String(error)}`);
     });
-    await triage(deps, run, result);
+    await rememberTeamId(deps);
+    const readCalls = await triage(deps, run, result);
+    await refreshPrStates(deps).catch(error => {
+      result.gaps.push(`PR states couldn't be checked: ${String(error)}`);
+    });
+    // Replies written without every source could be wrong, so they wait for a run that has them.
+    if (result.sourceFailed) {
+      result.gaps.push('No drafts were saved, because a source was missing. They wait for the next run.');
+    } else if (!params.prepareOnly) {
+      await saveDrafts(deps, run, result, readCalls).catch(error => {
+        result.gaps.push(`Drafts couldn't be saved: ${String(error)}`);
+      });
+    }
   } catch (error) {
     failure = error instanceof Error ? error.message : String(error);
   } finally {
@@ -210,7 +324,7 @@ export function startNightlyRuns(deps: NightlyRunDeps): void {
   personal.failInterruptedRuns('Watchtower restarted during the run.');
   let running = false;
 
-  const start = (params: { trigger: PersonalRun['trigger']; span?: string }) => {
+  const start = (params: { trigger: PersonalRun['trigger']; span?: string; prepareOnly?: boolean }) => {
     running = true;
     void runNightly(deps, params)
       .catch(error => logger.error({ error: String(error) }, 'my day: run crashed'))
@@ -225,7 +339,7 @@ export function startNightlyRuns(deps: NightlyRunDeps): void {
       const actions: PersonalAction[] = personal.takeActions();
       const runNow = actions.find(action => action.kind === 'run_now');
       if (runNow) {
-        start({ trigger: 'manual', span: runNow.span });
+        start({ trigger: 'manual', span: runNow.span, prepareOnly: runNow.prepareOnly });
         return;
       }
       const due = isRunDue({

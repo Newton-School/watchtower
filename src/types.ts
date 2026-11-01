@@ -14,6 +14,10 @@ export type MyDayItem = {
   prUrls: string[];
   jobId: string | null;
   sessionId: string | null;
+  ownerClosed: string | null;
+  draftStatus: string | null;
+  draftError: string | null;
+  prStates: Record<string, string>;
   firstSeenAt: string;
 };
 

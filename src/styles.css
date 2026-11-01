@@ -5235,6 +5235,11 @@ h3 {
   white-space: pre-wrap;
 }
 
+.my-day-draft-failed {
+  margin: 0 0 8px;
+  color: var(--danger);
+}
+
 .my-day-gaps {
   margin: 8px 0 0;
   padding-left: 18px;

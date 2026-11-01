@@ -548,6 +548,10 @@ export class JobStore {
         job_id TEXT,
         session_id TEXT,
         session_cwd TEXT,
+        owner_closed TEXT,
+        draft_status TEXT,
+        draft_error TEXT,
+        pr_states_json TEXT NOT NULL DEFAULT '{}',
         first_seen_at TEXT NOT NULL,
         last_seen_at TEXT NOT NULL,
         last_run_id TEXT NOT NULL
@@ -558,6 +562,7 @@ export class JobStore {
         id TEXT PRIMARY KEY,
         kind TEXT NOT NULL,
         span TEXT,
+        prepare_only INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
         taken_at TEXT
       );
@@ -886,6 +891,21 @@ export class JobStore {
       }
     } catch {
       /* row may not exist yet on a fresh install; harmless */
+    }
+
+    // My day's columns added after its tables first shipped.
+    for (const column of [
+      'personal_items ADD COLUMN owner_closed TEXT',
+      'personal_items ADD COLUMN draft_status TEXT',
+      'personal_items ADD COLUMN draft_error TEXT',
+      "personal_items ADD COLUMN pr_states_json TEXT NOT NULL DEFAULT '{}'",
+      'personal_actions ADD COLUMN prepare_only INTEGER NOT NULL DEFAULT 0',
+    ]) {
+      try {
+        this.db.exec(`ALTER TABLE ${column}`);
+      } catch {
+        /* column already present */
+      }
     }
 
     // Add PM config columns to app_settings if missing
