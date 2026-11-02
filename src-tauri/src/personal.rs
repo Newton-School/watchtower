@@ -32,6 +32,10 @@ pub struct MyDayItem {
     pub pr_states: std::collections::HashMap<String, String>,
     pub action: Option<String>,
     pub job_status: Option<String>,
+    pub pr_info: serde_json::Value,
+    pub tap_result: Option<String>,
+    pub deploy_job_id: Option<String>,
+    pub deploy_status: Option<String>,
     pub source: String,
     pub state: String,
     pub channel_name: Option<String>,
@@ -84,7 +88,7 @@ fn ensure_tables(connection: &Connection) -> Result<(), String> {
              );
              CREATE TABLE IF NOT EXISTS personal_actions (
                id TEXT PRIMARY KEY, kind TEXT NOT NULL, span TEXT, prepare_only INTEGER NOT NULL DEFAULT 0,
-               item_key TEXT, text TEXT,
+               item_key TEXT, text TEXT, pr_url TEXT, head TEXT,
                created_at TEXT NOT NULL, taken_at TEXT
              );",
         )
@@ -146,7 +150,10 @@ fn read_items(
             "SELECT item_key, source, state, channel_name, permalink, asker, asked_at, ask, done_summary,
                     reply_text, next_step, evidence, pr_urls_json, job_id, session_id, first_seen_at,
                     owner_closed, draft_status, draft_error, pr_states_json, action,
-                    (SELECT status FROM jobs WHERE jobs.id = personal_items.job_id)
+                    (SELECT status FROM jobs WHERE jobs.id = personal_items.job_id),
+                    pr_info_json, tap_result,
+                    (SELECT job_id FROM launchpad_requests WHERE launchpad_requests.id = personal_items.deploy_request_id),
+                    (SELECT status FROM launchpad_requests WHERE launchpad_requests.id = personal_items.deploy_request_id)
                FROM personal_items
               WHERE state != 'done' OR last_seen_at >= ?1
               ORDER BY first_seen_at DESC",
@@ -177,6 +184,11 @@ fn read_items(
                 pr_states: serde_json::from_str(&row.get::<_, String>(19)?).unwrap_or_default(),
                 action: row.get(20)?,
                 job_status: row.get(21)?,
+                pr_info: serde_json::from_str(&row.get::<_, String>(22)?)
+                    .unwrap_or_else(|_| serde_json::json!({})),
+                tap_result: row.get(23)?,
+                deploy_job_id: row.get(24)?,
+                deploy_status: row.get(25)?,
             })
         })
         .map_err(|err| format!("db read failed: {err}"))?;
@@ -510,6 +522,118 @@ fn stop_its_run(connection: &Connection, key: &str, now: &str) -> Result<(), Str
         .map_err(|err| format!("db write failed: {err}"))
 }
 
+/// The repo of a checked PR link: `https://github.com/<owner>/<repo>/pull/<number>`.
+fn repo_of_pr(url: &str) -> Option<&str> {
+    let rest = url.strip_prefix("https://github.com/")?;
+    let mut parts = rest.split('/');
+    let (owner, repo, pull, number) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    let word = |value: &str| {
+        !value.is_empty()
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte == b'.'
+            })
+    };
+    let digits = !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit());
+    (parts.next().is_none() && pull == "pull" && word(owner) && word(repo) && digits)
+        .then_some(repo)
+}
+
+/// The fixed ask for a repo's production deploy. Never built from the item's text.
+fn deploy_ask(repo: &str) -> Option<&'static str> {
+    match repo {
+        "newton-web" => Some("deploy newton-web to prod"),
+        "newton-marketing-web" => Some("deploy marketing to prod"),
+        _ => None,
+    }
+}
+
+fn item_pr_facts(
+    connection: &Connection,
+    key: &str,
+    url: &str,
+) -> Result<serde_json::Value, String> {
+    let (urls, info): (String, String) = connection
+        .query_row(
+            "SELECT pr_urls_json, pr_info_json FROM personal_items WHERE item_key = ?1",
+            params![key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|err| format!("db read failed: {err}"))?
+        .ok_or_else(|| "that item is no longer in the list".to_string())?;
+    if !strings_from_json(&urls).iter().any(|known| known == url) || repo_of_pr(url).is_none() {
+        return Err("that PR isn't on this item".to_string());
+    }
+    let info: serde_json::Value = serde_json::from_str(&info).unwrap_or_default();
+    Ok(info.get(url).cloned().unwrap_or(serde_json::Value::Null))
+}
+
+fn queue_pr_action(
+    connection: &Connection,
+    key: &str,
+    kind: &str,
+    url: &str,
+    head: &str,
+    now: &str,
+) -> Result<(), String> {
+    if kind != "merge" && kind != "approve" {
+        return Err(format!("{kind} isn't something a PR can be asked to do"));
+    }
+    if head.len() != 40 || !head.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("that isn't a commit".to_string());
+    }
+    let facts = item_pr_facts(connection, key, url)?;
+    if facts.get("state").and_then(|value| value.as_str()) != Some("open") {
+        return Err("that PR isn't open".to_string());
+    }
+    if kind == "approve" && facts.get("mine").and_then(|value| value.as_bool()) == Some(true) {
+        return Err("GitHub doesn't let you approve your own PR".to_string());
+    }
+    ensure_tables(connection)?;
+    connection
+        .execute(
+            "UPDATE personal_items SET tap_result = NULL WHERE item_key = ?1",
+            params![key],
+        )
+        .map_err(|err| format!("db write failed: {err}"))?;
+    connection
+        .execute(
+            "INSERT INTO personal_actions(id, kind, item_key, pr_url, head, created_at)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6
+              WHERE NOT EXISTS (SELECT 1 FROM personal_actions
+                                 WHERE kind = ?2 AND item_key = ?3 AND pr_url = ?4 AND taken_at IS NULL)",
+            params![uuid::Uuid::new_v4().to_string(), kind, key, url, head, now],
+        )
+        .map(|_| ())
+        .map_err(|err| format!("db write failed: {err}"))
+}
+
+/// What Deploy should ask for, or why it can't. The ask is an ordinary owner request,
+/// not tied to the item, so it goes through the deploy job's own `confirm deploy` gate.
+fn deploy_request(connection: &Connection, key: &str, url: &str) -> Result<&'static str, String> {
+    let facts = item_pr_facts(connection, key, url)?;
+    if facts.get("deployable").and_then(|value| value.as_bool()) != Some(true) {
+        return Err("that PR isn't waiting on a deploy".to_string());
+    }
+    let ask = repo_of_pr(url)
+        .and_then(deploy_ask)
+        .ok_or_else(|| "the app can't deploy that repo".to_string())?;
+    let running: Option<String> = connection
+        .query_row(
+            "SELECT request.status FROM personal_items item
+               JOIN launchpad_requests request ON request.id = item.deploy_request_id
+              WHERE item.item_key = ?1 AND request.status IN ('PENDING', 'CLAIMED', 'QUEUED', 'RUNNING')",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| format!("db read failed: {err}"))?;
+    if running.is_some() {
+        return Err("its deploy is already going. See the deploy.".to_string());
+    }
+    Ok(ask)
+}
+
 fn is_slack_id(value: &str, first: &[u8]) -> bool {
     value.len() >= 6
         && first.contains(&value.as_bytes()[0])
@@ -663,6 +787,40 @@ pub(crate) async fn start_my_day_item(
     }
 }
 
+/// Merge or Approve, from his button. The sidecar does it and says what came of it.
+#[tauri::command]
+pub(crate) async fn my_day_pr_action(
+    key: String,
+    kind: String,
+    url: String,
+    head: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let connection =
+        Connection::open(&*state.db_path).map_err(|err| format!("db open failed: {err}"))?;
+    queue_pr_action(&connection, &key, &kind, &url, &head, &now_iso())
+}
+
+/// Starts the deploy job, which asks for `confirm deploy` before anything happens.
+#[tauri::command]
+pub(crate) async fn deploy_my_day_item(
+    key: String,
+    url: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let connection =
+        Connection::open(&*state.db_path).map_err(|err| format!("db open failed: {err}"))?;
+    let ask = deploy_request(&connection, &key, &url)?;
+    let response = crate::submit_launchpad_task_inner(&connection, "miniog", ask)?;
+    connection
+        .execute(
+            "UPDATE personal_items SET deploy_request_id = ?1 WHERE item_key = ?2",
+            params![response.request_id, key],
+        )
+        .map(|_| ())
+        .map_err(|err| format!("db write failed: {err}"))
+}
+
 #[tauri::command]
 pub(crate) async fn close_my_day_item(
     key: String,
@@ -757,10 +915,12 @@ mod tests {
                    next_step TEXT, evidence TEXT, pr_urls_json TEXT, job_id TEXT, session_id TEXT, session_cwd TEXT,
                    channel_id TEXT, thread_ts TEXT, message_ts TEXT, owner_closed TEXT, draft_status TEXT, draft_error TEXT,
                    pr_states_json TEXT NOT NULL DEFAULT '{}', action TEXT, last_run_id TEXT,
+                   pr_info_json TEXT NOT NULL DEFAULT '{}', tap_result TEXT, deploy_request_id TEXT,
                    first_seen_at TEXT, last_seen_at TEXT);
                  CREATE TABLE agent_calls (job_id TEXT, cost_usd REAL);
                  CREATE TABLE jobs (id TEXT PRIMARY KEY, status TEXT);
-                 CREATE TABLE human_waits (job_id TEXT, prompt_ts TEXT);",
+                 CREATE TABLE human_waits (job_id TEXT, prompt_ts TEXT);
+                 CREATE TABLE launchpad_requests (id TEXT PRIMARY KEY, job_id TEXT, status TEXT);",
             )
             .expect("schema");
         connection
@@ -1010,6 +1170,124 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    const PR: &str = "https://github.com/o/newton-web/pull/12";
+    const HEAD: &str = "0123456789012345678901234567890123456789";
+
+    fn add_item_with_pr(connection: &Connection, info: serde_json::Value) {
+        add_item(connection, "a", "done", "2026-11-01");
+        connection
+            .execute(
+                "UPDATE personal_items SET pr_urls_json = ?1, pr_info_json = ?2 WHERE item_key = 'a'",
+                params![serde_json::json!([PR]).to_string(), serde_json::json!({ PR: info }).to_string()],
+            )
+            .expect("update");
+    }
+
+    #[test]
+    fn only_a_pr_on_the_item_at_a_real_commit_can_be_acted_on() {
+        let connection = database();
+        add_item_with_pr(
+            &connection,
+            serde_json::json!({"state": "open", "mine": false}),
+        );
+        queue_pr_action(&connection, "a", "merge", PR, HEAD, "now").expect("queued");
+        let queued: (String, String, String) = connection
+            .query_row(
+                "SELECT kind, pr_url, head FROM personal_actions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("row");
+        assert_eq!(
+            queued,
+            ("merge".to_string(), PR.to_string(), HEAD.to_string())
+        );
+        assert!(queue_pr_action(
+            &connection,
+            "a",
+            "merge",
+            "https://github.com/o/other/pull/1",
+            HEAD,
+            "now"
+        )
+        .is_err());
+        assert!(queue_pr_action(&connection, "a", "merge", PR, "abc", "now").is_err());
+        assert!(queue_pr_action(&connection, "a", "delete", PR, HEAD, "now").is_err());
+        assert!(queue_pr_action(&connection, "missing", "merge", PR, HEAD, "now").is_err());
+    }
+
+    #[test]
+    fn a_pr_that_is_not_open_or_is_his_own_is_refused_here_too() {
+        let connection = database();
+        add_item_with_pr(&connection, serde_json::json!({"state": "merged"}));
+        assert!(queue_pr_action(&connection, "a", "merge", PR, HEAD, "now").is_err());
+        connection
+            .execute("DELETE FROM personal_items", [])
+            .unwrap();
+        add_item_with_pr(
+            &connection,
+            serde_json::json!({"state": "open", "mine": true}),
+        );
+        assert!(queue_pr_action(&connection, "a", "approve", PR, HEAD, "now").is_err());
+        assert!(queue_pr_action(&connection, "a", "merge", PR, HEAD, "now").is_ok());
+    }
+
+    #[test]
+    fn deploy_asks_are_fixed_and_only_for_what_is_waiting() {
+        let connection = database();
+        add_item_with_pr(
+            &connection,
+            serde_json::json!({"state": "merged", "deployable": true}),
+        );
+        assert_eq!(
+            deploy_request(&connection, "a", PR).unwrap(),
+            "deploy newton-web to prod"
+        );
+        connection
+            .execute("DELETE FROM personal_items", [])
+            .unwrap();
+        add_item_with_pr(
+            &connection,
+            serde_json::json!({"state": "merged", "deployable": false}),
+        );
+        assert!(deploy_request(&connection, "a", PR).is_err());
+    }
+
+    #[test]
+    fn a_deploy_already_going_is_not_started_again() {
+        let connection = database();
+        add_item_with_pr(
+            &connection,
+            serde_json::json!({"state": "merged", "deployable": true}),
+        );
+        connection
+            .execute_batch(
+                "INSERT INTO launchpad_requests VALUES ('r1', NULL, 'RUNNING');
+                 UPDATE personal_items SET deploy_request_id = 'r1';",
+            )
+            .unwrap();
+        assert!(deploy_request(&connection, "a", PR).is_err());
+        connection
+            .execute("UPDATE launchpad_requests SET status = 'SUCCESS'", [])
+            .unwrap();
+        assert!(deploy_request(&connection, "a", PR).is_ok());
+    }
+
+    #[test]
+    fn pr_links_are_read_strictly() {
+        assert_eq!(repo_of_pr(PR), Some("newton-web"));
+        for bad in [
+            "https://evil.example/o/r/pull/1",
+            "https://github.com/o/r/issues/1",
+            "https://github.com/o/r/pull/1/files",
+            "https://github.com/o/r/pull/x",
+            "https://github.com/o/r;rm/pull/1",
+        ] {
+            assert_eq!(repo_of_pr(bad), None, "{bad}");
+        }
+        assert_eq!(deploy_ask("newton-api"), None);
     }
 
     #[test]

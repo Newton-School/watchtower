@@ -13,7 +13,8 @@ import { buildCoderPrompt } from '../src/agents/prompts.js';
 import { draftOutcomes, draftTarget, isConfirmedAsk, oneDraftPerConversation } from '../src/personal/drafts.js';
 import { ownPrAsks } from '../src/personal/githubInventory.js';
 import { clonesOf, localWorkOnBranch } from '../src/personal/localWork.js';
-import { fetchPrStates } from '../src/personal/prStates.js';
+import { runPrAction } from '../src/personal/prActions.js';
+import { fetchPrInfo } from '../src/personal/prInfo.js';
 import {
   buildJobPrompt,
   chooseWork,
@@ -321,20 +322,198 @@ describe("reading an agent's transcript", () => {
   });
 });
 
-describe('PR states', () => {
-  const respond = (body: unknown, ok = true) => ({ ok, json: async () => body }) as Response;
+describe('what the inbox knows about a PR', () => {
+  const json = (body: unknown, ok = true) =>
+    ({ ok, json: async () => body, text: async () => String(body) }) as Response;
+  const pr = (repo: string, n: number) => `https://github.com/o/${repo}/pull/${n}`;
+  const prBody = (over: Record<string, unknown> = {}) => ({
+    state: 'open',
+    merged_at: null,
+    draft: false,
+    head: { sha: 'headsha' },
+    user: { login: 'me' },
+    merge_commit_sha: 'mergesha',
+    base: { ref: 'master', repo: { default_branch: 'master' } },
+    ...over,
+  });
+  const fetcherFor = (routes: Record<string, unknown>) => async (url: string | URL | Request) => {
+    const path = String(url).replace('https://api.github.com', '');
+    return path in routes ? json(routes[path]) : json({}, false);
+  };
 
-  it('tells merged from closed, and leaves out what it could not read', async () => {
-    const fetcher = async (url: string | URL | Request) => {
-      const text = String(url);
-      if (text.endsWith('/1')) return respond({ state: 'closed', merged_at: '2026-11-01T00:00:00Z' });
-      if (text.endsWith('/2')) return respond({ state: 'closed', merged_at: null });
-      if (text.endsWith('/3')) return respond({ state: 'open', merged_at: null });
-      return respond({}, false);
+  it('tells merged from closed, whose it is, and the commit, and leaves out what it could not read', async () => {
+    const fetcher = fetcherFor({
+      '/user': { login: 'me' },
+      '/repos/o/r/pulls/1': prBody({
+        state: 'closed',
+        merged_at: 'x',
+        base: { ref: 'dev', repo: { default_branch: 'master' } },
+      }),
+      '/repos/o/r/pulls/2': prBody({ state: 'closed' }),
+      '/repos/o/r/pulls/3': prBody({ user: { login: 'someone' } }),
+    });
+    const info = await fetchPrInfo({
+      urls: [pr('r', 1), pr('r', 2), pr('r', 3), pr('r', 4), 'https://evil.example/pull/1'],
+      fetcher,
+    });
+    expect(info[pr('r', 1)]).toMatchObject({ state: 'merged', mine: true });
+    expect(info[pr('r', 2)].state).toBe('closed');
+    expect(info[pr('r', 3)]).toMatchObject({ state: 'open', head: 'headsha', mine: false });
+    expect(Object.keys(info)).toHaveLength(3);
+  });
+
+  const manifest = `image: registry/newton-web:${'a'.repeat(40)}`;
+  const deployable = async (status: unknown, extra: Record<string, unknown> = {}) => {
+    const url = pr('newton-web', 9);
+    const fetcher = async (requested: string | URL | Request) => {
+      const path = String(requested).replace('https://api.github.com', '');
+      if (path === '/user') return json({ login: 'me' });
+      if (path === '/repos/o/newton-web/pulls/9') return json(prBody({ state: 'closed', merged_at: 'x', ...extra }));
+      if (path.includes('deployment.yaml')) return json(manifest);
+      if (path.includes('/compare/mergesha...')) return status === undefined ? json({}, false) : json({ status });
+      return json({}, false);
     };
-    const pr = (n: number) => `https://github.com/o/r/pull/${n}`;
-    const states = await fetchPrStates({ urls: [pr(1), pr(2), pr(3), pr(4), 'https://evil.example/pull/1'], fetcher });
-    expect(states).toEqual({ [pr(1)]: 'merged', [pr(2)]: 'closed', [pr(3)]: 'open' });
+    return (await fetchPrInfo({ urls: [url], fetcher }))[url];
+  };
+
+  it('offers a deploy only when production is known not to have the merge', async () => {
+    expect((await deployable('behind')).deployable).toBe(true);
+    expect((await deployable('diverged')).deployable).toBe(true);
+    expect((await deployable('ahead')).deployable).toBe(false);
+    expect((await deployable('identical')).deployable).toBe(false);
+    expect((await deployable(undefined)).deployable).toBe(false);
+  });
+
+  it('offers no deploy for a PR into another branch, or a repo the app cannot deploy', async () => {
+    const onBranch = await deployable('behind', { base: { ref: 'feature', repo: { default_branch: 'master' } } });
+    expect(onBranch.deployable).toBeUndefined();
+    const url = pr('newton-api', 1);
+    const fetcher = fetcherFor({ '/user': { login: 'me' }, '/repos/o/newton-api/pulls/1': prBody({ merged_at: 'x' }) });
+    expect((await fetchPrInfo({ urls: [url], fetcher }))[url].deployable).toBeUndefined();
+  });
+});
+
+describe('Merge and Approve', () => {
+  const head = 'a'.repeat(40);
+  const url = 'https://github.com/o/r/pull/7';
+  const base = { url, head, allowedOrg: 'o', githubToken: 't' };
+  const clean = async () => ({ mergeStateStatus: 'CLEAN' });
+  const noThreads = async () => ({ unresolvedCount: 0, totalThreads: 0 });
+
+  function github(
+    overrides: { pr?: Record<string, unknown>; write?: { ok: boolean; body?: unknown }; squash?: boolean } = {},
+  ) {
+    const calls: Array<{ path: string; method: string; body?: Record<string, unknown> }> = [];
+    const fetcher = async (requested: string | URL | Request, init?: RequestInit) => {
+      const path = String(requested).replace('https://api.github.com', '');
+      const method = init?.method ?? 'GET';
+      calls.push({ path, method, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      const respond = (ok: boolean, body: unknown) =>
+        ({ ok, status: ok ? 200 : 405, json: async () => body }) as Response;
+      if (method !== 'GET') return respond(overrides.write?.ok ?? true, overrides.write?.body ?? {});
+      if (path === '/repos/o/r') return respond(true, { allow_squash_merge: overrides.squash ?? true });
+      return respond(true, { state: 'open', head: { sha: head }, ...overrides.pr });
+    };
+    return { fetcher, calls, writes: () => calls.filter(call => call.method !== 'GET') };
+  }
+  const merge = (gh: ReturnType<typeof github>, deps: Record<string, unknown> = {}) =>
+    runPrAction(
+      { ...base, kind: 'merge' },
+      {
+        fetcher: gh.fetcher,
+        readMergeState: clean as never,
+        readThreads: noThreads as never,
+        ...deps,
+      },
+    );
+
+  it('merges tied to the commit he saw, so GitHub refuses if it moved', async () => {
+    const gh = github();
+    expect(await merge(gh)).toEqual({ ok: true, message: `Merged r#7 at ${head.slice(0, 7)}.` });
+    expect(gh.writes()).toEqual([
+      { path: '/repos/o/r/pulls/7/merge', method: 'PUT', body: { sha: head, merge_method: 'squash' } },
+    ]);
+  });
+
+  it("uses a plain merge where the repo doesn't allow squash", async () => {
+    const gh = github({ squash: false });
+    await merge(gh);
+    expect(gh.writes()[0].body).toMatchObject({ merge_method: 'merge' });
+  });
+
+  it('does nothing if the PR moved since he looked', async () => {
+    const gh = github({ pr: { head: { sha: 'b'.repeat(40) } } });
+    expect((await merge(gh)).message).toContain('new commits');
+    expect(gh.writes()).toEqual([]);
+  });
+
+  it.each([
+    ['DIRTY', 'conflicts'],
+    ['UNSTABLE', 'failing'],
+    ['BLOCKED', 'branch rules'],
+    ['DRAFT', 'draft'],
+    ['UNKNOWN', 'try again'],
+  ])('refuses a PR that is %s', async (mergeStateStatus, words) => {
+    const gh = github();
+    const result = await merge(gh, { readMergeState: async () => ({ mergeStateStatus }) });
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain(words);
+    expect(gh.writes()).toEqual([]);
+  });
+
+  it('refuses when merge state cannot be read at all', async () => {
+    const gh = github();
+    expect((await merge(gh, { readMergeState: async () => undefined })).ok).toBe(false);
+    expect(gh.writes()).toEqual([]);
+  });
+
+  it("refuses with unresolved threads, or when it can't tell", async () => {
+    const gh = github();
+    const open = await merge(gh, { readThreads: async () => ({ unresolvedCount: 2, totalThreads: 2 }) });
+    expect(open.message).toContain('2 review threads are unresolved');
+    const unknown = await merge(gh, {
+      readThreads: async () => ({ unresolvedCount: 0, totalThreads: 0, failed: true }),
+    });
+    expect(unknown.ok).toBe(false);
+    expect(gh.writes()).toEqual([]);
+  });
+
+  it('passes on what GitHub says when it refuses the merge', async () => {
+    const gh = github({ write: { ok: false, body: { message: 'Head branch was modified' } } });
+    expect(await merge(gh)).toEqual({ ok: false, message: "Didn't merge r#7: Head branch was modified" });
+  });
+
+  it('approves that commit, once, and says when GitHub refuses', async () => {
+    const gh = github();
+    expect(await runPrAction({ ...base, kind: 'approve' }, { fetcher: gh.fetcher })).toEqual({
+      ok: true,
+      message: `Approved r#7 at ${head.slice(0, 7)}.`,
+    });
+    expect(gh.writes()).toEqual([
+      { path: '/repos/o/r/pulls/7/reviews', method: 'POST', body: { event: 'APPROVE', commit_id: head } },
+    ]);
+    const refused = github({ write: { ok: false, body: { message: 'Can not approve your own pull request' } } });
+    const result = await runPrAction({ ...base, kind: 'approve' }, { fetcher: refused.fetcher });
+    expect(result.message).toContain('Can not approve your own');
+  });
+
+  it('refuses what is merged, closed, outside the org, or has no real commit, touching nothing', async () => {
+    for (const pr of [{ merged: true }, { state: 'closed' }]) {
+      const gh = github({ pr });
+      expect((await merge(gh)).ok).toBe(false);
+      expect(gh.writes()).toEqual([]);
+    }
+    const gh = github();
+    const other = await runPrAction(
+      { ...base, kind: 'merge', url: 'https://github.com/evil/r/pull/7' },
+      { fetcher: gh.fetcher },
+    );
+    expect(other.ok).toBe(false);
+    expect((await runPrAction({ ...base, kind: 'merge', head: 'abc' }, { fetcher: gh.fetcher })).ok).toBe(false);
+    expect(
+      (await runPrAction({ ...base, kind: 'merge', url: 'https://evil.example/pull/7' }, { fetcher: gh.fetcher })).ok,
+    ).toBe(false);
+    expect(gh.calls).toEqual([]);
   });
 });
 
@@ -1201,6 +1380,33 @@ describe('the personal store', () => {
     expect(personal.openItems()[0]).toMatchObject({ replyText: 'first', draftStatus: 'saved' });
   });
 
+  it('takes only the kinds of action asked for, so a button never waits behind a run', () => {
+    const job = new JobStore(path.join(tempDir(), 'watchtower.db'));
+    const db = (job as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): void } } }).db;
+    const insert = db.prepare(
+      `INSERT INTO personal_actions (id, kind, item_key, pr_url, head, created_at) VALUES (?, ?, 'a', 'u', 'h', 'now')`,
+    );
+    insert.run('1', 'merge');
+    insert.run('2', 'run_now');
+    const personal = job.personalStore();
+    expect(personal.takeActions(['merge', 'approve'])).toMatchObject([{ kind: 'merge', prUrl: 'u', head: 'h' }]);
+    expect(personal.takeActions(['merge', 'approve'])).toEqual([]);
+    expect(personal.takeActions(['run_now', 'start_item']).map(action => action.kind)).toEqual(['run_now']);
+  });
+
+  it('looks up PRs on open items and recently finished ones', () => {
+    const personal = store();
+    personal.upsertItem({ ...item, key: 'open' });
+    personal.upsertItem({ ...item, key: 'done', state: 'done' });
+    personal.upsertItem({ ...item, key: 'no-pr', prUrls: [] });
+    expect(
+      personal
+        .itemsWithPrs()
+        .map(found => found.key)
+        .sort(),
+    ).toEqual(['done', 'open']);
+  });
+
   it('tries a failed draft again, and remembers PR states', () => {
     const personal = store();
     personal.upsertItem({ ...item, key: 'b', state: 'ready', replyText: 'text' });
@@ -1208,8 +1414,11 @@ describe('the personal store', () => {
     expect(personal.repliesToDraft('run-1')).toEqual([]);
     personal.upsertItem({ ...item, key: 'b', state: 'ready', replyText: 'text', lastRunId: 'run-2' });
     expect(personal.repliesToDraft('run-2').map(reply => reply.key)).toEqual(['b']);
-    personal.setPrStates('b', { url: 'merged' });
+    personal.setPrInfo('b', { url: { state: 'merged', deployable: true } });
     expect(personal.openItems()[0].prStates).toEqual({ url: 'merged' });
+    expect(personal.openItems()[0].prInfo).toEqual({ url: { state: 'merged', deployable: true } });
+    personal.setTapResult('b', 'Merged r#1.');
+    expect(personal.item('b')?.tapResult).toBe('Merged r#1.');
   });
 
   it('keeps work under way as it is when triage returns the same item', () => {

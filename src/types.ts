@@ -1,3 +1,11 @@
+export type MyDayPrInfo = {
+  state: string;
+  head?: string;
+  draft?: boolean;
+  mine?: boolean;
+  deployable?: boolean;
+};
+
 export type MyDayItem = {
   key: string;
   source: string;
@@ -20,6 +28,10 @@ export type MyDayItem = {
   prStates: Record<string, string>;
   action: string | null;
   jobStatus: string | null;
+  prInfo: Record<string, MyDayPrInfo>;
+  tapResult: string | null;
+  deployJobId: string | null;
+  deployStatus: string | null;
   firstSeenAt: string;
 };
 

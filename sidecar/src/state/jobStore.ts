@@ -563,6 +563,9 @@ export class JobStore {
         ask_confirmed INTEGER NOT NULL DEFAULT 0,
         request_id TEXT,
         settled_on TEXT,
+        pr_info_json TEXT NOT NULL DEFAULT '{}',
+        tap_result TEXT,
+        deploy_request_id TEXT,
         first_seen_at TEXT NOT NULL,
         last_seen_at TEXT NOT NULL,
         last_run_id TEXT NOT NULL
@@ -576,6 +579,8 @@ export class JobStore {
         prepare_only INTEGER NOT NULL DEFAULT 0,
         item_key TEXT,
         text TEXT,
+        pr_url TEXT,
+        head TEXT,
         created_at TEXT NOT NULL,
         taken_at TEXT
       );
@@ -923,6 +928,11 @@ export class JobStore {
       'personal_items ADD COLUMN request_id TEXT',
       'personal_items ADD COLUMN settled_on TEXT',
       'launchpad_requests ADD COLUMN personal_item_key TEXT',
+      "personal_items ADD COLUMN pr_info_json TEXT NOT NULL DEFAULT '{}'",
+      'personal_items ADD COLUMN tap_result TEXT',
+      'personal_items ADD COLUMN deploy_request_id TEXT',
+      'personal_actions ADD COLUMN pr_url TEXT',
+      'personal_actions ADD COLUMN head TEXT',
     ]) {
       try {
         this.db.exec(`ALTER TABLE ${column}`);

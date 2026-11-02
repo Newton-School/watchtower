@@ -9,7 +9,13 @@ import { logger } from '../logging/logger.js';
 import { notifyDesktop } from '../notify/desktopNotifier.js';
 import { KeepAwake } from '../runtime/keepAwake.js';
 import type { JobStore } from '../state/jobStore.js';
-import { spendKey, type PersonalAction, type PersonalRun, type PersonalWorkKind } from '../state/personalStore.js';
+import {
+  spendKey,
+  type PersonalAction,
+  type PersonalItem,
+  type PersonalRun,
+  type PersonalWorkKind,
+} from '../state/personalStore.js';
 import { agentCallContext } from '../state/runContext.js';
 import type { AppConfig, WorkflowStepLog } from '../types/contracts.js';
 import { readToolCalls } from './agentTranscript.js';
@@ -22,7 +28,8 @@ import {
   type DraftTarget,
 } from './drafts.js';
 import { collectGithubInventory } from './githubInventory.js';
-import { fetchPrStates } from './prStates.js';
+import { runPrAction } from './prActions.js';
+import { fetchPrInfo, type PrInfo } from './prInfo.js';
 import { policyNameFor, policyOf, reconcileWork, startItemNow, startWaitingWork } from './work.js';
 import { isRunDue, runWindow } from './schedule.js';
 import { findUnfinishedSessions } from './sessions.js';
@@ -44,6 +51,7 @@ export const PERSONAL_TEAM_ID_KEY = 'personal.team_id';
 const workAwake = new KeepAwake();
 const SESSION_KEY_PREFIX = 'session:';
 const TICK_MS = 15_000;
+const TAP_POLL_MS = 2_000;
 /** The agent reads dozens of threads one call at a time, and a three-day window is slow. */
 const TRIAGE_TIMEOUT_MS = 90 * 60 * 1000;
 const DRAFT_TIMEOUT_MS = 20 * 60 * 1000;
@@ -185,19 +193,47 @@ async function triage(deps: NightlyRunDeps, run: PersonalRun, result: RunGaps): 
   }
 }
 
-/** Each open item's PRs, looked up. A lookup that fails only leaves that PR without a state. */
-async function refreshPrStates(deps: NightlyRunDeps): Promise<void> {
+/** Each item's PRs, looked up. A lookup that fails only leaves that PR with nothing to press. */
+async function refreshPrInfo(deps: NightlyRunDeps, only?: PersonalItem): Promise<void> {
   const personal = deps.store.personalStore();
-  const items = personal.openItems().filter(item => item.prUrls.length > 0);
+  const items = only ? [only] : personal.itemsWithPrs();
   if (items.length === 0) return;
-  const states = await fetchPrStates({
+  const info = await fetchPrInfo({
     urls: items.flatMap(item => item.prUrls),
     githubToken: await resolveGithubTokenForCodex(),
   });
   for (const item of items) {
-    const known = item.prUrls.filter(url => states[url]).map(url => [url, states[url]]);
-    personal.setPrStates(item.key, Object.fromEntries(known) as Record<string, string>);
+    const known = item.prUrls.filter(url => info[url]).map(url => [url, info[url]]);
+    personal.setPrInfo(item.key, Object.fromEntries(known) as Record<string, PrInfo>);
   }
+}
+
+/** His Merge or Approve. Says what came of it on the item, and looks the PR up again either way. */
+async function runTap(deps: NightlyRunDeps, action: PersonalAction): Promise<void> {
+  const personal = deps.store.personalStore();
+  const item = action.itemKey ? personal.item(action.itemKey) : undefined;
+  if (!item || !action.prUrl || !action.head) return;
+  const kind = action.kind === 'merge' ? 'merge' : 'approve';
+  let message: string;
+  if (!item.prUrls.includes(action.prUrl)) {
+    message = "That PR isn't on this item, so nothing was done.";
+  } else {
+    const token = await resolveGithubTokenForCodex();
+    message = token
+      ? (
+          await runPrAction({
+            kind,
+            url: action.prUrl,
+            head: action.head,
+            allowedOrg: deps.config.allowedPrOrg,
+            githubToken: token,
+          })
+        ).message
+      : "Couldn't get a GitHub login, so nothing was done.";
+  }
+  personal.setTapResult(item.key, message);
+  logger.info({ key: item.key, kind, prUrl: action.prUrl, message }, 'my day: tap action');
+  await refreshPrInfo(deps, item).catch(error => logger.warn({ error: String(error) }, 'my day: PR lookup failed'));
 }
 
 /**
@@ -314,7 +350,7 @@ export async function runNightly(
     });
     await rememberTeamId(deps);
     await triage(deps, run, result);
-    await refreshPrStates(deps).catch(error => {
+    await refreshPrInfo(deps).catch(error => {
       result.gaps.push(`PR states couldn't be checked: ${String(error)}`);
     });
     // Without every source a reply or a review could be wrong, so that waits for a run that has them.
@@ -344,7 +380,7 @@ export function startNightlyRuns(deps: NightlyRunDeps): void {
   let running = false;
 
   const step = async () => {
-    const actions: PersonalAction[] = personal.takeActions();
+    const actions: PersonalAction[] = personal.takeActions(['run_now', 'start_item']);
     for (const action of actions) {
       if (action.kind === 'start_item') await startItemNow(deps, action);
     }
@@ -378,4 +414,18 @@ export function startNightlyRuns(deps: NightlyRunDeps): void {
   };
 
   setInterval(tick, TICK_MS);
+
+  // Apart from the rest: a button shouldn't wait for a run of an hour to finish.
+  let tapping = false;
+  setInterval(() => {
+    if (tapping) return;
+    tapping = true;
+    void (async () => {
+      for (const action of personal.takeActions(['merge', 'approve'])) await runTap(deps, action);
+    })()
+      .catch(error => logger.warn({ error: String(error) }, 'my day: tap action failed'))
+      .finally(() => {
+        tapping = false;
+      });
+  }, TAP_POLL_MS);
 }

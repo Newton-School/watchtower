@@ -77,6 +77,29 @@ function Line({ label, children }: { label: string; children: ReactNode }) {
   );
 }
 
+type Tap = { kind: 'merge' | 'approve' | 'deploy'; url: string; head?: string };
+
+function tapQuestion(tap: Tap): string {
+  const label = prLabel(tap.url);
+  const at = tap.head ? ` at ${tap.head.slice(0, 7)}` : '';
+  if (tap.kind === 'merge') return `Merge ${label}${at}?`;
+  if (tap.kind === 'approve') return `Approve ${label}${at}, under your name?`;
+  return `Deploy ${label}'s repo to production? This starts the deploy, and it still asks you to reply \`confirm deploy\` in its thread before anything happens.`;
+}
+
+/** What can be pressed for one PR. Only ever from what was looked up, never from the item's text. */
+function tapsFor(item: MyDayItem, url: string): Tap[] {
+  const info = item.prInfo[url];
+  if (!info || item.source === 'session') return [];
+  if (info.state === 'merged') return info.deployable ? [{ kind: 'deploy', url }] : [];
+  if (info.state !== 'open' || !info.head || info.draft) return [];
+  const taps: Tap[] = [{ kind: 'merge', url, head: info.head }];
+  if (!info.mine) taps.push({ kind: 'approve', url, head: info.head });
+  return taps;
+}
+
+const TAP_LABELS: Record<Tap['kind'], string> = { merge: 'Merge', approve: 'Approve', deploy: 'Deploy' };
+
 function ReplyStatus({ item }: { item: MyDayItem }) {
   if (item.state === 'done') {
     return item.draftStatus === 'saved' ? (
@@ -115,6 +138,8 @@ export function MyDayRow({
 }) {
   const [copied, setCopied] = useState(false);
   const [answer, setAnswer] = useState('');
+  // Nothing happens on the first press: it asks, naming the PR and the commit.
+  const [confirming, setConfirming] = useState<Tap | null>(null);
 
   const copyReply = async () => {
     if (!item.replyText) return;
@@ -133,6 +158,15 @@ export function MyDayRow({
       if (changes) onChanged();
     } catch (err) {
       onError(String(err));
+    }
+  };
+
+  const confirmTap = async (tap: Tap) => {
+    setConfirming(null);
+    if (tap.kind === 'deploy') {
+      await call('deploy_my_day_item', { key: item.key, url: tap.url }, true);
+    } else {
+      await call('my_day_pr_action', { key: item.key, kind: tap.kind, url: tap.url, head: tap.head }, true);
     }
   };
 
@@ -177,6 +211,24 @@ export function MyDayRow({
               {item.prStates[url] ? ` · ${item.prStates[url]}` : ''}
             </a>
           ))}
+          {item.prUrls
+            .flatMap(url => tapsFor(item, url))
+            .map(tap => (
+              <button
+                key={`${tap.kind}:${tap.url}`}
+                className="ghost-button"
+                type="button"
+                onClick={() => setConfirming(tap)}
+              >
+                {TAP_LABELS[tap.kind]}
+                {item.prUrls.length > 1 ? ` ${prLabel(tap.url)}` : ''}
+              </button>
+            ))}
+          {item.deployJobId && onOpenRun ? (
+            <button className="ghost-button" type="button" onClick={() => onOpenRun(item.deployJobId ?? '')}>
+              See the deploy
+            </button>
+          ) : null}
           {item.jobId && onOpenRun ? (
             <button className="ghost-button" type="button" onClick={() => onOpenRun(item.jobId ?? '')}>
               See the run
@@ -229,6 +281,18 @@ export function MyDayRow({
           ) : null}
         </div>
       </header>
+      {confirming ? (
+        <div className="my-day-confirm">
+          <span>{tapQuestion(confirming)}</span>
+          <button className="primary-button" type="button" onClick={() => void confirmTap(confirming)}>
+            Yes, {TAP_LABELS[confirming.kind].toLowerCase()}
+          </button>
+          <button className="ghost-button" type="button" onClick={() => setConfirming(null)}>
+            Cancel
+          </button>
+        </div>
+      ) : null}
+      {item.tapResult ? <Line label="Result">{item.tapResult}</Line> : null}
       <Line label={isSession ? 'Session' : 'Asked'}>{item.ask}</Line>
       {item.ownerClosed ? (
         <Line label="Closed">{item.ownerClosed === 'skipped' ? 'You skipped this.' : 'You marked this done.'}</Line>
@@ -387,7 +451,8 @@ export function MyDayPage({ onOpenRun }: { onOpenRun?: (runId: string) => void }
       <GlowCard>
         <strong>What runs on its own</strong>
         <p className="muted">
-          Merging, approving and deploying never do. Replies are always drafts. Prepare only does none of this.
+          Merging, approving and deploying never do: those need your button on the item. Replies are always drafts.
+          Prepare only does none of this.
         </p>
         <div className="my-day-policies">
           {POLICY_ROWS.map(row => (

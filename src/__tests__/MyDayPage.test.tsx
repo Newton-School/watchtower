@@ -30,6 +30,10 @@ function item(overrides: Partial<MyDayItem>): MyDayItem {
     prStates: {},
     action: null,
     jobStatus: null,
+    prInfo: {},
+    tapResult: null,
+    deployJobId: null,
+    deployStatus: null,
     firstSeenAt: '2026-11-01T00:00:00.000Z',
     ...overrides,
   };
@@ -262,6 +266,79 @@ describe('MyDayPage', () => {
     await screen.findByText("It hasn't run yet.");
     fireEvent.change(screen.getByLabelText('New PRs for clear asks'), { target: { value: 'ask' } });
     await waitFor(() => expect(invoke).toHaveBeenCalledWith('save_my_day_policy', { name: 'open_pr', value: 'ask' }));
+  });
+
+  const prUrl = 'https://github.com/o/newton-web/pull/9468';
+  const head = '0123456789abcdef0123456789abcdef01234567';
+
+  it('merges only after asking, naming the PR and commit, and sends that commit', async () => {
+    serve(day({ items: [item({ key: 'k', prInfo: { [prUrl]: { state: 'open', head, mine: false } } })] }));
+    render(<MyDayPage />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Merge' }));
+    expect(invoke).not.toHaveBeenCalledWith('my_day_pr_action', expect.anything());
+    expect(screen.getByText('Merge newton-web#9468 at 0123456?')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Yes, merge' }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith('my_day_pr_action', { key: 'k', kind: 'merge', url: prUrl, head }),
+    );
+  });
+
+  it('does nothing on Cancel', async () => {
+    serve(day({ items: [item({ key: 'k', prInfo: { [prUrl]: { state: 'open', head, mine: false } } })] }));
+    render(<MyDayPage />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('button', { name: 'Yes, approve' })).toBeNull();
+    expect(invoke).not.toHaveBeenCalledWith('my_day_pr_action', expect.anything());
+  });
+
+  it('offers no Approve on his own PR, and nothing on a draft, an unread PR or a closed one', async () => {
+    serve(
+      day({
+        items: [
+          item({ key: 'mine', ask: 'mine', prInfo: { [prUrl]: { state: 'open', head, mine: true } } }),
+          item({ key: 'draft', ask: 'draft', prInfo: { [prUrl]: { state: 'open', head, draft: true } } }),
+          item({ key: 'closed', ask: 'closed', prInfo: { [prUrl]: { state: 'closed', head } } }),
+          item({ key: 'unread', ask: 'unread' }),
+        ],
+      }),
+    );
+    render(<MyDayPage />);
+    await screen.findByText('mine');
+    expect(screen.getAllByRole('button', { name: 'Merge' })).toHaveLength(1);
+    expect(screen.queryByRole('button', { name: 'Approve' })).toBeNull();
+  });
+
+  it('offers Deploy only for a merged PR not yet live, and says a gate still follows', async () => {
+    serve(
+      day({
+        items: [
+          item({ key: 'k', state: 'done', prInfo: { [prUrl]: { state: 'merged', deployable: true } } }),
+          item({
+            key: 'live',
+            state: 'done',
+            ask: 'live',
+            prInfo: { [prUrl]: { state: 'merged', deployable: false } },
+          }),
+        ],
+      }),
+    );
+    render(<MyDayPage />);
+    fireEvent.click(await screen.findByRole('button', { name: /^Done/ }));
+    expect(screen.getAllByRole('button', { name: 'Deploy' })).toHaveLength(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Deploy' }));
+    expect(screen.getByText(/confirm deploy/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Yes, deploy' }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('deploy_my_day_item', { key: 'k', url: prUrl }));
+  });
+
+  it('shows what came of a button, and the deploy it started', async () => {
+    const onOpenRun = vi.fn();
+    serve(day({ items: [item({ key: 'k', tapResult: 'Merged newton-web#9468 at 0123456.', deployJobId: 'job-9' })] }));
+    render(<MyDayPage onOpenRun={onOpenRun} />);
+    expect(await screen.findByText('Merged newton-web#9468 at 0123456.')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'See the deploy' }));
+    expect(onOpenRun).toHaveBeenCalledWith('job-9');
   });
 
   it('sends Prepare only with Run now', async () => {
