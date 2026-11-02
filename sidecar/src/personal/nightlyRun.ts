@@ -52,7 +52,7 @@ const workAwake = new KeepAwake();
 const SESSION_KEY_PREFIX = 'session:';
 const TICK_MS = 15_000;
 const TAP_POLL_MS = 2_000;
-/** A press only counts while he's there. Longer means the sidecar was down when he pressed. */
+/** A press only counts while the owner's there. Longer means the sidecar was down at the press. */
 const TAP_MAX_AGE_MS = 2 * 60 * 1000;
 /** The agent reads dozens of threads one call at a time, and a three-day window is slow. */
 const TRIAGE_TIMEOUT_MS = 90 * 60 * 1000;
@@ -217,7 +217,7 @@ function stamped(message: string): string {
   return `${message} (${at})`;
 }
 
-/** His Merge or Approve. Says what came of it on the item, and looks the PR up again either way. */
+/** The owner's Merge or Approve. Says what came of it on the item, and looks the PR up again either way. */
 async function runTap(deps: NightlyRunDeps, action: PersonalAction): Promise<void> {
   const personal = deps.store.personalStore();
   const item = action.itemKey ? personal.item(action.itemKey) : undefined;
@@ -225,7 +225,7 @@ async function runTap(deps: NightlyRunDeps, action: PersonalAction): Promise<voi
   const kind = action.kind === 'merge' ? 'merge' : 'approve';
   let message: string;
   if (Date.now() - Date.parse(action.createdAt) > TAP_MAX_AGE_MS) {
-    // Pressed while the sidecar was down: he's no longer there to see it happen.
+    // Pressed while the sidecar was down: nobody's there to see it happen.
     message = 'That press was too long ago, so nothing was done. Press it again if you still want this.';
   } else if (!item.prUrls.includes(action.prUrl)) {
     message = "That PR isn't on this item, so nothing was done.";

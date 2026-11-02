@@ -106,7 +106,7 @@ function tapsFor(item: MyDayItem, url: string): Tap[] {
   const info = item.prInfo[url];
   if (!info || item.source === 'session') return [];
   if (info.state === 'merged') return info.deployable ? [{ kind: 'deploy', url }] : [];
-  // What he closed keeps Deploy, for something merged and waiting, but asks nothing more of the PR.
+  // A closed item keeps Deploy, for something merged and waiting, but asks nothing more of the PR.
   if (info.state !== 'open' || !info.head || info.draft || item.ownerClosed) return [];
   const taps: Tap[] = [{ kind: 'merge', url, head: info.head }];
   if (!info.mine) taps.push({ kind: 'approve', url, head: info.head });

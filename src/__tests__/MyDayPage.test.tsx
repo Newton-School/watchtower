@@ -291,7 +291,7 @@ describe('MyDayPage', () => {
     expect(screen.getByText('Merge newton-web#9468 at 0123456, "Real title" by shiv into master?')).toBeTruthy();
   });
 
-  it('asks nothing more of a PR on an item he closed, but still offers its deploy', async () => {
+  it('asks nothing more of a PR on a closed item, but still offers its deploy', async () => {
     serve(
       day({
         items: [

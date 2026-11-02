@@ -2,7 +2,7 @@ import type { Fetcher } from './githubInventory.js';
 
 /**
  * What the inbox needs to know about each PR it names: whether it's open or merged,
- * the commit a button would act on, whether it's his own, and whether it's merged
+ * the commit a button would act on, whether it's the owner's own, and whether it's merged
  * but not live. The triage agent only reads Slack and can't tell any of this. A PR
  * it can't read is left out and offers nothing, rather than acting on a guess.
  */
@@ -12,7 +12,7 @@ export interface PrInfo {
   /** The commit a merge or approval is tied to. */
   head?: string;
   draft?: boolean;
-  /** He wrote it: GitHub won't let him approve it. */
+  /** The owner wrote it, so GitHub won't let them approve it. */
   mine?: boolean;
   /** Merged, in a repo the app can deploy, and not in production yet. */
   deployable?: boolean;

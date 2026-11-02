@@ -787,7 +787,7 @@ pub(crate) async fn start_my_day_item(
     }
 }
 
-/// Merge or Approve, from his button. The sidecar does it and says what came of it.
+/// Merge or Approve, from the owner's button. The sidecar does it and says what came of it.
 #[tauri::command]
 pub(crate) async fn my_day_pr_action(
     key: String,

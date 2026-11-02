@@ -486,7 +486,7 @@ describe('Merge and Approve', () => {
       },
     );
 
-  it('merges tied to the commit he saw, so GitHub refuses if it moved', async () => {
+  it('merges tied to the commit that was shown, so GitHub refuses if it moved', async () => {
     const gh = github();
     expect(await merge(gh)).toEqual({ ok: true, message: `Merged r#7 at ${head.slice(0, 7)}.` });
     expect(gh.writes()).toEqual([
@@ -500,7 +500,7 @@ describe('Merge and Approve', () => {
     expect(gh.writes()[0].body).toMatchObject({ merge_method: 'merge' });
   });
 
-  it('does nothing if the PR moved since he looked', async () => {
+  it('does nothing if the PR moved since it was shown', async () => {
     const gh = github({ pr: { head: { sha: 'b'.repeat(40) } } });
     expect((await merge(gh)).message).toContain('new commits');
     expect(gh.writes()).toEqual([]);

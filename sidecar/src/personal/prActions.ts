@@ -2,11 +2,11 @@ import { fetchMergeState, fetchUnresolvedReviewThreadCount } from '../github/prR
 import type { Fetcher } from './githubInventory.js';
 
 /**
- * Merge and Approve, from a button only he can press. Nothing else in My day can
+ * Merge and Approve, from a button only the owner can press. Nothing else in My day can
  * do either: its agents have no token, and these only run on a request from the
- * app. Each is tied to the commit he saw, so a push after he looked stops it, and
+ * app. Each is tied to the commit they saw, so a push after they looked stops it, and
  * GitHub enforces that itself. It only merges what's plainly ready; anything else
- * is his to look at on GitHub, where he can still merge it by hand.
+ * is theirs to look at on GitHub, where they can still merge it by hand.
  */
 
 export type PrActionKind = 'merge' | 'approve';
@@ -33,7 +33,7 @@ async function requestedChanges(
 export interface PrActionRequest {
   kind: PrActionKind;
   url: string;
-  /** The commit he saw when he pressed it. */
+  /** The commit shown when the button was pressed. */
   head: string;
   allowedOrg: string;
   githubToken: string;
