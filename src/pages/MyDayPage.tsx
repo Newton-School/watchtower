@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import type { MyDay, MyDayItem, MyDayRun } from '../types';
+import type { MyDay, MyDayItem, MyDayPrInfo, MyDayRun } from '../types';
 import { GlowCard } from '../components/GlowCard';
 import { EmptyState, PageIntro, TabBar } from '../components/primitives';
 
@@ -42,6 +42,10 @@ function prLabel(url: string): string {
   return match ? `${match[1]}#${match[2]}` : url;
 }
 
+function repoOf(url: string): string {
+  return /github\.com\/[^/]+\/([^/]+)\/pull/.exec(url)?.[1] ?? url;
+}
+
 function money(usd: number): string {
   return `$${usd.toFixed(2)}`;
 }
@@ -79,12 +83,22 @@ function Line({ label, children }: { label: string; children: ReactNode }) {
 
 type Tap = { kind: 'merge' | 'approve' | 'deploy'; url: string; head?: string };
 
-function tapQuestion(tap: Tap): string {
+function tapQuestion(tap: Tap, info: MyDayPrInfo | undefined): string {
   const label = prLabel(tap.url);
   const at = tap.head ? ` at ${tap.head.slice(0, 7)}` : '';
-  if (tap.kind === 'merge') return `Merge ${label}${at}?`;
-  if (tap.kind === 'approve') return `Approve ${label}${at}, under your name?`;
-  return `Deploy ${label}'s repo to production? This starts the deploy, and it still asks you to reply \`confirm deploy\` in its thread before anything happens.`;
+  // From GitHub: the item's own words came through Slack and needn't describe this PR.
+  const about = [
+    info?.title && `"${info.title}"`,
+    info?.author && `by ${info.author}`,
+    info?.base && `into ${info.base}`,
+  ]
+    .filter(Boolean)
+    .join(' ');
+  const what = about ? `${label}${at}, ${about}` : `${label}${at}`;
+  if (tap.kind === 'merge') return `Merge ${what}?`;
+  if (tap.kind === 'approve') return `Approve ${what}, under your name?`;
+  const waiting = info?.undeployedCommits ? ` ${info.undeployedCommits} commits are waiting to ship.` : '';
+  return `Deploy ${repoOf(tap.url)} to production for ${what}?${waiting} It ships the newest good commit, so other merged work may go too, and it still asks you to reply \`confirm deploy\` before anything happens.`;
 }
 
 /** What can be pressed for one PR. Only ever from what was looked up, never from the item's text. */
@@ -92,7 +106,8 @@ function tapsFor(item: MyDayItem, url: string): Tap[] {
   const info = item.prInfo[url];
   if (!info || item.source === 'session') return [];
   if (info.state === 'merged') return info.deployable ? [{ kind: 'deploy', url }] : [];
-  if (info.state !== 'open' || !info.head || info.draft) return [];
+  // What he closed keeps Deploy, for something merged and waiting, but asks nothing more of the PR.
+  if (info.state !== 'open' || !info.head || info.draft || item.ownerClosed) return [];
   const taps: Tap[] = [{ kind: 'merge', url, head: info.head }];
   if (!info.mine) taps.push({ kind: 'approve', url, head: info.head });
   return taps;
@@ -209,6 +224,7 @@ export function MyDayRow({
             <a key={url} className="ghost-button" href={url} target="_blank" rel="noopener noreferrer">
               {prLabel(url)}
               {item.prStates[url] ? ` · ${item.prStates[url]}` : ''}
+              {item.prInfo[url]?.deployUnknown ? ' · not sure if live' : ''}
             </a>
           ))}
           {item.prUrls
@@ -283,7 +299,7 @@ export function MyDayRow({
       </header>
       {confirming ? (
         <div className="my-day-confirm">
-          <span>{tapQuestion(confirming)}</span>
+          <span>{tapQuestion(confirming, item.prInfo[confirming.url])}</span>
           <button className="primary-button" type="button" onClick={() => void confirmTap(confirming)}>
             Yes, {TAP_LABELS[confirming.kind].toLowerCase()}
           </button>

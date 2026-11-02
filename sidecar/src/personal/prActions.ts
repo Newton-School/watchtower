@@ -11,6 +11,25 @@ import type { Fetcher } from './githubInventory.js';
 
 export type PrActionKind = 'merge' | 'approve';
 
+/** Who currently has changes requested: each reviewer's latest say, ignoring plain comments. */
+async function requestedChanges(
+  fetcher: Fetcher,
+  url: string,
+  headers: Record<string, string>,
+): Promise<string[] | undefined> {
+  const response = await fetcher(url, { headers });
+  if (!response.ok) return undefined;
+  const reviews = (await response.json()) as Array<{ state?: string; user?: { login?: string } }>;
+  const latest = new Map<string, string>();
+  for (const review of reviews) {
+    const login = review.user?.login;
+    if (login && review.state && review.state !== 'COMMENTED' && review.state !== 'PENDING') {
+      latest.set(login, review.state);
+    }
+  }
+  return [...latest].filter(([, state]) => state === 'CHANGES_REQUESTED').map(([login]) => login);
+}
+
 export interface PrActionRequest {
   kind: PrActionKind;
   url: string;
@@ -27,12 +46,17 @@ export interface PrActionResult {
 
 const PR_URL = /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)$/;
 const API = 'https://api.github.com';
-/** The states GitHub would merge from. BEHIND is fine unless the branch rule says otherwise, and GitHub then refuses. */
-const MERGEABLE_STATES = new Set(['CLEAN', 'HAS_HOOKS', 'BEHIND']);
+/**
+ * Only what's plainly ready. BEHIND isn't: it's reported only where the branch rule
+ * wants it up to date, and an admin's merge goes straight past that rule.
+ */
+const MERGEABLE_STATES = new Set(['CLEAN', 'HAS_HOOKS']);
+const REQUEST_TIMEOUT_MS = 20_000;
 
 const STATE_WORDS: Record<string, string> = {
   DIRTY: 'it has conflicts',
-  UNSTABLE: 'its checks are failing',
+  UNSTABLE: 'its checks are failing or still running',
+  BEHIND: 'its branch is behind the base, and the branch rules want it up to date',
   BLOCKED: "it's blocked by the branch rules (a required review or check)",
   DRAFT: "it's a draft",
   UNKNOWN: "GitHub hasn't worked out if it can merge yet, so try again in a minute",
@@ -53,9 +77,24 @@ async function githubError(response: Response): Promise<string> {
   }
 }
 
+/** A failure partway can mean it happened anyway, so it says to look, never that nothing was done. */
 export async function runPrAction(request: PrActionRequest, deps: Deps = {}): Promise<PrActionResult> {
+  try {
+    return await act(request, deps);
+  } catch (error) {
+    return {
+      ok: false,
+      message: `Something went wrong during this, so check the PR on GitHub: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+async function act(request: PrActionRequest, deps: Deps): Promise<PrActionResult> {
   const { kind, url, head, allowedOrg, githubToken } = request;
-  const fetcher = deps.fetcher ?? fetch;
+  const given = deps.fetcher ?? fetch;
+  // A hung call mustn't hold up every other button.
+  const fetcher: Fetcher = (target, init) =>
+    given(target, { ...init, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
   const match = PR_URL.exec(url);
   if (!match) return { ok: false, message: "That isn't a PR link." };
   const [, owner, repo, numberText] = match;
@@ -96,9 +135,28 @@ export async function runPrAction(request: PrActionRequest, deps: Deps = {}): Pr
 
   const target = { owner, repo, pullNumber: number, githubToken };
   const state = await (deps.readMergeState ?? fetchMergeState)(target);
-  const status = state?.mergeStateStatus ?? 'UNKNOWN';
+  const status = state?.isDraft ? 'DRAFT' : (state?.mergeStateStatus ?? 'UNKNOWN');
   if (!MERGEABLE_STATES.has(status)) {
     return { ok: false, message: `Didn't merge ${label}: ${STATE_WORDS[status] ?? `GitHub says ${status}`}.` };
+  }
+  if (state?.headSha && state.headSha !== head) {
+    return { ok: false, message: `${label} has new commits since you looked, so nothing was done. Check them first.` };
+  }
+  // The rules may not require a review, but a person asking for changes still means not ready.
+  const changesRequested = await requestedChanges(
+    fetcher,
+    `${API}/repos/${owner}/${repo}/pulls/${number}/reviews?per_page=100`,
+    headers,
+  );
+  if (state?.reviewDecision === 'CHANGES_REQUESTED' || changesRequested === undefined || changesRequested.length > 0) {
+    const who = changesRequested?.length ? ` by ${changesRequested.join(', ')}` : '';
+    return {
+      ok: false,
+      message:
+        changesRequested === undefined
+          ? `Didn't merge ${label}: couldn't read its reviews.`
+          : `Didn't merge ${label}: changes were requested${who}. Merge on GitHub if you mean to.`,
+    };
   }
   const threads = await (deps.readThreads ?? fetchUnresolvedReviewThreadCount)(target);
   if (threads.failed || threads.incomplete) {
@@ -113,8 +171,16 @@ export async function runPrAction(request: PrActionRequest, deps: Deps = {}): Pr
   }
 
   const settings = await fetcher(`${API}/repos/${owner}/${repo}`, { headers });
-  const repository = settings.ok ? ((await settings.json()) as { allow_squash_merge?: boolean }) : undefined;
-  const method = repository?.allow_squash_merge === false ? 'merge' : 'squash';
+  const repository = settings.ok
+    ? ((await settings.json()) as { allow_squash_merge?: boolean; default_branch?: string })
+    : undefined;
+  if (!repository?.default_branch || state?.baseRef !== repository.default_branch) {
+    return {
+      ok: false,
+      message: `Didn't merge ${label}: it goes into ${state?.baseRef ?? 'another branch'}, not ${repository?.default_branch ?? 'the default branch'}. Merge on GitHub if you mean to.`,
+    };
+  }
+  const method = repository.allow_squash_merge === false ? 'merge' : 'squash';
   // `sha` makes GitHub itself refuse if anything was pushed after these checks.
   const merged = await fetcher(`${API}/repos/${owner}/${repo}/pulls/${number}/merge`, {
     method: 'PUT',

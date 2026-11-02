@@ -48,6 +48,8 @@ export interface TriageReply {
 
 export const SLACK_ID = /^[CDG][A-Z0-9]{5,}$/;
 export const SLACK_TS = /^\d{10}\.\d{1,6}$/;
+/** Each one is looked up on GitHub, and this list comes from an agent that read Slack. */
+const MAX_PR_URLS = 5;
 const GITHUB_PR = /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+$/;
 
 export function buildTriagePrompt(params: {
@@ -241,7 +243,7 @@ export function toPersonalItem(item: TriagedItem, runId: string) {
     replyText: item.reply_text ?? undefined,
     nextStep: item.next_step ?? undefined,
     evidence: item.evidence ?? undefined,
-    prUrls: (item.pr_urls ?? []).filter(url => GITHUB_PR.test(url)),
+    prUrls: (item.pr_urls ?? []).filter(url => GITHUB_PR.test(url)).slice(0, MAX_PR_URLS),
     lastRunId: runId,
   };
 }

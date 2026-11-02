@@ -16,6 +16,14 @@ export interface PrInfo {
   mine?: boolean;
   /** Merged, in a repo the app can deploy, and not in production yet. */
   deployable?: boolean;
+  /** Commits on the default branch that production doesn't have yet, this one's among them. */
+  undeployedCommits?: number;
+  /** It could be deployable, but whether it's live couldn't be read. */
+  deployUnknown?: boolean;
+  /** What the confirmation shows: the item's own words came from Slack and needn't describe the PR. */
+  title?: string;
+  author?: string;
+  base?: string;
 }
 
 const PR_URL = /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)$/;
@@ -50,6 +58,8 @@ async function productionCommit(owner: string, repo: string, read: Reader): Prom
 
 export async function fetchPrInfo(params: {
   urls: string[];
+  /** A link to any other org offers nothing: a Slack message can link anything. */
+  allowedOrg: string;
   githubToken?: string;
   fetcher?: Fetcher;
 }): Promise<Record<string, PrInfo>> {
@@ -73,9 +83,11 @@ export async function fetchPrInfo(params: {
     const match = PR_URL.exec(url);
     if (!match) return;
     const [, owner, repo, number] = match;
+    if (owner !== params.allowedOrg) return;
     try {
       const pr = await read<{
         state?: string;
+        title?: string;
         merged_at?: string | null;
         merge_commit_sha?: string | null;
         draft?: boolean;
@@ -86,8 +98,16 @@ export async function fetchPrInfo(params: {
       if (!pr) return;
       const state = pr.merged_at ? 'merged' : pr.state === 'open' || pr.state === 'closed' ? pr.state : undefined;
       if (!state) return;
-      const entry: PrInfo = { state, head: pr.head?.sha, draft: Boolean(pr.draft), mine: pr.user?.login === login };
-      const onDefault = pr.base?.ref && pr.base.ref === pr.base.repo?.default_branch;
+      const onDefault = Boolean(pr.base?.ref) && pr.base?.ref === pr.base?.repo?.default_branch;
+      const entry: PrInfo = {
+        state,
+        head: pr.head?.sha,
+        draft: Boolean(pr.draft),
+        mine: pr.user?.login === login,
+        title: pr.title?.slice(0, 200),
+        author: pr.user?.login,
+        base: pr.base?.ref,
+      };
       if (state === 'merged' && pr.merge_commit_sha && onDefault && DEPLOY_ASKS[repo]) {
         const key = `${owner}/${repo}`;
         if (!production.has(key))
@@ -96,12 +116,18 @@ export async function fetchPrInfo(params: {
             productionCommit(owner, repo, read).catch(() => undefined),
           );
         const live = await production.get(key);
-        if (live) {
-          // `ahead` or `identical`: production has the merge. Anything else doesn't, as far as can be told.
-          const compare = await read<{ status?: string }>(
-            `/repos/${owner}/${repo}/compare/${pr.merge_commit_sha}...${live}`,
-          );
-          entry.deployable = compare?.status === 'behind' || compare?.status === 'diverged';
+        // `ahead` or `identical`: production has the merge. `behind` or `diverged`: it doesn't.
+        const compare = live
+          ? await read<{ status?: string; behind_by?: number }>(
+              `/repos/${owner}/${repo}/compare/${pr.merge_commit_sha}...${live}`,
+            )
+          : undefined;
+        if (compare?.status) {
+          entry.deployable = compare.status === 'behind' || compare.status === 'diverged';
+          if (entry.deployable) entry.undeployedCommits = compare.behind_by;
+        } else {
+          entry.deployable = false;
+          entry.deployUnknown = true;
         }
       }
       info[url] = entry;

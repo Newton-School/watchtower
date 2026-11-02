@@ -52,6 +52,8 @@ const workAwake = new KeepAwake();
 const SESSION_KEY_PREFIX = 'session:';
 const TICK_MS = 15_000;
 const TAP_POLL_MS = 2_000;
+/** A press only counts while he's there. Longer means the sidecar was down when he pressed. */
+const TAP_MAX_AGE_MS = 2 * 60 * 1000;
 /** The agent reads dozens of threads one call at a time, and a three-day window is slow. */
 const TRIAGE_TIMEOUT_MS = 90 * 60 * 1000;
 const DRAFT_TIMEOUT_MS = 20 * 60 * 1000;
@@ -200,12 +202,19 @@ async function refreshPrInfo(deps: NightlyRunDeps, only?: PersonalItem): Promise
   if (items.length === 0) return;
   const info = await fetchPrInfo({
     urls: items.flatMap(item => item.prUrls),
+    allowedOrg: deps.config.allowedPrOrg,
     githubToken: await resolveGithubTokenForCodex(),
   });
   for (const item of items) {
     const known = item.prUrls.filter(url => info[url]).map(url => [url, info[url]]);
-    personal.setPrInfo(item.key, Object.fromEntries(known) as Record<string, PrInfo>);
+    // A lookup that failed keeps what was known, rather than taking the buttons away until tomorrow.
+    personal.setPrInfo(item.key, { ...item.prInfo, ...(Object.fromEntries(known) as Record<string, PrInfo>) });
   }
+}
+
+function stamped(message: string): string {
+  const at = new Date().toLocaleString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+  return `${message} (${at})`;
 }
 
 /** His Merge or Approve. Says what came of it on the item, and looks the PR up again either way. */
@@ -215,7 +224,10 @@ async function runTap(deps: NightlyRunDeps, action: PersonalAction): Promise<voi
   if (!item || !action.prUrl || !action.head) return;
   const kind = action.kind === 'merge' ? 'merge' : 'approve';
   let message: string;
-  if (!item.prUrls.includes(action.prUrl)) {
+  if (Date.now() - Date.parse(action.createdAt) > TAP_MAX_AGE_MS) {
+    // Pressed while the sidecar was down: he's no longer there to see it happen.
+    message = 'That press was too long ago, so nothing was done. Press it again if you still want this.';
+  } else if (!item.prUrls.includes(action.prUrl)) {
     message = "That PR isn't on this item, so nothing was done.";
   } else {
     const token = await resolveGithubTokenForCodex();
@@ -231,9 +243,18 @@ async function runTap(deps: NightlyRunDeps, action: PersonalAction): Promise<voi
         ).message
       : "Couldn't get a GitHub login, so nothing was done.";
   }
-  personal.setTapResult(item.key, message);
+  personal.setTapResult(item.key, stamped(message));
   logger.info({ key: item.key, kind, prUrl: action.prUrl, message }, 'my day: tap action');
   await refreshPrInfo(deps, item).catch(error => logger.warn({ error: String(error) }, 'my day: PR lookup failed'));
+}
+
+/** A deploy that ended changes what's live, so Deploy shouldn't stay offered for it. */
+async function refreshAfterDeploys(deps: NightlyRunDeps): Promise<void> {
+  const personal = deps.store.personalStore();
+  for (const item of personal.itemsWithFinishedDeploys()) {
+    await refreshPrInfo(deps, item);
+    personal.markDeployRefreshed(item.key);
+  }
 }
 
 /**
@@ -400,6 +421,7 @@ export function startNightlyRuns(deps: NightlyRunDeps): void {
       await runNightly(deps, { trigger: 'schedule' });
       return;
     }
+    await refreshAfterDeploys(deps).catch(error => logger.warn({ error: String(error) }, 'my day: PR lookup failed'));
     await advanceWork(deps);
   };
 
@@ -416,12 +438,27 @@ export function startNightlyRuns(deps: NightlyRunDeps): void {
   setInterval(tick, TICK_MS);
 
   // Apart from the rest: a button shouldn't wait for a run of an hour to finish.
+  for (const action of personal.takeInterruptedTaps()) {
+    if (action.itemKey) {
+      personal.setTapResult(
+        action.itemKey,
+        stamped(`Watchtower restarted during your ${action.kind}, so check the PR on GitHub.`),
+      );
+    }
+  }
   let tapping = false;
   setInterval(() => {
     if (tapping) return;
     tapping = true;
     void (async () => {
-      for (const action of personal.takeActions(['merge', 'approve'])) await runTap(deps, action);
+      // One at a time: taking several and failing on the first would lose the rest.
+      for (const action of personal.takeActions(['merge', 'approve'], 1)) {
+        try {
+          await runTap(deps, action);
+        } finally {
+          personal.finishAction(action.id);
+        }
+      }
     })()
       .catch(error => logger.warn({ error: String(error) }, 'my day: tap action failed'))
       .finally(() => {

@@ -283,6 +283,49 @@ describe('MyDayPage', () => {
     );
   });
 
+  it('asks with what GitHub says about the PR, not the words from Slack', async () => {
+    const info = { state: 'open', head, mine: false, title: 'Real title', author: 'shiv', base: 'master' };
+    serve(day({ items: [item({ key: 'k', ask: 'merge the harmless thing', prInfo: { [prUrl]: info } })] }));
+    render(<MyDayPage />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Merge' }));
+    expect(screen.getByText('Merge newton-web#9468 at 0123456, "Real title" by shiv into master?')).toBeTruthy();
+  });
+
+  it('asks nothing more of a PR on an item he closed, but still offers its deploy', async () => {
+    serve(
+      day({
+        items: [
+          item({ key: 'a', state: 'done', ownerClosed: 'skipped', prInfo: { [prUrl]: { state: 'open', head } } }),
+          item({
+            key: 'b',
+            state: 'done',
+            ownerClosed: 'done',
+            prInfo: { [prUrl]: { state: 'merged', deployable: true } },
+          }),
+        ],
+      }),
+    );
+    render(<MyDayPage />);
+    fireEvent.click(await screen.findByRole('button', { name: /^Done/ }));
+    expect(screen.queryByRole('button', { name: 'Merge' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Deploy' })).toBeTruthy();
+  });
+
+  it('says when it could not tell if a PR is live', async () => {
+    serve(
+      day({
+        items: [
+          item({
+            prInfo: { [prUrl]: { state: 'merged', deployable: false, deployUnknown: true } },
+            prStates: { [prUrl]: 'merged' },
+          }),
+        ],
+      }),
+    );
+    render(<MyDayPage />);
+    expect(await screen.findByRole('link', { name: 'newton-web#9468 · merged · not sure if live' })).toBeTruthy();
+  });
+
   it('does nothing on Cancel', async () => {
     serve(day({ items: [item({ key: 'k', prInfo: { [prUrl]: { state: 'open', head, mine: false } } })] }));
     render(<MyDayPage />);
@@ -328,6 +371,7 @@ describe('MyDayPage', () => {
     expect(screen.getAllByRole('button', { name: 'Deploy' })).toHaveLength(1);
     fireEvent.click(screen.getByRole('button', { name: 'Deploy' }));
     expect(screen.getByText(/confirm deploy/)).toBeTruthy();
+    expect(screen.getByText(/other merged work may go too/)).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Yes, deploy' }));
     await waitFor(() => expect(invoke).toHaveBeenCalledWith('deploy_my_day_item', { key: 'k', url: prUrl }));
   });

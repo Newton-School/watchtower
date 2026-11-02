@@ -4,6 +4,11 @@ export type MyDayPrInfo = {
   draft?: boolean;
   mine?: boolean;
   deployable?: boolean;
+  undeployedCommits?: number;
+  deployUnknown?: boolean;
+  title?: string;
+  author?: string;
+  base?: string;
 };
 
 export type MyDayItem = {

@@ -88,7 +88,7 @@ fn ensure_tables(connection: &Connection) -> Result<(), String> {
              );
              CREATE TABLE IF NOT EXISTS personal_actions (
                id TEXT PRIMARY KEY, kind TEXT NOT NULL, span TEXT, prepare_only INTEGER NOT NULL DEFAULT 0,
-               item_key TEXT, text TEXT, pr_url TEXT, head TEXT,
+               item_key TEXT, text TEXT, pr_url TEXT, head TEXT, finished_at TEXT,
                created_at TEXT NOT NULL, taken_at TEXT
              );",
         )
@@ -601,7 +601,7 @@ fn queue_pr_action(
             "INSERT INTO personal_actions(id, kind, item_key, pr_url, head, created_at)
              SELECT ?1, ?2, ?3, ?4, ?5, ?6
               WHERE NOT EXISTS (SELECT 1 FROM personal_actions
-                                 WHERE kind = ?2 AND item_key = ?3 AND pr_url = ?4 AND taken_at IS NULL)",
+                                 WHERE kind = ?2 AND item_key = ?3 AND pr_url = ?4 AND finished_at IS NULL)",
             params![uuid::Uuid::new_v4().to_string(), kind, key, url, head, now],
         )
         .map(|_| ())
@@ -796,9 +796,15 @@ pub(crate) async fn my_day_pr_action(
     head: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let connection =
+    let mut connection =
         Connection::open(&*state.db_path).map_err(|err| format!("db open failed: {err}"))?;
-    queue_pr_action(&connection, &key, &kind, &url, &head, &now_iso())
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|err| format!("db write failed: {err}"))?;
+    queue_pr_action(&transaction, &key, &kind, &url, &head, &now_iso())?;
+    transaction
+        .commit()
+        .map_err(|err| format!("db write failed: {err}"))
 }
 
 /// Starts the deploy job, which asks for `confirm deploy` before anything happens.
@@ -808,16 +814,22 @@ pub(crate) async fn deploy_my_day_item(
     url: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let connection =
+    // Together, so two presses can't start two deploys, and a deploy is never left untracked.
+    let mut connection =
         Connection::open(&*state.db_path).map_err(|err| format!("db open failed: {err}"))?;
-    let ask = deploy_request(&connection, &key, &url)?;
-    let response = crate::submit_launchpad_task_inner(&connection, "miniog", ask)?;
-    connection
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|err| format!("db write failed: {err}"))?;
+    let ask = deploy_request(&transaction, &key, &url)?;
+    let response = crate::submit_launchpad_task_inner(&transaction, "miniog", ask)?;
+    transaction
         .execute(
             "UPDATE personal_items SET deploy_request_id = ?1 WHERE item_key = ?2",
             params![response.request_id, key],
         )
-        .map(|_| ())
+        .map_err(|err| format!("db write failed: {err}"))?;
+    transaction
+        .commit()
         .map_err(|err| format!("db write failed: {err}"))
 }
 
@@ -1232,6 +1244,30 @@ mod tests {
         );
         assert!(queue_pr_action(&connection, "a", "approve", PR, HEAD, "now").is_err());
         assert!(queue_pr_action(&connection, "a", "merge", PR, HEAD, "now").is_ok());
+    }
+
+    #[test]
+    fn a_press_still_being_carried_out_is_not_queued_twice() {
+        let connection = database();
+        add_item_with_pr(&connection, serde_json::json!({"state": "open"}));
+        queue_pr_action(&connection, "a", "merge", PR, HEAD, "now").expect("first");
+        connection
+            .execute("UPDATE personal_actions SET taken_at = 'now'", [])
+            .unwrap();
+        queue_pr_action(&connection, "a", "merge", PR, HEAD, "now").expect("ignored");
+        let count = |connection: &Connection| -> i64 {
+            connection
+                .query_row("SELECT COUNT(*) FROM personal_actions", [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(count(&connection), 1);
+        connection
+            .execute("UPDATE personal_actions SET finished_at = 'now'", [])
+            .unwrap();
+        queue_pr_action(&connection, "a", "merge", PR, HEAD, "now").expect("again");
+        assert_eq!(count(&connection), 2);
     }
 
     #[test]

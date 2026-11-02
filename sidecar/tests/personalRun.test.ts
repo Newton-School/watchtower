@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { claudeCodeBackend, claudePermissionMode } from '../src/backends/claudeCodeBackend.js';
 import { settingsProblem } from '../src/backends/personalSlack.js';
 import { currentConnectors, NO_CONNECTORS, withConnectors } from '../src/backends/connectors.js';
@@ -14,6 +14,7 @@ import { draftOutcomes, draftTarget, isConfirmedAsk, oneDraftPerConversation } f
 import { ownPrAsks } from '../src/personal/githubInventory.js';
 import { clonesOf, localWorkOnBranch } from '../src/personal/localWork.js';
 import { runPrAction } from '../src/personal/prActions.js';
+import { __deployScript, missingDeployScript } from '../src/workflows/deployWorkflow.js';
 import { fetchPrInfo } from '../src/personal/prInfo.js';
 import {
   buildJobPrompt,
@@ -354,6 +355,7 @@ describe('what the inbox knows about a PR', () => {
     });
     const info = await fetchPrInfo({
       urls: [pr('r', 1), pr('r', 2), pr('r', 3), pr('r', 4), 'https://evil.example/pull/1'],
+      allowedOrg: 'o',
       fetcher,
     });
     expect(info[pr('r', 1)]).toMatchObject({ state: 'merged', mine: true });
@@ -373,7 +375,7 @@ describe('what the inbox knows about a PR', () => {
       if (path.includes('/compare/mergesha...')) return status === undefined ? json({}, false) : json({ status });
       return json({}, false);
     };
-    return (await fetchPrInfo({ urls: [url], fetcher }))[url];
+    return (await fetchPrInfo({ urls: [url], allowedOrg: 'o', fetcher }))[url];
   };
 
   it('offers a deploy only when production is known not to have the merge', async () => {
@@ -389,7 +391,54 @@ describe('what the inbox knows about a PR', () => {
     expect(onBranch.deployable).toBeUndefined();
     const url = pr('newton-api', 1);
     const fetcher = fetcherFor({ '/user': { login: 'me' }, '/repos/o/newton-api/pulls/1': prBody({ merged_at: 'x' }) });
-    expect((await fetchPrInfo({ urls: [url], fetcher }))[url].deployable).toBeUndefined();
+    expect((await fetchPrInfo({ urls: [url], allowedOrg: 'o', fetcher }))[url].deployable).toBeUndefined();
+  });
+
+  it('offers nothing for a PR in another org, even one named like a repo it can deploy', async () => {
+    const url = 'https://github.com/someone/newton-web/pull/1';
+    const fetcher = fetcherFor({
+      '/user': { login: 'me' },
+      '/repos/someone/newton-web/pulls/1': prBody({ merged_at: 'x' }),
+    });
+    expect(await fetchPrInfo({ urls: [url], allowedOrg: 'o', fetcher })).toEqual({});
+  });
+
+  it("says when it can't tell if a merge is live, rather than looking live", async () => {
+    expect(await deployable(undefined)).toMatchObject({ deployable: false, deployUnknown: true });
+  });
+
+  it('counts what is waiting to ship, for the confirmation', async () => {
+    const url = pr('newton-web', 9);
+    const fetcher = async (requested: string | URL | Request) => {
+      const path = String(requested).replace('https://api.github.com', '');
+      if (path === '/user') return json({ login: 'me' });
+      if (path === '/repos/o/newton-web/pulls/9') {
+        return json(prBody({ state: 'closed', merged_at: 'x', title: 'T' }));
+      }
+      if (path.includes('deployment.yaml')) return json(manifest);
+      if (path.includes('/compare/')) return json({ status: 'behind', behind_by: 4 });
+      return json({}, false);
+    };
+    expect((await fetchPrInfo({ urls: [url], allowedOrg: 'o', fetcher }))[url]).toMatchObject({
+      deployable: true,
+      undeployedCommits: 4,
+      title: 'T',
+    });
+  });
+});
+
+describe('a deploy skill pointing at nothing', () => {
+  const skill = 'Run:\n```\npython3 /x/deploy.py\n```\n```\npython3 /x/deploy.py --dry-run\n```';
+  afterEach(() => {
+    __deployScript.exists = (file: string) => fs.existsSync(file);
+  });
+
+  it('names the missing script', () => {
+    __deployScript.exists = () => false;
+    expect(missingDeployScript(skill)).toBe('/x/deploy.py');
+    expect(missingDeployScript('Update the tag by hand.')).toBeUndefined();
+    __deployScript.exists = () => true;
+    expect(missingDeployScript(skill)).toBeUndefined();
   });
 });
 
@@ -397,11 +446,16 @@ describe('Merge and Approve', () => {
   const head = 'a'.repeat(40);
   const url = 'https://github.com/o/r/pull/7';
   const base = { url, head, allowedOrg: 'o', githubToken: 't' };
-  const clean = async () => ({ mergeStateStatus: 'CLEAN' });
+  const clean = async () => ({ mergeStateStatus: 'CLEAN', baseRef: 'master', headSha: head });
   const noThreads = async () => ({ unresolvedCount: 0, totalThreads: 0 });
 
   function github(
-    overrides: { pr?: Record<string, unknown>; write?: { ok: boolean; body?: unknown }; squash?: boolean } = {},
+    overrides: {
+      pr?: Record<string, unknown>;
+      write?: { ok: boolean; body?: unknown };
+      squash?: boolean;
+      reviews?: unknown[] | 'unreadable';
+    } = {},
   ) {
     const calls: Array<{ path: string; method: string; body?: Record<string, unknown> }> = [];
     const fetcher = async (requested: string | URL | Request, init?: RequestInit) => {
@@ -411,7 +465,12 @@ describe('Merge and Approve', () => {
       const respond = (ok: boolean, body: unknown) =>
         ({ ok, status: ok ? 200 : 405, json: async () => body }) as Response;
       if (method !== 'GET') return respond(overrides.write?.ok ?? true, overrides.write?.body ?? {});
-      if (path === '/repos/o/r') return respond(true, { allow_squash_merge: overrides.squash ?? true });
+      if (path === '/repos/o/r') {
+        return respond(true, { allow_squash_merge: overrides.squash ?? true, default_branch: 'master' });
+      }
+      if (path.includes('/reviews')) {
+        return overrides.reviews === 'unreadable' ? respond(false, {}) : respond(true, overrides.reviews ?? []);
+      }
       return respond(true, { state: 'open', head: { sha: head }, ...overrides.pr });
     };
     return { fetcher, calls, writes: () => calls.filter(call => call.method !== 'GET') };
@@ -453,12 +512,74 @@ describe('Merge and Approve', () => {
     ['BLOCKED', 'branch rules'],
     ['DRAFT', 'draft'],
     ['UNKNOWN', 'try again'],
+    ['BEHIND', 'behind'],
   ])('refuses a PR that is %s', async (mergeStateStatus, words) => {
     const gh = github();
     const result = await merge(gh, { readMergeState: async () => ({ mergeStateStatus }) });
     expect(result.ok).toBe(false);
     expect(result.message).toContain(words);
     expect(gh.writes()).toEqual([]);
+  });
+
+  it('refuses when a reviewer asked for changes, even where no rule requires a review', async () => {
+    const gh = github({
+      reviews: [
+        { state: 'CHANGES_REQUESTED', user: { login: 'rev' } },
+        { state: 'COMMENTED', user: { login: 'rev' } },
+      ],
+    });
+    expect((await merge(gh)).message).toContain('changes were requested by rev');
+    expect(gh.writes()).toEqual([]);
+  });
+
+  it('takes a later approval from that reviewer as their say', async () => {
+    const gh = github({
+      reviews: [
+        { state: 'CHANGES_REQUESTED', user: { login: 'rev' } },
+        { state: 'APPROVED', user: { login: 'rev' } },
+      ],
+    });
+    expect((await merge(gh)).ok).toBe(true);
+  });
+
+  it("refuses on GitHub's own review decision, and when reviews can't be read", async () => {
+    const gh = github();
+    const state = async () => ({ mergeStateStatus: 'CLEAN', baseRef: 'master', reviewDecision: 'CHANGES_REQUESTED' });
+    expect((await merge(gh, { readMergeState: state })).ok).toBe(false);
+    const unreadable = github({ reviews: 'unreadable' });
+    expect((await merge(unreadable)).message).toContain("couldn't read its reviews");
+    expect([...gh.writes(), ...unreadable.writes()]).toEqual([]);
+  });
+
+  it('refuses a PR into any branch but the default', async () => {
+    const gh = github();
+    const state = async () => ({ mergeStateStatus: 'CLEAN', baseRef: 'feat/thing' });
+    expect((await merge(gh, { readMergeState: state })).message).toContain('goes into feat/thing');
+    expect(gh.writes()).toEqual([]);
+  });
+
+  it('refuses a draft, and a state describing a different commit', async () => {
+    const gh = github();
+    const draft = async () => ({ mergeStateStatus: 'CLEAN', isDraft: true });
+    expect((await merge(gh, { readMergeState: draft })).message).toContain('draft');
+    const moved = async () => ({ mergeStateStatus: 'CLEAN', baseRef: 'master', headSha: 'b'.repeat(40) });
+    expect((await merge(gh, { readMergeState: moved })).message).toContain('new commits');
+    expect(gh.writes()).toEqual([]);
+  });
+
+  it('says to check GitHub when a call dies partway, since it may have happened', async () => {
+    const result = await runPrAction(
+      { ...base, kind: 'merge' },
+      {
+        fetcher: async () => {
+          throw new Error('socket hang up');
+        },
+      },
+    );
+    expect(result).toEqual({
+      ok: false,
+      message: 'Something went wrong during this, so check the PR on GitHub: socket hang up',
+    });
   });
 
   it('refuses when merge state cannot be read at all', async () => {
@@ -715,6 +836,12 @@ describe("the triage agent's reply", () => {
     );
     expect(itemPermalink('https://evil.example', '1793000000.000100', undefined)).toBeUndefined();
     expect(itemPermalink('C01ABCDEF', '../x', undefined)).toBeUndefined();
+  });
+
+  it('caps the PR links one item can make it look up', () => {
+    const many = Array.from({ length: 20 }, (_, index) => `https://github.com/o/r/pull/${index}`);
+    const capped = toPersonalItem({ ...good, source: 'slack', state: 'ready', pr_urls: many }, 'run-1');
+    expect(capped.prUrls).toHaveLength(5);
   });
 
   it('keeps only real GitHub PR links', () => {
@@ -1378,6 +1505,39 @@ describe('the personal store', () => {
     expect(personal.repliesToDraft('run-1')).toEqual([]);
     personal.upsertItem({ ...item, key: 'b', state: 'ready', replyText: 'second' });
     expect(personal.openItems()[0]).toMatchObject({ replyText: 'first', draftStatus: 'saved' });
+  });
+
+  it('takes a button one at a time, and hands back one a restart interrupted', () => {
+    const job = new JobStore(path.join(tempDir(), 'watchtower.db'));
+    const db = (job as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): void } } }).db;
+    const insert = db.prepare(
+      `INSERT INTO personal_actions (id, kind, item_key, pr_url, head, created_at) VALUES (?, 'merge', 'a', 'u', 'h', ?)`,
+    );
+    insert.run('1', '2026-01-01');
+    insert.run('2', '2026-01-02');
+    const personal = job.personalStore();
+    const [first] = personal.takeActions(['merge', 'approve'], 1);
+    expect(first.id).toBe('1');
+    expect(personal.takeInterruptedTaps().map(action => action.id)).toEqual(['1']);
+    expect(personal.takeInterruptedTaps()).toEqual([]);
+    const [second] = personal.takeActions(['merge', 'approve'], 1);
+    expect(second.id).toBe('2');
+    personal.finishAction(second.id);
+    expect(personal.takeInterruptedTaps()).toEqual([]);
+  });
+
+  it('notices a deploy that ended, once', () => {
+    const job = new JobStore(path.join(tempDir(), 'watchtower.db'));
+    const personal = job.personalStore();
+    personal.upsertItem({ ...item, key: 'a' });
+    job.createLaunchpadRequest({ id: 'd1', target: 'miniog', prompt: 'deploy', ownerUserId: 'U1' });
+    const db = (job as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): void } } }).db;
+    db.prepare(`UPDATE personal_items SET deploy_request_id = 'd1' WHERE item_key = 'a'`).run();
+    expect(personal.itemsWithFinishedDeploys()).toEqual([]);
+    db.prepare(`UPDATE launchpad_requests SET status = 'SUCCESS' WHERE id = 'd1'`).run();
+    expect(personal.itemsWithFinishedDeploys().map(found => found.key)).toEqual(['a']);
+    personal.markDeployRefreshed('a');
+    expect(personal.itemsWithFinishedDeploys()).toEqual([]);
   });
 
   it('takes only the kinds of action asked for, so a button never waits behind a run', () => {

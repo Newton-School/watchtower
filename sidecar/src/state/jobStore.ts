@@ -566,6 +566,7 @@ export class JobStore {
         pr_info_json TEXT NOT NULL DEFAULT '{}',
         tap_result TEXT,
         deploy_request_id TEXT,
+        deploy_refreshed_for TEXT,
         first_seen_at TEXT NOT NULL,
         last_seen_at TEXT NOT NULL,
         last_run_id TEXT NOT NULL
@@ -582,6 +583,7 @@ export class JobStore {
         pr_url TEXT,
         head TEXT,
         created_at TEXT NOT NULL,
+        finished_at TEXT,
         taken_at TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_personal_actions_taken ON personal_actions(taken_at, created_at);
@@ -933,6 +935,8 @@ export class JobStore {
       'personal_items ADD COLUMN deploy_request_id TEXT',
       'personal_actions ADD COLUMN pr_url TEXT',
       'personal_actions ADD COLUMN head TEXT',
+      'personal_actions ADD COLUMN finished_at TEXT',
+      'personal_items ADD COLUMN deploy_refreshed_for TEXT',
     ]) {
       try {
         this.db.exec(`ALTER TABLE ${column}`);
