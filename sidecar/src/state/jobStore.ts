@@ -1392,6 +1392,14 @@ export class JobStore {
     return rows.map(row => ({ channelId: row.channel_id, threadTs: row.thread_ts, active: row.active === 1 }));
   }
 
+  /** The Slack thread a job answers in. */
+  getJobThread(jobId: string): { channelId: string; threadTs: string } | undefined {
+    const row = this.db.prepare(`SELECT channel_id, thread_ts FROM jobs WHERE id = ? LIMIT 1`).get(jobId) as
+      | { channel_id?: string | null; thread_ts?: string | null }
+      | undefined;
+    return row?.channel_id && row.thread_ts ? { channelId: row.channel_id, threadTs: row.thread_ts } : undefined;
+  }
+
   getState(key: string): string | undefined {
     const row = this.getStateStmt.get(key) as { value?: string } | undefined;
     return row?.value;

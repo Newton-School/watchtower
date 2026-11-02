@@ -22,7 +22,12 @@ import { composeChangeReply, requesterIsEngineer, sanitizeRequesterSummary } fro
 import { approvalBlocks, confirmationBlocks, postGatePrompt, yesNoBlocks } from '../slack/buttonReplies.js';
 import { connectorsFor, withConnectors } from '../backends/connectors.js';
 import { runCodex, getActiveBackendId, selectBackendForUser } from '../codex/runCodex.js';
-import { connectionLostReply, killedFromOutsideReply, runWithInfraRetry } from '../codex/infraRetry.js';
+import {
+  accountBlockedReply,
+  connectionLostReply,
+  killedFromOutsideReply,
+  runWithInfraRetry,
+} from '../codex/infraRetry.js';
 import { assembleRecall } from '../codex/recallAssembler.js';
 import { highReasoningProfile } from '../codex/modelProfiles.js';
 import { buildMentionSystemPrompt } from '../codex/mentionSystemPrompt.js';
@@ -1748,9 +1753,11 @@ Return the JSON now.`;
         logStep?.({
           stage: 'implementation.approval.revising.failed',
           message:
-            revisedResult.errorKind === 'API_ERROR'
-              ? 'Plan revision lost the connection to the model API; surfacing recovery prompt to the user.'
-              : 'Plan revision returned no plan; surfacing recovery prompt to the user.',
+            revisedResult.errorKind === 'ACCOUNT_BLOCKED'
+              ? 'Plan revision was refused by the model account; telling the user the reason.'
+              : revisedResult.errorKind === 'API_ERROR'
+                ? 'Plan revision lost the connection to the model API; surfacing recovery prompt to the user.'
+                : 'Plan revision returned no plan; surfacing recovery prompt to the user.',
           level: 'WARN',
           data: {
             feedbackRounds,
@@ -1764,9 +1771,13 @@ Return the JSON now.`;
             channel: task.event.channelId,
             thread_ts: task.event.threadTs,
             text:
-              revisedResult.errorKind === 'API_ERROR'
-                ? "I lost my connection to the model while revising the plan, and retrying didn't bring it back. The plan above is unchanged. Reply with your feedback again in a few minutes, `yes` to proceed with the original plan, or `no` to cancel."
-                : 'I had trouble revising the plan from that feedback: the planner did not return a revised plan. The plan above is unchanged. Reply with rephrased feedback, `yes` to proceed with it as it stands, or `no` to cancel.',
+              revisedResult.errorKind === 'ACCOUNT_BLOCKED'
+                ? accountBlockedReply('revise the plan', revisedResult.accountBlockMessage, {
+                    next: "The plan above is unchanged. Send your feedback again once it's fixed, or `no` to cancel.",
+                  })
+                : revisedResult.errorKind === 'API_ERROR'
+                  ? "I lost my connection to the model while revising the plan, and retrying didn't bring it back. The plan above is unchanged. Reply with your feedback again in a few minutes, `yes` to proceed with the original plan, or `no` to cancel."
+                  : 'I had trouble revising the plan from that feedback: the planner did not return a revised plan. The plan above is unchanged. Reply with rephrased feedback, `yes` to proceed with it as it stands, or `no` to cancel.',
           });
           overrideNextPromptTs = recoveryPosted.ts ?? undefined;
         } catch {
@@ -1917,8 +1928,9 @@ function requesterToConfirmFor(planMarkdown: string, config: AppConfig, requeste
 
 /** What the thread is told when the planner run itself failed. Never the run's own last line. */
 export function plannerFailureReply(
-  result: Pick<CodexRunResult, 'errorKind' | 'limitResetsAtText' | 'timedOut'>,
+  result: Pick<CodexRunResult, 'errorKind' | 'limitResetsAtText' | 'accountBlockMessage' | 'timedOut'>,
 ): string {
+  if (result.errorKind === 'ACCOUNT_BLOCKED') return accountBlockedReply('plan this', result.accountBlockMessage);
   if (result.errorKind === 'API_ERROR') return connectionLostReply('planning');
   if (result.errorKind === 'EXTERNAL_KILL') return killedFromOutsideReply('My planning run');
   if (result.errorKind === 'USAGE_LIMIT') {
@@ -3381,28 +3393,40 @@ async function runImplementationWorkflowBody(params: {
       // jobStore.isPausedAwaitingUsageLimitRetry — a "resume"/"retry" reply
       // in-thread restarts the workflow (which re-plans; the prior plan and
       // approval remain in thread context, so re-approval is one word).
+      // The model account refusing a step (billing, login) pauses the same
+      // way, under the same stage, so "resume" picks it up once it is fixed.
+      const blockedReason = fullResult.accountBlockMessage;
       logStep?.({
         stage: 'implementation.usage_limit.paused',
-        message: `Pipeline hit the Claude usage limit — pausing${fullResult.usageLimitResetsAt ? ` until reset (${fullResult.usageLimitResetsAt})` : ''}.`,
+        message: blockedReason
+          ? `The model account refused the pipeline — pausing: ${blockedReason}`
+          : `Pipeline hit the Claude usage limit — pausing${fullResult.usageLimitResetsAt ? ` until reset (${fullResult.usageLimitResetsAt})` : ''}.`,
         level: 'WARN',
-        data: { resetsAtText: fullResult.usageLimitResetsAt },
+        data: { resetsAtText: fullResult.usageLimitResetsAt, accountBlockMessage: blockedReason ?? null },
       });
 
       const resetsClause = fullResult.usageLimitResetsAt
         ? ` It resets ${fullResult.usageLimitResetsAt}.`
         : ' It usually resets within a few hours.';
+      const pauseText = blockedReason
+        ? accountBlockedReply('finish this', blockedReason, {
+            next: 'No code was lost. Reply "resume" in this thread once it\'s fixed and I\'ll pick this up.',
+          })
+        : `Claude usage limit hit before I could finish.${resetsClause} Reply "resume" in this thread after the reset and I'll pick this up.`;
       await slack.chat
         .postMessage({
           channel: task.event.channelId,
           thread_ts: task.event.threadTs,
-          text: `Claude usage limit hit before I could finish.${resetsClause} Reply "resume" in this thread after the reset and I'll pick this up.`,
+          text: pauseText,
         })
         .catch(() => {});
 
       return {
         workflow: 'IMPLEMENTATION',
         status: 'PAUSED',
-        message: `Paused on Claude usage limit${fullResult.usageLimitResetsAt ? ` (resets ${fullResult.usageLimitResetsAt})` : ''}.`,
+        message: blockedReason
+          ? `Paused: the model account refused the request (${blockedReason}).`
+          : `Paused on Claude usage limit${fullResult.usageLimitResetsAt ? ` (resets ${fullResult.usageLimitResetsAt})` : ''}.`,
         notifyDesktop: true,
         slackPosted: true,
       };

@@ -794,6 +794,34 @@ describe('the usage limit (issue #592)', () => {
     );
     expect(posted.some(t => t.includes('share more context'))).toBe(false);
   });
+
+  it('quotes the CLI reason when the model account refused the run, and does not retry', async () => {
+    runCodex.mockResolvedValue({
+      ok: false,
+      exitCode: 1,
+      timedOut: false,
+      stdout: '',
+      stderr: '',
+      lastMessage: 'Your session has expired. Please run /login to sign in again.',
+      errorKind: 'ACCOUNT_BLOCKED',
+      accountBlockMessage: 'Your session has expired. Please run /login to sign in again.',
+    });
+    const slack = slackStub();
+
+    const result = await runInvestigationWorkflow({
+      task: makeTask('button is misaligned'),
+      config,
+      slack: slack as any,
+    });
+
+    expect(runCodex).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ workflow: 'INVESTIGATION', status: 'FAILED' });
+    const posted = slack.chat.postMessage.mock.calls.map(c => c[0].text as string);
+    expect(posted).toContain(
+      "I can't investigate this right now: my model account refused the request. The problem is on my side, not with your message.\nThe error:\n> Your session has expired. Please run /login to sign in again.\nAsk me again once it's fixed.",
+    );
+    expect(posted.some(t => t.includes('share more context') || t.includes('lost my connection'))).toBe(false);
+  });
 });
 
 describe('investigationNextStep (issues #432, #624)', () => {

@@ -62,6 +62,13 @@ import { recoveryFor } from './runtime/restartRecovery.js';
 import { reloadBundlesIfChanged } from './runtime/bundleReload.js';
 import { closeDeployOfferAfterRestart } from './workflows/marketingDeployOffer.js';
 import { connectorAlertText, connectorsToAlert, onConnectorStatuses } from './runtime/connectorAlerts.js';
+import {
+  onAccountEvents,
+  recordRefusal,
+  recordWorking,
+  recoveredAlertText,
+  refusalAlertText,
+} from './runtime/accountAlerts.js';
 import { acquireInstanceLock, instanceLockPath, releaseInstanceLock } from './runtime/instanceLock.js';
 import {
   registerActiveJob,
@@ -1747,6 +1754,48 @@ async function main(): Promise<void> {
           .catch(err => logger.warn({ connector, err: String(err) }, 'could not DM the owner about a connector'));
       }
     }
+  });
+
+  // The model account refusing runs (a payment past due, a lapsed login) is
+  // the owner's to fix. On 30 Oct 2026 nobody told them, and a refused request
+  // sat for three and a half days. Told once when it starts, with the CLI's
+  // words, and again when a run works, with the threads it refused.
+  const threadLink = async (jobId: string | undefined): Promise<string | undefined> => {
+    const thread = jobId ? store.getJobThread(jobId) : undefined;
+    if (!thread || !connectorAlertClient) return undefined;
+    try {
+      const response = await connectorAlertClient.chat.getPermalink({
+        channel: thread.channelId,
+        message_ts: thread.threadTs,
+      });
+      return typeof response.permalink === 'string' ? response.permalink : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const dmOwners = (text: string): void => {
+    for (const ownerId of config.ownerSlackUserIds) {
+      void connectorAlertClient?.chat
+        .postMessage({ channel: ownerId, text })
+        .catch(err => logger.warn({ err: String(err) }, 'could not DM the owner about the model account'));
+    }
+  };
+  onAccountEvents({
+    refused(refusal) {
+      if (!recordRefusal(refusal, store).first) return;
+      logger.warn(
+        { backend: refusal.backend, code: refusal.code, jobId: refusal.jobId },
+        'the model account is refusing runs; telling the owner',
+      );
+      notifyDesktop('The model account is refusing runs', refusal.message);
+      void threadLink(refusal.jobId).then(link => dmOwners(refusalAlertText(refusal, link)));
+    },
+    working(backend) {
+      const outage = recordWorking(backend, store);
+      if (!outage) return;
+      logger.info({ backend, refused: outage.jobIds.length }, 'the model account works again; telling the owner');
+      void Promise.all(outage.jobIds.map(threadLink)).then(links => dmOwners(recoveredAlertText(outage, links)));
+    },
   });
 
   // Boot the optional Obsidian-compatible vault writer. When disabled (or no

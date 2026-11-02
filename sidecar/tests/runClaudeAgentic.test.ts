@@ -51,6 +51,32 @@ describe('runClaudeAgentic tier/effort resolution (live claude-code backend)', (
   });
 });
 
+describe('runClaudeAgentic when the model account refuses the run', () => {
+  beforeEach(() => runCodex.mockReset());
+
+  it('quotes the CLI reason instead of a lost connection, and does not retry', async () => {
+    runCodex.mockResolvedValue({
+      ok: false,
+      exitCode: 1,
+      timedOut: false,
+      cancelled: false,
+      stdout: '',
+      stderr: '',
+      lastMessage: '{"terminal_reason":"api_error","result":"Invalid API key · Fix external API key"}',
+      errorKind: 'ACCOUNT_BLOCKED',
+      accountBlockMessage: 'Invalid API key · Fix external API key',
+    });
+
+    const result = await runClaudeAgentic({ systemPrompt: 's', userMessage: 'u', cwd: '/tmp' });
+
+    expect(runCodex).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ ok: false, reason: 'error', interrupted: 'ACCOUNT_BLOCKED' });
+    expect(result.reply).toBe(
+      "I can't do this right now: my model account refused the request. The problem is on my side, not with your message.\nThe error:\n> Invalid API key · Fix external API key\nAsk me again once it's fixed.",
+    );
+  });
+});
+
 describe('runClaudeAgentic on the usage limit (issue #592)', () => {
   beforeEach(() => runCodex.mockReset());
 

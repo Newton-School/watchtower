@@ -51,7 +51,7 @@ import {
   type ClarifyAction,
 } from './routeClarify.js';
 import { cancelledResult } from '../workflows/shared/cancelState.js';
-import { cleanResetText, usageLimitReply } from '../codex/infraRetry.js';
+import { accountBlockedReply, cleanResetText, connectionLostReply, usageLimitReply } from '../codex/infraRetry.js';
 import { channelDenialHint } from '../access/denialHint.js';
 import { buildHelpReply, isHelpRequest } from './helpReply.js';
 import { unsupportedReply } from './unsupportedReply.js';
@@ -310,6 +310,10 @@ export async function routeTask(params: {
   let routerCouldNotDecide = false;
   /** Set when the router failed on the Claude usage limit: the reply then says when to come back. */
   let routerUsageLimit: { resetsAtText?: string } | undefined;
+  /** Set when the model account refused the router's call: the reply then quotes the CLI's reason. */
+  let routerAccountBlock: { message?: string } | undefined;
+  /** Set when both router calls lost the connection to the model API: the reply says so. */
+  let routerConnectionLost: { detail?: string } | undefined;
   let clarify: ClarifyAction = { kind: 'run' };
   /** Set when miniOG was asked directly for an action none of its tools reach: the reply to post. */
   let unsupportedText: string | undefined;
@@ -397,6 +401,8 @@ export async function routeTask(params: {
       // An owner mention the router could not read stays unanswered.
       routerCouldNotDecide = classification.failed && classification.intent !== 'NONE';
       routerUsageLimit = classification.usageLimit;
+      routerAccountBlock = classification.accountBlock;
+      routerConnectionLost = classification.connectionLost;
       classificationReasoning = classification.reasoning;
 
       // Confidence floor on DANGEROUS downgrades. RCA (Slack thread
@@ -763,21 +769,41 @@ export async function routeTask(params: {
   // their change from one that made it (issue #440). Placed after the access
   // check, so someone who would be denied gets the denial and nothing else.
   if (routerCouldNotDecide) {
-    // "Send it again" is wrong when the account hit its usage limit: a retry
-    // fails the same way until the reset. One requester sent the same lookup
-    // three times on 19 Oct (issue #592).
-    const replyText = routerUsageLimit
-      ? usageLimitReply("work out what you're asking", routerUsageLimit.resetsAtText)
-      : ROUTER_FAILED_REPLY;
+    // "Send it again" is wrong when the account hit its usage limit or was
+    // refused: a retry fails the same way until the reset or the fix. One
+    // requester sent the same lookup three times on 19 Oct (issue #592); on
+    // 30 Oct a billing block was posted as this generic line, and two
+    // requesters resent into it. The thread is told the real reason.
+    const replyText = routerAccountBlock
+      ? accountBlockedReply('look at this', routerAccountBlock.message)
+      : routerUsageLimit
+        ? usageLimitReply("work out what you're asking", routerUsageLimit.resetsAtText)
+        : routerConnectionLost
+          ? connectionLostReply('reading your message', { changesCode: false })
+          : ROUTER_FAILED_REPLY;
     logStep?.({
-      stage: routerUsageLimit ? 'router.decision.usage_limit' : 'router.decision.failed',
+      stage: routerAccountBlock
+        ? 'router.decision.account_blocked'
+        : routerUsageLimit
+          ? 'router.decision.usage_limit'
+          : 'router.decision.failed',
       message: signal?.aborted
         ? 'Router call failed and the job was cancelled — ran nothing.'
-        : routerUsageLimit
-          ? 'Router hit the Claude usage limit — told the requester when to come back and ran nothing.'
-          : 'Router could not decide after two calls — told the requester and ran nothing.',
+        : routerAccountBlock
+          ? 'The model account refused the router call — told the requester the reason and ran nothing.'
+          : routerUsageLimit
+            ? 'Router hit the Claude usage limit — told the requester when to come back and ran nothing.'
+            : routerConnectionLost
+              ? 'Router lost the connection to the model API on both calls — told the requester and ran nothing.'
+              : 'Router could not decide after two calls — told the requester and ran nothing.',
       level: 'ERROR',
-      data: { seedIntent: task.intent, userMessage, usageLimit: routerUsageLimit ?? null },
+      data: {
+        seedIntent: task.intent,
+        userMessage,
+        usageLimit: routerUsageLimit ?? null,
+        accountBlock: routerAccountBlock ?? null,
+        connectionLost: routerConnectionLost ?? null,
+      },
     });
     if (!signal?.aborted) {
       await engage();
@@ -790,10 +816,15 @@ export async function routeTask(params: {
     return {
       workflow: 'UNKNOWN',
       status: 'FAILED',
-      message: routerUsageLimit
-        ? `The usage limit was hit while routing${routerUsageLimit.resetsAtText ? `; it resets at ${cleanResetText(routerUsageLimit.resetsAtText)}` : ''}. Nothing was run.`
-        : 'The router could not decide what this message asks for (two failed calls); nothing was run.',
-      notifyDesktop: false,
+      message: routerAccountBlock
+        ? `The model account refused the router call${routerAccountBlock.message ? `: ${routerAccountBlock.message}` : ''}. Nothing was run.`
+        : routerUsageLimit
+          ? `The usage limit was hit while routing${routerUsageLimit.resetsAtText ? `; it resets at ${cleanResetText(routerUsageLimit.resetsAtText)}` : ''}. Nothing was run.`
+          : routerConnectionLost
+            ? `The router lost the connection to the model API on both calls${routerConnectionLost.detail ? ` (${routerConnectionLost.detail})` : ''}; nothing was run.`
+            : 'The router could not decide what this message asks for (two failed calls); nothing was run.',
+      // Only the owner can fix an account: the desktop is told, not just the thread.
+      notifyDesktop: Boolean(routerAccountBlock),
       slackPosted: true,
     };
   }

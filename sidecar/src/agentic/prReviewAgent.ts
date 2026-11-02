@@ -11,7 +11,7 @@ import type {
   WorkflowStepLogger,
 } from '../types/contracts.js';
 import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
-import { runWithInfraRetry } from '../codex/infraRetry.js';
+import { accountProblemReply, isAccountProblem, runWithInfraRetry } from '../codex/infraRetry.js';
 import { highReasoningProfile, lightweightProfile, profileForAgentRole } from '../codex/modelProfiles.js';
 import type { CodexExecutionProfile } from '../codex/modelProfiles.js';
 import { ORCHESTRATOR_TIMEOUT_FACTOR, runOrchestratorReview } from './prReviewOrchestrator.js';
@@ -1763,14 +1763,23 @@ export async function reviewSinglePr(params: {
     }
 
     if (!agentResult?.ok || !agentResult.parsedJson) {
-      const failureMessage =
-        `Review of ${prContext.url} failed (agent error${agentResult?.exitCode != null ? `, exit ${agentResult.exitCode}` : ''}, retried once). ` +
-        'Re-trigger with another mention to retry.';
+      // The account refused the run or hit its limit: say that, in the CLI's
+      // words, not "agent error, exit 1" and a retry that fails the same way.
+      const accountProblem = agentResult && isAccountProblem(agentResult.errorKind) ? agentResult : undefined;
+      const failureMessage = accountProblem
+        ? accountProblemReply(`review ${prContext.url}`, accountProblem)
+        : `Review of ${prContext.url} failed (agent error${agentResult?.exitCode != null ? `, exit ${agentResult.exitCode}` : ''}, retried once). ` +
+          'Re-trigger with another mention to retry.';
       logStep?.({
         stage: 'agentic.pr_review.pr.failed',
         message: `Review failed after one-shot retry for ${prContext.repo}#${prContext.number}.`,
         level: 'ERROR',
-        data: { prUrl: prContext.url, exitCode: agentResult?.exitCode ?? null },
+        data: {
+          prUrl: prContext.url,
+          exitCode: agentResult?.exitCode ?? null,
+          errorKind: agentResult?.errorKind ?? null,
+          accountBlockMessage: agentResult?.accountBlockMessage ?? null,
+        },
       });
       await postToThread(failureMessage);
       return failedOutcome(prContext, failureMessage, prHeadSha);

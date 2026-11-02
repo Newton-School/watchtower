@@ -730,6 +730,15 @@ describe('implementationWorkflow — a planner run that failed is not a plan (#4
     expect(plannerFailureReply({ errorKind: 'EXTERNAL_KILL', timedOut: false })).toContain(
       'My planning run was killed from outside',
     );
+    expect(
+      plannerFailureReply({
+        errorKind: 'ACCOUNT_BLOCKED',
+        accountBlockMessage: 'Credit balance is too low',
+        timedOut: false,
+      }),
+    ).toBe(
+      "I can't plan this right now: my model account refused the request. The problem is on my side, not with your message.\nThe error:\n> Credit balance is too low\nAsk me again once it's fixed.",
+    );
   });
 });
 

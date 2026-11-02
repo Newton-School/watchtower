@@ -1,5 +1,6 @@
 import { getActiveBackendId } from '../codex/runCodex.js';
 import {
+  accountBlockedReply,
   connectionLostReply,
   killedFromOutsideReply,
   usageLimitReply,
@@ -86,8 +87,11 @@ export interface RunClaudeAgenticResult {
   /** Final reply text, ready to post to Slack. */
   reply: string;
   error?: string;
-  /** Set when the run died of something outside the agent: the network, a kill from outside, or the usage limit. */
-  interrupted?: 'API_ERROR' | 'EXTERNAL_KILL' | 'USAGE_LIMIT';
+  /**
+   * Set when the run died of something outside the agent: the network, a kill
+   * from outside, the usage limit, or the model account refusing it.
+   */
+  interrupted?: 'API_ERROR' | 'EXTERNAL_KILL' | 'USAGE_LIMIT' | 'ACCOUNT_BLOCKED';
 }
 
 /**
@@ -150,6 +154,18 @@ export async function runClaudeAgentic(request: RunClaudeAgenticRequest): Promis
 
     if (signal?.aborted) {
       return { ok: false, reason: 'aborted', reply: '' };
+    }
+
+    // The model account refused the run (billing, login): nothing ran, and the
+    // CLI's own words are the reason the thread is told.
+    if (!result.ok && result.errorKind === 'ACCOUNT_BLOCKED') {
+      return {
+        ok: false,
+        reason: 'error',
+        reply: accountBlockedReply('do this', result.accountBlockMessage),
+        error: `ACCOUNT_BLOCKED: ${result.accountBlockMessage ?? 'refused by the model account'}`,
+        interrupted: 'ACCOUNT_BLOCKED',
+      };
     }
 
     if (!result.ok && (result.errorKind === 'API_ERROR' || result.errorKind === 'EXTERNAL_KILL')) {

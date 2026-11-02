@@ -3,10 +3,11 @@ import { cancelledResult } from './shared/cancelState.js';
 import type { AppConfig, NormalizedTask, WorkflowResult, WorkflowStepLogger } from '../types/contracts.js';
 import { getActiveBackendId } from '../codex/runCodex.js';
 import {
+  accountProblemReply,
   connectionLostReply,
+  isAccountProblem,
   killedFromOutsideReply,
   runWithInfraRetry,
-  usageLimitReply,
   cleanResetText,
 } from '../codex/infraRetry.js';
 import { readOnlyRunNote } from '../agentic/runClaude.js';
@@ -323,15 +324,20 @@ Return strict JSON:
     return cancelledResult('INVESTIGATION');
   }
 
-  // The Claude usage limit: asking for more context, as the generic failure
-  // below does, sends the requester off to explain a problem that was ours (issue #592).
-  if (!investigatorResult.ok && investigatorResult.errorKind === 'USAGE_LIMIT') {
-    const text = usageLimitReply('investigate this', investigatorResult.limitResetsAtText);
+  // The Claude usage limit, or the model account refusing the run: asking for
+  // more context, as the generic failure below does, sends the requester off
+  // to explain a problem that was ours (issue #592). The account refusal is
+  // quoted in the CLI's own words.
+  if (!investigatorResult.ok && isAccountProblem(investigatorResult.errorKind)) {
+    const text = accountProblemReply('investigate this', investigatorResult);
+    const blocked = investigatorResult.errorKind === 'ACCOUNT_BLOCKED';
     logStep?.({
-      stage: 'investigation.usage_limit',
-      message: 'Investigation stopped by the usage limit.',
+      stage: blocked ? 'investigation.account_blocked' : 'investigation.usage_limit',
+      message: blocked ? 'Investigation refused by the model account.' : 'Investigation stopped by the usage limit.',
       level: 'ERROR',
-      data: { resetsAt: cleanResetText(investigatorResult.limitResetsAtText) ?? null },
+      data: blocked
+        ? { reason: investigatorResult.accountBlockMessage ?? null }
+        : { resetsAt: cleanResetText(investigatorResult.limitResetsAtText) ?? null },
     });
     const slackPosted = await slack.chat
       .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text })

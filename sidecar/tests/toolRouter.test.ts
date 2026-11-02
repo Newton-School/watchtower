@@ -247,6 +247,30 @@ describe('decideTool', () => {
     expect(plain).not.toHaveProperty('usageLimit');
   });
 
+  it('passes on the CLI words when the model account refused the call, and a lost connection', async () => {
+    const refused = await decideTool({
+      facts,
+      runAgent: agent({
+        ok: false,
+        exitCode: 1,
+        errorKind: 'ACCOUNT_BLOCKED',
+        accountBlockMessage: 'Invalid API key · Fix external API key',
+      }) as never,
+    });
+    expect(refused).toMatchObject({ ok: false, accountBlock: { message: 'Invalid API key · Fix external API key' } });
+    const dropped = await decideTool({
+      facts,
+      runAgent: agent({
+        ok: false,
+        exitCode: 1,
+        errorKind: 'API_ERROR',
+        apiErrorDetail: 'API Error: ECONNRESET',
+      }) as never,
+    });
+    expect(dropped).toMatchObject({ ok: false, connectionLost: { detail: 'API Error: ECONNRESET' } });
+    expect(dropped).not.toHaveProperty('accountBlock');
+  });
+
   it('reports failure when the call throws', async () => {
     const outcome = await decideTool({ facts, runAgent: vi.fn().mockRejectedValue(new Error('boom')) as never });
     expect(outcome).toMatchObject({ ok: false, error: 'Error: boom' });

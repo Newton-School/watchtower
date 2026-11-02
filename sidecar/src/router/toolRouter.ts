@@ -68,6 +68,10 @@ export type RouterOutcome =
       durationMs: number;
       /** The Claude account hit its usage limit: retrying before the reset fails the same way. */
       usageLimit?: { resetsAtText?: string };
+      /** The model account refused the call (billing, login): the CLI's words for why. */
+      accountBlock?: { message?: string };
+      /** The model API could not be reached: the CLI's error line. */
+      connectionLost?: { detail?: string };
     };
 
 /** Tools named in the prompt: every registry tool except the exact-syntax ones. */
@@ -217,6 +221,8 @@ export async function decideTool(params: {
         error: `router call failed (exit ${result.exitCode})`,
         durationMs,
         ...(result.errorKind === 'USAGE_LIMIT' ? { usageLimit: { resetsAtText: result.limitResetsAtText } } : {}),
+        ...(result.errorKind === 'ACCOUNT_BLOCKED' ? { accountBlock: { message: result.accountBlockMessage } } : {}),
+        ...(result.errorKind === 'API_ERROR' ? { connectionLost: { detail: result.apiErrorDetail } } : {}),
       };
     }
     const decision = parseRouterDecision(result.parsedJson);

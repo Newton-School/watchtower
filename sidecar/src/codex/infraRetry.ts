@@ -187,6 +187,48 @@ export function usageLimitReply(doing: string, resetsAtText?: string): string {
   return `I've hit my usage limit, so I can't ${doing} right now. ${when}`;
 }
 
+/**
+ * What to tell a thread when the model account refused the run: a payment
+ * past due, a lapsed login, an account on hold. Quotes the CLI's own words,
+ * so the thread sees the real reason. On 30 Oct 2026 a billing block was
+ * posted as "I couldn't work out what you're asking … please send it again",
+ * and the requester resent it into the same block. `doing` reads after
+ * "can't", as for `usageLimitReply`.
+ */
+export function accountBlockedReply(
+  doing: string,
+  cliMessage?: string,
+  /** The closing line: what the requester can do next. */
+  options: { next?: string } = {},
+): string {
+  const reason = cliMessage?.trim();
+  const lines = [
+    `I can't ${doing} right now: my model account refused the request. The problem is on my side, not with your message.`,
+  ];
+  if (reason) {
+    // Slack reads &, < and > as markup in message text.
+    const escaped = reason.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    lines.push('The error:', ...escaped.split('\n').map(line => `> ${line}`));
+  }
+  lines.push(options.next ?? "Ask me again once it's fixed.");
+  return lines.join('\n');
+}
+
+/** The account can take no run until it resets or a person fixes it: retrying now fails the same way. */
+export function isAccountProblem(kind: CodexRunResult['errorKind']): kind is 'USAGE_LIMIT' | 'ACCOUNT_BLOCKED' {
+  return kind === 'USAGE_LIMIT' || kind === 'ACCOUNT_BLOCKED';
+}
+
+/** The reply for either account problem: the limit and its reset, or the refusal in the CLI's words. */
+export function accountProblemReply(
+  doing: string,
+  result: Pick<CodexRunResult, 'errorKind' | 'limitResetsAtText' | 'accountBlockMessage'>,
+): string {
+  return result.errorKind === 'ACCOUNT_BLOCKED'
+    ? accountBlockedReply(doing, result.accountBlockMessage)
+    : usageLimitReply(doing, result.limitResetsAtText);
+}
+
 /** The reset time as the CLI wrote it, without the sentence's own closing punctuation. */
 export function cleanResetText(resetsAtText?: string): string | undefined {
   const text = resetsAtText

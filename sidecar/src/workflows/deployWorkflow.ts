@@ -6,6 +6,7 @@ import { evaluateCapability } from '../access/control.js';
 import type { AppConfig, NormalizedTask, WorkflowResult, WorkflowStepLogger } from '../types/contracts.js';
 import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
 import { highReasoningProfile } from '../codex/modelProfiles.js';
+import { accountProblemReply, isAccountProblem } from '../codex/infraRetry.js';
 import { buildMentionSystemPrompt } from '../codex/mentionSystemPrompt.js';
 import { resolveGithubTokenForCodex } from '../github/githubAuth.js';
 import { extractReplyFromCodexResult } from './shared/workflowUtils.js';
@@ -337,7 +338,12 @@ export async function runDeployWorkflow(params: {
     return { workflow: 'DEPLOY', status: 'CANCELLED', message: msg, notifyDesktop: true, slackPosted };
   }
 
-  const reply = extractReplyFromCodexResult(result) || 'Deploy finished but produced no output. Check logs.';
+  // The account refused the deploy agent or hit its limit before it ran: say
+  // so, with the CLI's reason. Nothing was deployed.
+  const reply =
+    !result.ok && isAccountProblem(result.errorKind)
+      ? accountProblemReply('run the newton-web deploy', result)
+      : extractReplyFromCodexResult(result) || 'Deploy finished but produced no output. Check logs.';
 
   // The deploy side-effect (runCodex above) has already executed. Any failure to
   // post the final Slack reply must NOT escape this function: the shared retry
