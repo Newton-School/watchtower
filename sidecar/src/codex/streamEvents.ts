@@ -36,6 +36,18 @@ export interface StreamDecoder {
   assistantText(): string | undefined;
   /** The run's connectors and their state, once the session has started (Claude Code only). */
   connectorStatuses(): ConnectorStatus[] | undefined;
+  /**
+   * The CLI's own report that the model API refused or failed the turn, when
+   * there was one: its error code (Claude Code's `error` field, e.g.
+   * `billing_error`; Codex has none) and the words it gave for it.
+   */
+  apiError(): StreamApiError | undefined;
+}
+
+/** What the CLI said when the model API refused or failed a turn. */
+export interface StreamApiError {
+  code?: string;
+  text: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -184,6 +196,16 @@ function decodeClaudeLine(raw: string, state: DecoderState): WorkflowStepLog[] {
     const message = isRecord(event.message) ? event.message : undefined;
     const content = message && Array.isArray(message.content) ? message.content : [];
     const steps: WorkflowStepLog[] = [];
+    // The CLI writes an API refusal as a synthetic assistant message flagged
+    // as one, with the reason as a code ("billing_error") and as its text.
+    if (event.is_api_error_message === true) {
+      const text = content
+        .map(block => (isRecord(block) ? asString(block.text) : undefined))
+        .filter((part): part is string => Boolean(part))
+        .join('\n')
+        .trim();
+      if (text) state.apiError = { code: asString(event.error), text };
+    }
     for (const block of content) {
       if (!isRecord(block)) continue;
       const blockType = asString(block.type);
@@ -249,6 +271,15 @@ function decodeCodexLine(raw: string, state: DecoderState): WorkflowStepLog[] {
 
   const type = asString(event.type);
 
+  // The turn itself failed (a refused key, a quota): its message is the reason.
+  // The "Reconnecting… n/5" `error` events before it are retries, not the verdict.
+  if (type === 'turn.failed') {
+    const error = isRecord(event.error) ? event.error : undefined;
+    const text = asString(error?.message)?.trim();
+    if (text) state.apiError = { text };
+    return [];
+  }
+
   if (type === 'turn.completed') {
     const usage = isRecord(event.usage) ? event.usage : undefined;
     return [
@@ -308,6 +339,7 @@ interface DecoderState {
   finalMessage?: string;
   assistantText: string[];
   connectorStatuses?: ConnectorStatus[];
+  apiError?: StreamApiError;
 }
 
 /**
@@ -360,6 +392,9 @@ export function createStreamDecoder(backendId: string): StreamDecoder {
     },
     connectorStatuses(): ConnectorStatus[] | undefined {
       return state.connectorStatuses;
+    },
+    apiError(): StreamApiError | undefined {
+      return state.apiError;
     },
   };
 }

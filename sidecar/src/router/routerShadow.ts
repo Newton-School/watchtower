@@ -117,6 +117,10 @@ export interface RouterClassification {
   failed: boolean;
   /** It failed because the Claude account hit its usage limit. */
   usageLimit?: { resetsAtText?: string };
+  /** It failed because the model account refused the call: the CLI's words for why. */
+  accountBlock?: { message?: string };
+  /** It failed because the model API could not be reached, on both calls. */
+  connectionLost?: { detail?: string };
   /** What the router named, before it was mapped to an intent. Absent when it failed. */
   tool?: RouterTool;
   /** The question it wants put to the requester, for `ask_user`. */
@@ -171,9 +175,10 @@ export function startRouterShadow(params: {
     );
   // One more try: a failure here used to become a silent lookup or silence (issue #440).
   const pending = call().then(first => {
-    // An account limit with a reset time fails the second call the same way:
-    // not retried. A passing rate limit (no reset time) gets its retry.
-    if (first.ok || signal?.aborted || first.usageLimit?.resetsAtText) return first;
+    // An account limit with a reset time, or an account refusal, fails the
+    // second call the same way: not retried. A passing rate limit (no reset
+    // time) gets its retry.
+    if (first.ok || signal?.aborted || first.usageLimit?.resetsAtText || first.accountBlock) return first;
     logStep?.({
       stage: 'router.decision.retry',
       message: 'Router call failed — trying once more.',
@@ -191,13 +196,26 @@ export function startRouterShadow(params: {
         const fallback = failedClassification(facts.addressing);
         logStep?.({
           stage: 'router.decision.fallback',
-          message: outcome.usageLimit
-            ? `Router call hit the Claude usage limit — using ${fallback.intent} fallback.`
-            : `Router call failed twice — using ${fallback.intent} fallback.`,
+          message: outcome.accountBlock
+            ? `Router call was refused by the model account — using ${fallback.intent} fallback.`
+            : outcome.usageLimit
+              ? `Router call hit the Claude usage limit — using ${fallback.intent} fallback.`
+              : `Router call failed twice — using ${fallback.intent} fallback.`,
           level: 'WARN',
-          data: { error: outcome.error, durationMs: outcome.durationMs, usageLimit: outcome.usageLimit ?? null },
+          data: {
+            error: outcome.error,
+            durationMs: outcome.durationMs,
+            usageLimit: outcome.usageLimit ?? null,
+            accountBlock: outcome.accountBlock ?? null,
+            connectionLost: outcome.connectionLost ?? null,
+          },
         });
-        return outcome.usageLimit ? { ...fallback, usageLimit: outcome.usageLimit } : fallback;
+        return {
+          ...fallback,
+          ...(outcome.usageLimit ? { usageLimit: outcome.usageLimit } : {}),
+          ...(outcome.accountBlock ? { accountBlock: outcome.accountBlock } : {}),
+          ...(outcome.connectionLost ? { connectionLost: outcome.connectionLost } : {}),
+        };
       }
       return {
         intent: outcomeToLegacyIntent(outcome, facts.addressing, { allowDeploy: deployAllowed }),

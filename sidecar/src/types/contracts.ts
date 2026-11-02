@@ -564,9 +564,16 @@ export interface CodexRunResult {
    * API tokens were consumed (issue #342) — callers should pause/retry at
    * the reset time instead of treating the output as an agent verdict.
    */
-  errorKind?: 'USAGE_LIMIT' | 'API_ERROR' | 'EXTERNAL_KILL';
+  errorKind?: 'USAGE_LIMIT' | 'ACCOUNT_BLOCKED' | 'API_ERROR' | 'EXTERNAL_KILL';
   /** Verbatim reset clause from the limit message, e.g. "9:40pm (Asia/Calcutta)". */
   limitResetsAtText?: string;
+  /**
+   * For ACCOUNT_BLOCKED: the CLI's own words for why the model account refused
+   * the run ("Claude Code can't use your Claude subscription, usually because
+   * a payment is past due …"). Nothing ran, a retry fails the same way until a
+   * person fixes the account, and the requester is told these words.
+   */
+  accountBlockMessage?: string;
   /**
    * For EXTERNAL_KILL: the signal that ended the process, when the OS reported
    * one. The run was stopped from outside (not by a timeout or a cancel), so

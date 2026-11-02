@@ -27,6 +27,7 @@ import { computeCostUsd } from '../pricing/modelPrices.js';
 import { agentCallContext } from '../state/runContext.js';
 import { createStreamDecoder } from './streamEvents.js';
 import { reportConnectorStatuses } from '../runtime/connectorAlerts.js';
+import { reportAccountRefused, reportAccountWorking } from '../runtime/accountAlerts.js';
 import { activeClock } from '../runtime/activeClock.js';
 import type { DossierStore } from '../state/dossierStore.js';
 
@@ -213,6 +214,81 @@ export function detectUsageLimit(text: string): { resetsAtText?: string } | unde
   const resetsMatch = LIMIT_RESETS_RE.exec(text);
   const resetsAtText = resetsMatch?.[1]?.replace(/\\u00b7|·/g, '').trim();
   return { resetsAtText: resetsAtText && resetsAtText.length > 0 ? resetsAtText : undefined };
+}
+
+/**
+ * The codes Claude Code puts on its API error line when the account itself
+ * refused the run (CLI 2.1.x): a login, a payment, a hold or a check only a
+ * person can clear. Retrying does not help. `rate_limit`, `overloaded` and
+ * `server_error` pass on their own and stay connection errors, retried.
+ */
+const ACCOUNT_ERROR_CODES = new Set([
+  'authentication_failed',
+  'oauth_org_not_allowed',
+  'account_on_hold',
+  'verification_required',
+  'billing_error',
+  'cloud_credential_error',
+]);
+
+/** The same refusals in words, for a CLI that gives no code (Codex, or a Claude Code that drops it). */
+const ACCOUNT_ERROR_TEXT_RE =
+  /can'?t use your Claude subscription|payment is past due|credit balance is too low|invalid API key|please run \/login|session has expired|OAuth token has expired|organization has been disabled|account (?:is )?on hold|insufficient_quota|check your plan and billing details/i;
+/** A refused key, read only off the CLI's own API error line: an agent's answer may quote a 401 from any service. */
+const CLI_AUTH_STATUS_RE = /\b401 Unauthorized\b/;
+
+/** Past this many characters the text is an answer that mentions a login, not the CLI's refusal. */
+const ACCOUNT_ERROR_TEXT_MAX = 600;
+/** How much of the CLI's message is kept to quote back to the requester. */
+const ACCOUNT_ERROR_QUOTE_MAX = 400;
+
+/** The `result` of a CLI result envelope, or the text itself when it is not one. */
+function resultText(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('{')) return trimmed;
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    if (parsed && typeof parsed === 'object' && typeof (parsed as { result?: unknown }).result === 'string') {
+      return ((parsed as { result: string }).result ?? '').trim();
+    }
+  } catch {
+    // Not JSON after all: the text is the message.
+  }
+  return trimmed;
+}
+
+/**
+ * Classify a run the model account refused (billing, login, a held account),
+ * keeping the CLI's own words so the requester is told the real reason
+ * instead of "I couldn't work out what you're asking" (30 Oct 2026: "Claude
+ * Code can't use your Claude subscription, usually because a payment is past
+ * due" was read as a dropped connection and the router as undecided).
+ *
+ * The CLI's error code is enough on any run. Without one, the words are
+ * enough only on a failed run whose final message is short: an agent's answer
+ * that talks about an invalid API key is not a refusal.
+ */
+export function detectAccountBlock(input: {
+  streamError?: { code?: string; text: string };
+  lastMessage: string;
+  failedRun: boolean;
+}): { message: string; code?: string } | undefined {
+  const quote = (text: string): string =>
+    text.length > ACCOUNT_ERROR_QUOTE_MAX ? `${text.slice(0, ACCOUNT_ERROR_QUOTE_MAX - 1)}…` : text;
+  const { streamError } = input;
+  // A coded error line is the CLI's verdict either way: a rate limit or an
+  // overload is not a refusal, whatever its words say.
+  if (streamError?.code) {
+    if (!ACCOUNT_ERROR_CODES.has(streamError.code)) return undefined;
+    const text = streamError.text.trim() || resultText(input.lastMessage);
+    return { message: quote(text), code: streamError.code };
+  }
+  if (!input.failedRun) return undefined;
+  const cliText = streamError?.text.trim();
+  const text = cliText || resultText(input.lastMessage);
+  if (!text || text.length > ACCOUNT_ERROR_TEXT_MAX) return undefined;
+  if (!ACCOUNT_ERROR_TEXT_RE.test(text) && !(cliText && CLI_AUTH_STATUS_RE.test(cliText))) return undefined;
+  return { message: quote(text) };
 }
 
 /** Exit codes a process reports when it handles a fatal signal itself: 128 + the signal number. */
@@ -633,10 +709,34 @@ export async function runAgent(rawRequest: CodexRunRequest, backend: AgentBacken
     // Classify limit hits on failed runs so callers can pause/retry at the
     // stated reset instead of burning retries on doomed spawns (issue #342).
     const usageLimit = !exitedCleanly && !timedOut && !cancelled ? detectUsageLimit(lastMessage) : undefined;
+    // The account refused the run (billing, login): not retried, and the CLI's
+    // own words are kept so the requester can be told them.
+    const accountBlock =
+      !usageLimit && !timedOut && !cancelled
+        ? detectAccountBlock({ streamError: decoder.apiError(), lastMessage, failedRun: !exitedCleanly })
+        : undefined;
+    if (accountBlock) {
+      request.onLog?.({
+        stage: 'agent.account_blocked',
+        message: `${backend.displayName} was refused by the model account: ${accountBlock.message}`,
+        level: 'ERROR',
+        data: { code: accountBlock.code ?? null, exitCode },
+      });
+      // Only the owner can fix the account: they are told, once per outage.
+      reportAccountRefused({
+        backend: backend.id,
+        backendName: backend.displayName,
+        message: accountBlock.message,
+        code: accountBlock.code,
+        jobId: agentCallContext.getStore()?.jobId,
+      });
+    }
     // A run that died on the connection is not the agent's output, whatever
     // the exit code: callers retry it instead of reading it (issue #439).
     const apiError =
-      !usageLimit && !timedOut && !cancelled ? detectApiError(lastMessage, { failedRun: !exitedCleanly }) : undefined;
+      !usageLimit && !accountBlock && !timedOut && !cancelled
+        ? detectApiError(lastMessage, { failedRun: !exitedCleanly })
+        : undefined;
     if (apiError) {
       request.onLog?.({
         stage: 'agent.api_error',
@@ -649,7 +749,9 @@ export async function runAgent(rawRequest: CodexRunRequest, backend: AgentBacken
     // dead reviewer of one job was read as "Reviewer rejected" when a coder in
     // a different job ran `pkill` (issue #445).
     const externalKill =
-      !usageLimit && !apiError && !timedOut && !cancelled ? detectExternalKill(exitCode, closeSignal) : undefined;
+      !usageLimit && !accountBlock && !apiError && !timedOut && !cancelled
+        ? detectExternalKill(exitCode, closeSignal)
+        : undefined;
     if (externalKill) {
       request.onLog?.({
         stage: 'agent.killed',
@@ -658,7 +760,9 @@ export async function runAgent(rawRequest: CodexRunRequest, backend: AgentBacken
         data: { exitCode, signal: externalKill.signal },
       });
     }
-    const ok = exitedCleanly && !apiError;
+    const ok = exitedCleanly && !apiError && !accountBlock;
+    // A run that worked ends an outage the owner was told about.
+    if (ok) reportAccountWorking(backend.id);
     if (usageLimit) {
       request.onLog?.({
         stage: 'agent.usage_limit',
@@ -701,6 +805,7 @@ export async function runAgent(rawRequest: CodexRunRequest, backend: AgentBacken
       lastMessage,
       parsedJson,
       ...(usageLimit ? { errorKind: 'USAGE_LIMIT' as const, limitResetsAtText: usageLimit.resetsAtText } : {}),
+      ...(accountBlock ? { errorKind: 'ACCOUNT_BLOCKED' as const, accountBlockMessage: accountBlock.message } : {}),
       ...(apiError ? { errorKind: 'API_ERROR' as const, apiErrorDetail: apiError.detail } : {}),
       ...(externalKill ? { errorKind: 'EXTERNAL_KILL' as const, killSignal: externalKill.signal } : {}),
       durationMs,

@@ -28,6 +28,20 @@ export function diagnoseFailure(input: {
       entry.stage === 'codex.output.schema_invalid',
   ).length;
 
+  // Ahead of the usage limit: a refused account pauses a pipeline under the
+  // same `pipeline.usage_limit` stage, but waiting for a reset will not fix it.
+  const refusal = input.logs.find(entry => entry.stage === 'agent.account_blocked');
+  if (refusal) {
+    return {
+      errorKind: 'ACCOUNT_BLOCKED',
+      summary: `The model account refused the run: ${refusal.message.replace(/^.*?refused by the model account: /, '')}`,
+      actions: [
+        'Fix the account the CLI named: settle the payment, sign in again (`claude /login`), or switch the backend.',
+        'The requester was told the reason in the thread; mention miniOG there again once it is fixed (a paused change resumes on "resume").',
+      ],
+    };
+  }
+
   if (
     haystack.includes('hit your session limit') ||
     haystack.includes('hit your usage limit') ||

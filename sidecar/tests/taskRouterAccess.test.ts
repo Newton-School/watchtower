@@ -1140,6 +1140,55 @@ describe('routeTask lets the tool-router decide (issue #456)', () => {
     expect(stageLog(logStep, 'router.decision.usage_limit')).toMatchObject({ level: 'ERROR' });
   });
 
+  it('quotes the CLI when the model account refused the call, without a second call or a "send it again" (30 Oct billing block)', async () => {
+    const billing =
+      "Claude Code can't use your Claude subscription, usually because a payment is past due · Pay or renew at https://claude.ai/settings/billing (if you just paid, try again shortly), or use an Anthropic API key instead";
+    decideTool.mockResolvedValue({
+      ok: false,
+      error: 'router call failed (exit 1)',
+      durationMs: 3,
+      accountBlock: { message: billing },
+    });
+
+    const { result, logStep, slack } = await route('<@UBOT1> update the heading font on the pricing page', {
+      intent: 'IMPLEMENTATION',
+    });
+
+    expect(decideTool).toHaveBeenCalledTimes(1);
+    expect(runAgenticEntry).not.toHaveBeenCalled();
+    expect(runImplementationWorkflow).not.toHaveBeenCalled();
+    expect(slack.chat.postMessage).toHaveBeenCalledExactlyOnceWith({
+      channel: 'C-VIEW',
+      thread_ts: '111.22',
+      text: [
+        "I can't look at this right now: my model account refused the request. The problem is on my side, not with your message.",
+        'The error:',
+        `> ${billing}`,
+        "Ask me again once it's fixed.",
+      ].join('\n'),
+    });
+    expect(result).toMatchObject({ workflow: 'UNKNOWN', status: 'FAILED', notifyDesktop: true });
+    expect(result.message).toContain('payment is past due');
+    expect(stageLog(logStep, 'router.decision.account_blocked')).toMatchObject({ level: 'ERROR' });
+  });
+
+  it('says the connection was lost when both router calls could not reach the model', async () => {
+    decideTool.mockResolvedValue({
+      ok: false,
+      error: 'router call failed (exit 1)',
+      durationMs: 3,
+      connectionLost: { detail: 'API Error: Connection refused (ECONNREFUSED)' },
+    });
+
+    const { result, slack } = await route('<@UBOT1> how does login work?');
+
+    expect(decideTool).toHaveBeenCalledTimes(2);
+    expect(slack.chat.postMessage.mock.calls[0][0].text).toBe(
+      "I lost my connection to the model while reading your message, and retrying didn't bring it back. Mention me again in a few minutes and I'll pick it up.",
+    );
+    expect(result.message).toContain('ECONNREFUSED');
+  });
+
   it('still retries a passing rate limit that names no reset time', async () => {
     routerSays('answer');
     decideTool.mockResolvedValueOnce({

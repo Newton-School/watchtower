@@ -74,6 +74,11 @@ export interface PipelineResult {
   /** Verbatim reset clause when finalStatus === 'usage-limit' (issue #342). */
   usageLimitResetsAt?: string;
   /**
+   * Set when finalStatus === 'usage-limit' because the model account refused
+   * a step (billing, login) rather than hit its limit: the CLI's own words.
+   */
+  accountBlockMessage?: string;
+  /**
    * Set when the run stopped because a step was interrupted and retrying did
    * not help: the model API could not be reached (issue #439), or the agent's
    * process was killed from outside (issue #445). `finalStatus` is then

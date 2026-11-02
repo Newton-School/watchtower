@@ -8,7 +8,7 @@ import type { WorkflowStepLogger } from '../types/contracts.js';
 import { buildPromptForRole } from './prompts.js';
 import { lightweightProfile, profileForAgentRole } from '../codex/modelProfiles.js';
 import { runCodex, getActiveBackendId } from '../codex/runCodex.js';
-import { isInterruption, runWithInfraRetry, type InterruptionKind } from '../codex/infraRetry.js';
+import { isAccountProblem, isInterruption, runWithInfraRetry, type InterruptionKind } from '../codex/infraRetry.js';
 import { jobSlots } from '../runtime/jobSlots.js';
 import { activeClock } from '../runtime/activeClock.js';
 import { whileWaitingForAnswer } from '../runtime/humanWaits.js';
@@ -1700,6 +1700,8 @@ async function runAgentPipelineBody(
   let needsInputQuestion: string | undefined;
   let usageLimitHit = false;
   let usageLimitResetsAt: string | undefined;
+  /** The model account refused a step (billing, login): the CLI's words. The run pauses as for the usage limit. */
+  let accountBlockMessage: string | undefined;
   // The coder's whole change was outside the repository (issue #432).
   let externalOnly = false;
   let budgetExhausted: PipelineResult['budgetExhausted'];
@@ -1882,14 +1884,20 @@ async function runAgentPipelineBody(
     // not an agent verdict — abort the whole run instead of letting the
     // feedback loop burn more doomed spawns (issue #342; RCA: job 264ea287
     // failed coder→reviewer→2 loops→verifier in 23s, all 0-token exits).
-    if (result.errorKind === 'USAGE_LIMIT') {
+    // The model account refusing the run (billing, login) is the same: nothing
+    // ran, and nothing will until a person fixes the account.
+    if (isAccountProblem(result.errorKind)) {
       usageLimitHit = true;
       usageLimitResetsAt = result.limitResetsAtText;
+      accountBlockMessage = result.accountBlockMessage;
       logStep({
         stage: 'pipeline.usage_limit',
-        message: `Claude usage limit hit during ${role} — aborting the pipeline${usageLimitResetsAt ? ` (resets ${usageLimitResetsAt})` : ''}.`,
+        message:
+          result.errorKind === 'ACCOUNT_BLOCKED'
+            ? `The model account refused the ${role} — aborting the pipeline: ${accountBlockMessage ?? 'no reason given'}.`
+            : `Claude usage limit hit during ${role} — aborting the pipeline${usageLimitResetsAt ? ` (resets ${usageLimitResetsAt})` : ''}.`,
         level: 'ERROR',
-        data: { role, resetsAtText: usageLimitResetsAt },
+        data: { role, resetsAtText: usageLimitResetsAt, accountBlockMessage: accountBlockMessage ?? null },
       });
       steps.push({
         role,
@@ -2202,14 +2210,23 @@ async function runAgentPipelineBody(
           break;
         }
 
-        if (coderRetryResult.errorKind === 'USAGE_LIMIT') {
+        if (isAccountProblem(coderRetryResult.errorKind)) {
           usageLimitHit = true;
           usageLimitResetsAt = coderRetryResult.limitResetsAtText;
+          accountBlockMessage = coderRetryResult.accountBlockMessage;
           logStep({
             stage: 'pipeline.usage_limit',
-            message: `Claude usage limit hit during coder retry — aborting the pipeline${usageLimitResetsAt ? ` (resets ${usageLimitResetsAt})` : ''}.`,
+            message:
+              coderRetryResult.errorKind === 'ACCOUNT_BLOCKED'
+                ? `The model account refused the coder retry — aborting the pipeline: ${accountBlockMessage ?? 'no reason given'}.`
+                : `Claude usage limit hit during coder retry — aborting the pipeline${usageLimitResetsAt ? ` (resets ${usageLimitResetsAt})` : ''}.`,
             level: 'ERROR',
-            data: { role: 'coder', retryLoops, resetsAtText: usageLimitResetsAt },
+            data: {
+              role: 'coder',
+              retryLoops,
+              resetsAtText: usageLimitResetsAt,
+              accountBlockMessage: accountBlockMessage ?? null,
+            },
           });
           steps.push({
             role: 'coder',
@@ -2340,7 +2357,9 @@ async function runAgentPipelineBody(
         : finalStatus === 'needs-input'
           ? `Paused after ${took} — I need a bit more info before I can code a fix.`
           : finalStatus === 'usage-limit'
-            ? `Paused — Claude usage limit hit${usageLimitResetsAt ? ` (resets ${usageLimitResetsAt})` : ''}. No code was lost.`
+            ? accountBlockMessage
+              ? 'Paused — my model account refused the request. No code was lost.'
+              : `Paused — Claude usage limit hit${usageLimitResetsAt ? ` (resets ${usageLimitResetsAt})` : ''}. No code was lost.`
             : interrupted?.kind === 'connection_lost'
               ? `Stopped after ${took} — I lost my connection to the model and retrying didn't bring it back.`
               : interrupted
@@ -2373,6 +2392,7 @@ async function runAgentPipelineBody(
     aggregatedFindings,
     needsInputQuestion,
     usageLimitResetsAt,
+    ...(accountBlockMessage ? { accountBlockMessage } : {}),
     ...(interrupted ? { interrupted } : {}),
     ...externalChangesResult(latestByRole.get('coder'), externalOnly, plannerNormalized?.planMarkdown ?? ''),
     ...(budgetExhausted ? { budgetExhausted } : {}),
