@@ -8,6 +8,7 @@ import {
   __ghCli,
   __deployTiming,
   __deployConfirm,
+  __deployScript,
   DEPLOY_DRY_RUN_STATE_KEY,
   STAGING_OR_PROD_REPLY,
 } from '../src/workflows/deployWorkflow.js';
@@ -265,6 +266,7 @@ describe('runDeployWorkflow marketing branch', () => {
 
   beforeEach(() => {
     vi.mocked(runCodex).mockReset();
+    __deployScript.exists = () => true;
     __ghCli.exec = vi.fn().mockResolvedValue('');
     // Never sleep for real in tests.
     __deployTiming.resolvePollMs = 1;

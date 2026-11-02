@@ -99,6 +99,19 @@ async function confirmDeploy(params: {
   return stop('SKIPPED', msg, slackPosted);
 }
 
+/**
+ * The script a deploy skill says to run, if it says and it isn't there. Past the
+ * confirmation an agent outside the sandbox would be told to run a missing file during
+ * a production deploy, and left to improvise. Better to stop before asking.
+ */
+export function missingDeployScript(skillInstructions: string): string | undefined {
+  const script = /python3\s+(\S+\.py)\b/.exec(skillInstructions)?.[1];
+  return script && !__deployScript.exists(script) ? script : undefined;
+}
+
+/** Test seam, like the ones around it. */
+export const __deployScript = { exists: (file: string): boolean => fs.existsSync(file) };
+
 /** What a confirmed production deploy says while the deploy dry-run switch is on. */
 export function deployDryRunText(targetLabel: string): string {
   return `Dry run: this is where I would deploy *${targetLabel}* to production. Nothing was deployed.`;
@@ -261,6 +274,16 @@ export async function runDeployWorkflow(params: {
       notifyDesktop: true,
       slackPosted: true,
     };
+  }
+
+  const missingScript = missingDeployScript(skillInstructions);
+  if (missingScript) {
+    const msg = `The deploy skill points at a script that doesn't exist (\`${missingScript}\`), so nothing was deployed. Fix \`~/.claude/commands/deploy-prod.md\` first.`;
+    await slack.chat
+      .postMessage({ channel: task.event.channelId, thread_ts: task.event.threadTs, text: msg })
+      .catch(() => {});
+    logStep?.({ stage: 'deploy.script_missing', message: msg, level: 'ERROR' });
+    return { workflow: 'DEPLOY', status: 'FAILED', message: msg, notifyDesktop: true, slackPosted: true };
   }
 
   const notConfirmed = await confirmDeploy({ task, config, slack, targetLabel: 'newton-web', logStep, signal });

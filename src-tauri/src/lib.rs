@@ -602,6 +602,8 @@ pub fn run() {
             personal::open_my_day_in_slack,
             personal::save_my_day_policy,
             personal::start_my_day_item,
+            personal::my_day_pr_action,
+            personal::deploy_my_day_item,
             list_dossiers,
             get_dossier,
             save_dossier_field,

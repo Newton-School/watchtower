@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import type { MyDay, MyDayItem, MyDayRun } from '../types';
+import type { MyDay, MyDayItem, MyDayPrInfo, MyDayRun } from '../types';
 import { GlowCard } from '../components/GlowCard';
 import { EmptyState, PageIntro, TabBar } from '../components/primitives';
 
@@ -42,6 +42,10 @@ function prLabel(url: string): string {
   return match ? `${match[1]}#${match[2]}` : url;
 }
 
+function repoOf(url: string): string {
+  return /github\.com\/[^/]+\/([^/]+)\/pull/.exec(url)?.[1] ?? url;
+}
+
 function money(usd: number): string {
   return `$${usd.toFixed(2)}`;
 }
@@ -76,6 +80,40 @@ function Line({ label, children }: { label: string; children: ReactNode }) {
     </div>
   );
 }
+
+type Tap = { kind: 'merge' | 'approve' | 'deploy'; url: string; head?: string };
+
+function tapQuestion(tap: Tap, info: MyDayPrInfo | undefined): string {
+  const label = prLabel(tap.url);
+  const at = tap.head ? ` at ${tap.head.slice(0, 7)}` : '';
+  // From GitHub: the item's own words came through Slack and needn't describe this PR.
+  const about = [
+    info?.title && `"${info.title}"`,
+    info?.author && `by ${info.author}`,
+    info?.base && `into ${info.base}`,
+  ]
+    .filter(Boolean)
+    .join(' ');
+  const what = about ? `${label}${at}, ${about}` : `${label}${at}`;
+  if (tap.kind === 'merge') return `Merge ${what}?`;
+  if (tap.kind === 'approve') return `Approve ${what}, under your name?`;
+  const waiting = info?.undeployedCommits ? ` ${info.undeployedCommits} commits are waiting to ship.` : '';
+  return `Deploy ${repoOf(tap.url)} to production for ${what}?${waiting} It ships the newest good commit, so other merged work may go too, and it still asks you to reply \`confirm deploy\` before anything happens.`;
+}
+
+/** What can be pressed for one PR. Only ever from what was looked up, never from the item's text. */
+function tapsFor(item: MyDayItem, url: string): Tap[] {
+  const info = item.prInfo[url];
+  if (!info || item.source === 'session') return [];
+  if (info.state === 'merged') return info.deployable ? [{ kind: 'deploy', url }] : [];
+  // A closed item keeps Deploy, for something merged and waiting, but asks nothing more of the PR.
+  if (info.state !== 'open' || !info.head || info.draft || item.ownerClosed) return [];
+  const taps: Tap[] = [{ kind: 'merge', url, head: info.head }];
+  if (!info.mine) taps.push({ kind: 'approve', url, head: info.head });
+  return taps;
+}
+
+const TAP_LABELS: Record<Tap['kind'], string> = { merge: 'Merge', approve: 'Approve', deploy: 'Deploy' };
 
 function ReplyStatus({ item }: { item: MyDayItem }) {
   if (item.state === 'done') {
@@ -115,6 +153,8 @@ export function MyDayRow({
 }) {
   const [copied, setCopied] = useState(false);
   const [answer, setAnswer] = useState('');
+  // Nothing happens on the first press: it asks, naming the PR and the commit.
+  const [confirming, setConfirming] = useState<Tap | null>(null);
 
   const copyReply = async () => {
     if (!item.replyText) return;
@@ -133,6 +173,15 @@ export function MyDayRow({
       if (changes) onChanged();
     } catch (err) {
       onError(String(err));
+    }
+  };
+
+  const confirmTap = async (tap: Tap) => {
+    setConfirming(null);
+    if (tap.kind === 'deploy') {
+      await call('deploy_my_day_item', { key: item.key, url: tap.url }, true);
+    } else {
+      await call('my_day_pr_action', { key: item.key, kind: tap.kind, url: tap.url, head: tap.head }, true);
     }
   };
 
@@ -175,8 +224,27 @@ export function MyDayRow({
             <a key={url} className="ghost-button" href={url} target="_blank" rel="noopener noreferrer">
               {prLabel(url)}
               {item.prStates[url] ? ` · ${item.prStates[url]}` : ''}
+              {item.prInfo[url]?.deployUnknown ? ' · not sure if live' : ''}
             </a>
           ))}
+          {item.prUrls
+            .flatMap(url => tapsFor(item, url))
+            .map(tap => (
+              <button
+                key={`${tap.kind}:${tap.url}`}
+                className="ghost-button"
+                type="button"
+                onClick={() => setConfirming(tap)}
+              >
+                {TAP_LABELS[tap.kind]}
+                {item.prUrls.length > 1 ? ` ${prLabel(tap.url)}` : ''}
+              </button>
+            ))}
+          {item.deployJobId && onOpenRun ? (
+            <button className="ghost-button" type="button" onClick={() => onOpenRun(item.deployJobId ?? '')}>
+              See the deploy
+            </button>
+          ) : null}
           {item.jobId && onOpenRun ? (
             <button className="ghost-button" type="button" onClick={() => onOpenRun(item.jobId ?? '')}>
               See the run
@@ -229,6 +297,18 @@ export function MyDayRow({
           ) : null}
         </div>
       </header>
+      {confirming ? (
+        <div className="my-day-confirm">
+          <span>{tapQuestion(confirming, item.prInfo[confirming.url])}</span>
+          <button className="primary-button" type="button" onClick={() => void confirmTap(confirming)}>
+            Yes, {TAP_LABELS[confirming.kind].toLowerCase()}
+          </button>
+          <button className="ghost-button" type="button" onClick={() => setConfirming(null)}>
+            Cancel
+          </button>
+        </div>
+      ) : null}
+      {item.tapResult ? <Line label="Result">{item.tapResult}</Line> : null}
       <Line label={isSession ? 'Session' : 'Asked'}>{item.ask}</Line>
       {item.ownerClosed ? (
         <Line label="Closed">{item.ownerClosed === 'skipped' ? 'You skipped this.' : 'You marked this done.'}</Line>
@@ -387,7 +467,8 @@ export function MyDayPage({ onOpenRun }: { onOpenRun?: (runId: string) => void }
       <GlowCard>
         <strong>What runs on its own</strong>
         <p className="muted">
-          Merging, approving and deploying never do. Replies are always drafts. Prepare only does none of this.
+          Merging, approving and deploying never do: those need your button on the item. Replies are always drafts.
+          Prepare only does none of this.
         </p>
         <div className="my-day-policies">
           {POLICY_ROWS.map(row => (

@@ -1591,7 +1591,9 @@ export async function reviewSinglePr(params: {
   //     Non-fatal: a gate crash just means no BUILD STATUS block.
   let buildStatusBlock: string | undefined;
   let buildGateFailed = false;
-  if (orchestrated && hasLocalRepo && checkoutOk && !signal?.aborted) {
+  // Not on a My day review: this runs the PR's own install scripts outside the sandbox, and
+  // nobody asked for that overnight.
+  if (orchestrated && hasLocalRepo && checkoutOk && !signal?.aborted && !task.event.personalItemKey) {
     const changed = classifyChangedPaths(changedPaths);
     if (changed.depsChanged || changed.runtimeChanged) {
       try {

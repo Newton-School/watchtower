@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
+import type { PrInfo } from '../personal/prInfo.js';
 
 /** What the owner sees an item as: the inbox's tabs. Sessions have their own tab. */
 export type PersonalItemState = 'needs_you' | 'ready' | 'waiting' | 'working' | 'done';
@@ -37,6 +38,9 @@ export interface PersonalItem {
   draftStatus?: DraftStatus;
   draftError?: string;
   prStates: Record<string, string>;
+  prInfo: Record<string, PrInfo>;
+  /** What his last Merge or Approve came to. */
+  tapResult?: string;
   action?: PersonalWorkKind;
   actionDetail?: string;
   askerId?: string;
@@ -59,6 +63,8 @@ export type PersonalItemInput = Omit<
   | 'draftStatus'
   | 'draftError'
   | 'prStates'
+  | 'prInfo'
+  | 'tapResult'
   | 'askConfirmed'
   | 'requestId'
   | 'settledOn'
@@ -78,9 +84,11 @@ export interface PersonalRun {
 }
 
 /** A request from the app for the sidecar to act on, polled like launchpad requests. */
+export type PersonalActionKind = 'run_now' | 'start_item' | 'merge' | 'approve';
+
 export interface PersonalAction {
   id: string;
-  kind: 'run_now' | 'start_item';
+  kind: PersonalActionKind;
   /** For run_now: `3d` or a date, or nothing for "since the last run". */
   span?: string;
   /** For run_now: work everything out, and leave Slack untouched. */
@@ -88,6 +96,10 @@ export interface PersonalAction {
   /** For start_item: the item, and his answer if there is one. */
   itemKey?: string;
   text?: string;
+  /** For merge and approve: the PR, and the commit he saw. */
+  prUrl?: string;
+  head?: string;
+  createdAt: string;
 }
 
 /** A miniOG run, as far as deciding whether it already handled an ask. */
@@ -171,8 +183,17 @@ export interface PersonalStore {
   /** The item whose work runs in this thread. */
   itemKeyForAnchor(channelId: string, threadTs: string): string | undefined;
   jobResult(jobId: string): Record<string, unknown> | undefined;
-  setPrStates(key: string, states: Record<string, string>): void;
-  takeActions(): PersonalAction[];
+  setPrInfo(key: string, info: Record<string, PrInfo>): void;
+  setTapResult(key: string, result: string): void;
+  /** Items with PRs worth knowing about: open ones, and what finished in the last week. */
+  itemsWithPrs(): PersonalItem[];
+  takeActions(kinds: PersonalActionKind[], limit?: number): PersonalAction[];
+  finishAction(id: string): void;
+  /** Taken and never finished: Watchtower stopped partway, and only GitHub knows how far it got. */
+  takeInterruptedTaps(): PersonalAction[];
+  /** Items whose deploy has ended since their PRs were last looked up. */
+  itemsWithFinishedDeploys(): PersonalItem[];
+  markDeployRefreshed(key: string): void;
   jobsSince(iso: string): MiniogJob[];
   /** However old: a carried item's run may be from before this window. */
   jobsInThread(channelId: string, threadTs: string): MiniogJob[];
@@ -209,6 +230,8 @@ interface ItemRow {
   draft_status: DraftStatus | null;
   draft_error: string | null;
   pr_states_json: string;
+  pr_info_json: string;
+  tap_result: string | null;
   action: PersonalWorkKind | null;
   action_detail: string | null;
   asker_id: string | null;
@@ -231,6 +254,32 @@ interface RunRow {
   gaps_json: string;
   error_message: string | null;
   prepare_only: number;
+}
+
+interface ActionRow {
+  id: string;
+  kind: PersonalActionKind;
+  span: string | null;
+  prepare_only: number;
+  item_key: string | null;
+  text: string | null;
+  pr_url: string | null;
+  head: string | null;
+  created_at: string;
+}
+
+function toAction(row: ActionRow): PersonalAction {
+  return {
+    id: row.id,
+    kind: row.kind,
+    span: row.span ?? undefined,
+    prepareOnly: row.prepare_only === 1,
+    itemKey: row.item_key ?? undefined,
+    text: row.text ?? undefined,
+    prUrl: row.pr_url ?? undefined,
+    head: row.head ?? undefined,
+    createdAt: row.created_at,
+  };
 }
 
 interface JobRow {
@@ -305,6 +354,8 @@ function toItem(row: ItemRow): PersonalItem {
     draftStatus: row.draft_status ?? undefined,
     draftError: row.draft_error ?? undefined,
     prStates: parseStates(row.pr_states_json),
+    prInfo: parseStates(row.pr_info_json) as unknown as Record<string, PrInfo>,
+    tapResult: row.tap_result ?? undefined,
     action: row.action ?? undefined,
     actionDetail: row.action_detail ?? undefined,
     askerId: row.asker_id ?? undefined,
@@ -648,35 +699,77 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
       }
     },
 
-    setPrStates(key, states) {
-      db.prepare(`UPDATE personal_items SET pr_states_json = ? WHERE item_key = ?`).run(JSON.stringify(states), key);
+    setPrInfo(key, info) {
+      const states = Object.fromEntries(Object.entries(info).map(([url, entry]) => [url, entry.state]));
+      db.prepare(`UPDATE personal_items SET pr_info_json = ?, pr_states_json = ? WHERE item_key = ?`).run(
+        JSON.stringify(info),
+        JSON.stringify(states),
+        key,
+      );
     },
 
-    takeActions() {
+    setTapResult(key, result) {
+      db.prepare(`UPDATE personal_items SET tap_result = ? WHERE item_key = ?`).run(result, key);
+    },
+
+    itemsWithPrs() {
+      const rows = db
+        .prepare(
+          `SELECT * FROM personal_items
+            WHERE pr_urls_json != '[]' AND source != 'session'
+              AND (state != 'done' OR last_seen_at >= ?)`,
+        )
+        .all(new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString()) as ItemRow[];
+      return rows.map(toItem);
+    },
+
+    takeActions(kinds, limit = 1000) {
+      return db.transaction(() => {
+        const marks = kinds.map(() => '?').join(', ');
+        const rows = db
+          .prepare(
+            `SELECT id, kind, span, prepare_only, item_key, text, pr_url, head, created_at FROM personal_actions
+              WHERE taken_at IS NULL AND kind IN (${marks}) ORDER BY created_at LIMIT ?`,
+          )
+          .all(...kinds, limit) as ActionRow[];
+        const mark = db.prepare(`UPDATE personal_actions SET taken_at = ? WHERE id = ?`);
+        for (const row of rows) mark.run(new Date().toISOString(), row.id);
+        return rows.map(toAction);
+      })();
+    },
+
+    finishAction(id) {
+      db.prepare(`UPDATE personal_actions SET finished_at = ? WHERE id = ?`).run(new Date().toISOString(), id);
+    },
+
+    takeInterruptedTaps() {
       return db.transaction(() => {
         const rows = db
           .prepare(
-            `SELECT id, kind, span, prepare_only, item_key, text FROM personal_actions WHERE taken_at IS NULL ORDER BY created_at`,
+            `SELECT id, kind, span, prepare_only, item_key, text, pr_url, head, created_at FROM personal_actions
+              WHERE kind IN ('merge', 'approve') AND taken_at IS NOT NULL AND finished_at IS NULL`,
           )
-          .all() as Array<{
-          id: string;
-          kind: PersonalAction['kind'];
-          span: string | null;
-          prepare_only: number;
-          item_key: string | null;
-          text: string | null;
-        }>;
-        const mark = db.prepare(`UPDATE personal_actions SET taken_at = ? WHERE id = ?`);
+          .all() as ActionRow[];
+        const mark = db.prepare(`UPDATE personal_actions SET finished_at = ? WHERE id = ?`);
         for (const row of rows) mark.run(new Date().toISOString(), row.id);
-        return rows.map(row => ({
-          id: row.id,
-          kind: row.kind,
-          span: row.span ?? undefined,
-          prepareOnly: row.prepare_only === 1,
-          itemKey: row.item_key ?? undefined,
-          text: row.text ?? undefined,
-        }));
+        return rows.map(toAction);
       })();
+    },
+
+    itemsWithFinishedDeploys() {
+      const rows = db
+        .prepare(
+          `SELECT item.* FROM personal_items item
+             JOIN launchpad_requests request ON request.id = item.deploy_request_id
+            WHERE item.deploy_request_id != COALESCE(item.deploy_refreshed_for, '')
+              AND request.status IN ('SUCCESS', 'FAILED', 'SKIPPED')`,
+        )
+        .all() as ItemRow[];
+      return rows.map(toItem);
+    },
+
+    markDeployRefreshed(key) {
+      db.prepare(`UPDATE personal_items SET deploy_refreshed_for = deploy_request_id WHERE item_key = ?`).run(key);
     },
 
     jobsSince(iso) {
