@@ -1,6 +1,11 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { buildDeferredNote, runAgenticPrReview } from '../src/agentic/agenticPrReview.js';
+import { BEHAVIOUR_PROMPT_MARKER } from '../src/agentic/behaviourReview.js';
+import { __connectors, currentConnectors } from '../src/backends/connectors.js';
 import { VERIFIER_PROMPT_MARKER } from '../src/agentic/prReviewAgent.js';
 import { ORCHESTRATOR_PROMPT_MARKER } from '../src/agentic/prReviewOrchestrator.js';
 import { EMPTY_DISCOVERY } from '../src/agentic/reviewSkills.js';
@@ -129,6 +134,7 @@ function routedRunAgent(routes: {
   reviewer?: unknown;
   security?: unknown;
   performance?: unknown;
+  behaviour?: unknown;
   verifier?: (req: any) => unknown;
   oneShot?: unknown;
 }) {
@@ -141,6 +147,7 @@ function routedRunAgent(routes: {
     if (p.includes('reviewer specialist')) return Promise.resolve(routes.reviewer ?? agentOk([]));
     if (p.includes('security specialist')) return Promise.resolve(routes.security ?? agentOk([]));
     if (p.includes('performance specialist')) return Promise.resolve(routes.performance ?? agentOk([]));
+    if (p.includes(BEHAVIOUR_PROMPT_MARKER)) return Promise.resolve(routes.behaviour ?? agentDead());
     return Promise.resolve(routes.oneShot ?? agentDead());
   });
 }
@@ -258,8 +265,8 @@ describe('agenticPrReview', () => {
     });
 
     expect(result.status).toBe('SUCCESS');
-    // Fan-out runs one agent per lens (reviewer/security/performance).
-    expect(deps.runAgent).toHaveBeenCalledTimes(3);
+    // Orchestrator + security + performance, and the behaviour check (src/a.ts is app code).
+    expect(deps.runAgent).toHaveBeenCalledTimes(4);
     const outcomes = (result.result as any).outcomes;
     expect(outcomes).toHaveLength(1);
     expect(outcomes[0].prUrl).toBe(WEB_PR);
@@ -279,8 +286,8 @@ describe('agenticPrReview', () => {
     });
 
     expect(result.status).toBe('SUCCESS');
-    // 2 PRs × 3 lenses (default low-severity findings → no verifier calls).
-    expect(deps.runAgent).toHaveBeenCalledTimes(6);
+    // 2 PRs × (3 lenses + the behaviour check) (default low-severity findings → no verifier calls).
+    expect(deps.runAgent).toHaveBeenCalledTimes(8);
     const outcomes = (result.result as any).outcomes;
     expect(outcomes.map((o: any) => o.prUrl).sort()).toEqual([API_PR, WEB_PR].sort());
     // One ack listing both + one '*PR Review Complete*' summary per PR.
@@ -415,8 +422,8 @@ describe('agenticPrReview', () => {
     });
 
     expect(result.status).toBe('SUCCESS');
-    // No local clone → diff-only fan-out, one agent per lens, no checkout.
-    expect(deps.runAgent).toHaveBeenCalledTimes(3);
+    // No local clone → diff-only fan-out, one agent per lens plus the behaviour check, no checkout.
+    expect(deps.runAgent).toHaveBeenCalledTimes(4);
     expect(deps.runAgent.mock.calls[0][0].prompt).toContain('Do not explore the repository');
     expect(deps.checkoutPr).not.toHaveBeenCalled();
     expect(logStep).toHaveBeenCalledWith(expect.objectContaining({ stage: 'agentic.pr_review.repo_diff_only' }));
@@ -2074,5 +2081,196 @@ describe('agenticPrReview — a cancelled review is not a failed one (issue #438
       .map((c: any[]) => c[0].text as string)
       .filter((text: string) => !text.includes('PR review in progress'));
     expect(postedAfterCancel).toEqual([]);
+  });
+});
+
+describe('agenticPrReview — the behaviour check', () => {
+  let home: string;
+  const realHome = __connectors.home;
+
+  beforeEach(() => {
+    // The owner's Jira server, added in one project, as on the real host.
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'watchtower-behaviour-'));
+    __connectors.home = () => home;
+    fs.writeFileSync(
+      path.join(home, '.claude.json'),
+      JSON.stringify({
+        projects: {
+          '/code/newton-web': {
+            mcpServers: { atlassian: { command: 'node', args: ['atlassian-mcp'], env: { ATLASSIAN_API_TOKEN: 't' } } },
+          },
+        },
+      }),
+    );
+  });
+
+  afterEach(() => {
+    __connectors.home = realHome;
+    fs.rmSync(home, { recursive: true, force: true });
+    delete process.env.WATCHTOWER_PR_REVIEW_BEHAVIOUR;
+  });
+
+  const GAP = {
+    role: 'behaviour',
+    severity: 'high',
+    category: 'acceptance-criteria',
+    message: 'NMW-9 says "only leads can clear a cart". The API lets any member clear it.',
+    file: 'src/a.ts',
+    line: 2,
+    item: 2,
+  };
+
+  function agentBehaviour(findings: unknown[] = [GAP], extra: Record<string, unknown> = {}) {
+    return {
+      ...agentOk(findings),
+      parsedJson: {
+        findings,
+        summaryNotes: [],
+        summary: 'done',
+        specSource: 'jira',
+        ticketsRead: ['NMW-9'],
+        specNote: '',
+        checklist: [
+          { expectation: 'An empty cart shows "Browse courses"', source: 'NMW-9', status: 'done', where: 'src/a.ts:2' },
+          {
+            expectation: 'Only leads can clear a cart',
+            source: 'NMW-9',
+            status: 'partial',
+            note: 'The API allows anyone.',
+          },
+        ],
+        questions: [],
+        ...extra,
+      },
+    };
+  }
+
+  function depsFor(runAgent: any, title = 'NMW-9 Lead-only cart clear') {
+    return makeDeps({
+      runAgent,
+      fetchMetadata: vi.fn().mockResolvedValue({ title, body: 'Only leads can clear.', headSha: 'metasha' }),
+    });
+  }
+
+  async function review(deps: any) {
+    const slack = makeSlack([`review ${WEB_PR}`]);
+    const result = await runAgenticPrReview({
+      task: makeTask(`<@UBOT1> review ${WEB_PR}`),
+      config,
+      slack: slack as any,
+      store: emptyStore,
+      deps,
+    });
+    const submitted = deps.submitReview.mock.calls[0]?.[0];
+    const texts = slack.chat.postMessage.mock.calls.map((c: any[]) => c[0].text as string);
+    return { result, submitted, slackSummary: texts.find((t: string) => t.includes('*PR Review Complete*')) ?? '' };
+  }
+
+  it('runs beside the other passes, and only it gets the Jira server, with every write denied', async () => {
+    const seen = new Map<string, string[]>();
+    const routed = routedRunAgent({ orchestrator: agentOk([]), behaviour: agentBehaviour([]) });
+    const runAgent = vi.fn().mockImplementation((req: any) => {
+      const p = req.prompt as string;
+      const who = p.includes(BEHAVIOUR_PROMPT_MARKER)
+        ? 'behaviour'
+        : p.includes(ORCHESTRATOR_PROMPT_MARKER)
+          ? 'orchestrator'
+          : p.includes('security specialist')
+            ? 'security'
+            : 'other';
+      seen.set(who, Object.keys(currentConnectors().mcpServers));
+      if (who === 'behaviour') {
+        expect(currentConnectors().disallowedTools).toContain('mcp__atlassian__create-jira-issue');
+      }
+      return routed(req);
+    });
+
+    const { result } = await review(depsFor(runAgent));
+
+    expect(result.status).toBe('SUCCESS');
+    expect(seen.get('behaviour')).toEqual(['atlassian']);
+    expect(seen.get('orchestrator')).toEqual([]);
+    expect(seen.get('security')).toEqual([]);
+    const prompt = runAgent.mock.calls
+      .map((c: any[]) => c[0].prompt as string)
+      .find(p => p.includes(BEHAVIOUR_PROMPT_MARKER));
+    expect(prompt).toContain('The PR names NMW-9');
+    expect(runAgent.mock.calls.find((c: any[]) => c[0].prompt.includes(BEHAVIOUR_PROMPT_MARKER))?.[0]).toMatchObject({
+      reasoningEffort: 'high',
+    });
+  });
+
+  it('puts the checklist table in the review body, a line in Slack, and its gap inline; a gap is never an approval', async () => {
+    const runAgent = routedRunAgent({ orchestrator: agentOk([]), behaviour: agentBehaviour() });
+    const deps = depsFor(runAgent);
+
+    const { submitted, slackSummary } = await review(deps);
+
+    expect(submitted.summary).toContain('### Behaviour check');
+    expect(submitted.summary).toContain('Checked against NMW-9 (Jira) and the PR description.');
+    expect(submitted.summary).toContain(
+      '| 2 | Only leads can clear a cart | NMW-9 | ⚠️ Partial: The API allows anyone. | — |',
+    );
+    const behaviourFindings = submitted.findingsByRole.find((r: any) => r.role === 'behaviour').findings;
+    expect(behaviourFindings.map((f: any) => f.message)).toEqual([GAP.message]);
+    expect(submitted.neverApprove).toBe(true);
+    expect(slackSummary).toContain('Behaviour check against NMW-9: 1 of 2 done, 1 partial.');
+  });
+
+  it('shows a gap the verifier refuted as unclear, and posts no finding for it', async () => {
+    const runAgent = routedRunAgent({
+      orchestrator: agentOk([]),
+      behaviour: agentBehaviour(),
+      verifier: () => agentVerify('refuted'),
+    });
+    const deps = depsFor(runAgent);
+
+    const { submitted } = await review(deps);
+
+    expect(submitted.summary).toContain('❓ Unclear: A second check of the code did not confirm this gap.');
+    expect(submitted.findingsByRole.find((r: any) => r.role === 'behaviour').findings).toEqual([]);
+  });
+
+  it('keeps a gap with no finding from reading "good to go"', async () => {
+    const runAgent = routedRunAgent({ orchestrator: agentOk([]), behaviour: agentBehaviour([]) });
+    const { submitted } = await review(depsFor(runAgent));
+
+    expect(submitted.summary).not.toContain('Good to go');
+    expect(submitted.summary).toContain('1 expected behaviour(s) are missing, partial or different');
+    expect(submitted.neverApprove).toBe(true);
+  });
+
+  it('says in the review that it did not finish, and the review still posts', async () => {
+    const runAgent = routedRunAgent({ orchestrator: agentOk([]) });
+    const { result, submitted } = await review(depsFor(runAgent));
+
+    expect(result.status).toBe('SUCCESS');
+    expect(submitted.summary).toContain('### Behaviour check\nDid not finish.');
+    // Tried twice: high, then medium.
+    expect(runAgent.mock.calls.filter((c: any[]) => c[0].prompt.includes(BEHAVIOUR_PROMPT_MARKER))).toHaveLength(2);
+  });
+
+  it('is not run on a docs-only PR, and the review says why', async () => {
+    const runAgent = routedRunAgent({ orchestrator: agentOk([]), behaviour: agentBehaviour() });
+    const deps = depsFor(runAgent);
+    deps.fetchDiff = vi.fn().mockResolvedValue({
+      diff: 'diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1,1 +1,2 @@\n line\n+added',
+      truncated: false,
+      reason: 'ok',
+    });
+
+    const { submitted } = await review(deps);
+
+    expect(runAgent.mock.calls.some((c: any[]) => c[0].prompt.includes(BEHAVIOUR_PROMPT_MARKER))).toBe(false);
+    expect(submitted.summary).toContain('### Behaviour check\nNot run.');
+  });
+
+  it('is gone entirely when switched off', async () => {
+    process.env.WATCHTOWER_PR_REVIEW_BEHAVIOUR = '0';
+    const runAgent = routedRunAgent({ orchestrator: agentOk([]), behaviour: agentBehaviour() });
+    const { submitted } = await review(depsFor(runAgent));
+
+    expect(runAgent.mock.calls.some((c: any[]) => c[0].prompt.includes(BEHAVIOUR_PROMPT_MARKER))).toBe(false);
+    expect(submitted.summary).not.toContain('Behaviour check');
   });
 });
