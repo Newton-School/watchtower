@@ -974,6 +974,52 @@ function dedupeFindings(findings: CollectedFinding[]): CollectedFinding[] {
   return kept;
 }
 
+/** How far from another pass's finding, in lines of the same file, a behaviour finding can be its echo. */
+export const BEHAVIOUR_ECHO_LINES = 30;
+/** Words a behaviour finding shares with that finding to be its echo. */
+export const BEHAVIOUR_ECHO_OVERLAP = 0.2;
+/** Words a behaviour summary note shares with another pass's note to be its echo. */
+export const BEHAVIOUR_NOTE_ECHO_OVERLAP = 0.3;
+
+function isBehaviourEcho(behaviour: AgentFinding, other: AgentFinding): boolean {
+  if (!behaviour.file || behaviour.file !== other.file) return false;
+  if (
+    typeof behaviour.line === 'number' &&
+    typeof other.line === 'number' &&
+    Math.abs(behaviour.line - other.line) > BEHAVIOUR_ECHO_LINES
+  ) {
+    return false;
+  }
+  return messageOverlap(behaviour.message, other.message) >= BEHAVIOUR_ECHO_OVERLAP;
+}
+
+/**
+ * The behaviour pass reads the same code as the lead reviewer, and sometimes
+ * reports the same problem in its own words a few lines away, which the
+ * same-line dedup cannot see. On the first live review both of its findings
+ * were the lead's: 2 and 24 lines apart, sharing 25% and 31% of their words,
+ * where its findings and the lead's different ones shared 9-10%. Such a
+ * finding is dropped and the other pass's finding stays.
+ */
+export function dropBehaviourEchoes<T extends AgentFinding & { lens: PrReviewRole }>(
+  findings: T[],
+): { kept: T[]; dropped: number } {
+  const others = findings.filter(f => f.lens !== 'behaviour');
+  const kept = findings.filter(f => f.lens !== 'behaviour' || !others.some(other => isBehaviourEcho(f, other)));
+  return { kept, dropped: findings.length - kept.length };
+}
+
+/** The behaviour pass's summary notes, minus those another pass already wrote (the same live review: 44% shared). */
+export function dropBehaviourNoteEchoes(notesByRole: Partial<Record<PrReviewRole, string[]>>): number {
+  const own = notesByRole.behaviour ?? [];
+  const others = Object.entries(notesByRole)
+    .filter(([role]) => role !== 'behaviour')
+    .flatMap(([, notes]) => notes ?? []);
+  const kept = own.filter(note => !others.some(other => messageOverlap(note, other) >= BEHAVIOUR_NOTE_ECHO_OVERLAP));
+  if (own.length > 0) notesByRole.behaviour = kept;
+  return own.length - kept.length;
+}
+
 /**
  * The fan-out → verify → synthesize orchestrator. Returns the per-role outputs
  * the downstream submit/summary code consumes, plus a representative
@@ -1333,7 +1379,15 @@ async function runOrchestratedReview(params: {
   }
 
   const beforeDedupe = collected.length;
-  const deduped = dedupeFindings(collected);
+  const { kept: deduped, dropped: behaviourEchoes } = dropBehaviourEchoes(dedupeFindings(collected));
+  const behaviourNoteEchoes = dropBehaviourNoteEchoes(summaryNotesByLens);
+  if (behaviourEchoes + behaviourNoteEchoes > 0) {
+    logStep?.({
+      stage: 'agentic.pr_review.behaviour.echoes_dropped',
+      message: `Dropped ${behaviourEchoes} behaviour finding(s) and ${behaviourNoteEchoes} note(s) that repeat another pass.`,
+      data: { prUrl, findings: behaviourEchoes, notes: behaviourNoteEchoes },
+    });
+  }
 
   // Adversarially verify findings of medium severity and above (orchestrator
   // and lens findings alike — the safety net applies to the skills-led review too).

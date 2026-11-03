@@ -2265,6 +2265,34 @@ describe('agenticPrReview — the behaviour check', () => {
     expect(submitted.summary).toContain('### Behaviour check\nNot run.');
   });
 
+  it('posts a problem once when the behaviour check repeats the lead reviewer in its own words', async () => {
+    const lead = {
+      role: 'reviewer',
+      severity: 'medium',
+      category: 'async-state',
+      file: 'src/a.ts',
+      line: 2,
+      message:
+        'The cart list can be stale. A learner can empty the cart in another tab, and this row still shows the old count. When the admin then selects Clear Cart, the endpoint looks up only carts with items, so the call fails with a not found error and the dialog closes.',
+    };
+    const echo = {
+      role: 'behaviour',
+      severity: 'medium',
+      category: 'error-state',
+      file: 'src/a.ts',
+      line: 2,
+      message:
+        'The dialog treats every failure of the clear call the same way: it shows the server error, closes and reloads. When the learner already emptied the cart in another tab, the endpoint returns a not found error, so the admin is told the cart does not exist.',
+    };
+    const runAgent = routedRunAgent({ orchestrator: agentOk([lead]), behaviour: agentBehaviour([echo]) });
+    const { submitted } = await review(depsFor(runAgent));
+
+    const posted = submitted.findingsByRole.flatMap((r: any) => r.findings.map((f: any) => `${r.role}:${f.category}`));
+    expect(posted).toEqual(['reviewer:async-state']);
+    // The echo is not sent to a verifier either.
+    expect(verifierCalls(runAgent)).toBe(1);
+  });
+
   it('is gone entirely when switched off', async () => {
     process.env.WATCHTOWER_PR_REVIEW_BEHAVIOUR = '0';
     const runAgent = routedRunAgent({ orchestrator: agentOk([]), behaviour: agentBehaviour() });
