@@ -310,6 +310,8 @@ Rules:
   its source, for example: PROJ-12 says "only course leads can reassign a task". Then it says what the code does.
   Set "item" to the row number (1 for the first row).
 - A problem you find in STEP 3 that has no row is a finding too, without "item".
+- Do not report missing tests, naming, style or code structure: the lead reviewer covers them. Report only what a
+  user would see or get wrong.
 - Severity: code that contradicts the ticket, or breaks a user flow on a real path, is high. A missing state, a
   partial flow or a role gap on a narrower path is medium. Behaviour the sources do not mention is a question, never a finding.
 - A source that can be read two ways is a question for the author in "questions", never a finding. At most ${MAX_QUESTIONS} questions.
@@ -501,10 +503,18 @@ function cell(value: string | undefined, max: number): string {
   return flat.length > max ? `${flat.slice(0, max - 1).trimEnd()}…` : flat;
 }
 
+const MAX_WHERE_CHARS = 60;
+
+/**
+ * A file:line, clipped from the left: the file name and line are what a
+ * reader looks for, and a long path cut at its end loses both.
+ */
 function whereCell(where: string | undefined): string {
   if (!where) return '—';
-  const flat = cell(where, 80);
-  return flat.includes('`') ? flat : `\`${flat}\``;
+  const flat = where.replace(/\s+/g, ' ').replace(/\|/g, '\\|').replace(/`/g, '').trim();
+  if (!flat) return '—';
+  const clipped = flat.length > MAX_WHERE_CHARS ? `…${flat.slice(flat.length - (MAX_WHERE_CHARS - 1))}` : flat;
+  return `\`${clipped}\``;
 }
 
 function sourcesLine(report: Extract<BehaviourReport, { status: 'checked' }>): string {

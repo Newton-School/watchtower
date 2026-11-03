@@ -17,6 +17,7 @@ import {
   type BehaviourPromptParams,
   type BehaviourReport,
 } from '../src/agentic/behaviourReview.js';
+import { BEHAVIOUR_ECHO_LINES, dropBehaviourEchoes, dropBehaviourNoteEchoes } from '../src/agentic/prReviewAgent.js';
 import type { AppConfig } from '../src/types/contracts.js';
 
 const config = {} as AppConfig;
@@ -320,5 +321,69 @@ describe('the behaviour check in Slack', () => {
     expect(behaviourSlackLine(skipped)).toBeUndefined();
     expect(behaviourSlackLine(undefined)).toBeUndefined();
     expect(behaviourSlackLine({ status: 'failed', reason: 'x' })).toContain('did not finish');
+  });
+});
+
+describe('a behaviour finding that repeats another pass', () => {
+  // The first live review: both behaviour findings were the lead reviewer's, reworded, 2 and 24 lines away.
+  const LEAD =
+    'The cart list can be stale. A learner can empty the cart in another tab, and this row still shows the old count. When the admin then selects Clear Cart, the endpoint looks up only carts with items, so the call fails with a not found error and the dialog closes.';
+  const ECHO =
+    'The dialog treats every failure of the clear call the same way: it shows the server error, closes and reloads. When the learner already emptied the cart in another tab, the endpoint returns a not found error, so the admin is told the cart does not exist.';
+  const OTHER =
+    'The new discount badge renders the percentage with two decimals, while the design and the ticket show a whole number, so learners see 12.50% off instead of 13% off.';
+  const base = { severity: 'medium' as const, category: 'flow', file: 'src/cart/ClearDialog.tsx' };
+  const lead = { ...base, lens: 'reviewer' as const, line: 51, message: LEAD };
+
+  it('is dropped when it is near in the same file and says much the same; the other pass keeps its finding', () => {
+    const echo = { ...base, lens: 'behaviour' as const, line: 49, message: ECHO };
+    expect(dropBehaviourEchoes([lead, echo])).toEqual({ kept: [lead], dropped: 1 });
+  });
+
+  it('is kept when it is about something else, in another file, or far away', () => {
+    const different = { ...base, lens: 'behaviour' as const, line: 50, message: OTHER };
+    const elsewhere = { ...base, lens: 'behaviour' as const, file: 'src/cart/Badge.tsx', line: 51, message: ECHO };
+    const far = { ...base, lens: 'behaviour' as const, line: 51 + BEHAVIOUR_ECHO_LINES + 1, message: ECHO };
+    const findings = [lead, different, elsewhere, far];
+    expect(dropBehaviourEchoes(findings)).toEqual({ kept: findings, dropped: 0 });
+  });
+
+  it("never drops another pass's finding for a behaviour one", () => {
+    const security = { ...base, lens: 'security' as const, line: 49, message: ECHO };
+    expect(dropBehaviourEchoes([lead, security]).dropped).toBe(0);
+  });
+
+  it('drops a behaviour note another pass already wrote, and keeps the rest', () => {
+    const notes = {
+      reviewer: [
+        'This PR depends on the API change in the backend PR, which is still open. Without it, Clear Cart fails with a validation error. Merge and deploy the API PR first.',
+      ],
+      behaviour: [
+        'Clear Cart needs the API change in the backend PR, and that PR is still open. If this PR ships first, every Clear Cart fails with a validation error. Merge and deploy the API PR first.',
+        'The empty state copy differs from the ticket: it says Browse courses where the ticket says Explore programs.',
+      ],
+    };
+    expect(dropBehaviourNoteEchoes(notes)).toBe(1);
+    expect(notes.behaviour).toEqual([
+      'The empty state copy differs from the ticket: it says Browse courses where the ticket says Explore programs.',
+    ]);
+  });
+});
+
+describe('the behaviour check after its first live review', () => {
+  it('leaves missing tests and style to the lead reviewer', () => {
+    expect(buildBehaviourLensPrompt(promptParams())).toContain(
+      'Do not report missing tests, naming, style or code structure: the lead reviewer covers them.',
+    );
+  });
+
+  it('keeps the file name and line of a long path, clipping from the left', () => {
+    const where = 'src/containers/mentor/progression-tracker/components/StudentPresenceModal/index.js:51';
+    const section = renderBehaviourSection(
+      readBehaviourReport({ ...CHECKED, checklist: [{ expectation: 'x', source: 'NMW-9', status: 'done', where }] }),
+    );
+    expect(section).toContain('/StudentPresenceModal/index.js:51` |');
+    expect(section).toContain('`…');
+    expect(section).not.toContain('`src/containers/mentor');
   });
 });
