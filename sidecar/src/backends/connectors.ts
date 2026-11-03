@@ -19,13 +19,14 @@ import type { AppConfig, McpServerConfig } from '../types/contracts.js';
  *   lookup             Metabase and OpenPanel, read-only
  *   code_change        Figma
  *   code_change_admin  Figma + the Newton admin server, upload tools only
+ *   pr_behaviour       Jira (the host user's Atlassian server), read-only
  *
  * Anything not listed here is off for every agent, whatever the host user has
  * linked. Adding a connector to a kind of run is one name in CONNECTOR_POLICY
  * plus, if it is new, a spec in CONNECTORS.
  */
 
-export type ConnectorProfile = 'none' | 'lookup' | 'code_change' | 'code_change_admin';
+export type ConnectorProfile = 'none' | 'lookup' | 'code_change' | 'code_change_admin' | 'pr_behaviour';
 
 export interface RunConnectors {
   /** Servers the run may load, by the name its tools are published under. */
@@ -103,6 +104,22 @@ function userServer(name: string): McpServerConfig | undefined {
   return asServerConfig(servers?.[name]);
 }
 
+/**
+ * A server the host user added for one project (`claude mcp add` inside a
+ * repo): the first project that has one by this name. The owner's Jira server
+ * lives with the newton-web project, not with the user.
+ */
+function projectServer(name: string): McpServerConfig | undefined {
+  const config = readJson(path.join(__connectors.home(), '.claude.json'));
+  const projects = config?.projects as Record<string, unknown> | undefined;
+  for (const project of Object.values(projects ?? {})) {
+    const servers = (project as { mcpServers?: Record<string, unknown> } | null)?.mcpServers;
+    const server = asServerConfig(servers?.[name]);
+    if (server) return server;
+  }
+  return undefined;
+}
+
 /** A server an installed plugin ships. */
 function pluginServer(plugin: string, name: string): McpServerConfig | undefined {
   const installed = readJson(path.join(__connectors.home(), '.claude', 'plugins', 'installed_plugins.json'));
@@ -154,6 +171,28 @@ const CONNECTORS: Record<string, ConnectorSpec> = {
     about: 'designs, for a change that implements one',
     resolve: () => userServer('figma'),
   },
+  // Jira tickets (and Confluence pages), for what a PR was meant to do. The
+  // owner's own server (atlassian-mcp) signs in as the owner, so everything
+  // that writes is removed by name and by pattern.
+  jira: {
+    serverName: 'atlassian',
+    denyTools: [
+      'create-jira-issue',
+      'update-jira-issue',
+      'delete-jira-issue',
+      'create-page',
+      'update-page',
+      'delete-page',
+      'create-*',
+      'update-*',
+      'delete-*',
+      'add-*',
+      'transition-*',
+    ],
+    limit: 'read-only',
+    about: 'Jira tickets and Confluence pages, for what a change was meant to do',
+    resolve: () => userServer('atlassian') ?? projectServer('atlassian'),
+  },
   // Uploading an asset a change needs (a developer image). Only `login` and
   // the `upload_*` tools are left: the server also searches and edits user
   // and course records, which no agent run needs. Loaded under the name the
@@ -183,6 +222,7 @@ export const CONNECTOR_POLICY: Record<ConnectorProfile, string[]> = {
   lookup: ['metabase', 'openpanel'],
   code_change: ['figma'],
   code_change_admin: ['figma', 'newton-admin'],
+  pr_behaviour: ['jira'],
 };
 
 /** Resolve a profile against what this host can actually provide. */
@@ -205,6 +245,7 @@ const PROFILE_LABELS: Array<[ConnectorProfile, string]> = [
   ['lookup', 'lookups and investigations'],
   ['code_change', 'code changes'],
   ['code_change_admin', 'code changes for an admin'],
+  ['pr_behaviour', 'the behaviour check of a PR review'],
 ];
 
 /** The policy in words, for an agent asked what it can reach. */

@@ -61,7 +61,7 @@ describe('prReviewSupport', () => {
       }),
     );
 
-    expect(outputs.map(o => o.role)).toEqual(['reviewer', 'security', 'performance']);
+    expect(outputs.map(o => o.role)).toEqual(['reviewer', 'security', 'performance', 'behaviour']);
     expect(outputs[0].findings.map(f => f.message)).toEqual(['Edge case', 'Untagged finding']);
     expect(outputs[1].findings).toHaveLength(1);
     expect(outputs[2].findings).toHaveLength(1);

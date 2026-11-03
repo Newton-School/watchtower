@@ -38,6 +38,20 @@ describe('connectorsFor', () => {
           openpanel: { type: 'http', url: 'https://openpanel.example/mcp' },
           'newton-grafana-prod': { type: 'stdio', command: 'uvx', args: ['mcp-grafana'], env: { TOKEN: 'secret' } },
         },
+        // The owner's Jira server was added inside one repo, not for the user.
+        projects: {
+          '/code/watchtower': { mcpServers: {} },
+          '/code/newton-web': {
+            mcpServers: {
+              atlassian: {
+                type: 'stdio',
+                command: 'node',
+                args: ['npx-cli.js', '-y', 'atlassian-mcp@latest'],
+                env: { ATLASSIAN_BASE_URL: 'https://jira.example', ATLASSIAN_API_TOKEN: 'secret' },
+              },
+            },
+          },
+        },
       }),
     );
     const installPath = path.join(home, '.claude', 'plugins', 'cache', 'newton-plugins', 'newton-admin-mcp', 'abc123');
@@ -167,8 +181,51 @@ describe('connectorsFor', () => {
       'lookups and investigations: metabase (read-only) [not set up on this host], openpanel (read-only)',
       'code changes: figma',
       'code changes for an admin: figma, newton-admin (upload only)',
+      'the behaviour check of a PR review: jira (read-only)',
       'every other run: none',
     ]);
+  });
+
+  it("gives a PR's behaviour check the owner's Jira server from the project it was added in, with every write denied", () => {
+    const connectors = connectorsFor('pr_behaviour', config);
+    expect(Object.keys(connectors.mcpServers)).toEqual(['atlassian']);
+    expect(connectors.mcpServers.atlassian).toMatchObject({
+      type: 'stdio',
+      command: 'node',
+      env: { ATLASSIAN_BASE_URL: 'https://jira.example', ATLASSIAN_API_TOKEN: 'secret' },
+    });
+    // The server's own write tools, by name, and anything like them it adds later.
+    for (const tool of ['create-jira-issue', 'update-jira-issue', 'delete-jira-issue', 'create-page', 'update-page']) {
+      expect(connectors.disallowedTools).toContain(`mcp__atlassian__${tool}`);
+    }
+    expect(connectors.disallowedTools).toEqual(
+      expect.arrayContaining(['mcp__atlassian__create-*', 'mcp__atlassian__update-*', 'mcp__atlassian__delete-*']),
+    );
+    expect(connectors.disallowedTools.some(rule => rule.includes('get-jira-issue'))).toBe(false);
+    expect(connectors.unavailable).toEqual([]);
+  });
+
+  it('prefers a Jira server added for the user over one added in a project', () => {
+    const file = path.join(home, '.claude.json');
+    const json = JSON.parse(fs.readFileSync(file, 'utf8'));
+    json.mcpServers.atlassian = { type: 'http', url: 'https://user-level.example/mcp' };
+    fs.writeFileSync(file, JSON.stringify(json));
+    expect(connectorsFor('pr_behaviour', config).mcpServers.atlassian).toEqual({
+      type: 'http',
+      url: 'https://user-level.example/mcp',
+    });
+  });
+
+  it('says Jira is not set up when no project has it', () => {
+    const file = path.join(home, '.claude.json');
+    const json = JSON.parse(fs.readFileSync(file, 'utf8'));
+    delete json.projects;
+    fs.writeFileSync(file, JSON.stringify(json));
+    expect(connectorsFor('pr_behaviour', config)).toEqual({
+      mcpServers: {},
+      disallowedTools: [],
+      unavailable: ['jira'],
+    });
   });
 });
 

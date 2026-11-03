@@ -33,6 +33,7 @@ import {
   formatSlackReviewSummary,
   normalizePrReviewAgentOutput,
   splitAgenticOutputByRole,
+  CODE_REVIEW_LENSES,
   PR_REVIEW_ROLES,
   NO_NEW_CHANGES_TEXT,
   formatUnpostedFindings,
@@ -40,6 +41,7 @@ import {
   fetchDiffSince,
 } from '../github/prReviewSupport.js';
 import type {
+  CodeReviewLens,
   NormalizedPrReviewAgentOutput,
   PrMetadata,
   PrDiffResult,
@@ -52,6 +54,17 @@ import { prepareSiblingRepos } from '../workspaces/siblingRepos.js';
 import { applyFollowUpScope, formatFollowUpLine, type FollowUpStats } from './reReview.js';
 import { withAgentCallContext } from '../state/runContext.js';
 import { STE_REVIEW_TEXT_RULE } from '../codex/replyStyle.js';
+import {
+  behaviourGaps,
+  behaviourSlackLine,
+  findingKey,
+  planBehaviourReview,
+  renderBehaviourSection,
+  runBehaviourLens,
+  withRefutedGapsCleared,
+  type BehaviourPlan,
+  type BehaviourReport,
+} from './behaviourReview.js';
 
 /**
  * Per-PR review outcome. A job reviewing N PRs carries N of these in
@@ -303,9 +316,9 @@ const SEVERITY_RANK: Record<AgentFinding['severity'], number> = {
 
 /** On a cross-lens collision the higher-severity finding wins; ties break by
  * lens — security framing is the most actionable, performance the least. */
-const LENS_PRIORITY: Record<PrReviewRole, number> = { security: 2, reviewer: 1, performance: 0 };
+const LENS_PRIORITY: Record<PrReviewRole, number> = { security: 2, reviewer: 1, behaviour: 0.5, performance: 0 };
 
-const LENS_DIRECTIVE: Record<PrReviewRole, string> = {
+const LENS_DIRECTIVE: Record<CodeReviewLens, string> = {
   reviewer: 'logic errors, bugs, edge cases, missing error handling, test coverage, regressions, readability, naming',
   security:
     'SQL/command injection, XSS, broken authn/authz, secrets or PII exposure, insecure deserialization, CSRF/SSRF, path traversal, unsafe eval, missing input validation — changed code only',
@@ -370,7 +383,7 @@ function severityRank(severity: AgentFinding['severity']): number {
  * lenses. The pinned "MUST NOT post" invariant is preserved in every lens.
  */
 export function buildLensPrompt(params: {
-  lens: PrReviewRole;
+  lens: CodeReviewLens;
   recallBlock: string;
   prContext: PrContext;
   prMeta: PrMetadata;
@@ -493,8 +506,14 @@ export function buildPrReviewVerifierPrompt(params: {
       ? `You are a ${ADJUDICATOR_PROMPT_MARKER} — a ${VERIFIER_PROMPT_MARKER} of last resort. Another agent (the "${finding.lens}" lens) made the claim below about a PR. Deliver an independent verdict on the evidence alone: confirm it ONLY if you can positively establish the issue from the actual code; otherwise refute it.`
       : `You are a ${VERIFIER_PROMPT_MARKER}. Another agent (the "${finding.lens}" lens) made the claim below about a PR. Your job is to REFUTE it. Default to REFUTED unless you can positively confirm the issue from the actual code.`;
 
-  return `${roleLine}
+  // The behaviour pass compares the code with the ticket, which the verifier cannot read.
+  const behaviourLine =
+    finding.lens === 'behaviour'
+      ? `\nThis finding says the code does not do what the Jira ticket or the PR description asks. You cannot read the ticket: take the expectation the message quotes as given, and judge only the code. Refute it when the code does meet that expectation, here or anywhere else in the repository. Confirm it when the code does not.\n`
+      : '';
 
+  return `${roleLine}
+${behaviourLine}
 Finding under scrutiny:
 - lens: ${finding.lens}
 - severity: ${finding.severity}
@@ -537,7 +556,7 @@ ${diff}
  * degradation, the improvement over the legacy all-or-nothing single agent).
  */
 async function runReviewLens(params: {
-  lens: PrReviewRole;
+  lens: CodeReviewLens;
   deps: PrReviewDeps;
   cwd: string;
   promptParams: ReviewPromptParams;
@@ -996,10 +1015,10 @@ async function runMultiAgentReview(params: {
   logStep?.({
     stage: 'agentic.pr_review.fanout.start',
     message: 'Fanning out 3 review lenses (reviewer, security, performance).',
-    data: { prUrl, lenses: PR_REVIEW_ROLES },
+    data: { prUrl, lenses: CODE_REVIEW_LENSES },
   });
   const lensResults = await Promise.all(
-    PR_REVIEW_ROLES.map(lens =>
+    CODE_REVIEW_LENSES.map(lens =>
       runReviewLens({
         lens,
         deps,
@@ -1019,7 +1038,7 @@ async function runMultiAgentReview(params: {
   const failedLenses = lensResults.filter(r => !r.ok).map(r => r.lens);
   logStep?.({
     stage: 'agentic.pr_review.fanout.done',
-    message: `Fan-out: ${okLenses.length}/${PR_REVIEW_ROLES.length} lenses ok.`,
+    message: `Fan-out: ${okLenses.length}/${CODE_REVIEW_LENSES.length} lenses ok.`,
     data: { prUrl, okLenses: okLenses.map(r => r.lens), failedLenses },
   });
 
@@ -1119,6 +1138,9 @@ async function runOrchestratedReview(params: {
   schemaPath: string;
   orchestratorSchemaPath: string;
   verifierSchemaPath: string;
+  behaviourSchemaPath: string;
+  /** Whether the behaviour pass runs alongside the safety net, and with what. */
+  behaviourPlan: BehaviourPlan;
   githubToken?: string;
   hasLocalRepo: boolean;
   diffTruncated?: boolean;
@@ -1131,6 +1153,8 @@ async function runOrchestratedReview(params: {
       agentResult: CodexRunResult;
       appliedSkills: string[];
       degradedToFanout: boolean;
+      /** The behaviour pass's checklist, when it was planned to run. */
+      behaviour?: BehaviourReport;
     }
   | undefined
 > {
@@ -1143,6 +1167,8 @@ async function runOrchestratedReview(params: {
     schemaPath,
     orchestratorSchemaPath,
     verifierSchemaPath,
+    behaviourSchemaPath,
+    behaviourPlan,
     githubToken,
     hasLocalRepo,
     diffTruncated,
@@ -1157,14 +1183,19 @@ async function runOrchestratedReview(params: {
 
   if (signal?.aborted) return undefined;
 
+  const runsBehaviour = behaviourPlan.kind === 'run';
   logStep?.({
     stage: 'agentic.pr_review.fanout.start',
-    message: 'Orchestrated review: lead orchestrator + security/performance safety net.',
-    data: { prUrl, lenses: ['orchestrator', 'security', 'performance'], skills: skills.map(skill => skill.name) },
+    message: `Orchestrated review: lead orchestrator + security/performance safety net${runsBehaviour ? ' + behaviour check' : ''}.`,
+    data: {
+      prUrl,
+      lenses: ['orchestrator', 'security', 'performance', ...(runsBehaviour ? ['behaviour'] : [])],
+      skills: skills.map(skill => skill.name),
+    },
   });
 
-  const safetyLenses: PrReviewRole[] = ['security', 'performance'];
-  const [orch, ...lensResults] = await Promise.all([
+  const safetyLenses: CodeReviewLens[] = ['security', 'performance'];
+  const codeRuns = Promise.all([
     runOrchestratorReview({
       deps,
       cwd,
@@ -1194,6 +1225,25 @@ async function runOrchestratedReview(params: {
       }),
     ),
   ]);
+
+  // The behaviour pass runs beside the orchestrator and with its longer leash,
+  // so it adds an agent to the review but no time to it.
+  const behaviourRun =
+    behaviourPlan.kind === 'run'
+      ? runBehaviourLens({
+          deps,
+          cwd,
+          plan: behaviourPlan,
+          promptParams: { ...promptParams, oneShot: forceDiffOnly },
+          schemaPath: behaviourSchemaPath,
+          githubToken,
+          timeoutMs: timeoutMs ? timeoutMs * ORCHESTRATOR_TIMEOUT_FACTOR : timeoutMs,
+          logStep,
+          signal,
+        })
+      : Promise.resolve(undefined);
+
+  const [orch, ...lensResults] = await codeRuns;
 
   if (signal?.aborted) return undefined;
 
@@ -1231,6 +1281,7 @@ async function runOrchestratedReview(params: {
   ];
 
   const orchOutputs = orch.ok && orch.result ? splitAgenticOutputByRole(orch.result) : undefined;
+  const behaviour = await behaviourRun;
 
   if (!orchOutputs && okLenses.length === 0) {
     logStep?.({
@@ -1275,6 +1326,11 @@ async function runOrchestratedReview(params: {
     for (const finding of norm.findings) collected.push({ ...finding, lens });
     addNotes(lens, norm.summaryNotes);
   }
+  if (behaviour?.result) {
+    const norm = normalizePrReviewAgentOutput('behaviour', behaviour.result);
+    for (const finding of norm.findings) collected.push({ ...finding, lens: 'behaviour' });
+    addNotes('behaviour', norm.summaryNotes);
+  }
 
   const beforeDedupe = collected.length;
   const deduped = dedupeFindings(collected);
@@ -1311,6 +1367,15 @@ async function runOrchestratedReview(params: {
     data: { prUrl, beforeDedupe, afterDedupe: deduped.length, final: finalFindings.length },
   });
 
+  // A checklist gap whose findings the verifier refuted is not left saying "missing".
+  let behaviourReport = behaviour?.report;
+  if (behaviour && behaviourReport) {
+    const keptKeys = new Set(finalFindings.map(findingKey));
+    const refuted = blocking.filter(f => f.lens === 'behaviour' && !keptKeys.has(findingKey(f)));
+    const kept = finalFindings.filter(f => f.lens === 'behaviour');
+    behaviourReport = withRefutedGapsCleared(behaviourReport, behaviour.rows, refuted, kept);
+  }
+
   const representative = (orch.ok && orch.result ? orch.result : okLenses[0].result) as CodexRunResult;
   const outputs = PR_REVIEW_ROLES.map(role =>
     normalizePrReviewAgentOutput(role, {
@@ -1322,13 +1387,19 @@ async function runOrchestratedReview(params: {
     }),
   );
 
-  return { outputs, agentResult: representative, appliedSkills: orch.skillsApplied, degradedToFanout };
+  return {
+    outputs,
+    agentResult: representative,
+    appliedSkills: orch.skillsApplied,
+    degradedToFanout,
+    ...(behaviourReport ? { behaviour: behaviourReport } : {}),
+  };
 }
 
 /**
- * Enforce "changed code only" for security/performance findings: the prompt
- * restricts them to changed code, but nothing validated that their anchor
- * actually lands in a diff hunk. If it falls on pre-existing (unchanged)
+ * Enforce "changed code only" for security/performance/behaviour findings:
+ * the prompts restrict them to changed code, but nothing validated that their
+ * anchor actually lands in a diff hunk. If it falls on pre-existing (unchanged)
  * code, demote it to a summary note rather than posting an inline comment on
  * code this PR didn't touch. reviewer-role findings are untouched.
  * Mutates `outputs` in place; returns the demotion count.
@@ -1342,7 +1413,7 @@ export function enforceChangedCodeGate(
   const hunkIndex = parseDiffHunks(diff);
   let downgradedChangedCode = 0;
   for (const output of outputs) {
-    if (output.role !== 'security' && output.role !== 'performance') continue;
+    if (output.role === 'reviewer') continue;
     const kept: AgentFinding[] = [];
     for (const f of output.findings) {
       if (typeof f.line === 'number' && f.file && !isAnchorInDiff(hunkIndex, f.file, f.line)) {
@@ -1361,7 +1432,7 @@ export function enforceChangedCodeGate(
   if (downgradedChangedCode > 0) {
     logStep?.({
       stage: 'agentic.pr_review.pr.changed_code_downgraded',
-      message: `Downgraded ${downgradedChangedCode} security/performance finding(s) anchored outside the PR diff to summary notes.`,
+      message: `Downgraded ${downgradedChangedCode} security/performance/behaviour finding(s) anchored outside the PR diff to summary notes.`,
       data: { prUrl, downgradedChangedCode },
     });
   }
@@ -1584,6 +1655,14 @@ export async function reviewSinglePr(params: {
 
   const orchestrated = orchestratedReviewEnabled();
   const changedPaths = extractChangedPaths(diffResult.diff);
+  // Every changed file, not the capped list: a user-facing file past the cap
+  // must not leave the behaviour check out.
+  const behaviourPlan = planBehaviourReview({
+    config,
+    prMeta,
+    changedPaths: extractChangedPaths(anchorDiff, Number.MAX_SAFE_INTEGER),
+    orchestrated,
+  });
 
   // 4b. Deterministic build gate for deps/runtime-affecting PRs (the
   //     webapp-QA runtime-PR RCA, applied to review): npm ci + build against
@@ -1634,6 +1713,7 @@ export async function reviewSinglePr(params: {
   const schemaPath = path.resolve(process.cwd(), 'schemas', 'agentic-pr-review-result.schema.json');
   const orchestratorSchemaPath = path.resolve(process.cwd(), 'schemas', 'pr-review-orchestrator-result.schema.json');
   const verifierSchemaPath = path.resolve(process.cwd(), 'schemas', 'pr-review-verifier.schema.json');
+  const behaviourSchemaPath = path.resolve(process.cwd(), 'schemas', 'pr-review-behaviour-result.schema.json');
   const isFollowUp = Boolean(previousReview && priorFindings && priorFindings.length > 0);
   const priorReviewBlock =
     previousReview && priorFindings && isFollowUp
@@ -1692,6 +1772,8 @@ export async function reviewSinglePr(params: {
         schemaPath,
         orchestratorSchemaPath,
         verifierSchemaPath,
+        behaviourSchemaPath,
+        behaviourPlan,
         githubToken,
         hasLocalRepo,
         diffTruncated: diffResult.truncated,
@@ -1797,6 +1879,26 @@ export async function reviewSinglePr(params: {
 
   enforceChangedCodeGate(normalizedOutputs, anchorDiff, prContext.url, logStep);
 
+  // The behaviour check is in every review that planned one: its checklist,
+  // or a line saying why there is none.
+  const behaviourReport: BehaviourReport | undefined =
+    behaviourPlan.kind === 'skip'
+      ? { status: 'skipped', reason: behaviourPlan.reason }
+      : behaviourPlan.kind === 'run'
+        ? (orchestratedResult?.behaviour ?? {
+            status: 'failed',
+            reason: 'The rest of the review fell back to a diff-only pass, so the behaviour check was not used.',
+          })
+        : undefined;
+  const gaps = behaviourGaps(behaviourReport);
+  const behaviourOutput = normalizedOutputs.find(output => output.role === 'behaviour');
+  if (gaps > 0 && behaviourOutput && behaviourOutput.findings.length === 0) {
+    // A gap with no finding still keeps the review from reading "good to go".
+    behaviourOutput.summaryNotes.push(
+      `${gaps} expected behaviour(s) are missing, partial or different from what was asked: see the behaviour check.`,
+    );
+  }
+
   // 6b. A second review of the same PR follows up on the first (issue #451):
   //     what became of its findings, and what is new in the code changed since.
   //     New low/medium points on code that has not changed are left out.
@@ -1859,9 +1961,19 @@ export async function reviewSinglePr(params: {
       pullNumber: prContext.number,
       commitId: prHeadSha,
       findingsByRole: postingPlan.toSubmit,
-      neverApprove: Boolean(task.event.personalItemKey),
+      // A behaviour gap or an open question for the author is not an approval.
+      neverApprove:
+        Boolean(task.event.personalItemKey) ||
+        gaps > 0 ||
+        (behaviourReport?.status === 'checked' && behaviourReport.questions.length > 0),
       findingsInBody: allFindings.length - postingPlan.toSubmit.reduce((sum, r) => sum + r.findings.length, 0),
-      summary: buildGithubReviewSummary(normalizedOutputs, appliedSkills, postingPlan, followUpLine),
+      summary: buildGithubReviewSummary(
+        normalizedOutputs,
+        appliedSkills,
+        postingPlan,
+        followUpLine,
+        behaviourReport ? renderBehaviourSection(behaviourReport) : undefined,
+      ),
       githubToken,
       prDiff: anchorDiff,
       logStep,
@@ -1895,6 +2007,8 @@ export async function reviewSinglePr(params: {
     postingPlan.collapsed.length,
   );
   const summaryParts = [baseSummary];
+  const behaviourLine = behaviourSlackLine(behaviourReport);
+  if (behaviourLine) summaryParts.push(behaviourLine);
   if (followUpLine) summaryParts.push(followUpLine);
   // False when the submission failed or was skipped: then the thread is the
   // only place the findings can be read (issue #449).

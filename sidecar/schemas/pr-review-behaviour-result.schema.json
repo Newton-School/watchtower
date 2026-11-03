@@ -1,0 +1,44 @@
+{
+  "type": "object",
+  "required": ["findings", "summaryNotes", "summary", "specSource", "ticketsRead", "specNote", "checklist", "questions"],
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["role", "severity", "category", "message"],
+        "properties": {
+          "role": { "type": "string", "enum": ["behaviour"] },
+          "severity": { "type": "string", "enum": ["critical", "high", "medium", "low", "info"] },
+          "category": { "type": "string" },
+          "message": { "type": "string" },
+          "file": { "type": "string" },
+          "line": { "type": "number" },
+          "suggestion": { "type": "string" },
+          "item": { "type": "number" }
+        }
+      }
+    },
+    "summaryNotes": { "type": "array", "items": { "type": "string" } },
+    "summary": { "type": "string" },
+    "specSource": { "type": "string", "enum": ["jira", "description", "title"] },
+    "ticketsRead": { "type": "array", "items": { "type": "string" } },
+    "specNote": { "type": "string" },
+    "checklist": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["expectation", "source", "status"],
+        "properties": {
+          "expectation": { "type": "string" },
+          "source": { "type": "string" },
+          "status": { "type": "string", "enum": ["done", "partial", "missing", "differs", "unclear"] },
+          "where": { "type": "string" },
+          "note": { "type": "string" }
+        }
+      }
+    },
+    "questions": { "type": "array", "items": { "type": "string" } }
+  },
+  "additionalProperties": false
+}

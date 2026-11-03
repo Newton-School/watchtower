@@ -11,8 +11,12 @@ const execFileAsync = promisify(execFile);
 export const SUPPORTED_PR_REPOS = REPO_KEYS;
 const FINDING_SEVERITIES = new Set<AgentFinding['severity']>(['critical', 'high', 'medium', 'low', 'info']);
 
-export type PrReviewRole = 'reviewer' | 'security' | 'performance';
-export const PR_REVIEW_ROLES: readonly PrReviewRole[] = ['reviewer', 'security', 'performance'];
+/** The passes that read the code for problems. */
+export type CodeReviewLens = 'reviewer' | 'security' | 'performance';
+export const CODE_REVIEW_LENSES: readonly CodeReviewLens[] = ['reviewer', 'security', 'performance'];
+/** Every role a finding can carry: the code passes, and the behaviour pass (agentic/behaviourReview.ts). */
+export type PrReviewRole = CodeReviewLens | 'behaviour';
+export const PR_REVIEW_ROLES: readonly PrReviewRole[] = [...CODE_REVIEW_LENSES, 'behaviour'];
 export type AttachablePrReviewFinding = AgentFinding & { file: string; line: number };
 
 export interface NormalizedPrReviewAgentOutput {
@@ -552,7 +556,7 @@ export function splitAgenticOutputByRole(result: CodexRunResult): NormalizedPrRe
   const output = result.parsedJson ?? {};
   const rawFindings = Array.isArray(output.findings) ? output.findings : [];
 
-  const byRole: Record<PrReviewRole, unknown[]> = { reviewer: [], security: [], performance: [] };
+  const byRole: Record<PrReviewRole, unknown[]> = { reviewer: [], security: [], performance: [], behaviour: [] };
   for (const finding of rawFindings) {
     const role =
       isRecord(finding) && typeof finding.role === 'string' && (PR_REVIEW_ROLES as string[]).includes(finding.role)
@@ -680,9 +684,17 @@ export function buildGithubReviewSummary(
   plan?: ReviewPostingPlan,
   /** For a follow-up review: what became of the earlier findings, as the first line. */
   followUpLine?: string,
+  /** The behaviour check's section (agentic/behaviourReview.ts): posted on every review that planned one. */
+  behaviourSection?: string,
 ): string {
   if (followUpLine) {
-    return `${followUpLine}\n\n${buildGithubReviewSummary(outputs, appliedSkills, plan)}`;
+    return `${followUpLine}\n\n${buildGithubReviewSummary(outputs, appliedSkills, plan, undefined, behaviourSection)}`;
+  }
+  if (behaviourSection) {
+    // Right under the opening lines, where it is read. It is not counted in
+    // the budget that cuts the lower-priority list, so it never cuts the table.
+    const [opening, ...rest] = buildGithubReviewSummary(outputs, appliedSkills, plan).split('\n\n');
+    return [opening, behaviourSection, ...rest].join('\n\n');
   }
   const allFindings = outputs.flatMap(output => output.findings);
   const attachableFindings = outputs.flatMap(output => output.attachableFindings);
