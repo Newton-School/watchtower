@@ -604,6 +604,8 @@ pub fn run() {
             personal::start_my_day_item,
             personal::my_day_pr_action,
             personal::deploy_my_day_item,
+            personal::snooze_my_day_item,
+            personal::close_my_day_items,
             list_dossiers,
             get_dossier,
             save_dossier_field,
