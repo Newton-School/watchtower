@@ -31,7 +31,14 @@ import { isPrReviewRequest, normalizeTask } from '../src/router/intentParser.js'
 import { isRunDue, latestRunTime, runWindow } from '../src/personal/schedule.js';
 import { dirtyPaths, findUnfinishedSessions, readSession, unfinishedReasons } from '../src/personal/sessions.js';
 import { standDownForMiniog } from '../src/personal/standDown.js';
-import { itemPermalink, parseTriageReply, toPersonalItem } from '../src/personal/triage.js';
+import { inboxReadyLine } from '../src/personal/summary.js';
+import {
+  buildTriagePrompt,
+  itemPermalink,
+  parseTriageReply,
+  toChoices,
+  toPersonalItem,
+} from '../src/personal/triage.js';
 import { JobStore } from '../src/state/jobStore.js';
 import { spendKey, type MiniogJob, type PersonalItem } from '../src/state/personalStore.js';
 
@@ -1047,6 +1054,7 @@ describe('what a My day job is asked to do', () => {
     prUrls: [pr],
     prStates: {},
     askConfirmed: true,
+    choices: [],
     firstSeenAt: 'a',
     lastSeenAt: 'a',
     lastRunId: 'r',
@@ -1272,6 +1280,76 @@ describe('what a My day job is asked to do', () => {
     expect(settled.state).toBe('needs_you');
     expect(settled.nextStep).toContain('usage limit');
     expect(settled).not.toHaveProperty('replyText');
+  });
+
+  const skipped = (outcomes: Array<Record<string, unknown>>) => ({
+    status: 'SKIPPED',
+    workflow: 'PR_REVIEW',
+    result: { outcomes },
+  });
+  const unchanged = (n: number) => ({
+    prUrl: `https://github.com/o/r/pull/${n}`,
+    repo: 'r',
+    number: n,
+    status: 'SKIPPED',
+  });
+
+  it('counts a review with no new commits since the last one as done, not a run that gave up', () => {
+    const settled = settleItem({ ...base, action: 're_review_pr' }, skipped([unchanged(12)]));
+    expect(settled.state).toBe('done');
+    expect(settled.doneSummary).toBe('No new commits on r#12 since miniOG last reviewed it. Nothing new to review.');
+    expect(settled.tagLine).toBeUndefined();
+  });
+
+  it("doesn't blame the cap for a PR that was merged rather than reviewed", () => {
+    const merged = 'https://github.com/o/r/pull/13';
+    const settled = settleItem(
+      { ...base, action: 'review_pr', prUrls: [pr, merged], prInfo: { [merged]: { state: 'merged' } } },
+      skipped([unchanged(12)]),
+    );
+    expect(settled).toMatchObject({
+      state: 'done',
+      doneSummary:
+        'No new commits on r#12 since miniOG last reviewed it. r#13 is already merged or closed. Nothing new to review.',
+    });
+  });
+
+  it('names the PRs one run left out, and offers no run that would stop at the same cap', () => {
+    const urls = [12, 13, 14, 15, 16].map(n => `https://github.com/o/r/pull/${n}`);
+    const outcomes = [unchanged(12), unchanged(13)];
+    const settled = settleItem(
+      { ...base, action: 'review_pr', prUrls: urls },
+      { ...skipped(outcomes), result: { outcomes, deferredUrls: urls.slice(2, 4) } },
+    );
+    expect(settled.state).toBe('needs_you');
+    expect(settled.nextStep).toContain('No new commits on r#12 and r#13');
+    expect(settled.nextStep).toContain("r#14 and r#15 weren't reviewed: one run takes 3 PRs at most");
+    expect(settled.nextStep).toContain("r#16 wasn't reviewed. See the run for why.");
+    expect(settled.clearAction).toBe(true);
+  });
+
+  it('says a skipped review of merged PRs is done, and anything else needs a look', () => {
+    const merged = { ...base, action: 'review_pr' as const, prInfo: { [pr]: { state: 'merged' as const } } };
+    expect(settleItem(merged, skipped([]))).toMatchObject({ state: 'done' });
+    expect(settleItem(merged, skipped([])).doneSummary).toContain('already merged or closed');
+    const open = { ...base, action: 'review_pr' as const, prInfo: { [pr]: { state: 'open' as const } } };
+    expect(settleItem(open, skipped([])).state).toBe('needs_you');
+  });
+
+  it("gives the job's own reason when a skipped review has no PR to name", () => {
+    const settled = settleItem(
+      { ...base, action: 'review_pr', prUrls: [] },
+      { status: 'SKIPPED', workflow: 'PR_REVIEW', result: {}, error: 'No open PR on that branch.' },
+    );
+    expect(settled).toEqual({ state: 'needs_you', nextStep: "The run didn't finish: No open PR on that branch." });
+  });
+
+  it('says a skipped change stopped without changing anything', () => {
+    const settled = settleItem({ ...base, action: 'open_pr' }, { status: 'SKIPPED', workflow: 'IMPLEMENTATION' });
+    expect(settled).toMatchObject({
+      state: 'needs_you',
+      nextStep: "The run didn't finish: It stopped without changing anything.",
+    });
   });
 
   it("shows the question a plan asked, not the gate's line after it", () => {
@@ -1728,5 +1806,176 @@ describe('the personal store', () => {
     const job = new JobStore(path.join(tempDir(), 'watchtower.db'));
     expect(job.personalStore().runCostUsd('none')).toBe(0);
     expect(spendKey('r')).toBe('personal:r');
+  });
+});
+
+describe('one-tap answers from triage', () => {
+  const good = {
+    key: 'slack:C1:1793000000.000100',
+    source: 'slack' as const,
+    state: 'needs_you' as const,
+    ask: 'Plan NS-1 for next sprint?',
+  };
+
+  it('keeps each answer it can check, in order, and drops the rest', () => {
+    const choices = toChoices(
+      [
+        { do: 'snooze', label: 'Plan for next week', days: 4, extra: 'dropped' },
+        { do: 'close', label: '' },
+        { do: 'miniog', label: 'Have miniOG look', instruction: 'Look into the 403s on https://example.com' },
+        { do: 'deploy', label: 'Ship it' },
+        { do: 'snooze', label: 'Forever', days: 365 },
+      ],
+      'needs_you',
+    );
+    expect(choices).toEqual([
+      { do: 'snooze', label: 'Plan for next week', days: 4 },
+      { do: 'miniog', label: 'Have miniOG look', instruction: 'Look into the 403s on https://example.com' },
+    ]);
+  });
+
+  it('gives at most three, and none for an item not waiting on his call', () => {
+    const many = Array.from({ length: 5 }, (_, index) => ({ do: 'close', label: `Close ${index}` }));
+    expect(toChoices(many, 'needs_you')).toHaveLength(3);
+    expect(toChoices(many, 'ready')).toEqual([]);
+    expect(toChoices('close it', 'needs_you')).toEqual([]);
+  });
+
+  it('keeps an item whose answers are all bad, without them', () => {
+    const reply = parseTriageReply(JSON.stringify({ items: [{ ...good, choices: [{ do: 'merge' }] }] }));
+    expect(reply.items).toHaveLength(1);
+    expect(toPersonalItem(reply.items[0], 'run-1').choices).toEqual([]);
+  });
+
+  it('gives none to work the run can start itself, which has its own button', () => {
+    const triaged = {
+      ...good,
+      action: 'review_pr' as const,
+      pr_urls: ['https://github.com/o/r/pull/1'],
+      choices: [{ do: 'close', label: 'Close it' }],
+    };
+    expect(toPersonalItem(triaged, 'run-1').choices).toEqual([]);
+    expect(toPersonalItem({ ...triaged, action: 'none' }, 'run-1').choices).toEqual([
+      { do: 'close', label: 'Close it' },
+    ]);
+  });
+
+  it('asks for answers and notes written to him', () => {
+    const prompt = buildTriagePrompt({
+      ownerSlackId: 'U1',
+      ownerNames: ['Dipesh'],
+      windowStart: new Date('2026-11-01T00:00:00Z'),
+      windowEnd: new Date('2026-11-02T00:00:00Z'),
+      github: { login: 'd', reviewRequests: [], mentions: [], ownPrAsks: [], errors: [] } as never,
+      miniogJobs: [],
+      openItems: [],
+    });
+    expect(prompt).toContain('"do":"snooze"');
+    expect(prompt).toContain('write it to him, as "you"');
+    expect(prompt).toContain('Never a merge, approval, deploy');
+  });
+});
+
+describe('answers and snoozes in the store', () => {
+  const store = () => new JobStore(path.join(tempDir(), 'watchtower.db'));
+  const item = {
+    key: 'slack:C1:1.2',
+    source: 'slack' as const,
+    state: 'needs_you' as const,
+    ask: 'plan it?',
+    prUrls: [],
+    lastRunId: 'run-1',
+  };
+  const db = (job: JobStore) => (job as unknown as { db: { exec(sql: string): void } }).db;
+
+  it('keeps the latest answers from triage, and drops them once work starts', () => {
+    const job = store();
+    const personal = job.personalStore();
+    personal.upsertItem({ ...item, choices: [{ do: 'close', label: 'Close it' }] });
+    expect(personal.item(item.key)?.choices).toEqual([{ do: 'close', label: 'Close it' }]);
+    personal.upsertItem({ ...item, choices: [{ do: 'snooze', label: 'Next week', days: 7 }] });
+    expect(personal.item(item.key)?.choices).toEqual([{ do: 'snooze', label: 'Next week', days: 7 }]);
+    personal.setWorkStarted(item.key, 'request-1');
+    expect(personal.item(item.key)?.choices).toEqual([]);
+    personal.upsertItem({ ...item, choices: [{ do: 'close', label: 'Close it' }] });
+    expect(personal.item(item.key)?.choices).toEqual([]);
+  });
+
+  it('leaves a snooze to him, until new work on the item brings it back', () => {
+    const job = store();
+    const personal = job.personalStore();
+    personal.upsertItem(item);
+    db(job).exec(`UPDATE personal_items SET snoozed_until = '2099-01-01T00:00:00.000Z' WHERE item_key = '${item.key}'`);
+    personal.upsertItem({ ...item, ask: 'plan it, asked again?' });
+    expect(personal.item(item.key)?.snoozedUntil).toBe('2099-01-01T00:00:00.000Z');
+    personal.finishWork(item.key, { state: 'needs_you', nextStep: 'The run is waiting on you.' });
+    expect(personal.item(item.key)?.snoozedUntil).toBeUndefined();
+  });
+});
+
+describe('settling skipped work again', () => {
+  it('reopens only open items whose run was skipped, so the new rules read them', () => {
+    const job = new JobStore(path.join(tempDir(), 'watchtower.db'));
+    const db = (job as unknown as { db: { exec(sql: string): void } }).db;
+    const personal = job.personalStore();
+    const item = { source: 'slack' as const, state: 'needs_you' as const, ask: 'a', prUrls: [], lastRunId: 'r' };
+    personal.upsertItem({ ...item, key: 'skipped' });
+    personal.upsertItem({ ...item, key: 'failed' });
+    personal.upsertItem({ ...item, key: 'closed' });
+    db.exec(`
+      INSERT INTO jobs (id, event_id, dedupe_key, workflow, status, channel_id, thread_ts, payload_json, attempts, created_at, updated_at)
+        VALUES ('j1', 'e1', 'd1', 'PR_REVIEW', 'SKIPPED', 'D1', '1.1', '{}', 1, 'a', 'a'),
+               ('j2', 'e2', 'd2', 'PR_REVIEW', 'FAILED', 'D1', '1.2', '{}', 1, 'a', 'a');
+      UPDATE personal_items SET request_id = 'q', settled_on = job_id;
+      UPDATE personal_items SET job_id = 'j1', settled_on = 'j1' WHERE item_key IN ('skipped', 'closed');
+      UPDATE personal_items SET job_id = 'j2', settled_on = 'j2' WHERE item_key = 'failed';
+      UPDATE personal_items SET owner_closed = 'done' WHERE item_key = 'closed';
+    `);
+    expect(personal.resettleSkippedWork()).toBe(1);
+    expect(personal.item('skipped')?.settledOn).toBeUndefined();
+    expect(personal.item('failed')?.settledOn).toBe('j2');
+    expect(personal.item('closed')?.settledOn).toBe('j1');
+  });
+});
+
+describe('what the end-of-run notification says', () => {
+  const base: PersonalItem = {
+    key: 'k',
+    source: 'slack',
+    state: 'needs_you',
+    ask: 'a',
+    prUrls: [],
+    prStates: {},
+    prInfo: {},
+    choices: [],
+    askConfirmed: false,
+    firstSeenAt: '2026-11-01T00:00:00Z',
+    lastSeenAt: '2026-11-01T00:00:00Z',
+    lastRunId: 'run-1',
+  };
+  const never = () => false;
+
+  it('counts what needs him and what is ready to send', () => {
+    const items = [
+      { ...base, key: 'a' },
+      { ...base, key: 'b' },
+      { ...base, key: 'c', state: 'ready' as const },
+      { ...base, key: 'd', state: 'waiting' as const },
+    ];
+    expect(inboxReadyLine(items, never)).toBe('2 need you, 1 reply to send.');
+  });
+
+  it('says what miniOG takes on itself, and leaves out sessions and what he put off', () => {
+    const items = [
+      { ...base, key: 'a', action: 'review_pr' as const },
+      { ...base, key: 'b' },
+      { ...base, key: 'c', source: 'session' as const },
+      { ...base, key: 'd', snoozedUntil: '2099-01-01T00:00:00Z' },
+    ];
+    expect(inboxReadyLine(items, item => Boolean(item.action))).toBe('1 needs you. miniOG is starting on 1 more.');
+  });
+
+  it('says so when nothing needs him', () => {
+    expect(inboxReadyLine([], never)).toBe('Nothing needs you.');
   });
 });

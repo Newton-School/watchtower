@@ -11,6 +11,18 @@ export type PersonalRunStatus = 'RUNNING' | 'OK' | 'PARTIAL' | 'FAILED';
 /** `blocked`: a draft is already in that conversation, an earlier one or his own. */
 export type DraftStatus = 'saved' | 'failed' | 'blocked';
 
+/**
+ * A one-tap answer to an item's question, the recommended one first. `close`
+ * needs nothing more, `snooze` hides it for `days`, and `miniog` starts a run with
+ * `instruction`, the same as his typed answer would.
+ */
+export interface PersonalChoice {
+  label: string;
+  do: 'close' | 'snooze' | 'miniog';
+  days?: number;
+  instruction?: string;
+}
+
 export interface PersonalItem {
   /** Stable from night to night: how a later run recognises the same ask. */
   key: string;
@@ -50,6 +62,10 @@ export interface PersonalItem {
   requestId?: string;
   /** The job or question the item was last brought up to date with. */
   settledOn?: string;
+  /** One-tap answers to `nextStep`, from triage. */
+  choices: PersonalChoice[];
+  /** He put it off until then. Only he sets it; new work on the item clears it. */
+  snoozedUntil?: string;
   firstSeenAt: string;
   lastSeenAt: string;
   lastRunId: string;
@@ -57,6 +73,8 @@ export interface PersonalItem {
 
 export type PersonalItemInput = Omit<
   PersonalItem,
+  | 'choices'
+  | 'snoozedUntil'
   | 'firstSeenAt'
   | 'lastSeenAt'
   | 'ownerClosed'
@@ -68,7 +86,7 @@ export type PersonalItemInput = Omit<
   | 'askConfirmed'
   | 'requestId'
   | 'settledOn'
->;
+> & { choices?: PersonalChoice[] };
 
 export interface PersonalRun {
   id: string;
@@ -199,6 +217,8 @@ export interface PersonalStore {
   jobsInThread(channelId: string, threadTs: string): MiniogJob[];
   /** What the run's agents cost, from the telemetry they record under `spendKey(run)`. */
   runCostUsd(runId: string): number;
+  /** Lets work a skipped run left open be settled again, under rules that read it better. */
+  resettleSkippedWork(): number;
 }
 
 /** The job id a run's agent calls are recorded under. */
@@ -238,6 +258,8 @@ interface ItemRow {
   ask_confirmed: number;
   request_id: string | null;
   settled_on: string | null;
+  choices_json: string | null;
+  snoozed_until: string | null;
   first_seen_at: string;
   last_seen_at: string;
   last_run_id: string;
@@ -329,6 +351,16 @@ function parseStates(json: string): Record<string, string> {
   }
 }
 
+function parseChoices(json: string | null): PersonalChoice[] {
+  if (!json) return [];
+  try {
+    const value: unknown = JSON.parse(json);
+    return Array.isArray(value) ? (value as PersonalChoice[]) : [];
+  } catch {
+    return [];
+  }
+}
+
 function toItem(row: ItemRow): PersonalItem {
   return {
     key: row.item_key,
@@ -362,6 +394,8 @@ function toItem(row: ItemRow): PersonalItem {
     askConfirmed: row.ask_confirmed === 1,
     requestId: row.request_id ?? undefined,
     settledOn: row.settled_on ?? undefined,
+    choices: parseChoices(row.choices_json),
+    snoozedUntil: row.snoozed_until ?? undefined,
     firstSeenAt: row.first_seen_at,
     lastSeenAt: row.last_seen_at,
     lastRunId: row.last_run_id,
@@ -388,12 +422,12 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
     INSERT INTO personal_items (
       item_key, source, state, channel_id, channel_name, thread_ts, message_ts, permalink, asker, asked_at, ask,
       done_summary, reply_text, next_step, evidence, pr_urls_json, job_id, session_id, session_cwd,
-      action, action_detail, asker_id, first_seen_at, last_seen_at, last_run_id
+      action, action_detail, asker_id, choices_json, first_seen_at, last_seen_at, last_run_id
     )
     VALUES (
       @key, @source, @state, @channelId, @channelName, @threadTs, @messageTs, @permalink, @asker, @askedAt, @ask,
       @doneSummary, @replyText, @nextStep, @evidence, @prUrlsJson, @jobId, @sessionId, @sessionCwd,
-      @action, @actionDetail, @askerId, @now, @now, @lastRunId
+      @action, @actionDetail, @askerId, @choicesJson, @now, @now, @lastRunId
     )
     ON CONFLICT(item_key) DO UPDATE SET
       source = excluded.source,
@@ -418,6 +452,8 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
       draft_status = CASE WHEN personal_items.draft_status = 'saved' THEN 'saved' ELSE NULL END,
       draft_error = NULL,
       next_step = CASE WHEN personal_items.request_id IS NOT NULL THEN personal_items.next_step ELSE excluded.next_step END,
+      -- They answer triage's question, which work under way has replaced with its own.
+      choices_json = CASE WHEN personal_items.request_id IS NOT NULL THEN personal_items.choices_json ELSE excluded.choices_json END,
       evidence = excluded.evidence,
       pr_urls_json = CASE WHEN personal_items.request_id IS NOT NULL THEN personal_items.pr_urls_json ELSE excluded.pr_urls_json END,
       job_id = COALESCE(personal_items.job_id, excluded.job_id),
@@ -512,6 +548,7 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
         action: item.action ?? null,
         actionDetail: item.actionDetail ?? null,
         askerId: item.askerId ?? null,
+        choicesJson: JSON.stringify(item.choices ?? []),
         now: new Date().toISOString(),
         lastRunId: item.lastRunId,
       });
@@ -603,7 +640,8 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
     setWorkStarted(key, requestId) {
       db.prepare(
         `UPDATE personal_items
-            SET state = 'working', request_id = ?, job_id = NULL, settled_on = NULL, last_seen_at = ?
+            SET state = 'working', request_id = ?, job_id = NULL, settled_on = NULL, choices_json = '[]',
+                last_seen_at = ?
           WHERE item_key = ?`,
       ).run(requestId, new Date().toISOString(), key);
     },
@@ -620,9 +658,10 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
       const item = db.prepare(`SELECT * FROM personal_items WHERE item_key = ?`).get(key) as ItemRow | undefined;
       if (!item) return;
       db.prepare(
+        // Something new came of the work, so an item he put off comes back.
         `UPDATE personal_items
             SET state = ?, done_summary = ?, next_step = ?, reply_text = ?, pr_urls_json = ?,
-                job_id = ?, settled_on = ?, action = ?, last_seen_at = ?
+                job_id = ?, settled_on = ?, action = ?, snoozed_until = NULL, last_seen_at = ?
           WHERE item_key = ?`,
       ).run(
         outcome.state,
@@ -782,6 +821,16 @@ export function createPersonalStore(db: Database.Database): PersonalStore {
         .prepare(`${JOB_SELECT} WHERE channel_id = ? AND thread_ts = ? ORDER BY created_at`)
         .all(channelId, threadTs) as JobRow[];
       return rows.map(toJob);
+    },
+
+    resettleSkippedWork() {
+      return db
+        .prepare(
+          `UPDATE personal_items SET settled_on = NULL
+            WHERE state = 'needs_you' AND owner_closed IS NULL AND request_id IS NOT NULL
+              AND job_id IN (SELECT id FROM jobs WHERE status = 'SKIPPED')`,
+        )
+        .run().changes;
     },
 
     runCostUsd(runId) {

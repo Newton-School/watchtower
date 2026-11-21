@@ -567,6 +567,9 @@ export class JobStore {
         tap_result TEXT,
         deploy_request_id TEXT,
         deploy_refreshed_for TEXT,
+        snoozed_until TEXT,
+        choices_json TEXT NOT NULL DEFAULT '[]',
+        closed_from TEXT,
         first_seen_at TEXT NOT NULL,
         last_seen_at TEXT NOT NULL,
         last_run_id TEXT NOT NULL
@@ -937,6 +940,10 @@ export class JobStore {
       'personal_actions ADD COLUMN head TEXT',
       'personal_actions ADD COLUMN finished_at TEXT',
       'personal_items ADD COLUMN deploy_refreshed_for TEXT',
+      'personal_items ADD COLUMN snoozed_until TEXT',
+      "personal_items ADD COLUMN choices_json TEXT NOT NULL DEFAULT '[]'",
+      // Written by the app when he closes an item, so Reopen puts it back as it was.
+      'personal_items ADD COLUMN closed_from TEXT',
     ]) {
       try {
         this.db.exec(`ALTER TABLE ${column}`);
