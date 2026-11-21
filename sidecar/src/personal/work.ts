@@ -293,6 +293,16 @@ function settleSkippedReview(item: PersonalItem, result: Record<string, unknown>
   return { state: 'needs_you', nextStep: said.join(' '), clearAction: true };
 }
 
+/**
+ * A run My day asked for, on an item he closed before it started: closing it said
+ * stop. Only the request's own item counts, not whichever item its thread belongs to.
+ */
+export function closedBeforeStart(store: JobStore, requestId: string | undefined): boolean {
+  if (!requestId) return false;
+  const key = store.getLaunchpadRequest(requestId)?.personalItemKey;
+  return Boolean(key && store.personalStore().item(key)?.ownerClosed);
+}
+
 /** What a finished job means for its item. Pure, apart from what to do about the tag. */
 export function settleItem(
   item: PersonalItem,
@@ -535,7 +545,8 @@ export async function reconcileWork(deps: WorkDeps, nowMs = Date.now()): Promise
       if (request.status === 'FAILED' || request.status === 'SKIPPED' || neverStarted) {
         personal.finishWork(item.key, {
           state: 'needs_you',
-          nextStep: `The run couldn't start: ${request.errorMessage ?? 'it never got going'}. Run it again when you're ready.`,
+          // Reasons are whole sentences: one full stop, not two.
+          nextStep: `The run couldn't start: ${(request.errorMessage ?? 'it never got going').replace(/\.+$/, '')}. Run it again when you're ready.`,
           settled: `request:${item.requestId}`,
         });
       }
