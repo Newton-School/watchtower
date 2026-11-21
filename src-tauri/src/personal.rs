@@ -21,6 +21,12 @@ const TEAM_ID_KEY: &str = "personal.team_id";
 const DEFAULT_RUN_TIME: &str = "22:00";
 /// Done items older than this drop off the inbox; the rows stay.
 const DONE_ITEM_DAYS: i64 = 7;
+/// How far ahead an item can be put off: further is closing it, which says so.
+const MAX_SNOOZE_DAYS: i64 = 60;
+/// Nights of history the settings show.
+const RUN_HISTORY: usize = 14;
+/// Items one bulk close may touch: the oldest open ones, never the whole table.
+const MAX_BULK_CLOSE: usize = 200;
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +57,20 @@ pub struct MyDayItem {
     pub job_id: Option<String>,
     pub session_id: Option<String>,
     pub first_seen_at: String,
+    /// Where a session's work is, for naming its repo.
+    pub session_cwd: Option<String>,
+    /// Set when the nightly run started work on it, as against miniOG handling it live.
+    pub request_id: Option<String>,
+    /// What the linked job actually ran as, such as PR_REVIEW.
+    pub job_workflow: Option<String>,
+    /// When the linked job last changed: when the work it did happened.
+    pub job_updated_at: Option<String>,
+    pub snoozed_until: Option<String>,
+    /// One-tap answers to its question, from triage, the recommended one first.
+    pub choices: serde_json::Value,
+    pub last_seen_at: String,
+    /// What it was when he closed it: Reopen puts it back there.
+    pub closed_from: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
@@ -64,7 +84,13 @@ pub struct MyDayRun {
     pub finished_at: Option<String>,
     pub gaps: Vec<String>,
     pub error: Option<String>,
+    /// The sweep and the work it started, together.
     pub cost_usd: f64,
+    /// Reading Slack and saving drafts.
+    pub sweep_cost_usd: f64,
+    /// The reviews and changes My day started, until the next run began.
+    pub work_cost_usd: f64,
+    pub prepare_only: bool,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
@@ -72,9 +98,13 @@ pub struct MyDayRun {
 pub struct MyDay {
     pub enabled: bool,
     pub run_time: String,
+    /// When the schedule was turned on or moved: no run fires for a time before it.
+    pub enabled_at: Option<String>,
     /// Run now was pressed and the sidecar hasn't picked it up.
     pub run_queued: bool,
     pub last_run: Option<MyDayRun>,
+    /// The last few runs, newest first.
+    pub runs: Vec<MyDayRun>,
     pub items: Vec<MyDayItem>,
     /// What runs on its own: `auto`, `ask` or `off` for each kind of work.
     pub policies: std::collections::BTreeMap<String, String>,
@@ -105,6 +135,34 @@ fn has_table(connection: &Connection, name: &str) -> Result<bool, String> {
         .optional()
         .map(|row| row.is_some())
         .map_err(|err| format!("db read failed: {err}"))
+}
+
+/// A column added in a later version: the app can start before the sidecar has added it.
+/// `table` is always one of this file's own names, never anything read from the database.
+fn has_column(connection: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|err| format!("db read failed: {err}"))?;
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|err| format!("db read failed: {err}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("db read failed: {err}"))?;
+    Ok(names.iter().any(|name| name == column))
+}
+
+/// The column if it's there yet, or what it reads as before it is.
+fn column_or(
+    connection: &Connection,
+    table: &str,
+    column: &'static str,
+    missing: &'static str,
+) -> Result<&'static str, String> {
+    Ok(if has_column(connection, table, column)? {
+        column
+    } else {
+        missing
+    })
 }
 
 fn read_state(connection: &Connection, key: &str) -> Result<Option<String>, String> {
@@ -145,19 +203,27 @@ fn read_items(
     }
     let done_since =
         (now - chrono::Duration::days(DONE_ITEM_DAYS)).to_rfc3339_opts(SecondsFormat::Millis, true);
+    let snoozed_until = column_or(connection, "personal_items", "snoozed_until", "NULL")?;
+    let choices = column_or(connection, "personal_items", "choices_json", "'[]'")?;
+    let closed_from = column_or(connection, "personal_items", "closed_from", "NULL")?;
     let mut statement = connection
-        .prepare(
+        .prepare(&format!(
             "SELECT item_key, source, state, channel_name, permalink, asker, asked_at, ask, done_summary,
                     reply_text, next_step, evidence, pr_urls_json, job_id, session_id, first_seen_at,
                     owner_closed, draft_status, draft_error, pr_states_json, action,
                     (SELECT status FROM jobs WHERE jobs.id = personal_items.job_id),
                     pr_info_json, tap_result,
                     (SELECT job_id FROM launchpad_requests WHERE launchpad_requests.id = personal_items.deploy_request_id),
-                    (SELECT status FROM launchpad_requests WHERE launchpad_requests.id = personal_items.deploy_request_id)
+                    (SELECT status FROM launchpad_requests WHERE launchpad_requests.id = personal_items.deploy_request_id),
+                    session_cwd, request_id,
+                    (SELECT COALESCE(NULLIF(executed_workflow, ''), workflow) FROM jobs WHERE jobs.id = personal_items.job_id),
+                    {snoozed_until}, {choices}, last_seen_at,
+                    (SELECT updated_at FROM jobs WHERE jobs.id = personal_items.job_id),
+                    {closed_from}
                FROM personal_items
               WHERE state != 'done' OR last_seen_at >= ?1
-              ORDER BY first_seen_at DESC",
-        )
+              ORDER BY first_seen_at DESC"
+        ))
         .map_err(|err| format!("db read failed: {err}"))?;
     let rows = statement
         .query_map(params![done_since], |row| {
@@ -189,6 +255,19 @@ fn read_items(
                 tap_result: row.get(23)?,
                 deploy_job_id: row.get(24)?,
                 deploy_status: row.get(25)?,
+                session_cwd: row.get(26)?,
+                request_id: row.get(27)?,
+                job_workflow: row.get(28)?,
+                snoozed_until: row.get(29)?,
+                choices: serde_json::from_str::<serde_json::Value>(
+                    &row.get::<_, Option<String>>(30)?.unwrap_or_default(),
+                )
+                .ok()
+                .filter(serde_json::Value::is_array)
+                .unwrap_or_else(|| serde_json::json!([])),
+                last_seen_at: row.get(31)?,
+                job_updated_at: row.get(32)?,
+                closed_from: row.get(33)?,
             })
         })
         .map_err(|err| format!("db read failed: {err}"))?;
@@ -196,49 +275,96 @@ fn read_items(
         .map_err(|err| format!("db read failed: {err}"))
 }
 
-fn read_last_run(connection: &Connection) -> Result<Option<MyDayRun>, String> {
-    if !has_table(connection, "personal_runs")? {
-        return Ok(None);
+/// What one run cost. The work is what My day started from this run's start until
+/// the next run's: miniOG's own runs in the same threads are not My day's spending.
+fn run_costs(
+    connection: &Connection,
+    id: &str,
+    started_at: &str,
+    next_started_at: Option<&str>,
+) -> Result<(f64, f64), String> {
+    if !has_table(connection, "agent_calls")? {
+        return Ok((0.0, 0.0));
     }
-    let run = connection
+    let sweep: f64 = connection
         .query_row(
-            "SELECT id, status, trigger, window_start, window_end, started_at, finished_at, gaps_json, error_message
-               FROM personal_runs ORDER BY started_at DESC LIMIT 1",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    MyDayRun {
-                        status: row.get(1)?,
-                        trigger: row.get(2)?,
-                        window_start: row.get(3)?,
-                        window_end: row.get(4)?,
-                        started_at: row.get(5)?,
-                        finished_at: row.get(6)?,
-                        gaps: strings_from_json(&row.get::<_, String>(7)?),
-                        error: row.get(8)?,
-                        cost_usd: 0.0,
-                    },
-                ))
-            },
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM agent_calls WHERE job_id = ?1",
+            params![format!("personal:{id}")],
+            |row| row.get(0),
         )
-        .optional()
         .map_err(|err| format!("db read failed: {err}"))?;
-    let Some((id, mut run)) = run else {
-        return Ok(None);
-    };
-    if has_table(connection, "agent_calls")? {
-        run.cost_usd = connection
+    let work: f64 = if has_table(connection, "launchpad_requests")?
+        && has_column(connection, "launchpad_requests", "personal_item_key")?
+    {
+        connection
             .query_row(
                 "SELECT COALESCE(SUM(cost_usd), 0) FROM agent_calls
-                  WHERE job_id = ?1
-                     OR job_id IN (SELECT job_id FROM personal_items WHERE last_run_id = ?2 AND job_id IS NOT NULL)",
-                params![format!("personal:{id}"), id],
+                  WHERE job_id IN (SELECT job_id FROM launchpad_requests
+                                    WHERE personal_item_key IS NOT NULL AND job_id IS NOT NULL
+                                      AND created_at >= ?1 AND (?2 IS NULL OR created_at < ?2))",
+                params![started_at, next_started_at],
                 |row| row.get(0),
             )
-            .map_err(|err| format!("db read failed: {err}"))?;
+            .map_err(|err| format!("db read failed: {err}"))?
+    } else {
+        0.0
+    };
+    Ok((sweep, work))
+}
+
+/// The newest runs first, each with what it cost.
+fn read_runs(connection: &Connection, limit: usize) -> Result<Vec<MyDayRun>, String> {
+    if !has_table(connection, "personal_runs")? {
+        return Ok(Vec::new());
     }
-    Ok(Some(run))
+    let prepare_only = column_or(connection, "personal_runs", "prepare_only", "0")?;
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT id, status, trigger, window_start, window_end, started_at, finished_at, gaps_json,
+                    error_message, {prepare_only}
+               FROM personal_runs ORDER BY started_at DESC LIMIT ?1"
+        ))
+        .map_err(|err| format!("db read failed: {err}"))?;
+    let rows = statement
+        .query_map(params![limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                MyDayRun {
+                    status: row.get(1)?,
+                    trigger: row.get(2)?,
+                    window_start: row.get(3)?,
+                    window_end: row.get(4)?,
+                    started_at: row.get(5)?,
+                    finished_at: row.get(6)?,
+                    gaps: strings_from_json(&row.get::<_, String>(7)?),
+                    error: row.get(8)?,
+                    cost_usd: 0.0,
+                    sweep_cost_usd: 0.0,
+                    work_cost_usd: 0.0,
+                    prepare_only: row.get::<_, Option<i64>>(9)?.unwrap_or(0) == 1,
+                },
+            ))
+        })
+        .map_err(|err| format!("db read failed: {err}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("db read failed: {err}"))?;
+    let mut runs = Vec::with_capacity(rows.len());
+    let mut next_started_at: Option<String> = None;
+    for (id, mut run) in rows {
+        let (sweep, work) =
+            run_costs(connection, &id, &run.started_at, next_started_at.as_deref())?;
+        run.sweep_cost_usd = sweep;
+        run.work_cost_usd = work;
+        run.cost_usd = sweep + work;
+        next_started_at = Some(run.started_at.clone());
+        runs.push(run);
+    }
+    Ok(runs)
+}
+
+#[cfg(test)]
+fn read_last_run(connection: &Connection) -> Result<Option<MyDayRun>, String> {
+    Ok(read_runs(connection, 1)?.into_iter().next())
 }
 
 fn read_my_day(connection: &Connection, now: chrono::DateTime<Utc>) -> Result<MyDay, String> {
@@ -252,12 +378,15 @@ fn read_my_day(connection: &Connection, now: chrono::DateTime<Utc>) -> Result<My
             .optional()
             .map_err(|err| format!("db read failed: {err}"))?
             .is_some();
+    let runs = read_runs(connection, RUN_HISTORY)?;
     Ok(MyDay {
         enabled: read_state(connection, ENABLED_KEY)?.as_deref() == Some("1"),
         run_time: read_state(connection, RUN_TIME_KEY)?
             .unwrap_or_else(|| DEFAULT_RUN_TIME.to_string()),
+        enabled_at: read_state(connection, ENABLED_AT_KEY)?,
         run_queued,
-        last_run: read_last_run(connection)?,
+        last_run: runs.first().cloned(),
+        runs,
         items: read_items(connection, now)?,
         policies: read_policies(connection)?,
     })
@@ -474,18 +603,36 @@ fn session_of(connection: &Connection, key: &str) -> Result<(String, String), St
 
 /// Closes an item as he says, or reopens one he closed. A later run leaves what
 /// he closed alone. Only his own closing can be undone: a run's `done` has a reason.
+/// Reopening puts it back as it was: a reply that was ready to send comes back
+/// ready, not as work to run again, which would open a second PR.
 fn set_closed(connection: &Connection, key: &str, how: &str, now: &str) -> Result<(), String> {
-    let changed = match how {
-        "skipped" | "done" => connection.execute(
-            "UPDATE personal_items SET state = 'done', owner_closed = ?2, last_seen_at = ?3 WHERE item_key = ?1",
-            params![key, how, now],
-        ),
-        "reopen" => connection.execute(
-            "UPDATE personal_items SET state = 'needs_you', owner_closed = NULL, last_seen_at = ?2
+    if !["skipped", "done", "reopen"].contains(&how) {
+        return Err(format!("{how} isn't something an item can be set to"));
+    }
+    if has_table(connection, "personal_items")?
+        && !has_column(connection, "personal_items", "closed_from")?
+    {
+        connection
+            .execute_batch("ALTER TABLE personal_items ADD COLUMN closed_from TEXT")
+            .map_err(|err| format!("db schema failed: {err}"))?;
+    }
+    let changed = if how == "reopen" {
+        connection.execute(
+            "UPDATE personal_items
+                SET state = COALESCE(closed_from, 'needs_you'), owner_closed = NULL, closed_from = NULL,
+                    last_seen_at = ?2
               WHERE item_key = ?1 AND owner_closed IS NOT NULL",
             params![key, now],
-        ),
-        other => return Err(format!("{other} isn't something an item can be set to")),
+        )
+    } else {
+        // The state before his first close: closing again doesn't lose it.
+        connection.execute(
+            "UPDATE personal_items
+                SET closed_from = CASE WHEN owner_closed IS NULL THEN state ELSE closed_from END,
+                    state = 'done', owner_closed = ?2, last_seen_at = ?3
+              WHERE item_key = ?1",
+            params![key, how, now],
+        )
     }
     .map_err(|err| format!("db write failed: {err}"))?;
     if changed == 0 {
@@ -495,6 +642,89 @@ fn set_closed(connection: &Connection, key: &str, how: &str, now: &str) -> Resul
         stop_its_run(connection, key, now)?;
     }
     Ok(())
+}
+
+/// Puts an open item off until `until`, or brings it back with `None`. The time comes
+/// from the app, so it's checked: never in the past, and never so far it hides one for good.
+fn set_snooze(
+    connection: &Connection,
+    key: &str,
+    until: Option<&str>,
+    now: chrono::DateTime<Utc>,
+) -> Result<(), String> {
+    let value = match until {
+        None => None,
+        Some(text) => {
+            let at = chrono::DateTime::parse_from_rfc3339(text)
+                .map_err(|_| format!("{text} isn't a time"))?
+                .with_timezone(&Utc);
+            if at <= now {
+                return Err("that time has already passed".to_string());
+            }
+            if at > now + chrono::Duration::days(MAX_SNOOZE_DAYS) {
+                return Err(format!(
+                    "an item can be put off for {MAX_SNOOZE_DAYS} days at most"
+                ));
+            }
+            Some(at.to_rfc3339_opts(SecondsFormat::Millis, true))
+        }
+    };
+    if !has_column(connection, "personal_items", "snoozed_until")? {
+        connection
+            .execute_batch("ALTER TABLE personal_items ADD COLUMN snoozed_until TEXT")
+            .map_err(|err| format!("db schema failed: {err}"))?;
+    }
+    let changed = connection
+        .execute(
+            "UPDATE personal_items SET snoozed_until = ?2 WHERE item_key = ?1 AND state != 'done'",
+            params![key, value],
+        )
+        .map_err(|err| format!("db write failed: {err}"))?;
+    if changed == 0 {
+        return Err("that item is no longer open".to_string());
+    }
+    Ok(())
+}
+
+/// Closes several items as one: all of them or, on a real failure, none. An item a
+/// run closed in the meantime is simply not counted.
+fn close_many(
+    connection: &mut Connection,
+    keys: &[String],
+    how: &str,
+    now: &str,
+) -> Result<usize, String> {
+    if how != "skipped" && how != "done" {
+        return Err(format!("{how} isn't something items can be set to"));
+    }
+    if keys.len() > MAX_BULK_CLOSE {
+        return Err(format!(
+            "at most {MAX_BULK_CLOSE} items can be closed at once"
+        ));
+    }
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|err| format!("db write failed: {err}"))?;
+    let mut closed = 0;
+    for key in keys {
+        let open: bool = transaction
+            .query_row(
+                "SELECT 1 FROM personal_items WHERE item_key = ?1 AND state != 'done'",
+                params![key],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|err| format!("db read failed: {err}"))?
+            .is_some();
+        if open {
+            set_closed(&transaction, key, how, now)?;
+            closed += 1;
+        }
+    }
+    transaction
+        .commit()
+        .map_err(|err| format!("db write failed: {err}"))?;
+    Ok(closed)
 }
 
 /// Closing an item stops its run: otherwise it would go on to push and open a PR.
@@ -844,6 +1074,30 @@ pub(crate) async fn close_my_day_item(
     set_closed(&connection, &key, &how, &now_iso())
 }
 
+/// Puts an item off until a time, or brings it back.
+#[tauri::command]
+pub(crate) async fn snooze_my_day_item(
+    key: String,
+    until: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let connection =
+        Connection::open(&*state.db_path).map_err(|err| format!("db open failed: {err}"))?;
+    set_snooze(&connection, &key, until.as_deref(), Utc::now())
+}
+
+/// Clears several items at once, such as everything older than a week.
+#[tauri::command]
+pub(crate) async fn close_my_day_items(
+    keys: Vec<String>,
+    how: String,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    let mut connection =
+        Connection::open(&*state.db_path).map_err(|err| format!("db open failed: {err}"))?;
+    close_many(&mut connection, &keys, &how, &now_iso())
+}
+
 /// Opens the Slack app on the item's message, or the web page if that fails.
 #[tauri::command]
 pub(crate) async fn open_my_day_in_slack(
@@ -928,11 +1182,13 @@ mod tests {
                    channel_id TEXT, thread_ts TEXT, message_ts TEXT, owner_closed TEXT, draft_status TEXT, draft_error TEXT,
                    pr_states_json TEXT NOT NULL DEFAULT '{}', action TEXT, last_run_id TEXT,
                    pr_info_json TEXT NOT NULL DEFAULT '{}', tap_result TEXT, deploy_request_id TEXT,
-                   first_seen_at TEXT, last_seen_at TEXT);
+                   request_id TEXT, first_seen_at TEXT, last_seen_at TEXT);
                  CREATE TABLE agent_calls (job_id TEXT, cost_usd REAL);
-                 CREATE TABLE jobs (id TEXT PRIMARY KEY, status TEXT);
+                 CREATE TABLE jobs (id TEXT PRIMARY KEY, status TEXT, workflow TEXT, executed_workflow TEXT,
+                   updated_at TEXT);
                  CREATE TABLE human_waits (job_id TEXT, prompt_ts TEXT);
-                 CREATE TABLE launchpad_requests (id TEXT PRIMARY KEY, job_id TEXT, status TEXT);",
+                 CREATE TABLE launchpad_requests (id TEXT PRIMARY KEY, job_id TEXT, status TEXT,
+                   personal_item_key TEXT, created_at TEXT);",
             )
             .expect("schema");
         connection
@@ -1078,18 +1334,121 @@ mod tests {
     }
 
     #[test]
-    fn last_run_cost_includes_its_jobs() {
+    fn a_run_costs_its_sweep_and_its_own_work_not_miniogs_live_runs() {
         let connection = database();
         connection
             .execute_batch(
-                "INSERT INTO personal_runs VALUES ('r1', 'schedule', 'OK', 'a', 'b', '2026-11-01', NULL, '[]', NULL);
+                "INSERT INTO personal_runs VALUES ('r1', 'schedule', 'OK', 'a', 'b', '2026-11-01T16:30:00Z', NULL, '[]', NULL);
+                 INSERT INTO personal_runs VALUES ('r2', 'schedule', 'OK', 'a', 'b', '2026-11-02T16:30:00Z', NULL, '[]', NULL);
+                 INSERT INTO launchpad_requests (id, job_id, status, personal_item_key, created_at) VALUES
+                   ('q1', 'job-1', 'SUCCESS', 'a', '2026-11-01T16:40:00Z'),
+                   ('q2', 'job-2', 'SUCCESS', 'b', '2026-11-02T16:40:00Z'),
+                   ('q3', 'job-live', 'SUCCESS', NULL, '2026-11-01T17:00:00Z');
                  INSERT INTO personal_items (item_key, source, state, ask, pr_urls_json, first_seen_at, last_seen_at, job_id, last_run_id)
-                   VALUES ('a', 'slack', 'done', 'x', '[]', 'a', 'a', 'job-1', 'r1');
-                 INSERT INTO agent_calls VALUES ('personal:r1', 1.0), ('job-1', 2.5), ('job-other', 9.0);",
+                   VALUES ('c', 'slack', 'done', 'x', '[]', 'a', 'a', 'job-live', 'r1');
+                 INSERT INTO agent_calls VALUES ('personal:r1', 1.0), ('job-1', 2.5), ('job-2', 4.0), ('job-live', 9.0),
+                   ('personal:r2', 0.5);",
             )
             .expect("seed");
-        let run = read_last_run(&connection).expect("read").expect("run");
-        assert!((run.cost_usd - 3.5).abs() < f64::EPSILON);
+        let runs = read_runs(&connection, 5).expect("read");
+        assert_eq!(runs.len(), 2);
+        assert!((runs[0].sweep_cost_usd - 0.5).abs() < f64::EPSILON);
+        assert!((runs[0].work_cost_usd - 4.0).abs() < f64::EPSILON);
+        assert!((runs[1].cost_usd - 3.5).abs() < f64::EPSILON);
+        assert_eq!(
+            read_last_run(&connection)
+                .expect("read")
+                .expect("run")
+                .started_at,
+            "2026-11-02T16:30:00Z"
+        );
+    }
+
+    #[test]
+    fn reads_items_before_and_after_the_sidecar_adds_snooze_and_answers() {
+        let connection = database();
+        add_item(&connection, "a", "needs_you", &now_iso());
+        let before = read_my_day(&connection, Utc::now()).expect("read");
+        assert_eq!(before.items[0].snoozed_until, None);
+        assert_eq!(before.items[0].choices, serde_json::json!([]));
+        connection
+            .execute_batch(
+                "ALTER TABLE personal_items ADD COLUMN snoozed_until TEXT;
+                 ALTER TABLE personal_items ADD COLUMN choices_json TEXT NOT NULL DEFAULT '[]';
+                 UPDATE personal_items SET choices_json = '[{\"do\":\"close\",\"label\":\"Close it\"}]',
+                   snoozed_until = '2099-01-01T00:00:00.000Z';",
+            )
+            .expect("migrate");
+        let after = read_my_day(&connection, Utc::now()).expect("read");
+        assert_eq!(after.items[0].choices[0]["label"], "Close it");
+        assert_eq!(
+            after.items[0].snoozed_until.as_deref(),
+            Some("2099-01-01T00:00:00.000Z")
+        );
+        connection
+            .execute("UPDATE personal_items SET choices_json = 'not json'", [])
+            .expect("break");
+        assert_eq!(
+            read_my_day(&connection, Utc::now()).expect("read").items[0].choices,
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn puts_an_open_item_off_only_to_a_real_time_ahead() {
+        let connection = database();
+        add_item(&connection, "a", "needs_you", "2026-11-01");
+        add_item(&connection, "d", "done", "2026-11-01");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-20T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        set_snooze(&connection, "a", Some("2026-11-23T03:30:00Z"), now).expect("snooze");
+        let until: Option<String> = connection
+            .query_row(
+                "SELECT snoozed_until FROM personal_items WHERE item_key = 'a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(until.as_deref(), Some("2026-11-23T03:30:00.000Z"));
+        assert!(set_snooze(&connection, "a", Some("2026-11-19T00:00:00Z"), now).is_err());
+        assert!(set_snooze(&connection, "a", Some("2027-06-01T00:00:00Z"), now).is_err());
+        assert!(set_snooze(&connection, "a", Some("tomorrow"), now).is_err());
+        assert!(set_snooze(&connection, "d", Some("2026-11-23T03:30:00Z"), now).is_err());
+        assert!(set_snooze(&connection, "missing", None, now).is_err());
+        set_snooze(&connection, "a", None, now).expect("back");
+        let until: Option<String> = connection
+            .query_row(
+                "SELECT snoozed_until FROM personal_items WHERE item_key = 'a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(until, None);
+    }
+
+    #[test]
+    fn closes_many_together_and_counts_only_what_was_still_open() {
+        let mut connection = database();
+        add_item(&connection, "a", "needs_you", "2026-11-01");
+        add_item(&connection, "b", "ready", "2026-11-01");
+        add_item(&connection, "c", "done", "2026-11-01");
+        let keys = ["a", "b", "c", "missing"].map(String::from);
+        assert_eq!(
+            close_many(&mut connection, &keys, "skipped", "now").unwrap(),
+            2
+        );
+        let closed: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM personal_items WHERE owner_closed = 'skipped'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(closed, 2);
+        assert!(close_many(&mut connection, &keys, "reopen", "now").is_err());
+        let many: Vec<String> = (0..=MAX_BULK_CLOSE).map(|n| n.to_string()).collect();
+        assert!(close_many(&mut connection, &many, "done", "now").is_err());
     }
 
     #[test]
@@ -1112,7 +1471,10 @@ mod tests {
                 )
                 .expect("link");
             connection
-                .execute("INSERT INTO jobs VALUES (?1, ?2)", params![id, status])
+                .execute(
+                    "INSERT INTO jobs (id, status) VALUES (?1, ?2)",
+                    params![id, status],
+                )
                 .expect("job");
         }
     }
@@ -1300,7 +1662,7 @@ mod tests {
         );
         connection
             .execute_batch(
-                "INSERT INTO launchpad_requests VALUES ('r1', NULL, 'RUNNING');
+                "INSERT INTO launchpad_requests (id, job_id, status) VALUES ('r1', NULL, 'RUNNING');
                  UPDATE personal_items SET deploy_request_id = 'r1';",
             )
             .unwrap();
@@ -1350,6 +1712,36 @@ mod tests {
         assert_eq!(state, "needs_you");
         assert!(set_closed(&connection, "a", "nonsense", "now").is_err());
         assert!(set_closed(&connection, "missing", "done", "now").is_err());
+    }
+
+    #[test]
+    fn reopening_puts_an_item_back_as_it_was() {
+        let connection = database();
+        add_item(&connection, "reply", "ready", "2026-11-01");
+        set_closed(&connection, "reply", "done", "now").expect("sent");
+        set_closed(&connection, "reply", "skipped", "now").expect("closed again");
+        set_closed(&connection, "reply", "reopen", "now").expect("undo");
+        let state = |key: &str| -> (String, Option<String>) {
+            connection
+                .query_row(
+                    "SELECT state, closed_from FROM personal_items WHERE item_key = ?1",
+                    params![key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("row")
+        };
+        assert_eq!(state("reply"), ("ready".to_string(), None));
+        add_item(&connection, "old", "needs_you", "2026-11-01");
+        connection
+            .execute(
+                "UPDATE personal_items SET state = 'done', owner_closed = 'skipped' WHERE item_key = 'old'",
+                [],
+            )
+            .unwrap();
+        set_closed(&connection, "old", "reopen", "now").expect("closed before the column");
+        assert_eq!(state("old").0, "needs_you");
+        let day = read_my_day(&connection, Utc::now()).expect("read");
+        assert!(day.items.iter().all(|item| item.closed_from.is_none()));
     }
 
     #[test]
