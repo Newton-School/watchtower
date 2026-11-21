@@ -34,6 +34,7 @@ import { policyNameFor, policyOf, reconcileWork, startItemNow, startWaitingWork 
 import { isRunDue, runWindow } from './schedule.js';
 import { findUnfinishedSessions } from './sessions.js';
 import { standDownForMiniog } from './standDown.js';
+import { inboxReadyLine } from './summary.js';
 import { buildTriagePrompt, parseTriageReply, toPersonalItem } from './triage.js';
 
 /**
@@ -50,6 +51,8 @@ export const PERSONAL_TEAM_ID_KEY = 'personal.team_id';
 
 const workAwake = new KeepAwake();
 const SESSION_KEY_PREFIX = 'session:';
+/** Once: reviews skipped for having nothing new were shown as runs that "decided not to go on". */
+const RESETTLED_SKIPPED_KEY = 'personal.resettled_skipped_reviews';
 const TICK_MS = 15_000;
 const TAP_POLL_MS = 2_000;
 /** A press only counts while the owner's there. Longer means the sidecar was down at the press. */
@@ -388,7 +391,13 @@ export async function runNightly(
     await alertOwner(deps, `Tonight's My day run failed: ${failure}`);
   } else {
     logger.info({ runId: run.id, status, costUsd: personal.runCostUsd(run.id) }, 'my day: run finished');
-    notifyDesktop('My day', 'Your inbox is ready.', 'success');
+    // Work starts only after a run that read every source, and never on Prepare only.
+    const startsWork = status === 'OK' && !params.prepareOnly;
+    const line = inboxReadyLine(
+      personal.openItems(),
+      item => startsWork && !item.requestId && willStartItself(deps, item.action),
+    );
+    notifyDesktop('My day', line, 'success');
   }
   return { ...run, status };
 }
@@ -398,6 +407,11 @@ export function startNightlyRuns(deps: NightlyRunDeps): void {
   const { store } = deps;
   const personal = store.personalStore();
   personal.failInterruptedRuns('Watchtower restarted during the run.');
+  if (store.getState(RESETTLED_SKIPPED_KEY) !== '1') {
+    const count = personal.resettleSkippedWork();
+    store.setState(RESETTLED_SKIPPED_KEY, '1');
+    if (count > 0) logger.info({ count }, 'my day: settling skipped work again');
+  }
   let running = false;
 
   const step = async () => {

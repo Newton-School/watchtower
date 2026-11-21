@@ -233,6 +233,64 @@ export interface Settled {
   replyText?: string;
   prUrls?: string[];
   tagLine?: string;
+  /** Running the same work again would end the same way, so it isn't offered. */
+  clearAction?: boolean;
+}
+
+function prName(url: string): string {
+  const match = PR_URL.exec(url);
+  return match ? `${match[2]}#${match[3]}` : url;
+}
+
+function joinNames(names: string[]): string {
+  return names.length <= 1 ? (names[0] ?? '') : `${names.slice(0, -1).join(', ')} and ${names.at(-1)}`;
+}
+
+/**
+ * Why a review run did nothing, from what it recorded. Usually nothing changed
+ * since miniOG's last review, which is done, not a failure. A PR it dropped
+ * before reviewing is merged or closed, or past one run's cap; those past the
+ * cap are named, since running the same ask again would stop at the same cap.
+ * Nothing to go on (no PR on the item, none recorded) leaves it to the job's own reason.
+ */
+function settleSkippedReview(item: PersonalItem, result: Record<string, unknown> | undefined): Settled | undefined {
+  const urls = validPrUrls(item);
+  const unchanged = reviewOutcomes(result)
+    .map(outcome => (outcome.status === 'SKIPPED' ? outcome.prUrl : undefined))
+    .filter((url): url is string => Boolean(url));
+  const deferred = new Set(
+    Array.isArray(result?.deferredUrls)
+      ? result.deferredUrls.filter((url): url is string => typeof url === 'string')
+      : [],
+  );
+  const shut = urls.filter(url => ['merged', 'closed'].includes(item.prInfo?.[url]?.state ?? ''));
+  const accounted = new Set([...unchanged, ...shut]);
+  const pastCap = urls.filter(url => deferred.has(url) && !accounted.has(url));
+  const unknown = urls.filter(url => !accounted.has(url) && !deferred.has(url));
+  const many = (list: string[]) => list.length > 1;
+  const said = [
+    unchanged.length > 0
+      ? `No new commits on ${joinNames(unchanged.map(prName))} since miniOG last reviewed ${many(unchanged) ? 'them' : 'it'}.`
+      : '',
+    shut.length > 0 ? `${joinNames(shut.map(prName))} ${many(shut) ? 'are' : 'is'} already merged or closed.` : '',
+  ].filter(Boolean);
+  if (pastCap.length === 0 && unknown.length === 0 && said.length > 0) {
+    return { state: 'done', doneSummary: `${said.join(' ')} Nothing new to review.` };
+  }
+  if (pastCap.length > 0) {
+    const names = joinNames(pastCap.map(prName));
+    said.push(
+      `${names} ${many(pastCap) ? "weren't" : "wasn't"} reviewed: one run takes 3 PRs at most. Tell miniOG to review ${many(pastCap) ? 'them' : 'it'}.`,
+    );
+  }
+  if (unknown.length > 0) {
+    said.push(
+      `${joinNames(unknown.map(prName))} ${many(unknown) ? "weren't" : "wasn't"} reviewed. See the run for why.`,
+    );
+  }
+  if (said.length === 0) return undefined;
+  // Running the same ask again would end the same way.
+  return { state: 'needs_you', nextStep: said.join(' '), clearAction: true };
 }
 
 /** What a finished job means for its item. Pure, apart from what to do about the tag. */
@@ -240,11 +298,16 @@ export function settleItem(
   item: PersonalItem,
   job: Pick<MiniogJob, 'status' | 'workflow'> & { result?: Record<string, unknown>; error?: string },
 ): Settled {
-  if (job.status === 'FAILED' || job.status === 'CANCELLED' || job.status === 'SKIPPED') {
-    const why = job.error?.trim() || (job.status === 'SKIPPED' ? 'It decided not to go on.' : 'It stopped.');
-    return { state: 'needs_you', nextStep: `The run didn't finish: ${why} See the run, then answer or run it again.` };
-  }
   const expected = expectedWorkflow(item);
+  if (job.status === 'SKIPPED' && expected === 'PR_REVIEW' && sameKind(job.workflow, expected)) {
+    const settled = settleSkippedReview(item, job.result);
+    if (settled) return settled;
+  }
+  if (job.status === 'FAILED' || job.status === 'CANCELLED' || job.status === 'SKIPPED') {
+    const why =
+      job.error?.trim() || (job.status === 'SKIPPED' ? 'It stopped without changing anything.' : 'It stopped.');
+    return { state: 'needs_you', nextStep: `The run didn't finish: ${why}` };
+  }
   if (expected && !sameKind(job.workflow, expected)) {
     return {
       state: 'needs_you',
