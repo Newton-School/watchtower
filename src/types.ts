@@ -11,6 +11,14 @@ export type MyDayPrInfo = {
   base?: string;
 };
 
+/** A one-tap answer to an item's question; the first is the one triage recommends. */
+export type MyDayChoice = {
+  label: string;
+  do: 'close' | 'snooze' | 'miniog';
+  days?: number;
+  instruction?: string;
+};
+
 export type MyDayItem = {
   key: string;
   source: string;
@@ -38,6 +46,14 @@ export type MyDayItem = {
   deployJobId: string | null;
   deployStatus: string | null;
   firstSeenAt: string;
+  sessionCwd: string | null;
+  requestId: string | null;
+  jobWorkflow: string | null;
+  jobUpdatedAt: string | null;
+  snoozedUntil: string | null;
+  choices: MyDayChoice[];
+  lastSeenAt: string;
+  closedFrom: string | null;
 };
 
 export type MyDayRun = {
@@ -50,13 +66,18 @@ export type MyDayRun = {
   gaps: string[];
   error: string | null;
   costUsd: number;
+  sweepCostUsd: number;
+  workCostUsd: number;
+  prepareOnly: boolean;
 };
 
 export type MyDay = {
   enabled: boolean;
   runTime: string;
+  enabledAt: string | null;
   runQueued: boolean;
   lastRun: MyDayRun | null;
+  runs: MyDayRun[];
   items: MyDayItem[];
   policies: Record<string, string>;
 };
