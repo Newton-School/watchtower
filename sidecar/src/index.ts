@@ -15,6 +15,7 @@ import {
 import { startLaunchpadRequestPoller, takeBackPostedAsk } from './launchpad/launchpadIntake.js';
 import { startAppAnswerPoller } from './launchpad/appAnswers.js';
 import { startNightlyRuns } from './personal/nightlyRun.js';
+import { closedBeforeStart } from './personal/work.js';
 import { logger } from './logging/logger.js';
 import { configureButtons } from './slack/buttonReplies.js';
 import { runPrFollowUp } from './workflows/prFollowUp.js';
@@ -847,6 +848,16 @@ async function closeLaunchpadRequest(
 }
 
 async function processEventClaimed(event: SlackEventEnvelope, client: WebClient): Promise<void> {
+  // He closed its My day item while the run waited its turn: closing it said stop.
+  if (!event.answersJobId && closedBeforeStart(store, event.launchpadRequestId)) {
+    store.recordEvent(event.eventId, event.channelId, event.threadTs);
+    logger.info(
+      { eventId: event.eventId, requestId: event.launchpadRequestId },
+      'launchpad request skipped: its My day item was closed',
+    );
+    await closeLaunchpadRequest(event, client, 'SKIPPED', 'Closed in My day before it started.');
+    return;
+  }
   // A launchpad run may start from a message an earlier run started from: a
   // re-run from the app does exactly that. Its request id already makes it
   // unique.

@@ -19,6 +19,7 @@ import { fetchPrInfo } from '../src/personal/prInfo.js';
 import {
   buildJobPrompt,
   chooseWork,
+  closedBeforeStart,
   deciderJob,
   isIntentAllowedForPersonalJob,
   planAsksOwner,
@@ -1705,6 +1706,22 @@ describe('the personal store', () => {
     personal.setWorkStarted('a', 'r2');
     expect(personal.itemKeyForAnchor('D1', '1.2')).toBe('a');
     expect(job.claimPendingLaunchpadRequests().map(request => request.personalItemKey)).toContain('a');
+  });
+
+  it("drops a run My day asked for once he closes its item, and only that item's runs", () => {
+    const job = new JobStore(path.join(tempDir(), 'watchtower.db'));
+    const personal = job.personalStore();
+    personal.upsertItem({ ...item, key: 'a', action: 'review_pr' });
+    job.createLaunchpadRequest({ id: 'r1', target: 'miniog', prompt: 'x', ownerUserId: 'U1', personalItemKey: 'a' });
+    job.createLaunchpadRequest({ id: 'r2', target: 'miniog', prompt: 'x', ownerUserId: 'U1' });
+    expect(closedBeforeStart(job, 'r1')).toBe(false);
+    (job as unknown as { db: { exec(sql: string): void } }).db.exec(
+      `UPDATE personal_items SET state = 'done', owner_closed = 'skipped' WHERE item_key = 'a'`,
+    );
+    expect(closedBeforeStart(job, 'r1')).toBe(true);
+    expect(closedBeforeStart(job, 'r2')).toBe(false);
+    expect(closedBeforeStart(job, 'missing')).toBe(false);
+    expect(closedBeforeStart(job, undefined)).toBe(false);
   });
 
   it('starts a request and its item together, or neither', () => {

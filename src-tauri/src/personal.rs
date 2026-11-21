@@ -605,7 +605,8 @@ fn session_of(connection: &Connection, key: &str) -> Result<(String, String), St
 /// he closed alone. Only his own closing can be undone: a run's `done` has a reason.
 /// Reopening puts it back as it was: a reply that was ready to send comes back
 /// ready, not as work to run again, which would open a second PR.
-fn set_closed(connection: &Connection, key: &str, how: &str, now: &str) -> Result<(), String> {
+/// Says whether closing stopped work, which Reopen can't bring back.
+fn set_closed(connection: &Connection, key: &str, how: &str, now: &str) -> Result<bool, String> {
     if !["skipped", "done", "reopen"].contains(&how) {
         return Err(format!("{how} isn't something an item can be set to"));
     }
@@ -638,10 +639,10 @@ fn set_closed(connection: &Connection, key: &str, how: &str, now: &str) -> Resul
     if changed == 0 {
         return Err("that item is no longer in the list".to_string());
     }
-    if how != "reopen" {
-        stop_its_run(connection, key, now)?;
+    if how == "reopen" {
+        return Ok(false);
     }
-    Ok(())
+    stop_its_run(connection, key, now)
 }
 
 /// Puts an open item off until `until`, or brings it back with `None`. The time comes
@@ -686,6 +687,24 @@ fn set_snooze(
     Ok(())
 }
 
+/// Brings a put-off item back now. Waking it is news, as the snooze running out
+/// would be, so an old item he brings back by hand isn't filed with the week-old
+/// ones. One that isn't put off any more is left as it is.
+fn wake(connection: &Connection, key: &str, now: chrono::DateTime<Utc>) -> Result<(), String> {
+    if !has_column(connection, "personal_items", "snoozed_until")? {
+        return Ok(());
+    }
+    let now = now.to_rfc3339_opts(SecondsFormat::Millis, true);
+    connection
+        .execute(
+            "UPDATE personal_items SET snoozed_until = ?2
+              WHERE item_key = ?1 AND state != 'done' AND snoozed_until > ?2",
+            params![key, now],
+        )
+        .map(|_| ())
+        .map_err(|err| format!("db write failed: {err}"))
+}
+
 /// Closes several items as one: all of them or, on a real failure, none. An item a
 /// run closed in the meantime is simply not counted.
 fn close_many(
@@ -728,9 +747,13 @@ fn close_many(
 }
 
 /// Closing an item stops its run: otherwise it would go on to push and open a PR.
-fn stop_its_run(connection: &Connection, key: &str, now: &str) -> Result<(), String> {
+/// That includes the job its request started before the sidecar linked it to the
+/// item, and a request that hasn't started: one not yet taken is called off here,
+/// and the sidecar drops one it has taken when its turn comes. Says whether there
+/// was work to stop.
+fn stop_its_run(connection: &Connection, key: &str, now: &str) -> Result<bool, String> {
     if !has_table(connection, "jobs")? {
-        return Ok(());
+        return Ok(false);
     }
     connection
         .execute_batch(
@@ -739,17 +762,59 @@ fn stop_its_run(connection: &Connection, key: &str, now: &str) -> Result<(), Str
              )",
         )
         .map_err(|err| format!("db schema failed: {err}"))?;
-    connection
+    let requests = has_table(connection, "launchpad_requests")?
+        && has_column(connection, "personal_items", "request_id")?;
+    let request_job = if requests {
+        " UNION SELECT launchpad_requests.job_id FROM launchpad_requests
+            JOIN personal_items ON personal_items.request_id = launchpad_requests.id
+           WHERE personal_items.item_key = ?1"
+    } else {
+        ""
+    };
+    let live = connection
+        .prepare(&format!(
+            "SELECT id FROM jobs
+              WHERE status IN ('RUNNING', 'PAUSED')
+                AND id IN (SELECT job_id FROM personal_items WHERE item_key = ?1{request_job})"
+        ))
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![key], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|err| format!("db read failed: {err}"))?;
+    for job_id in &live {
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO pending_cancel_jobs (job_id, created_at) VALUES (?1, ?2)",
+                params![job_id, now],
+            )
+            .map_err(|err| format!("db write failed: {err}"))?;
+    }
+    if !requests {
+        return Ok(!live.is_empty());
+    }
+    let called_off = connection
         .execute(
-            "INSERT OR IGNORE INTO pending_cancel_jobs (job_id, created_at)
-             SELECT item.job_id, ?2
-               FROM personal_items item
-               JOIN jobs ON jobs.id = item.job_id
-              WHERE item.item_key = ?1 AND jobs.status IN ('RUNNING', 'PAUSED')",
+            "UPDATE launchpad_requests
+                SET status = 'SKIPPED', error_message = 'Closed in My day before it started.', updated_at = ?2
+              WHERE id = (SELECT request_id FROM personal_items WHERE item_key = ?1)
+                AND status = 'PENDING' AND job_id IS NULL",
             params![key, now],
         )
-        .map(|_| ())
-        .map_err(|err| format!("db write failed: {err}"))
+        .map_err(|err| format!("db write failed: {err}"))?;
+    let taken = connection
+        .query_row(
+            "SELECT 1 FROM launchpad_requests
+              WHERE id = (SELECT request_id FROM personal_items WHERE item_key = ?1)
+                AND status IN ('CLAIMED', 'QUEUED') AND job_id IS NULL",
+            params![key],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|err| format!("db read failed: {err}"))?
+        .is_some();
+    Ok(!live.is_empty() || called_off > 0 || taken)
 }
 
 /// The repo of a checked PR link: `https://github.com/<owner>/<repo>/pull/<number>`.
@@ -1063,12 +1128,13 @@ pub(crate) async fn deploy_my_day_item(
         .map_err(|err| format!("db write failed: {err}"))
 }
 
+/// Says whether closing stopped work, so the app offers no Undo then.
 #[tauri::command]
 pub(crate) async fn close_my_day_item(
     key: String,
     how: String,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let connection =
         Connection::open(&*state.db_path).map_err(|err| format!("db open failed: {err}"))?;
     set_closed(&connection, &key, &how, &now_iso())
@@ -1084,6 +1150,17 @@ pub(crate) async fn snooze_my_day_item(
     let connection =
         Connection::open(&*state.db_path).map_err(|err| format!("db open failed: {err}"))?;
     set_snooze(&connection, &key, until.as_deref(), Utc::now())
+}
+
+/// Brings a put-off item back now.
+#[tauri::command]
+pub(crate) async fn wake_my_day_item(
+    key: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let connection =
+        Connection::open(&*state.db_path).map_err(|err| format!("db open failed: {err}"))?;
+    wake(&connection, &key, Utc::now())
 }
 
 /// Clears several items at once, such as everything older than a week.
@@ -1188,7 +1265,7 @@ mod tests {
                    updated_at TEXT);
                  CREATE TABLE human_waits (job_id TEXT, prompt_ts TEXT);
                  CREATE TABLE launchpad_requests (id TEXT PRIMARY KEY, job_id TEXT, status TEXT,
-                   personal_item_key TEXT, created_at TEXT);",
+                   personal_item_key TEXT, created_at TEXT, error_message TEXT, updated_at TEXT);",
             )
             .expect("schema");
         connection
@@ -1748,13 +1825,120 @@ mod tests {
     fn closing_an_item_stops_its_run() {
         let connection = database();
         add_item_with_job(&connection, Some(("j", "RUNNING")));
-        set_closed(&connection, "a", "skipped", "now").expect("close");
+        assert!(set_closed(&connection, "a", "skipped", "now").expect("close"));
         let job: String = connection
             .query_row("SELECT job_id FROM pending_cancel_jobs", [], |row| {
                 row.get(0)
             })
             .expect("queued");
         assert_eq!(job, "j");
+    }
+
+    #[test]
+    fn closing_stops_work_the_item_has_not_been_linked_to_yet() {
+        let connection = database();
+        add_item(&connection, "a", "working", "2026-11-01");
+        connection
+            .execute_batch(
+                "UPDATE personal_items SET request_id = 'q1' WHERE item_key = 'a';
+                 INSERT INTO launchpad_requests (id, job_id, status) VALUES ('q1', 'j-new', 'RUNNING');
+                 INSERT INTO jobs (id, status) VALUES ('j-new', 'RUNNING');",
+            )
+            .expect("seed");
+        assert!(set_closed(&connection, "a", "skipped", "now").expect("close"));
+        let job: String = connection
+            .query_row("SELECT job_id FROM pending_cancel_jobs", [], |row| {
+                row.get(0)
+            })
+            .expect("queued");
+        assert_eq!(job, "j-new");
+    }
+
+    #[test]
+    fn closing_calls_off_work_that_has_not_started() {
+        let connection = database();
+        for (key, request, status) in [("p", "q1", "PENDING"), ("t", "q2", "QUEUED")] {
+            add_item(&connection, key, "working", "2026-11-01");
+            connection
+                .execute(
+                    "UPDATE personal_items SET request_id = ?2 WHERE item_key = ?1",
+                    params![key, request],
+                )
+                .expect("link");
+            connection
+                .execute(
+                    "INSERT INTO launchpad_requests (id, status) VALUES (?1, ?2)",
+                    params![request, status],
+                )
+                .expect("request");
+        }
+        assert!(set_closed(&connection, "p", "skipped", "now").expect("close"));
+        assert!(set_closed(&connection, "t", "done", "now").expect("close"));
+        let request = |id: &str| -> (String, Option<String>) {
+            connection
+                .query_row(
+                    "SELECT status, error_message FROM launchpad_requests WHERE id = ?1",
+                    params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("row")
+        };
+        assert_eq!(
+            request("q1"),
+            (
+                "SKIPPED".to_string(),
+                Some("Closed in My day before it started.".to_string())
+            )
+        );
+        // Taken by the sidecar already: it drops the request when its turn comes.
+        assert_eq!(request("q2"), ("QUEUED".to_string(), None));
+    }
+
+    #[test]
+    fn closing_with_no_work_going_stops_nothing() {
+        let connection = database();
+        add_item_with_job(&connection, Some(("j", "SUCCESS")));
+        connection
+            .execute_batch(
+                "UPDATE personal_items SET request_id = 'q1';
+                 INSERT INTO launchpad_requests (id, job_id, status) VALUES ('q1', 'j', 'SUCCESS');",
+            )
+            .expect("seed");
+        assert!(!set_closed(&connection, "a", "skipped", "now").expect("close"));
+        assert!(!set_closed(&connection, "a", "reopen", "now").expect("reopen"));
+        let pending: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pending_cancel_jobs", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn waking_an_item_by_hand_counts_from_now() {
+        let connection = database();
+        connection
+            .execute_batch("ALTER TABLE personal_items ADD COLUMN snoozed_until TEXT;")
+            .expect("column");
+        add_item(&connection, "a", "needs_you", "2026-11-01");
+        add_item(&connection, "b", "needs_you", "2026-11-01");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-20T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        set_snooze(&connection, "a", Some("2026-11-23T03:30:00Z"), now).expect("snooze");
+        wake(&connection, "a", now).expect("wake");
+        wake(&connection, "b", now).expect("not put off");
+        let until = |key: &str| -> Option<String> {
+            connection
+                .query_row(
+                    "SELECT snoozed_until FROM personal_items WHERE item_key = ?1",
+                    params![key],
+                    |row| row.get(0),
+                )
+                .expect("row")
+        };
+        assert_eq!(until("a").as_deref(), Some("2026-11-20T10:00:00.000Z"));
+        assert_eq!(until("b"), None);
     }
 
     #[test]
