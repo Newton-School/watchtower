@@ -21,6 +21,8 @@ type AppShellProps = {
   children: ReactNode;
   currentView: AppView;
   failuresCount: number;
+  /** What's his move in My day, for its badge. */
+  myDayCount?: number;
   navDrawerOpen: boolean;
   onNavigate: (view: AppView) => void;
   onToggleNavDrawer: () => void;
@@ -33,13 +35,14 @@ type NavItem = {
   label: string;
   icon: ReactNode;
   badge?: string | number | null;
-  badgeTone?: 'danger' | 'warning' | 'info';
+  badgeTone?: 'danger' | 'warning' | 'info' | 'accent';
 };
 
 export function AppShell({
   children,
   currentView,
   failuresCount,
+  myDayCount = 0,
   navDrawerOpen,
   onNavigate,
   onToggleNavDrawer,
@@ -48,7 +51,13 @@ export function AppShell({
 }: AppShellProps) {
   const navItems: NavItem[] = [
     { view: 'launchpad', label: 'Launchpad', icon: <LaunchpadIcon /> },
-    { view: 'myday', label: 'My day', icon: <MyDayIcon /> },
+    {
+      view: 'myday',
+      label: 'My day',
+      icon: <MyDayIcon />,
+      badge: myDayCount > 0 ? myDayCount : null,
+      badgeTone: 'accent',
+    },
     { view: 'overview', label: 'Overview', icon: <OverviewIcon /> },
     {
       view: 'runs',

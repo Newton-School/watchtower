@@ -10,6 +10,7 @@ import { formatSidecarLine } from './lib/formatters';
 import { IntelligencePage } from './pages/IntelligencePage';
 import { PerformancePage } from './pages/PerformancePage';
 import { MyDayPage } from './pages/MyDayPage';
+import { yourMoveCount } from './lib/myDay';
 import { UxMetricsPage } from './pages/UxMetricsPage';
 import { LaunchpadPage } from './pages/LaunchpadPage';
 import { OverviewPage } from './pages/OverviewPage';
@@ -20,6 +21,7 @@ import { SettingsPage } from './pages/SettingsPage';
 import type {
   AppSettings,
   AppNotificationPayload,
+  MyDay,
   AppView,
   DashboardData,
   ImportNotificationAudioResponse,
@@ -32,6 +34,8 @@ import type {
 } from './types';
 
 const POLL_MS = 5000;
+/** The My day badge: a light read, so not as often as the dashboard. */
+const MY_DAY_BADGE_MS = 60_000;
 const NOTIFICATION_AUDIO_MAX_BYTES = 10 * 1024 * 1024;
 const PENDING_SHORTCUT_VIEW_KEY = 'watchtower:pending-shortcut-view';
 const PENDING_SHORTCUT_TARGET_KEY = 'watchtower:pending-shortcut-target';
@@ -127,12 +131,24 @@ function App() {
   const [slackCommandTarget, setSlackCommandTarget] = useState<SlackCommandTarget>('miniog');
   const [slackComposerFocusToken, setSlackComposerFocusToken] = useState(0);
   const [reviewJobId, setReviewJobId] = useState<string | null>(null);
+  const [myDayCount, setMyDayCount] = useState(0);
 
   const openReview = (jobId: string) => {
     setReviewJobId(jobId);
     setView('review');
     setNavDrawerOpen(false);
   };
+
+  useEffect(() => {
+    const readMyDay = () =>
+      invoke<MyDay>('get_my_day')
+        .then(day => setMyDayCount(yourMoveCount(day)))
+        .catch(() => undefined);
+    void readMyDay();
+    const interval = window.setInterval(readMyDay, MY_DAY_BADGE_MS);
+    return () => window.clearInterval(interval);
+    // Leaving My day is when its count is most likely to have changed.
+  }, [view]);
 
   const settingsIncomplete = useMemo(() => {
     return data ? !data.settingsConfigured : false;
@@ -505,6 +521,7 @@ function App() {
     <AppShell
       currentView={view}
       failuresCount={summary.failures}
+      myDayCount={myDayCount}
       navDrawerOpen={navDrawerOpen}
       onNavigate={navigateToView}
       onToggleNavDrawer={() => setNavDrawerOpen(open => !open)}
